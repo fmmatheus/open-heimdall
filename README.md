@@ -1,24 +1,27 @@
 # Heimdall
 
-**A local control plane for running and observing parallel engineering workflows across multiple projects.**
+**An opinionated, minimalist agent orchestrator for the OpenCode + OpenChamber workflow.**
 
 > **Status:** Early development / pre-alpha.
 
-Heimdall runs as a single global service that coordinates isolated tasks across your local Git projects.
+You provide a feature. Heimdall breaks it into tasks, executes them sequentially within each run, manages model choice, and controls usage according to your configuration.
 
-Instead of installing and maintaining workflow infrastructure independently in every repository, Heimdall provides one place to manage execution, concurrency, lifecycle, and observability.
+Heimdall runs as a single global service across your local Git projects, keeping workflow policy, execution, and observability in one place.
 
 ## Why Heimdall?
 
-Engineering workflows increasingly need to operate across multiple repositories and run several tasks concurrently.
+Multiple features and runs can progress concurrently in the same project or across different projects. Each run handles one task at a time.
 
-Heimdall is designed around three principles:
+Heimdall is designed around these principles:
 
 - **One control plane** — a single installation and workflow version across projects.
-- **Safe parallelism** — tasks execute independently, using isolated Git worktrees where appropriate.
+- **Sequential tasks, concurrent runs** — each run executes one task at a time; concurrent agent changes use isolated Git worktrees. Multiple agents never modify the same worktree simultaneously.
+- **Model and usage policy** — Heimdall manages model choice. Usage is unlimited by default, with optional boundaries such as session time and token usage per window.
 - **Global observability** — see what is running, what succeeded, what failed, and why.
 
 ## How it works
+
+The core workflow is feature request → task breakdown → sequential task execution, with model choice and configured usage boundaries managed throughout.
 
 ```text
                      Heimdall
@@ -40,7 +43,7 @@ Heimdall is designed around three principles:
           Worktree   Worktree   Worktree
 ```
 
-The daemon acts as the control plane. Individual workers execute tasks in isolation, allowing multiple projects—and multiple tasks within the same project—to run concurrently.
+The daemon coordinates OpenCode task execution through subprocess workers. Multiple runs and features can be active concurrently within or across projects, subject to global and per-project concurrency limits. Within each run, one task finishes before the next starts, and a worktree has only one agent modifying it at a time.
 
 ## Architecture
 
@@ -54,8 +57,12 @@ accepted decisions, tradeoffs, and deferred choices.
 
 Heimdall aims to provide:
 
+- Feature breakdown into tasks
+- Sequential task execution within each run
+- Model selection policy
+- Optional session-time and token-usage boundaries, unlimited by default
 - Global project and task management
-- Parallel task execution
+- Concurrent runs within and across projects
 - Git worktree isolation
 - Centralized workflow versioning
 - Centralized filesystem watching
@@ -66,6 +73,8 @@ Heimdall aims to provide:
 
 ## Non-goals
 
+Heimdall is focused on the OpenCode + OpenChamber workflow. A general-purpose orchestration platform is outside its scope.
+
 Heimdall is not intended to replace:
 
 - Git
@@ -73,7 +82,7 @@ Heimdall is not intended to replace:
 - container orchestrators
 - project-specific build and test tooling
 
-It coordinates local engineering workflows around those tools.
+It coordinates agent work around those tools.
 
 ## Project status
 
@@ -85,14 +94,13 @@ The architecture and public interfaces are not yet stable, and there is no usabl
 
 Initial development will focus on:
 
-1. Global daemon and CLI
-2. Project registry
-3. Task and run lifecycle
-4. Isolated Git worktrees
-5. Parallel workers
-6. Central event and state storage
-7. Watch management
-8. Logs and status reporting
+1. Define the OpenCode + OpenChamber integration boundary
+2. Feature breakdown and sequential task execution
+3. Model selection and configurable usage boundaries
+4. Global daemon, CLI, and project registry
+5. Task and run lifecycle, with isolated Git worktrees
+6. Concurrent runs and global/per-project limits
+7. Central event and state storage, watch management, and status reporting
 
 ## Contributing
 
