@@ -1,0 +1,44 @@
+{
+  "name": "@open-heimdall/core",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Opinionated OpenCode workflow coordination, extracted from the validated ADR workflow",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "bin": {
+    "heimdall": "./dist/cli.js"
+  },
+  "exports": {
+    ".": "./dist/index.js",
+    "./plugin": "./dist/opencode/plugin.js"
+  },
+  "files": [
+    "dist",
+    "prompts",
+    "examples",
+    "README.md",
+    "docs"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.0.22",
+    "@slkiser/opencode-quota": "5.0.1",
+    "smol-toml": "1.9.0"
+  },
+  "overrides": {
+    "@slkiser/opencode-quota": {
+      "@opencode/plugin": "2.0.22"
+    }
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "typescript": "7.0.2"
+  }
+}

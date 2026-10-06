@@ -6,11 +6,11 @@
 
 You provide a feature. Heimdall breaks it into tasks, executes them sequentially within each run, manages model choice, and controls usage according to your configuration.
 
-Heimdall runs as a single global service across your local Git projects, keeping workflow policy, execution coordination, and observability in one place.
+Heimdall is designed to run as a single global service across your local Git projects, keeping workflow policy, execution coordination, and observability in one place.
 
 ## Why Heimdall?
 
-Multiple features and runs can progress concurrently in the same project or across different projects. Each run handles one task at a time.
+The target coordinator allows multiple features and runs to progress concurrently in the same project or across different projects. Each run handles one task at a time. The current extraction preserves one active run per state directory.
 
 Heimdall is designed around these principles:
 
@@ -43,11 +43,11 @@ The core workflow is feature request → task breakdown → sequential task exec
           Worktree   Worktree   Worktree
 ```
 
-The global coordinator controls OpenCode sessions through an adapter. OpenCode owns agent and tool execution. Multiple runs and features can be active concurrently within or across projects, subject to global and per-project concurrency limits. Within each run, one task finishes before the next starts, and a worktree has only one agent modifying it at a time.
+The planned global coordinator controls OpenCode sessions through an adapter. OpenCode owns agent and tool execution. Multiple runs and features will be coordinated within or across projects, subject to global and per-project concurrency limits. Within each run, one task finishes before the next starts, and a worktree has only one agent modifying it at a time.
 
 ## Architecture
 
-The first version uses TypeScript and Node.js for a global coordinator and CLI,
+The selected stack is TypeScript and Node.js for a global coordinator and CLI,
 SQLite for coordination state and event history, and the Git CLI with isolated
 worktrees. It builds on the validated ADR workflow and the existing
 OpenChamber-managed OpenCode connection. OpenCode retains its session storage.
@@ -90,9 +90,24 @@ It coordinates agent work around those tools.
 
 ## Project status
 
-Heimdall is currently being designed.
+Heimdall has a development baseline extracted from the working ADR workflow:
+a TypeScript runner, OpenCode adapter, quota-aware model selection, configurable
+paths, and the preserved behavioral tests.
 
-The architecture and public interfaces are not yet stable, and there is no usable release yet.
+The global coordinator and public interfaces are still being developed. There is
+no usable release yet. See [baseline development](docs/development.md) for setup,
+supported versions, current limits, and how to keep existing workflows separate.
+
+## Development
+
+```sh
+npm ci --ignore-scripts
+npm run check
+npm test
+```
+
+Use Node.js 22.19 or newer. The tests use synthetic backends and temporary project
+directories; they do not run live agents or operate on existing workflow state.
 
 ## Roadmap
 
