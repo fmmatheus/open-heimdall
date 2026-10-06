@@ -50,6 +50,8 @@ real parent tool context and the effective native `subagent` tool. Configure the
 existing local managed server's URL in `[opencode]` and supply its password through
 the named environment variable. The adapter validates server version, session
 identity and project directory. It does not harvest passwords from processes.
+Explicitly passwordless loopback servers can use `authentication = "none"` in
+`[opencode]`; password authentication remains the default.
 
 After building this checkout, use a local link in a **separate development Git
 project**. Run these commands from that separate project:

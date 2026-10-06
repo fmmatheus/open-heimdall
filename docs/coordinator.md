@@ -17,6 +17,14 @@ project with a valid [project configuration](../examples/heimdall.toml). Set its
 existing local OpenCode **2.0.22** URL and provide the configured password in the
 coordinator's environment. Provider credentials remain in OpenCode.
 
+For an explicitly passwordless loopback server, set
+`authentication = "none"` in `[opencode]`. This omits authorization and does not
+read the password environment variable. Basic authentication remains the default.
+OpenCode 2.0.22's standard CLI generates a password; its embedded fetch server
+supports passwordless operation. Starting a second server on an existing native
+database can resume its unfinished sessions, so validation must keep execution
+state separate from running workflows.
+
 Copy [coordinator.toml](../examples/coordinator.toml) to a private configuration
 directory. Limits default to one global run and one run per project when omitted.
 An explicit project `--limit` overrides the registration default. Limits count

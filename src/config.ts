@@ -14,7 +14,7 @@ export interface Configuration {
   planRoot: string;
   settings: RunnerSettings;
   readSettings?: () => Promise<RunnerSettings>;
-  opencode: { baseUrl?: string; passwordEnvironmentVariable: string };
+  opencode: { baseUrl?: string; passwordEnvironmentVariable: string; authentication?: 'basic' | 'none' };
 }
 
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value) && !(value instanceof Date);
@@ -69,7 +69,7 @@ export async function loadConfiguration({ projectDirectory = process.cwd(), conf
   const opencode = table(document.opencode, 'opencode');
   keys(workflow, ['plannerAgent', 'executorAgent', 'plannerModel', 'plannerVariant', 'executorModel', 'executorFallbackModel', 'executorCandidates', 'maxTasks', 'minQuotaRemainingPercent', 'fiveHourQuotaWeight', 'tokenLimitsDisabled', 'timeoutMinutes', 'maxSessionTokens', 'maxRunTokens', 'maxPlannerTokens', 'maxSessionUncachedTokens', 'maxRunUncachedTokens', 'maxPlannerUncachedTokens', 'packagePath'], 'workflow');
   keys(paths, ['state', 'plans', 'plannerPrompt', 'executorPrompt'], 'paths');
-  keys(opencode, ['baseUrl', 'passwordEnvironmentVariable'], 'opencode');
+  keys(opencode, ['baseUrl', 'passwordEnvironmentVariable', 'authentication'], 'opencode');
   let candidates: ExecutorCandidate[] | undefined;
   if (workflow.executorCandidates !== undefined) {
     if (!Array.isArray(workflow.executorCandidates) || workflow.executorCandidates.length === 0) throw new Error('executorCandidates must be a nonempty array');
@@ -107,6 +107,8 @@ export async function loadConfiguration({ projectDirectory = process.cwd(), conf
   const planRoot = path.resolve(directory, text(paths.plans, 'paths.plans', path.join(workflowRoot, 'plans')));
   const relativePlans = path.relative(directory, planRoot);
   if (relativePlans === '..' || relativePlans.startsWith('..' + path.sep) || path.isAbsolute(relativePlans)) throw new Error('paths.plans must remain inside the project; configure it explicitly when state is external');
+  const authentication = opencode.authentication ?? 'basic';
+  if (authentication !== 'basic' && authentication !== 'none') throw new Error('opencode.authentication must be basic or none');
   const passwordEnvironmentVariable = text(opencode.passwordEnvironmentVariable, 'opencode.passwordEnvironmentVariable', 'OPENCODE_PASSWORD');
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(passwordEnvironmentVariable)) throw new Error('passwordEnvironmentVariable must be an environment variable name');
   const baseUrl = opencode.baseUrl === undefined ? undefined : text(opencode.baseUrl, 'opencode.baseUrl');
@@ -119,14 +121,14 @@ export async function loadConfiguration({ projectDirectory = process.cwd(), conf
     plannerPromptPath: paths.plannerPrompt === undefined ? fileURLToPath(new URL('../prompts/planner.md', import.meta.url)) : path.resolve(directory, text(paths.plannerPrompt, 'paths.plannerPrompt')),
     executorPromptPath: paths.executorPrompt === undefined ? fileURLToPath(new URL('../prompts/executor.md', import.meta.url)) : path.resolve(directory, text(paths.executorPrompt, 'paths.executorPrompt')),
     planRoot,
-    opencode: { ...(baseUrl ? { baseUrl } : {}), passwordEnvironmentVariable },
+    opencode: { ...(baseUrl ? { baseUrl } : {}), passwordEnvironmentVariable, authentication },
   };
   configuration.readSettings = async () => {
     const current = await loadConfiguration({ projectDirectory: directory, configPath: file });
     for (const key of ['workflowRoot', 'planRoot', 'plannerPromptPath', 'executorPromptPath'] as const) {
       if (current[key] !== configuration[key]) throw new Error('Changing workflow paths requires reloading the plugin; existing run locations are preserved');
     }
-    if (current.settings.plannerAgent !== settings.plannerAgent || current.settings.executorAgent !== settings.executorAgent || current.opencode.baseUrl !== configuration.opencode.baseUrl || current.opencode.passwordEnvironmentVariable !== configuration.opencode.passwordEnvironmentVariable) throw new Error('Changing native roles or connection settings requires reloading the plugin');
+    if (current.settings.plannerAgent !== settings.plannerAgent || current.settings.executorAgent !== settings.executorAgent || current.opencode.authentication !== configuration.opencode.authentication || current.opencode.baseUrl !== configuration.opencode.baseUrl || current.opencode.passwordEnvironmentVariable !== configuration.opencode.passwordEnvironmentVariable) throw new Error('Changing native roles or connection settings requires reloading the plugin');
     return current.settings;
   };
   return configuration;

@@ -6,16 +6,20 @@ import { createManagedExecutor, managedPrompt } from '../dist/coordinator/execut
 const tokens = value => ({ input: value, output: 0, reasoning: 0, cache: { read: 0, write: 0 } });
 const runFixture = () => ({ id: 'run-one', ownerToken: 'synthetic-owner', capacityReserved: true, version: 1, parentSessionId: 'ses_reserved', promptMessageId: 'msg_reserved', worktreePath: '/synthetic/managed/checkout', launchAction: 'start', resolution: null, checkpoint: null, specification: { settings: { plannerAgent: 'adr-planner', executorAgent: 'adr-executor', plannerModel: 'anthropic/planner', plannerVariant: 'max' }, opencode: { baseUrl: 'http://127.0.0.1:4096', passwordEnvironmentVariable: 'SYNTHETIC_PASSWORD' } } });
 
-function fixture(run = runFixture()) {
+function fixture(run = runFixture(), connectionOverrides = {}) {
   const calls = [], projected = new Map(), sessions = new Map();
-  let active = {}, inbox = [], permissions = [], forms = [], pluginsValid = true, listingAvailable = true;
+  let active = {}, inbox = [], permissions = [], forms = [], pluginsValid = true, listingAvailable = true, coldReads = 0, pluginFailed = false, clock = 0;
+  const delays = [];
   const parent = { id: run.parentSessionId, agent: 'adr-orchestrator', model: { providerID: 'anthropic', id: 'planner', variant: 'max' }, location: { directory: run.worktreePath }, metadata: { heimdallRunId: run.id }, tokens: tokens(0), time: { created: 1 } };
   sessions.set(parent.id, parent);
   const fetchImpl = async (url, options = {}) => {
     const body = options.body ? JSON.parse(options.body) : undefined;
-    calls.push({ method: options.method ?? 'GET', route: url.pathname, body, directory: url.searchParams.get('location[directory]') });
+    calls.push({ method: options.method ?? 'GET', route: url.pathname, body, directory: url.searchParams.get('location[directory]'), authenticated: Object.hasOwn(options.headers ?? {}, 'Authorization') });
     if (url.pathname === '/api/info') return Response.json({ version: '2.0.22', pid: 44 });
-    if (url.pathname === '/api/plugin') return Response.json({ data: pluginsValid ? [{ id: 'adr.workflow', source: { type: 'local', path: path.join(run.worktreePath, '.opencode/plugins/heimdall.ts') }, state: { status: 'active' } }] : [] });
+    if (url.pathname === '/api/plugin') {
+      const cold = coldReads > 0; if (cold) coldReads--;
+      return Response.json({ data: pluginsValid && !cold ? [{ id: 'adr.workflow', source: { type: 'local', path: path.join(run.worktreePath, '.opencode/plugins/heimdall.ts') }, state: { status: pluginFailed ? 'failed' : 'active' } }] : [] });
+    }
     if (url.pathname === '/api/agent') return Response.json({ data: ['adr-orchestrator', 'adr-planner', 'adr-executor'].map(id => ({ id, mode: id === 'adr-orchestrator' ? 'primary' : 'subagent' })) });
     if (url.pathname === '/api/session' && options.method === 'POST') return Response.json({ data: sessions.get(body.id) });
     if (url.pathname === '/api/session' && (options.method ?? 'GET') === 'GET') {
@@ -45,10 +49,10 @@ function fixture(run = runFixture()) {
     }
     return new Response('', { status: 404 });
   };
-  const executor = createManagedExecutor({ getRun: () => run, connection: { environment: { SYNTHETIC_PASSWORD: 'synthetic-test-secret' }, fetchImpl } });
+  const executor = createManagedExecutor({ getRun: () => run, preflightTimeoutMs: 1000, now: () => clock, pause: async ms => { assert.ok(!calls.some(call => call.method === 'POST'), 'readiness never writes before active inventory'); delays.push(ms); clock += ms; }, connection: { environment: { SYNTHETIC_PASSWORD: 'synthetic-test-secret' }, fetchImpl, ...connectionOverrides } });
   const settled = (id, parentID) => ({ id, ...(parentID ? { parentID } : {}), location: { directory: run.worktreePath }, tokens: tokens(1), outcome: 'succeeded', time: { idle: 10 } });
-  return { run, executor, calls, parent, sessions, projected, settled,
-    set active(value) { active = value; }, set inbox(value) { inbox = value; }, set permissions(value) { permissions = value; }, set forms(value) { forms = value; }, set pluginsValid(value) { pluginsValid = value; }, set listingAvailable(value) { listingAvailable = value; } };
+  return { run, executor, calls, parent, sessions, projected, settled, delays,
+    set active(value) { active = value; }, set inbox(value) { inbox = value; }, set permissions(value) { permissions = value; }, set forms(value) { forms = value; }, set pluginsValid(value) { pluginsValid = value; }, set listingAvailable(value) { listingAvailable = value; }, set coldReads(value) { coldReads = value; }, set pluginFailed(value) { pluginFailed = value; } };
 }
 
 test('native launch uses exact saved session/message IDs, explicit worktree location, and two-phase admission', async () => {
@@ -148,4 +152,36 @@ test('stale executor ownership/version cannot create a session or admit another 
   f.run.version = expected.version; f.run.capacityReserved = false;
   await assert.rejects(f.executor.launch(expected), /ownership or version/);
   assert.equal(f.calls.length, 0);
+});
+
+
+test('cold plugin readiness is read-only until the actual inventory becomes active', async () => {
+  const f = fixture(); f.coldReads = 2;
+  await f.executor.launch(f.run);
+  assert.equal(f.calls.filter(call => call.route === '/api/plugin').length, 3);
+  assert.deepEqual(f.delays, [250, 250]);
+  assert.equal(f.calls.filter(call => call.method === 'POST').length, 3);
+});
+
+test('failed native plugins fail immediately and readiness deadline never mutates sessions', async () => {
+  const failed = fixture(); failed.pluginFailed = true;
+  await assert.rejects(failed.executor.launch(failed.run), /failed to activate/);
+  assert.deepEqual(failed.delays, []);
+  assert.ok(!failed.calls.some(call => call.method === 'POST'));
+  const pending = fixture(); pending.pluginsValid = false;
+  await assert.rejects(pending.executor.launch(pending.run), /Timed out waiting/);
+  assert.equal(pending.delays.reduce((sum, ms) => sum + ms, 0), 1000);
+  assert.ok(!pending.calls.some(call => call.method === 'POST'));
+  assert.throws(() => createManagedExecutor({ getRun: () => pending.run, preflightTimeoutMs: 10001 }), /at most 10000ms/);
+});
+
+
+test('persisted authentication wins over a shared connection override, including legacy basic defaults', async () => {
+  const legacy = fixture(runFixture(), { authentication: 'none', environment: {} });
+  await assert.rejects(legacy.executor.launch(legacy.run), /password environment/);
+  assert.equal(legacy.calls.length, 0);
+  const explicit = runFixture(); explicit.specification.opencode.authentication = 'none';
+  const none = fixture(explicit, { authentication: 'basic', environment: new Proxy({}, { get: () => assert.fail('Explicit none must not read a password') }) });
+  await none.executor.launch(none.run);
+  assert.ok(none.calls.every(call => call.authenticated === false));
 });

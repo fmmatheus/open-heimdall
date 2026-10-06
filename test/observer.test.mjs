@@ -97,3 +97,31 @@ test('observer connects lazily and verifies session project before every complet
   assert.equal(routes.filter(route => route === '/api/info').length, 1);
   assert.equal(routes.filter(route => route === '/api/session/ses_child').length, 2);
 });
+
+
+test('explicit no-auth omits Authorization and never accesses a password environment', async () => {
+  const environment = new Proxy({}, { get: () => assert.fail('No-auth must not read password variables') });
+  const calls = [];
+  const api = await connect(directory, 'ses_child', { baseUrl, authentication: 'none', environment, fetchImpl: async (url, options) => {
+    calls.push(options);
+    return Response.json(url.pathname === '/api/info' ? info() : { data: session() });
+  } });
+  assert.equal(api.version, '2.0.22');
+  assert.equal(calls.length, 2);
+  assert.ok(calls.every(options => !Object.hasOwn(options.headers, 'Authorization')));
+  const direct = createAPI({ baseUrl, authentication: 'none', directory, fetchImpl: async (url, options) => {
+    assert.equal(Object.hasOwn(options.headers, 'Authorization'), false);
+    return Response.json(info());
+  } });
+  await direct.request('/api/info');
+});
+
+test('basic mode still requires a nonblank password; invalid auth or remote no-auth never requests', async () => {
+  const fetchImpl = async () => assert.fail('Invalid connection must not make a request');
+  for (const password of [undefined, '', '   ']) {
+    assert.throws(() => createAPI({ baseUrl, password, authentication: 'basic', directory, fetchImpl }), /Invalid configured/);
+    await assert.rejects(connect(directory, undefined, { baseUrl, authentication: 'basic', environment: { OPENCODE_PASSWORD: password }, fetchImpl }), /password environment/);
+  }
+  await assert.rejects(connect(directory, undefined, { baseUrl, authentication: 'disabled', environment: {}, fetchImpl }), /authentication mode/);
+  await assert.rejects(connect(directory, undefined, { baseUrl: 'http://external.example', authentication: 'none', environment: {}, fetchImpl }), /local OpenCode HTTP/);
+});

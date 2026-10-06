@@ -37,3 +37,5 @@ plans = ".heimdall/plans"
 # baseUrl = "http://127.0.0.1:4096"
 passwordEnvironmentVariable = "OPENCODE_PASSWORD"
 # Keep the password in the runtime environment, never in this file.
+# Explicitly opt in only for a passwordless loopback server:
+# authentication = "none" # Default: "basic".

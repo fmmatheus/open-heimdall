@@ -144,6 +144,19 @@ test('tracked original plugin assets are rejected before queueing or reserving a
   assert.equal(await fs.readFile(original, 'utf8'), '// Existing workflow remains untouched.\n');
 });
 
+test('explicit no-auth settings survive submission snapshots and managed runtime configuration', async t => {
+  const f = await fixture(t);
+  const configFile = path.join(f.project, '.heimdall.toml');
+  await fs.appendFile(configFile, 'authentication = "none"\n');
+  const project = await f.client.request('POST', '/projects', { directory: f.project });
+  const queued = await f.client.request('POST', '/runs', { projectId: project.id, feature: 'Feature' });
+  assert.equal(f.service().store.getRun(queued.id).specification.opencode.authentication, 'none');
+  await f.service().scheduler.tick();
+  const run = await settled(f.service().store, queued.id);
+  const runtime = await fs.readFile(path.join(run.worktreePath, '.heimdall/runtime.toml'), 'utf8');
+  assert.match(runtime, /authentication = "none"/);
+});
+
 test('relative project registration resolves against the client rather than server cwd', async t => {
   const f = await fixture(t);
   const file = path.join(f.temporary, 'coordinator.toml');
