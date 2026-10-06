@@ -16,6 +16,7 @@ export interface WorkflowOptions {
   quota?: RunnerOptions['quota'];
   authRefresh?: RunnerOptions['authRefresh'];
   git?: RunnerOptions['git'];
+  persistence?: RunnerOptions['persistence'];
 }
 
 /** Compose the extracted workflow without starting or changing an OpenCode server. */
@@ -33,6 +34,6 @@ export function createWorkflow(options: WorkflowOptions): ReturnType<typeof crea
     plannerPromptPath: configuration.plannerPromptPath, executorPromptPath: configuration.executorPromptPath,
     quota: options.quota ?? createQuota({ integration: ctx?.integration, directory: configuration.projectDirectory, workflowRoot: configuration.workflowRoot }),
     authRefresh: options.authRefresh ?? (ctx ? () => refreshClaudeAuth(ctx.integration) : undefined),
-    guards: options.guards, git: options.git,
+    guards: options.guards, git: options.git, persistence: options.persistence,
   });
 }

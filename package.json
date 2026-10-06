@@ -12,7 +12,8 @@
   },
   "exports": {
     ".": "./dist/index.js",
-    "./plugin": "./dist/opencode/plugin.js"
+    "./plugin": "./dist/opencode/plugin.js",
+    "./coordinator": "./dist/coordinator/index.js"
   },
   "files": [
     "dist",

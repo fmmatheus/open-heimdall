@@ -10,6 +10,7 @@ Usage:
   heimdall init [--project DIRECTORY] [--config FILE]
   heimdall check [--project DIRECTORY] [--config FILE]
   heimdall status RUN_ID [--project DIRECTORY] [--config FILE]
+  heimdall coordinator --help
 
 init writes a new configuration without overwriting existing files.
 check validates configuration without contacting OpenCode or starting agents.
@@ -17,6 +18,11 @@ status reads saved progress. Start/resume work through the OpenCode plugin.
 `;
 
 async function main(args: string[]): Promise<void> {
+  if (args[0] === 'coordinator') {
+    const { coordinatorMain } = await import('./coordinator/cli.js');
+    await coordinatorMain(args.slice(1));
+    return;
+  }
   if (!args.length || args.includes('--help') || args[0] === 'help') { process.stdout.write(help); return; }
   const command = args.shift();
   let projectDirectory = process.cwd();

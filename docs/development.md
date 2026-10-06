@@ -82,9 +82,10 @@ transient; caches retain normalized quota fields and hashed account scope.
 
 ## Current limits
 
-- One active run per configured state directory. Multi-project registration,
-  concurrent-run scheduling and worktree allocation come next.
-- Run state remains in checkpoint files. SQLite remains the agreed target.
+- The standalone baseline keeps one active run per configured state directory
+  and file-backed checkpoints. The [opt-in coordinator](coordinator.md) adds
+  project registration, isolated worktrees, concurrent scheduling and SQLite
+  checkpoints/receipts without migrating existing runs.
 - Usage caps are disabled by default. Enabled caps cover cumulative session/run
   token counts, checked before child prompting, before tool execution and during
   periodic polling. Active requests can exceed a cap before cancellation is
@@ -96,5 +97,5 @@ transient; caches retain normalized quota fields and hashed account scope.
 - Phone deployment and the independent watchdog service are not included. The
   runner's saved receipts and reserved-recovery checks remain intact.
 
-These are the extracted baseline's limits. ADR 0002 describes the next global
-coordinator, not functionality already shipped by this package.
+These are the standalone baseline's limits. See the coordinator guide for its
+execution and recovery boundaries; existing workflows remain separate.
