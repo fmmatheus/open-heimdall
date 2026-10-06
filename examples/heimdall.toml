@@ -1,0 +1,39 @@
+# Replace model IDs with models available through your OpenCode accounts.
+[workflow]
+plannerAgent = "adr-planner"
+executorAgent = "adr-executor"
+plannerModel = "anthropic/your-planner-model"
+maxTasks = 10
+minQuotaRemainingPercent = 10
+fiveHourQuotaWeight = 0.6
+tokenLimitsDisabled = true
+
+# Optional cumulative budgets. Set tokenLimitsDisabled = false to enable them.
+# maxSessionTokens = 60000
+# maxRunTokens = 300000
+# maxPlannerTokens = 60000
+# timeoutMinutes = 30 # Warning only in the extracted baseline.
+
+[[workflow.executorCandidates]]
+key = "primary"
+quotaProvider = "anthropic"
+model = "anthropic/your-executor-model"
+
+# Add more executor candidates for quota-aware routing.
+# [[workflow.executorCandidates]]
+# key = "fallback"
+# quotaProvider = "openai"
+# model = "openai/your-executor-model"
+# variant = "your-supported-variant"
+
+[paths]
+state = ".heimdall"
+plans = ".heimdall/plans"
+# plannerPrompt = "my-prompts/planner.md"
+# executorPrompt = "my-prompts/executor.md"
+
+[opencode]
+# Set the local origin of the existing OpenChamber-managed OpenCode 2.0.22.
+# baseUrl = "http://127.0.0.1:4096"
+passwordEnvironmentVariable = "OPENCODE_PASSWORD"
+# Keep the password in the runtime environment, never in this file.
