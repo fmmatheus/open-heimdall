@@ -1,7 +1,15 @@
 # ADR 0001: Technical foundation
 
-- Status: Accepted
+- Status: Accepted; partially superseded by [ADR 0002](0002-opencode-coordinator-stack.md)
 - Date: 2026-10-06
+
+## Amendment
+
+[ADR 0002: TypeScript coordinator and OpenCode execution](0002-opencode-coordinator-stack.md)
+replaces the Go choice and daemon/subprocess-worker execution boundary, and
+refines watching to use OpenCode events with native subscriptions only for
+required workflow triggers. The remaining foundations are retained. This record
+preserves the initial decision and its rationale.
 
 ## Context
 
