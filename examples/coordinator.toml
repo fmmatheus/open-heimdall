@@ -1,0 +1,6 @@
+# Limits count complete feature runs, each executing one task at a time.
+[coordinator]
+globalConcurrency = 2
+projectConcurrency = 1
+# Relative paths resolve against this file. Defaults use the user's state directory.
+# stateDirectory = "/short/private/path/heimdall"

@@ -80,7 +80,7 @@ export function validateCompletion(result: WorkflowResult, task: WorkflowTask, {
 const contextSignal = (context: RunnerContext) => context.signal || context.abort;
 const callerIdentity = (context: RunnerContext) => ({ sessionID: context.sessionID, id: context.id, messageID: context.messageID, agent: context.agent });
 
-export function createRunner({ backend, directory, quota, authRefresh, guards = new Map(), git = args => execFileSync('git', args, { cwd: directory, encoding: 'utf8' }), settings: suppliedSettings, workflowRoot, settingsPath, plannerPromptPath, executorPromptPath, planRoot: suppliedPlanRoot }: RunnerOptions) {
+export function createRunner({ backend, directory, quota, authRefresh, guards = new Map(), git = args => execFileSync('git', args, { cwd: directory, encoding: 'utf8' }), settings: suppliedSettings, workflowRoot, settingsPath, plannerPromptPath, executorPromptPath, planRoot: suppliedPlanRoot, persistence }: RunnerOptions) {
   if (!backend || typeof quota !== 'function') throw new Error('Native backend and quota callback are required');
   const root = path.resolve(directory, workflowRoot ?? '.opencode/adr-workflow');
   const planRoot = path.resolve(directory, suppliedPlanRoot ?? '.omo/plans');
@@ -97,15 +97,35 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
   let saveTail = Promise.resolve();
   const save = (state: RunState) => {
     const value = structuredClone(state);
-    const pending = saveTail.then(() => atomicJSON(path.join(root, 'runs', value.id, 'state.json'), value));
+    const pending = saveTail.then(() => persistence ? persistence.save(value) : atomicJSON(path.join(root, 'runs', value.id, 'state.json'), value));
     saveTail = pending.catch(() => {});
     return pending;
   };
+  const load = async (id: string): Promise<RunState> => {
+    const state = persistence ? await persistence.load(id) : await readJSON<RunState>(path.join(root, 'runs', id, 'state.json'));
+    if (!state) throw new Error('No authoritative checkpoint exists for this run');
+    return state;
+  };
+  const writeReceipt = async (id: string, receipt: NonNullable<RunState['attempt']> & { response: unknown }) => persistence ? persistence.writeReceipt(id, receipt) : atomicJSON(path.join(root, 'runs', id, 'attempt-' + receipt.id + '.json'), receipt);
   const ledger = (state: RunState) => fs.writeFile(path.join(root, 'runs', state.id, 'ledger.md'), '# Task handoffs\n\n' + state.results.map(r => '## ' + r.taskId + '\n' + r.summary + '\n\n' + r.handoff + '\n\n' + r.evidence.map(e => '- ' + e.gate + ': ' + e.detail).join('\n')).join('\n\n'));
   return async function run(args: RunArguments, context: RunnerContext): Promise<string> {
     if (args.action === 'status') {
       if (!/^[\w-]+$/.test(args.runId || '')) throw new Error('Provide the run ID');
-      return JSON.stringify(await readJSON(path.join(root, 'runs', args.runId!, 'state.json')));
+      return JSON.stringify(await load(args.runId!));
+    }
+    if (persistence) {
+      if (!/^[A-Za-z0-9_-]+$/.test(args.runId ?? '')) throw new Error('Managed workflow requires its reserved run ID');
+      if (args.recovery) throw new Error('Managed recovery requires an explicit coordinator-approved resume');
+      if (args.action === 'start') {
+        if (!context.id || !context.messageID || !context.agent) throw new Error('Managed start requires a native caller identity');
+        await persistence.bindStart({ sessionID: context.sessionID, id: context.id, messageID: context.messageID, agent: context.agent });
+        const existing = await persistence.load(args.runId!);
+        if (existing) {
+          if (existing.id !== args.runId || existing.parent !== context.sessionID || existing.adr !== args.adr) throw new Error('Managed start identity does not match the authoritative run');
+          if (existing.status === 'completed') return JSON.stringify(existing);
+          throw new Error('Managed run already started; reconcile its existing checkpoint before an explicit resume');
+        }
+      }
     }
     await fs.mkdir(path.join(root, 'runs'), { recursive: true });
     const lockPath = path.join(root, 'active.lock');
@@ -123,13 +143,14 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
         const adr = await fs.realpath(path.resolve(directory, args.adr));
         const repo = await fs.realpath(directory);
         if (!adr.startsWith(repo + path.sep)) throw new Error('ADR must be inside this project');
-        state = { id: randomUUID(), status: 'running', adr: args.adr, parent: context.sessionID, caller: callerIdentity(context), branch: git(['branch', '--show-current']).trim(), baseline: git(['status', '--porcelain']), index: 0, tasks: [], results: [], phase: 'planner', child: null, settings };
-        await fs.mkdir(path.join(root, 'runs', state.id));
+        state = { id: persistence ? args.runId! : randomUUID(), status: 'running', adr: args.adr, parent: context.sessionID, caller: callerIdentity(context), branch: git(['branch', '--show-current']).trim(), baseline: git(['status', '--porcelain']), index: 0, tasks: [], results: [], phase: 'planner', child: null, settings };
+        await fs.mkdir(path.join(root, 'runs', state.id), { recursive: !!persistence });
         await save(state);
         started = true;
       } else if (args.action === 'resume') {
         if (!/^[\w-]+$/.test(args.runId || '') || !nonempty(args.input)) throw new Error('Resume requires a run ID and resolution');
-        state = await readJSON<RunState>(path.join(root, 'runs', args.runId!, 'state.json'));
+        state = await load(args.runId!);
+        if (persistence) await fs.mkdir(path.join(root, 'runs', state.id), { recursive: true });
         if (state.parent !== context.sessionID) throw new Error('Resume must run from the original parent session');
         if (state.status === 'completed') return JSON.stringify(state);
         if (state.attempt?.status === 'launching' && !state.child) throw new Error('Child creation was interrupted before its ID was recorded. Reconcile linked sessions manually before resuming; a duplicate child will not be created');
@@ -194,14 +215,14 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
         if (state.attempt && state.attempt.status !== 'rejected') {
           if (state.attempt.phase !== state.phase || state.attempt.index !== state.index || state.attempt.child !== state.child) throw new Error('Attempt does not match the current task');
           const receiptPath = path.join(runDir, 'attempt-' + state.attempt.id + '.json');
-          try { receipt = await readJSON<NonNullable<typeof receipt>>(receiptPath); } catch (error) { if (!isRecord(error) || error.code !== 'ENOENT') throw error; }
+          try { receipt = persistence ? await persistence.readReceipt(state.id, state.attempt.id) ?? undefined : await readJSON<NonNullable<typeof receipt>>(receiptPath); } catch (error) { if (!isRecord(error) || error.code !== 'ENOENT') throw error; }
           if (!receipt && state.child && ['admitted', 'interrupted'].includes(state.attempt.status)) {
             let response: unknown;
             try { response = await backend.recoverResponse(state.child, state.parent, state.attempt); }
             catch (error) { state.attempt.status = 'rejected'; throw error; }
             if (response !== undefined) {
               receipt = { ...state.attempt, response };
-              await atomicJSON(receiptPath, receipt);
+              await writeReceipt(state.id, receipt);
             }
           }
           if (receipt) {
@@ -268,7 +289,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
             if (guardError) throw guardError;
             if (controller.signal.aborted) throw new Error('Run cancelled');
             receipt = { ...state.attempt, response };
-            await atomicJSON(path.join(runDir, 'attempt-' + state.attempt.id + '.json'), receipt);
+            await writeReceipt(state.id, receipt);
             await atomicJSON(path.join(runDir, 'last-response.json'), response);
             try { result = parseResult(response); }
             catch (error) { state.attempt.status = 'rejected'; throw error; }

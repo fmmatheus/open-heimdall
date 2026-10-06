@@ -10,7 +10,7 @@ Heimdall is designed to run as a single global service across your local Git pro
 
 ## Why Heimdall?
 
-The target coordinator allows multiple features and runs to progress concurrently in the same project or across different projects. Each run handles one task at a time. The current extraction preserves one active run per state directory.
+The opt-in development coordinator allows multiple features and runs to progress concurrently in the same project or across different projects. Each run handles one task at a time in its own Git worktree, subject to global and per-project limits.
 
 Heimdall is designed around these principles:
 
@@ -43,7 +43,7 @@ The core workflow is feature request → task breakdown → sequential task exec
           Worktree   Worktree   Worktree
 ```
 
-The planned global coordinator controls OpenCode sessions through an adapter. OpenCode owns agent and tool execution. Multiple runs and features will be coordinated within or across projects, subject to global and per-project concurrency limits. Within each run, one task finishes before the next starts, and a worktree has only one agent modifying it at a time.
+The global coordinator controls OpenCode sessions through an adapter. OpenCode owns agent and tool execution. Multiple runs and features are coordinated within or across projects, subject to global and per-project concurrency limits. Within each run, one task finishes before the next starts, and each run owns a separate worktree.
 
 ## Architecture
 
@@ -90,13 +90,13 @@ It coordinates agent work around those tools.
 
 ## Project status
 
-Heimdall has a development baseline extracted from the working ADR workflow:
-a TypeScript runner, OpenCode adapter, quota-aware model selection, configurable
-paths, and the preserved behavioral tests.
+Heimdall has a TypeScript runner extracted from the working ADR workflow, an
+OpenCode adapter, quota-aware model selection, and an opt-in SQLite coordinator
+with project registration, isolated worktrees, concurrency limits and local IPC.
 
-The global coordinator and public interfaces are still being developed. There is
-no usable release yet. See [baseline development](docs/development.md) for setup,
-supported versions, current limits, and how to keep existing workflows separate.
+There is no public release yet. See [baseline development](docs/development.md)
+and [coordinator development](docs/coordinator.md) for setup, tested boundaries,
+current limits, and how to keep existing workflows separate.
 
 ## Development
 

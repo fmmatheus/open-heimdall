@@ -121,7 +121,19 @@ export interface RunArguments {
   recovery?: { child: string; expectedReservationAt: number };
 }
 
+export interface WorkflowReceipt extends WorkflowAttempt { response: unknown }
+
+/** Authoritative managed-run storage. The local file backend remains the default. */
+export interface RunnerPersistence {
+  load(runId: string): Promise<RunState | null>;
+  save(state: RunState): Promise<void>;
+  readReceipt(runId: string, attemptId: string): Promise<WorkflowReceipt | null>;
+  writeReceipt(runId: string, receipt: WorkflowReceipt): Promise<void>;
+  bindStart(binding: Required<Pick<RunnerContext, 'sessionID' | 'id' | 'messageID' | 'agent'>>): Promise<void>;
+}
+
 export interface RunnerOptions {
+  persistence?: RunnerPersistence;
   backend: RunnerBackend;
   directory: string;
   quota: (settings: RunnerSettings) => Promise<QuotaSnapshot>;

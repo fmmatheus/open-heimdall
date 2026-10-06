@@ -7,6 +7,7 @@ import type { Configuration } from '../config.js';
 import type { RunArguments, RunnerContext } from '../workflow/types.js';
 import type { SessionObserver } from './types.js';
 import { createObserver } from './observer.js';
+import { createManagedPersistence, readManagedMetadata } from './managed.js';
 
 const actions = ['start', 'resume', 'status'];
 const inputSchema = {
@@ -28,13 +29,14 @@ export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
   return Plugin.define({
     id: 'adr.workflow',
     async setup(ctx) {
+      const metadata = await readManagedMetadata(ctx.location.directory);
       const configuredPath = process.env.HEIMDALL_CONFIG?.trim() ? process.env.HEIMDALL_CONFIG : undefined;
-      const configuration = options.configuration ?? await loadConfiguration({ projectDirectory: ctx.location.directory, configPath: options.configPath ?? configuredPath });
+      const configuration = options.configuration ?? await loadConfiguration({ projectDirectory: ctx.location.directory, configPath: options.configPath ?? (metadata ? '.heimdall/runtime.toml' : configuredPath) });
       if (path.resolve(configuration.projectDirectory) !== path.resolve(ctx.location.directory)) throw new Error('Heimdall configuration belongs to a different native project');
       const root = configuration.workflowRoot;
       const guards = new Map<string, () => Promise<void>>();
       const observe = options.observe ?? createObserver({ directory: configuration.projectDirectory, ...configuration.opencode });
-      const run = createWorkflow({ configuration, ctx, observe, guards });
+      const run = metadata ? undefined : createWorkflow({ configuration, ctx, observe, guards });
       const registrations: Array<{ dispose(): Promise<void> }> = [];
       const recoveries = new Map<string, { operation: Promise<string>; controller: AbortController }>();
       registrations.push(await ctx.tool.transform(editor => editor.add({
@@ -45,13 +47,25 @@ export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
         output: { type: 'object', additionalProperties: true },
         async execute(value, context) {
           if (!record(value) || typeof value.action !== 'string' || !actions.includes(value.action)) throw new Error('Unknown workflow action');
-          const text = await run(value as unknown as RunArguments, context);
+          const args = value as unknown as RunArguments;
+          let text: string;
+          if (metadata) {
+            const current = await readManagedMetadata(ctx.location.directory);
+            if (!current || current.runId !== metadata.runId || current.parentSessionId !== metadata.parentSessionId || current.endpoint !== metadata.endpoint) throw new Error('Managed workflow identity changed');
+            const managed = createManagedPersistence(ctx.location.directory, current);
+            const authorized = await managed.authorize(args, context);
+            const execute = createWorkflow({ configuration, ctx, observe, guards, persistence: managed.persistence });
+            text = await execute(authorized, context);
+          } else text = await run!(args, context);
           return { output: JSON.parse(text) as unknown, content: text };
         },
       })));
       registrations.push(await ctx.tool.hook('execute.before', async input => { await guards.get(input.sessionID)?.(); }));
       registrations.push(await ctx.session.hook('context', async event => {
-        if ([configuration.settings.plannerAgent, configuration.settings.executorAgent].includes(event.agent)) {
+        if (metadata && event.agent === 'adr-orchestrator') {
+          if (event.sessionID !== metadata.parentSessionId) event.tools = {};
+          else for (const name of Object.keys(event.tools)) if (!/^(?:.*[.:/]|.*__)?adr_workflow$/.test(name)) delete event.tools[name];
+        } else if ([configuration.settings.plannerAgent, configuration.settings.executorAgent].includes(event.agent)) {
           for (const name of Object.keys(event.tools)) if (delegated(name)) delete event.tools[name];
         } else if (event.agent === 'adr-orchestrator') {
           const messages = await ctx.session.context({ sessionID: event.sessionID });
@@ -59,7 +73,7 @@ export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
           if (latest?.metadata?.adrNotification === true) event.tools = {};
         }
       }));
-      registrations.push(await ctx.rpc.register({
+      if (!metadata) registrations.push(await ctx.rpc.register({
         id: 'adr.workflow',
         methods: {
           recover: {
@@ -86,7 +100,7 @@ export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
             signal: controller.signal,
             progress: async update => { await log({ event: 'progress', ...update }); },
           };
-          const operation = run({ action: 'resume', runId: input.runId, input: input.input, recovery: input, onLaunch: async () => { await log({ event: 'recovery_started', reservation: input.expectedReservationAt }); launched({ started: true, runId: input.runId }); } }, context);
+          const operation = run!({ action: 'resume', runId: input.runId, input: input.input, recovery: input, onLaunch: async () => { await log({ event: 'recovery_started', reservation: input.expectedReservationAt }); launched({ started: true, runId: input.runId }); } }, context);
           recoveries.set(input.runId, { operation, controller });
           const finished = operation.then(async result => {
             await log({ event: 'recovery_finished', result: JSON.parse(result) as unknown });
