@@ -42,6 +42,14 @@ Heimdall is designed around three principles:
 
 The daemon acts as the control plane. Individual workers execute tasks in isolation, allowing multiple projects—and multiple tasks within the same project—to run concurrently.
 
+## Architecture
+
+The initial foundation is Go, a global daemon with subprocess workers, SQLite
+persistence, and Git worktree isolation.
+
+See [ADR 0001: Technical foundation](docs/adr/0001-technical-foundation.md) for the
+accepted decisions, tradeoffs, and deferred choices.
+
 ## Goals
 
 Heimdall aims to provide:
