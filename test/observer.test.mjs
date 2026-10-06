@@ -116,12 +116,16 @@ test('explicit no-auth omits Authorization and never accesses a password environ
   await direct.request('/api/info');
 });
 
-test('basic mode still requires a nonblank password; invalid auth or remote no-auth never requests', async () => {
+test('basic mode preserves passwords exactly; missing auth or remote no-auth never requests', async () => {
   const fetchImpl = async () => assert.fail('Invalid connection must not make a request');
-  for (const password of [undefined, '', '   ']) {
+  for (const password of [undefined, '']) {
     assert.throws(() => createAPI({ baseUrl, password, authentication: 'basic', directory, fetchImpl }), /Invalid configured/);
     await assert.rejects(connect(directory, undefined, { baseUrl, authentication: 'basic', environment: { OPENCODE_PASSWORD: password }, fetchImpl }), /password environment/);
   }
   await assert.rejects(connect(directory, undefined, { baseUrl, authentication: 'disabled', environment: {}, fetchImpl }), /authentication mode/);
   await assert.rejects(connect(directory, undefined, { baseUrl: 'http://external.example', authentication: 'none', environment: {}, fetchImpl }), /local OpenCode HTTP/);
+  await connect(directory, undefined, { baseUrl, environment: { OPENCODE_PASSWORD: '   ' }, fetchImpl: async (_url, options) => {
+    assert.equal(options.headers.Authorization, 'Basic ' + Buffer.from('opencode:   ').toString('base64'));
+    return Response.json(info());
+  } });
 });
