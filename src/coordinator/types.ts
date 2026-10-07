@@ -15,7 +15,7 @@ export interface RunSpecification {
   plannerPrompt: string;
   executorPrompt: string;
   agents: Record<string, string>;
-  opencode: { baseUrl: string; passwordEnvironmentVariable: string };
+  opencode: { baseUrl: string; passwordEnvironmentVariable: string; authentication?: 'basic' | 'none' };
 }
 
 export type RunStatus = 'queued' | 'preparing' | 'running' | 'paused' | 'succeeded' | 'failed' | 'reconciliation-required';

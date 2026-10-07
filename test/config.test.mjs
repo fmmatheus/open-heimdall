@@ -31,7 +31,7 @@ test('configured state, prompt and quota-package paths avoid machine-specific de
   assert.equal(c.planRoot, path.join(c.workflowRoot, 'plans'));
   assert.equal(c.plannerPromptPath, path.join(f.directory, 'prompts', 'plan.md'));
   assert.equal(c.settings.packagePath, path.join(f.directory, 'local-quota'));
-  assert.deepEqual(c.opencode, { baseUrl: 'http://127.0.0.1:4321', passwordEnvironmentVariable: 'TEST_OPENCODE_PASSWORD' });
+  assert.deepEqual(c.opencode, { baseUrl: 'http://127.0.0.1:4321', passwordEnvironmentVariable: 'TEST_OPENCODE_PASSWORD', authentication: 'basic' });
 });
 test('configured limits require explicit budgets and reject malformed values', async t => {
   for (const value of ['tokenLimitsDisabled = false', 'maxRunTokens = -1', 'maxTasks = 11', 'timeoutMinutes = inf', 'tokenLimitsDisabled = "false"', 'fiveHourQuotaWeight = 0', 'fiveHourQuotaWeight = 1']) {
@@ -77,4 +77,19 @@ test('planning artifacts must remain inside the project even when state is exter
   }
   const f = await fixture(t, minimal + '[paths]\nstate = "../external-state"\nplans = "local-plans"\n');
   assert.equal((await f.load()).planRoot, path.join(f.directory, 'local-plans'));
+});
+
+
+test('local authentication defaults to basic and no-auth must be explicitly selected', async t => {
+  const defaults = await fixture(t);
+  assert.equal((await defaults.load()).opencode.authentication, 'basic');
+  const none = await fixture(t, minimal + '[opencode]\nauthentication = "none"\nbaseUrl = "http://127.0.0.1:4096"\n');
+  const configured = await none.load();
+  assert.equal(configured.opencode.authentication, 'none');
+  await fs.writeFile(none.file, minimal + '[opencode]\nauthentication = "basic"\nbaseUrl = "http://127.0.0.1:4096"\n');
+  await assert.rejects(configured.readSettings(), /connection settings requires reloading/);
+  for (const value of ['"disabled"', 'false', '1']) {
+    const bad = await fixture(t, minimal + '[opencode]\nauthentication = ' + value + '\n');
+    await assert.rejects(bad.load(), /authentication must be basic or none/);
+  }
 });

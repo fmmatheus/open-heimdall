@@ -3,6 +3,7 @@ import path from 'node:path';
 import type { ObservedSession, SessionAPI, SessionObserver, SessionSnapshot } from './types.js';
 
 export const supportedOpenCodeVersion = '2.0.22';
+export type OpenCodeAuthentication = 'basic' | 'none';
 
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
 
@@ -15,17 +16,18 @@ function localURL(value: string): URL {
   return url;
 }
 
-export function createAPI({ baseUrl, password, directory, fetchImpl = fetch }: {
+export function createAPI({ baseUrl, password, authentication = 'basic', directory, fetchImpl = fetch }: {
   baseUrl: string;
-  password: string;
+  password?: string;
+  authentication?: OpenCodeAuthentication;
   directory: string;
   fetchImpl?: typeof fetch;
 }): SessionAPI {
   const base = localURL(baseUrl);
-  if (typeof password !== 'string' || !password || !directory) throw new Error('Invalid configured OpenCode connection');
+  if (!['basic', 'none'].includes(authentication) || !directory || (authentication === 'basic' && (typeof password !== 'string' || !password))) throw new Error('Invalid configured OpenCode connection');
   const headers = {
     'Content-Type': 'application/json',
-    Authorization: 'Basic ' + Buffer.from('opencode:' + password).toString('base64'),
+    ...(authentication === 'basic' ? { Authorization: 'Basic ' + Buffer.from('opencode:' + password).toString('base64') } : {}),
     'x-opencode-directory': encodeURIComponent(directory),
   };
   return {
@@ -49,6 +51,7 @@ export function createAPI({ baseUrl, password, directory, fetchImpl = fetch }: {
 }
 
 export interface ConnectionOptions {
+  authentication?: OpenCodeAuthentication;
   baseUrl?: string;
   passwordEnvironmentVariable?: string;
   environment?: NodeJS.ProcessEnv;
@@ -56,18 +59,20 @@ export interface ConnectionOptions {
   readFS?: Pick<typeof fs, 'realpath'>;
 }
 
-/** Uses only the configured endpoint and an in-memory environment credential. */
+/** Uses the explicit loopback endpoint; no-auth connections never resolve a password. */
 export async function connect(directory: string, sessionID?: string, {
   baseUrl,
+  authentication = 'basic',
   passwordEnvironmentVariable = 'OPENCODE_PASSWORD',
   environment = process.env,
   fetchImpl = fetch,
   readFS = fs,
 }: ConnectionOptions = {}): Promise<SessionAPI> {
   if (!baseUrl) throw new Error('Configure opencode.baseUrl before executing a workflow');
-  const password = environment[passwordEnvironmentVariable];
-  if (!password) throw new Error('Set the configured OpenCode password environment variable');
-  const api = createAPI({ baseUrl, password, directory, fetchImpl });
+  if (!['basic', 'none'].includes(authentication)) throw new Error('Invalid OpenCode authentication mode');
+  const password = authentication === 'basic' ? environment[passwordEnvironmentVariable] : undefined;
+  if (authentication === 'basic' && (typeof password !== 'string' || !password)) throw new Error('Set the configured OpenCode password environment variable');
+  const api = createAPI({ baseUrl, password, authentication, directory, fetchImpl });
   const info = await api.request('/api/info');
   if (!record(info) || info.version !== supportedOpenCodeVersion || !Number.isInteger(info.pid) || (info.pid as number) < 1) {
     throw new Error('Configured server does not match supported OpenCode ' + supportedOpenCodeVersion);

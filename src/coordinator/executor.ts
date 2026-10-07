@@ -22,17 +22,21 @@ export function managedPrompt(run: RunRecord): string {
   return 'Heimdall managed run: ' + run.id + '\nCall the native adr_workflow tool exactly once with these arguments:\n' + JSON.stringify(args) + '\nReport its result and wait. Do not implement, delegate directly, or retry a paused run.';
 }
 
-export function createManagedExecutor({ getRun, connection = {} }: {
+export function createManagedExecutor({ getRun, connection = {}, preflightTimeoutMs = 10000, pause = ms => new Promise<void>(resolve => setTimeout(resolve, ms)), now = Date.now }: {
   getRun: (id: string) => RunRecord | Promise<RunRecord>;
   connection?: ConnectionOptions;
+  preflightTimeoutMs?: number;
+  pause?: (ms: number) => Promise<void>;
+  now?: () => number;
 }): ManagedExecutor {
+  if (!Number.isFinite(preflightTimeoutMs) || preflightTimeoutMs <= 0 || preflightTimeoutMs > 10000) throw new Error('Native readiness timeout must be positive and at most 10000ms');
   const current = async (expected: RunRecord, launching = false) => {
     const run = await getRun(expected.id);
     if (run.id !== expected.id || run.parentSessionId !== expected.parentSessionId || path.resolve(run.worktreePath) !== path.resolve(expected.worktreePath)) throw new Error('Managed run launch identity changed');
     if (run.ownerToken !== expected.ownerToken || run.version !== expected.version || (launching && (!run.ownerToken || !run.capacityReserved))) throw new Error('Managed executor ownership or version changed');
     return run;
   };
-  const apiFor = (run: RunRecord) => connect(run.worktreePath, undefined, { ...connection, ...run.specification.opencode });
+  const apiFor = (run: RunRecord) => connect(run.worktreePath, undefined, { ...connection, ...run.specification.opencode, authentication: run.specification.opencode.authentication ?? 'basic' });
   const verifySession = (value: SessionSnapshot, run: RunRecord, parent?: string) => {
     if (typeof value.session.location?.directory !== 'string' || path.resolve(value.session.location.directory) !== path.resolve(run.worktreePath) || (parent !== undefined && value.session.parentID !== parent)) throw new Error('Native session escaped the managed worktree or parent');
   };
@@ -57,15 +61,43 @@ export function createManagedExecutor({ getRun, connection = {} }: {
     }
   };
   const preflight = async (api: SessionAPI, run: RunRecord) => {
-    const [plugins, agents] = await Promise.all([api.request('/api/plugin'), api.request('/api/agent')]);
+    const deadline = now() + preflightTimeoutMs;
     const expected = path.join(run.worktreePath, '.opencode/plugins/heimdall.ts');
-    const workflow = Array.isArray(plugins) ? plugins.filter(record).filter(plugin => plugin.id === 'adr.workflow') : [];
-    if (workflow.length !== 1 || !record(workflow[0]!.state) || workflow[0]!.state.status !== 'active' || !record(workflow[0]!.source) || workflow[0]!.source.type !== 'local' || typeof workflow[0]!.source.path !== 'string' || path.resolve(workflow[0]!.source.path) !== path.resolve(expected)) throw new Error('Expected one active managed Heimdall plugin in this worktree');
     const roles = ['adr-orchestrator', run.specification.settings.plannerAgent, run.specification.settings.executorAgent];
-    if (!Array.isArray(agents)) throw new Error('Cannot verify managed native agents');
-    for (const role of roles) {
-      const found = agents.filter(record).filter(agent => agent.id === role);
-      if (found.length !== 1 || (role === 'adr-orchestrator' ? found[0]!.mode !== 'primary' : found[0]!.mode !== 'subagent')) throw new Error('Managed native agent is unavailable or has the wrong mode: ' + role);
+    const timeout = () => new Error('Timed out waiting for managed Heimdall plugin and native agents');
+    while (true) {
+      const remaining = deadline - now();
+      if (remaining <= 0) throw timeout();
+      const signal = AbortSignal.timeout(Math.max(1, Math.ceil(remaining)));
+      let plugins: unknown, agents: unknown;
+      try {
+        [plugins, agents] = await Promise.all([api.request('/api/plugin', { signal }), api.request('/api/agent', { signal })]);
+      } catch (error) {
+        if (signal.aborted || now() >= deadline) throw timeout();
+        if (status(error) !== 503) throw error;
+        await pause(Math.min(250, deadline - now()));
+        continue;
+      }
+      if (!Array.isArray(plugins) || !Array.isArray(agents)) throw new Error('Cannot verify managed native plugin and agent inventories');
+      const entries = plugins.filter(record);
+      for (const entry of entries) {
+        const ours = record(entry.source) && entry.source.type === 'local' && typeof entry.source.path === 'string' && path.resolve(entry.source.path) === path.resolve(expected);
+        if ((entry.id === 'adr.workflow' || ours) && record(entry.state) && entry.state.status === 'failed') throw new Error('Managed Heimdall plugin failed to activate');
+        if (ours && entry.id !== 'adr.workflow') throw new Error('Managed Heimdall plugin has an unexpected native identity');
+      }
+      const workflow = entries.filter(plugin => plugin.id === 'adr.workflow');
+      if (workflow.length > 1) throw new Error('Expected exactly one managed Heimdall plugin');
+      if (workflow[0] && (!record(workflow[0].state) || workflow[0].state.status !== 'active' || !record(workflow[0].source) || workflow[0].source.type !== 'local' || typeof workflow[0].source.path !== 'string' || path.resolve(workflow[0].source.path) !== path.resolve(expected))) throw new Error('Expected one active managed Heimdall plugin in this worktree');
+      let ready = workflow.length === 1;
+      for (const role of roles) {
+        const found = agents.filter(record).filter(agent => agent.id === role);
+        if (found.length > 1 || (found[0] && (role === 'adr-orchestrator' ? found[0].mode !== 'primary' : found[0].mode !== 'subagent'))) throw new Error('Managed native agent has the wrong mode or ambiguous identity: ' + role);
+        if (!found.length) ready = false;
+      }
+      // Cold locations announce an empty inventory until their asynchronous setup settles.
+      if (now() >= deadline) throw timeout();
+      if (ready) return;
+      await pause(Math.min(250, deadline - now()));
     }
   };
   return {

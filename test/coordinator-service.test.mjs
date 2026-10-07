@@ -6,6 +6,7 @@ import os from 'node:os';
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
+import { EventEmitter, once } from 'node:events';
 import { createCoordinatorClient } from '../dist/coordinator/client.js';
 import { loadCoordinatorConfiguration } from '../dist/coordinator/config.js';
 import { startCoordinatorService, readCoordinatorToken } from '../dist/coordinator/service.js';
@@ -25,9 +26,10 @@ async function fixture(t) {
   await fs.writeFile(path.join(project, '.heimdall.toml'), `[workflow]\nplannerModel = "anthropic/fixture"\nexecutorModel = "anthropic/fixture"\nexecutorFallbackModel = "openai/fixture"\n[opencode]\nbaseUrl = "http://127.0.0.1:4096"\n`);
   const configuration = { stateDirectory: state, endpoint: path.join(state, 'coordinator.sock'), globalConcurrency: 2, projectConcurrency: 1 };
   const launches = [];
+  const launched = new EventEmitter();
   let observation = { idle: false, status: 'unknown' };
   const executor = {
-    async launch(run) { launches.push(run); },
+    async launch(run) { launches.push(run); launched.emit('launch'); },
     async inspect() { return observation; },
   };
   let service = await startCoordinatorService({ configuration, executor, pollIntervalMs: 60000 });
@@ -35,6 +37,9 @@ async function fixture(t) {
   const client = createCoordinatorClient(configuration.endpoint, await readCoordinatorToken(state));
   return {
     temporary, project, state, configuration, client, launches,
+    async waitForLaunch(count) {
+      while (launches.length < count) await once(launched, 'launch', { signal: AbortSignal.timeout(10000) });
+    },
     service: () => service,
     observation: value => { observation = value; },
     async restart() { await service.close(); service = await startCoordinatorService({ configuration, executor, pollIntervalMs: 60000 }); },
@@ -112,7 +117,7 @@ test('restart retains active ownership; explicit idle reconciliation and resume 
   await f.service().scheduler.tick();
   const fresh = await settled(f.service().store, run.id);
   // Resumed admission is already running while metadata/launch finish.
-  for (let n = 0; n < 100 && f.launches.length < 2; n++) await new Promise(resolve => setTimeout(resolve, 5));
+  await f.waitForLaunch(2);
   assert.equal(fresh.worktreePath, run.worktreePath);
   assert.equal(fresh.parentSessionId, run.parentSessionId);
   assert.notEqual(fresh.ownerToken, run.ownerToken);
@@ -142,6 +147,19 @@ test('tracked original plugin assets are rejected before queueing or reserving a
   assert.equal(f.service().store.listRuns().length, 0);
   await assert.rejects(fs.stat(path.join(f.state, 'worktrees')), { code: 'ENOENT' });
   assert.equal(await fs.readFile(original, 'utf8'), '// Existing workflow remains untouched.\n');
+});
+
+test('explicit no-auth settings survive submission snapshots and managed runtime configuration', async t => {
+  const f = await fixture(t);
+  const configFile = path.join(f.project, '.heimdall.toml');
+  await fs.appendFile(configFile, 'authentication = "none"\n');
+  const project = await f.client.request('POST', '/projects', { directory: f.project });
+  const queued = await f.client.request('POST', '/runs', { projectId: project.id, feature: 'Feature' });
+  assert.equal(f.service().store.getRun(queued.id).specification.opencode.authentication, 'none');
+  await f.service().scheduler.tick();
+  const run = await settled(f.service().store, queued.id);
+  const runtime = await fs.readFile(path.join(run.worktreePath, '.heimdall/runtime.toml'), 'utf8');
+  assert.match(runtime, /authentication = "none"/);
 });
 
 test('relative project registration resolves against the client rather than server cwd', async t => {

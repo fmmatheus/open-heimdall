@@ -32,7 +32,7 @@ export async function snapshotSpecification(project: ProjectRecord): Promise<Run
   return {
     settings, plannerPrompt, executorPrompt,
     agents: { 'adr-orchestrator': orchestratorRole.replaceAll('resource: adr-planner', `resource: ${planner}`).replaceAll('resource: adr-executor', `resource: ${executor}`), [planner]: plannerRole, [executor]: executorRole },
-    opencode: { baseUrl: configuration.opencode.baseUrl, passwordEnvironmentVariable: configuration.opencode.passwordEnvironmentVariable },
+    opencode: { baseUrl: configuration.opencode.baseUrl, passwordEnvironmentVariable: configuration.opencode.passwordEnvironmentVariable, authentication: configuration.opencode.authentication },
   };
 }
 
