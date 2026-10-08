@@ -14,9 +14,17 @@ const readJSON = async <T>(p: string): Promise<T> => JSON.parse(await fs.readFil
 const errorMessage = (error: unknown): string => error instanceof Error ? error.message : String(error);
 const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object';
 const nonempty = (x: unknown): x is string => typeof x === 'string' && x.trim().length > 0;
+const invalidResponse = () => new Error('Invalid child response: expected one intact workflow JSON object. Saved last-response.json; caller tool arguments are not the issue.');
+const workflowJSON = (text: string): WorkflowResult | undefined => {
+  try {
+    const value: unknown = JSON.parse(text);
+    if (isRecord(value) && typeof value.status === 'string' && ['completed', 'planned', 'blocked'].includes(value.status)) return value as WorkflowResult;
+  } catch {}
+};
+const workflowMarker = (text: string) => /["'](?:status|taskId|planMarkdown|factSheet|evidence|artifacts|summary|handoff)["']\s*:|\{\s*["'](?:status|taskId|planMarkdown|factSheet|evidence|artifacts|summary|handoff)["']|\{\s*["'](?:s|st|sta|stat|statu|task|taskI)[ \t]*(?:\r?\n|$)/.test(text);
 export function parseResult(response: unknown): WorkflowResult {
   if (typeof response === 'string') response = { data: { parts: [{ type: 'text', text: response }] } };
-  if (!isRecord(response)) throw new Error('Invalid child response: expected one intact workflow JSON object. Saved last-response.json; caller tool arguments are not the issue.');
+  if (!isRecord(response)) throw invalidResponse();
   const data = isRecord(response.data) ? response.data : undefined;
   const info = isRecord(data?.info) ? data.info : undefined;
   if (response.error || info?.error) {
@@ -25,18 +33,39 @@ export function parseResult(response: unknown): WorkflowResult {
   }
   if (info?.finish === 'length') throw new Error('Planner/executor output truncated at model output limit. Raw response saved; recover artifacts before resuming.');
   const raw = Array.isArray(data?.parts) ? data.parts.filter(isRecord).filter(p => p.type === 'text').map(p => p.text).join('\n') : '';
-  const cleaned = raw.trim().replace(/^```(?:json)?\s*\n/, '').replace(/\n```$/, '');
-  try { return JSON.parse(cleaned) as WorkflowResult; } catch {}
-  // Permit prose/fences around one intact object; never repair or guess JSON.
+  const cleaned = raw.trim();
+  const direct = workflowJSON(cleaned);
+  if (direct) return direct;
+  // A complete fence gives an exact boundary even when surrounding prose contains JS braces.
+  let fenced: { result: WorkflowResult; start: number; end: number } | undefined;
+  const fencePattern = /(^|\n)[ \t]*```([^\r\n`]*)\r?\n([\s\S]*?)\r?\n[ \t]*```[ \t]*(?=\r?\n|$)/g;
+  for (const match of cleaned.matchAll(fencePattern)) {
+    const language = match[2]!.trim().toLowerCase();
+    if (language !== 'json' && language !== '') continue;
+    const value = workflowJSON(match[3]!);
+    if (language === 'json' && !value) throw invalidResponse();
+    if (!value) {
+      if (workflowMarker(match[3]!)) throw invalidResponse();
+      continue;
+    }
+    if (fenced) throw invalidResponse();
+    fenced = { result: value, start: match.index, end: match.index + match[0].length };
+  }
+  if (fenced) {
+    const outside = cleaned.slice(0, fenced.start) + cleaned.slice(fenced.end);
+    const unfenced = outside.replace(fencePattern, '');
+    if (workflowMarker(outside) || /(^|\n)[ \t]*```(?:json)?[ \t]*\r?\n/i.test(unfenced)) throw invalidResponse();
+    return fenced.result;
+  }
+  if (/(^|\n)[ \t]*```(?:json)?[ \t]*\r?\n/i.test(cleaned)) throw invalidResponse();
+  // Preserve the legacy single-object prose envelope. Never repair or guess JSON.
   const start = cleaned.indexOf('{');
   const end = cleaned.lastIndexOf('}');
   if (start >= 0 && end > start) {
-    try {
-      const value: unknown = JSON.parse(cleaned.slice(start, end + 1));
-      if (isRecord(value) && typeof value.status === 'string' && ['completed', 'planned', 'blocked'].includes(value.status)) return value as WorkflowResult;
-    } catch {}
+    const value = workflowJSON(cleaned.slice(start, end + 1));
+    if (value) return value;
   }
-  throw new Error('Invalid child response: expected one intact workflow JSON object. Saved last-response.json; caller tool arguments are not the issue.');
+  throw invalidResponse();
 }
 export async function loadPlanArtifacts(result: WorkflowResult, directory: string, id: string, planRoot = '.omo/plans'): Promise<WorkflowResult> {
   if (result.status !== 'planned' || result.artifacts !== true) return result;
@@ -212,7 +241,8 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
         // A receipt saved before a crash is applied without submitting the same task again.
         let result!: WorkflowResult;
         let receipt: (NonNullable<RunState['attempt']> & { response: unknown }) | undefined;
-        if (state.attempt && state.attempt.status !== 'rejected') {
+        const recheckRejected = args.action === 'resume' && !args.recovery && state.attempt?.status === 'rejected';
+        if (state.attempt && (state.attempt.status !== 'rejected' || recheckRejected)) {
           if (state.attempt.phase !== state.phase || state.attempt.index !== state.index || state.attempt.child !== state.child) throw new Error('Attempt does not match the current task');
           const receiptPath = path.join(runDir, 'attempt-' + state.attempt.id + '.json');
           try { receipt = persistence ? await persistence.readReceipt(state.id, state.attempt.id) ?? undefined : await readJSON<NonNullable<typeof receipt>>(receiptPath); } catch (error) { if (!isRecord(error) || error.code !== 'ENOENT') throw error; }
@@ -227,16 +257,28 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
           }
           if (receipt) {
             if (receipt.id !== state.attempt.id || receipt.child !== state.child || receipt.phase !== state.phase || receipt.index !== state.index) throw new Error('Saved response does not match the current attempt');
-            try { result = parseResult(receipt.response); }
-            catch (error) { state.attempt.status = 'rejected'; throw error; }
-            await checkBudget();
+            try {
+              result = parseResult(receipt.response);
+              if (recheckRejected) {
+                if (planning) {
+                  result = await loadPlanArtifacts(result, directory, state.id, planRoot);
+                  validatePlan(result, cfg.maxTasks);
+                } else validateCompletion(result, task, { requireGateIds: true });
+              }
+            } catch (error) {
+              state.attempt.status = 'rejected';
+              if (!recheckRejected) throw error;
+              receipt = undefined; // Explicit resume may request a fresh reply; preserve the invalid original receipt.
+            }
+            if (receipt) await checkBudget();
           }
         }
         if (!receipt) {
           if (!tokenLimitsDisabled && Object.values(usage).reduce((a, b) => a + b, 0) >= maxRunTokens) throw new Error('ADR token budget reached');
           if (planning) {
             const snapshot = await quota(cfg);
-            if (!snapshot.anthropic?.entries?.length || snapshot.anthropic.errors?.length) throw new Error('Claude quota unavailable before planning');
+            const provider = cfg.plannerModel.startsWith('claude-code/') ? 'claude-code' : 'anthropic';
+            if (!snapshot[provider]?.entries?.length || snapshot[provider]!.errors?.length) throw new Error('Claude quota unavailable before planning');
           } else {
             state.selection = chooseExecutor(await quota(cfg), cfg);
           }
@@ -295,18 +337,26 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
             catch (error) { state.attempt.status = 'rejected'; throw error; }
             await checkBudget();
           } catch (error) {
-            controller.abort(error);
+            // Native cancellation may reject with a generic interruption. Preserve the guard that caused it.
+            const cause = guardError ?? error;
+            controller.abort(cause);
             if (!receipt && state.child) state.attempt.status = 'interrupted';
             if (state.child) {
               try { await backend.interrupt(state.child, state.parent); }
-              catch (cancelError) { throw new Error(errorMessage(cancelError) + '. Original error: ' + errorMessage(error)); }
+              catch (cancelError) {
+                if (guardError) throw new Error(errorMessage(guardError) + '. Cancellation check: ' + errorMessage(cancelError));
+                throw new Error(errorMessage(cancelError) + '. Original error: ' + errorMessage(cause));
+              }
             }
-            if ((planning || chosen.startsWith('anthropic/')) && authExpired(errorMessage(error))) {
+            if (chosen.startsWith('claude-code/') && authExpired(errorMessage(cause))) {
+              throw new Error('Claude Code authentication unavailable. Refresh Claude Code manually, then explicitly resume this run.');
+            }
+            if ((planning || chosen.startsWith('anthropic/')) && authExpired(errorMessage(cause))) {
               if (typeof authRefresh !== 'function') throw new Error('Claude authentication expired; no credential refresh integration is available');
               await authRefresh();
               throw new Error('Claude authentication expired. Native credential refresh attempted; check provider connection, then resume.');
             }
-            throw error;
+            throw cause;
           } finally {
             if (activeStartedAt) state.taskElapsedMs = (state.taskElapsedMs ?? 0) + Date.now() - activeStartedAt;
             clearTimeout(timer);

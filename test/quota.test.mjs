@@ -5,6 +5,43 @@ import os from 'node:os';
 import path from 'node:path';
 import {chooseExecutor,createQuota,fetchQuota,probeQuota,refreshClaudeAuth,sanitizeQuotaResult} from '../dist/policy/quota.js';
 const settings={minQuotaRemainingPercent:10,fiveHourQuotaWeight:0.6,executorCandidates:[{key:'sonnet',quotaProvider:'anthropic',model:'anthropic/sonnet',variant:'xhigh'},{key:'kimi',quotaProvider:'kimi',model:'kimi/k3'},{key:'gpt',quotaProvider:'openai',model:'openai/gpt',variant:'max'}]};
+
+test('Claude Code quota uses its shared-login reader without native credential resolution', async () => {
+ const cfg = { ...settings, plannerModel: 'claude-code/opus', executorCandidates: [{ key: 'sonnet', quotaProvider: 'claude-code', model: 'claude-code/sonnet' }] };
+ let probes = 0;
+ const options = {
+  integration: { connection: { resolve: () => assert.fail('Claude Code must not resolve native credentials') } },
+  load: () => assert.fail('Claude Code-only quota must not load the native account adapter'),
+  claudeCodeProbe: async () => { probes++; return { fetchedAt: Date.now(), errors: [], entries: [{ name: '5h', percentRemaining: 80 }, { name: 'Weekly', percentRemaining: 70 }, { name: 'Opus Weekly', percentRemaining: 0 }] }; },
+  log: () => assert.fail('successful quota must not log authentication errors'),
+ };
+ const value = await fetchQuota(cfg, options);
+ assert.deepEqual(Object.keys(value), ['claude-code']);
+ assert.equal(probes, 1);
+ assert.equal(chooseExecutor(value, cfg).model, 'claude-code/sonnet');
+});
+
+test('Claude Code quota authentication failure requests its own manual refresh', async () => {
+ const cfg = { ...settings, plannerModel: 'claude-code/opus', executorCandidates: [{ key: 'sonnet', quotaProvider: 'claude-code', model: 'claude-code/sonnet' }] };
+ const events = [];
+ await assert.rejects(fetchQuota(cfg, {
+  integration: { connection: { resolve: () => assert.fail('no native refresh') } },
+  claudeCodeProbe: async () => ({ fetchedAt: Date.now(), errors: ['claude_auth_required'], entries: [], authExpired: true }),
+  log: async entry => events.push(entry),
+ }), /Refresh Claude Code manually/);
+ assert.equal(events.length, 1);
+ assert.equal(events[0].provider, 'claude-code');
+});
+
+test('an unavailable optional Claude Code executor does not block native planning or fallback', async () => {
+ const cfg = { ...settings, plannerModel: 'anthropic/opus', executorCandidates: [{ key: 'sdk', quotaProvider: 'claude-code', model: 'claude-code/sonnet' }, { key: 'native', quotaProvider: 'anthropic', model: 'anthropic/sonnet' }] };
+ const value = await fetchQuota(cfg, {
+  integration: { connection: { resolve: () => assert.fail('injected snapshots must not resolve credentials') } },
+  probe: async () => ({ anthropic: { fetchedAt: Date.now(), entries: [{ name: '5h', percentRemaining: 80 }, { name: 'Weekly', percentRemaining: 80 }], errors: [] }, 'claude-code': { fetchedAt: Date.now(), entries: [], errors: ['claude_auth_required'], authExpired: true } }),
+  log: async () => {},
+ });
+ assert.equal(chooseExecutor(value, cfg).model, 'anthropic/sonnet');
+});
 const quota=(five,week,extra={})=>({fetchedAt:Date.now(),errors:[],entries:[{name:'5h',percentRemaining:five},{name:'Weekly',percentRemaining:week}],...extra});
 test('fresh quota reserve, harmonic weighting and per-task model variants are preserved',()=>{
  const pick=chooseExecutor({anthropic:quota(50,50),kimi:quota(80,9),openai:quota(90,90)},settings);

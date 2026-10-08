@@ -69,6 +69,22 @@ test('native launch uses exact saved session/message IDs, explicit worktree loca
   assert.equal(f.calls.filter(call => call.route.endsWith('/prompt')).length, 2, 'projected prompt retries never admit or wake another inference');
 });
 
+test('native default variant projection matches an omitted planner variant without weakening explicit variants', async () => {
+  const run = runFixture();
+  delete run.specification.settings.plannerVariant;
+  const implicit = fixture(run);
+  implicit.parent.model.variant = 'default';
+  await implicit.executor.launch(run);
+  const created = implicit.calls.find(call => call.route === '/api/session' && call.method === 'POST');
+  assert.ok(!Object.hasOwn(created.body.model, 'variant'));
+  assert.equal(implicit.calls.filter(call => call.route.endsWith('/prompt')).length, 2);
+
+  const explicit = fixture();
+  explicit.parent.model.variant = 'default';
+  await assert.rejects(explicit.executor.launch(explicit.run), /Created native parent does not match/);
+  assert.ok(!explicit.calls.some(call => call.route.endsWith('/prompt')));
+});
+
 test('launch retries wake a matching pending admission and reject conflicting parent identity', async () => {
   const f = fixture();
   f.inbox = [{ id: f.run.promptMessageId, sessionID: f.run.parentSessionId, type: 'user', payload: { text: managedPrompt(f.run), metadata: { heimdallRunId: f.run.id } } }];

@@ -1,5 +1,8 @@
 # Native coordinator bootstrap validation
 
+For subsequent real-model execution and recovery results, see the
+[Claude Code coordinator smoke](claude-code-coordinator-smoke.md).
+
 Validated against merged PR #4 and OpenCode **2.0.22** using disposable Git
 projects and a separate passwordless loopback server. The server used private
 execution state, configuration, logs, cache and temporary directories; automatic

@@ -4,6 +4,7 @@ import { appendFile, mkdir, readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { cachedQuota, deduplicateUsageFetch } from './quota-cache.js';
+import { readClaudeCodeQuota } from './claude-code-quota.js';
 import type { CandidateQuotaScore, ExecutorSelection, QuotaEvent, QuotaResult, QuotaSettings, QuotaSnapshot, RawQuotaResult } from './types.js';
 
 export function chooseExecutor(snapshot: QuotaSnapshot, settings: QuotaSettings): ExecutorSelection {
@@ -30,15 +31,15 @@ export function chooseExecutor(snapshot: QuotaSnapshot, settings: QuotaSettings)
     } catch (error) { return { eligible: false, score: 0, reason: errorMessage(error) }; }
   };
   const candidates = settings.executorCandidates || [
-    { key: 'sonnet', quotaProvider: 'anthropic', model: settings.executorModel },
-    { key: 'kimi', quotaProvider: 'kimi', model: settings.executorFallbackModel },
+    { key: 'sonnet', quotaProvider: settings.executorModel.startsWith('claude-code/') ? 'claude-code' : 'anthropic', model: settings.executorModel },
+    { key: 'kimi', quotaProvider: settings.executorFallbackModel.startsWith('claude-code/') ? 'claude-code' : 'kimi', model: settings.executorFallbackModel },
   ];
   for (const candidate of candidates) {
     if (['model', 'variant', 'checkedAt'].includes(candidate.key)) throw new Error('Executor candidate key is a reserved selection field: ' + candidate.key);
   }
   const scores: Record<string, CandidateQuotaScore> = Object.fromEntries(candidates.map(candidate => [
     candidate.key,
-    score(candidate.quotaProvider, candidate.quotaProvider === 'anthropic' ? /fable|opus/i : candidate.quotaProvider === 'openai' ? /code.?review/i : /$^/),
+    score(candidate.quotaProvider, ['anthropic', 'claude-code'].includes(candidate.quotaProvider) ? /fable|opus/i : candidate.quotaProvider === 'openai' ? /code.?review/i : /$^/),
   ]));
   let winner: (typeof candidates)[number] | undefined;
   for (const candidate of candidates) {
@@ -197,6 +198,7 @@ export interface QuotaProbeOptions extends Omit<QuotaPackageLoaderOptions, 'pack
   cacheDirectory?: string;
   fetchImpl?: typeof fetch;
   now?: () => number;
+  claudeCodeProbe?: typeof readClaudeCodeQuota;
 }
 
 export interface QuotaOptions extends QuotaProbeOptions {
@@ -219,11 +221,14 @@ export async function fetchQuota(settings: QuotaSettings, options: QuotaOptions 
   for (const [provider, value] of Object.entries(result)) {
     if (value?.errors?.length) await log({
       at: new Date().toISOString(), provider, errorCode: value.errorCode || 'quota_unavailable',
-      action: value.authExpired ? 'reconnect_in_openchamber' : value.cached ? 'cooldown_skip' : 'exclude_from_selection',
+      action: value.authExpired ? (provider === 'claude-code' ? 'refresh_claude_code_manually' : 'reconnect_in_openchamber') : value.cached ? 'cooldown_skip' : 'exclude_from_selection',
       retryAt: value.retryAt,
     });
   }
-  if (result.anthropic?.authExpired) {
+  if (result['claude-code']?.authExpired && settings.plannerModel?.startsWith('claude-code/')) {
+    throw new Error('Claude Code authentication unavailable. Refresh Claude Code manually, then explicitly resume this run.');
+  }
+  if (result.anthropic?.authExpired && !settings.plannerModel?.startsWith('claude-code/')) {
     throw new Error('Anthropic authentication unavailable after OpenCode credential resolution. Reconnect Anthropic in OpenChamber, then resume this run.');
   }
   return result;
@@ -244,10 +249,24 @@ export function probeQuota(settings: QuotaSettings, options: QuotaProbeOptions):
 type ProviderKey = 'anthropic' | 'kimi' | 'openai';
 interface NativeCredential { row?: CredentialRow; token?: string; valid: boolean; scope?: string }
 
-async function performProbe(settings: QuotaSettings, {
+async function performProbe(settings: QuotaSettings, options: QuotaProbeOptions): Promise<QuotaSnapshot> {
+  const candidates = settings.executorCandidates ?? [
+    { quotaProvider: settings.executorModel.startsWith('claude-code/') ? 'claude-code' : 'anthropic' },
+    { quotaProvider: settings.executorFallbackModel.startsWith('claude-code/') ? 'claude-code' : 'kimi' },
+  ];
+  const usesClaudeCode = settings.plannerModel?.startsWith('claude-code/') || candidates.some(candidate => candidate.quotaProvider === 'claude-code');
+  if (!usesClaudeCode) return performNativeProbe(settings, options);
+  const sdk = await (options.claudeCodeProbe ?? readClaudeCodeQuota)({ fetchImpl: options.fetchImpl, now: options.now });
+  const requested = new Set(candidates.map(candidate => candidate.quotaProvider).filter(provider => provider !== 'claude-code'));
+  if (settings.plannerModel?.startsWith('anthropic/')) requested.add('anthropic');
+  const native = requested.size ? await performNativeProbe(settings, options, requested) : {};
+  return { ...native, 'claude-code': sdk };
+}
+
+async function performNativeProbe(settings: QuotaSettings, {
   integration, directory = process.cwd(), workflowRoot = path.join(directory, '.heimdall'),
   cacheDirectory = path.join(workflowRoot, 'quota-cache'), load, resolveModule, fetchImpl = globalThis.fetch, now = Date.now,
-}: QuotaProbeOptions): Promise<QuotaSnapshot> {
+}: QuotaProbeOptions, requested?: Set<string>): Promise<QuotaSnapshot> {
   const loader = await createQuotaPackageLoader({ packagePath: settings.packagePath, load, resolveModule });
   const auth = await loader.auth();
   auth.notifyCredentialsChanged();
@@ -255,6 +274,7 @@ async function performProbe(settings: QuotaSettings, {
   const integrations: Record<ProviderKey, string> = { anthropic: 'anthropic', kimi: 'kimi-code-plan-global', openai: 'openai' };
   const native = {} as Record<ProviderKey, NativeCredential>;
   for (const key of Object.keys(integrations) as ProviderKey[]) {
+    if (requested && !requested.has(key)) { native[key] = { valid: false }; continue; }
     const integrationID = integrations[key];
     // Resolve the active account before considering cached quota, without CLI/env fallback.
     const rows = await source.readRows({ integrationIds: [integrationID], methods: [key === 'kimi' ? 'key' : 'oauth'], firstOnly: true });
@@ -295,6 +315,7 @@ async function performProbe(settings: QuotaSettings, {
     const result: QuotaSnapshot = {};
     const providers: [ProviderKey, Provider][] = [['anthropic', anthropicProvider], ['kimi', kimiProvider], ['openai', openaiProvider]];
     await Promise.all(providers.map(async ([key, provider]) => {
+      if (requested && !requested.has(key)) return;
       if (!native[key].valid) {
         result[key] = { fetchedAt: now(), authExpired: key === 'anthropic', errorCode: 'native_credential_unavailable', errors: ['native_credential_unavailable'], entries: [] };
         return;

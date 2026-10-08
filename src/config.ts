@@ -45,10 +45,11 @@ function candidate(value: unknown, index: number): ExecutorCandidate {
   const row = table(value, `workflow.executorCandidates[${index}]`);
   keys(row, ['key', 'quotaProvider', 'model', 'variant'], 'executor candidate');
   const provider = text(row.quotaProvider, 'quotaProvider');
-  if (!['anthropic', 'openai', 'kimi'].includes(provider)) throw new Error('quotaProvider must be anthropic, openai, or kimi in this baseline');
+  if (!['anthropic', 'claude-code', 'openai', 'kimi'].includes(provider)) throw new Error('quotaProvider must be anthropic, claude-code, openai, or kimi');
   const key = text(row.key, 'candidate key');
   if (!/^[A-Za-z0-9_-]+$/.test(key) || ['model', 'variant', 'checkedAt'].includes(key)) throw new Error('Executor candidate key is invalid or reserved');
   const result: ExecutorCandidate = { key, quotaProvider: provider, model: model(row.model, 'candidate model') };
+  if ((provider === 'claude-code') !== result.model.startsWith('claude-code/')) throw new Error('Claude Code candidates must pair quotaProvider claude-code with a claude-code/model');
   if (row.variant !== undefined) {
     result.variant = text(row.variant, 'candidate variant');
     if (result.variant.includes('#')) throw new Error('candidate variant cannot contain #');
