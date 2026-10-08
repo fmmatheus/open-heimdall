@@ -40,13 +40,13 @@ async function fixture(t, responses, overrides = {}) {
       calls.push(['prompt', o]);
       try {
         const r = responses.shift();
-        if (typeof r === 'function') return await r();
+        if (typeof r === 'function') return await r(input, context);
         if (r instanceof Error) throw r;
         return JSON.stringify(r);
       } finally { active--; }
     },
   };
-  return { root, calls, backend, run: createRunner({ backend, directory, quota: async () => snapshot(), authRefresh: async () => { calls.push(['authRefresh']); }, git: a => a[0] === 'branch' ? 'main\\n' : ' M existing.txt\\n' }), context: { sessionID: 'parent', id: 'call_1', messageID: 'msg_1', agent: 'adr-orchestrator', abort: new AbortController().signal } };
+  return { root, calls, backend, run: createRunner({ backend, directory, quota: async () => overrides.quotaSnapshot ?? snapshot(), authRefresh: async () => { calls.push(['authRefresh']); }, git: a => a[0] === 'branch' ? 'main\\n' : ' M existing.txt\\n' }), context: { sessionID: 'parent', id: 'call_1', messageID: 'msg_1', agent: 'adr-orchestrator', abort: new AbortController().signal } };
 }
 test('planner then fresh sequential sessions, durable completion', async t => {
   const f = await fixture(t, [plan, done('T1'), done('T2')]);
@@ -87,6 +87,37 @@ test('token budget stops before inference', async t => {
   assert.match(result.reason,/Token budget/);
   assert.equal(f.calls.filter(c=>c[0]==='prompt').length,0);
 });
+test('polling cancellation preserves the token-budget reason over native interruption and cleanup failures', async t => {
+  for (const cleanupFails of [false, true]) await t.test(cleanupFails ? 'cleanup remains uncertain' : 'cleanup confirms interruption', async child => {
+    const f = await fixture(child, [async (_input, context) => new Promise((resolve, reject) => {
+      context.signal.addEventListener('abort', () => reject(new Error('Native child was interrupted')), { once: true });
+    })], {
+      plannerModel: 'claude-code/planner',
+      executorCandidates: [{ key: 'sonnet', quotaProvider: 'claude-code', model: 'claude-code/executor' }],
+      quotaSnapshot: { 'claude-code': snapshot().anthropic },
+      timeoutMinutes: null,
+    });
+    let probes = 0;
+    f.backend.usage = async () => ({ used: ++probes > 1 ? 69374 : 0, uncached: 2000 });
+    if (cleanupFails) f.backend.interrupt = async () => { f.calls.push(['abort']); throw new Error('Could not confirm child termination'); };
+    const result = JSON.parse(await f.run({ action: 'start', adr: 'ADR.md' }, f.context));
+    assert.equal(result.status, 'paused');
+    assert.match(result.reason, /^Token budget reached: session 69374\/60000/);
+    assert.doesNotMatch(result.reason, /Native child was interrupted/);
+    if (cleanupFails) assert.match(result.reason, /Cancellation check: Could not confirm child termination/);
+    assert.equal(probes, 2, 'the periodic usage poll crosses the cap after prompt admission');
+    assert.equal(f.calls.filter(call => call[0] === 'prompt').length, 1);
+    assert.equal(f.calls.filter(call => call[0] === 'abort').length, 1);
+    assert.equal(f.calls.filter(call => call[0] === 'authRefresh').length, 0);
+    const state = JSON.parse(await f.run({ action: 'status', runId: result.runId }, f.context));
+    assert.equal(state.reason, result.reason);
+    assert.equal(state.usage.s1, 69374);
+    assert.equal(state.child, 's1');
+    assert.equal(state.attempt.status, 'interrupted');
+    assert.equal(state.index, 0);
+    assert.deepEqual(state.results, []);
+  });
+});
 test('project can disable all token and elapsed-time limits while retaining counters',async t=>{
  const f=await fixture(t,[plan,done('T1'),done('T2')],{tokenLimitsDisabled:true,timeoutMinutes:null,maxSessionTokens:null,maxRunTokens:null,maxSessionUncachedTokens:1,maxRunUncachedTokens:1,reportedTokens:1000000000});
  const result=JSON.parse(await f.run({action:'start',adr:'ADR.md'},f.context));
@@ -112,8 +143,9 @@ test('ordinary error pauses without fallback or next task', async t => {
   assert.equal(f.calls.filter(c => c[0] === 'prompt').length, 2);
 });
 test('elapsed time emits one warning and allows task completion without abort', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
   const f = await fixture(t, [async () => {
-    await new Promise(resolve => setTimeout(resolve, 30));
+    t.mock.timers.tick(30);
     return {data:{parts:[{type:'text',text:JSON.stringify(plan)}]}};
   }, done('T1'), done('T2')], {timeoutMinutes:0.0001});
   const notices = [];
@@ -123,6 +155,7 @@ test('elapsed time emits one warning and allows task completion without abort', 
   assert.equal(f.calls.filter(c => c[0] === 'abort').length,0);
   assert.equal(notices.filter(n => n.metadata.warning).length,1);
   const state = JSON.parse(await fs.readFile(path.join(f.root,'runs',result.runId,'state.json'),'utf8'));
+  assert.deepEqual(Object.keys(state.timeWarnings), ['s1']);
   assert.match(state.timeWarnings.s1.message,/warning only/);
 });
 
@@ -144,6 +177,32 @@ test('Claude auth failure starts recovery once and pauses', async t => {
   assert.match(result.reason,/authentication expired/);
   assert.equal(f.calls.filter(c=>c[0]==='authRefresh').length,1);
   assert.equal(f.calls.filter(c=>c[0]==='prompt').length,1);
+});
+
+test('Claude Code plans and selects executors without a native Anthropic credential', async t => {
+  const f = await fixture(t, [plan, done('T1'), done('T2')], {
+    plannerModel: 'claude-code/planner',
+    executorModel: 'claude-code/executor', executorFallbackModel: 'claude-code/executor',
+    executorCandidates: [{ key: 'sonnet', quotaProvider: 'claude-code', model: 'claude-code/executor' }],
+    quotaSnapshot: { 'claude-code': snapshot().anthropic },
+  });
+  const result = JSON.parse(await f.run({ action: 'start', adr: 'ADR.md' }, f.context));
+  assert.equal(result.status, 'completed');
+  assert.deepEqual(f.calls.filter(c => c[0] === 'prompt').map(c => c[1].body.model), ['claude-code/planner', 'claude-code/executor', 'claude-code/executor']);
+  assert.equal(f.calls.filter(c => c[0] === 'authRefresh').length, 0);
+});
+
+test('Claude Code authentication failure pauses for manual refresh without native recovery', async t => {
+  const f = await fixture(t, [new Error('401 Unauthorized')], {
+    plannerModel: 'claude-code/planner',
+    executorCandidates: [{ key: 'sonnet', quotaProvider: 'claude-code', model: 'claude-code/executor' }],
+    quotaSnapshot: { 'claude-code': snapshot().anthropic },
+  });
+  const result = JSON.parse(await f.run({ action: 'start', adr: 'ADR.md' }, f.context));
+  assert.equal(result.status, 'paused');
+  assert.match(result.reason, /Refresh Claude Code manually/);
+  assert.equal(f.calls.filter(c => c[0] === 'authRefresh').length, 0);
+  assert.equal(f.calls.filter(c => c[0] === 'prompt').length, 1);
 });
 
 test('truncated model output has an explicit diagnostic', () => {
@@ -187,6 +246,29 @@ test('parse one intact completion with prose without accepting broken or multipl
   assert.deepEqual(parseResult(response('Committed.\n\n'+JSON.stringify(result))), result);
   assert.throws(() => parseResult(response('Committed. {"status":"completed","summary":"cut')), /Invalid child response/);
   assert.throws(() => parseResult(response(JSON.stringify(result)+'\n'+JSON.stringify(result))), /Invalid child response/);
+});
+
+const fencedCompletion = result => 'Implemented `export function greet(name) { return name; }` and preserved `import { identity }`.\n\n```json\n' + JSON.stringify(result) + '\n```\n\nThe check exercised `identity({ value: 1 })` successfully.';
+test('one intact fenced completion accepts surrounding prose with unrelated JavaScript braces', () => {
+  const result = done('T1');
+  assert.deepEqual(parseResult(fencedCompletion(result)), result);
+  assert.deepEqual(parseResult('```js\nconst { identity } = module;\n```\n' + fencedCompletion(result)), result);
+  assert.deepEqual(parseResult('```\nconst { identity } = module;\n```\n' + fencedCompletion(result)), result);
+});
+
+test('malformed fenced JSON including illegal escaped apostrophes is never repaired', () => {
+  const invalid = JSON.stringify({ ...done('T2'), summary: "Preserved O'Neil" }).replace("O'Neil", "O\\'Neil");
+  for (const response of ['```json\n' + invalid + '\n```', '```json\n{"status":"completed","taskId":"T2"\n```', '```json\n' + JSON.stringify(done('T2')), '```json\n' + JSON.stringify(done('T2')) + '\n' + JSON.stringify(done('T2')) + '\n```']) {
+    assert.throws(() => parseResult(response), /Invalid child response/);
+  }
+});
+
+test('a valid fence cannot hide an additional valid malformed or partial workflow response', () => {
+  const valid = fencedCompletion(done('T1'));
+  for (const extra of [JSON.stringify(done('T1')), '```json\n' + JSON.stringify(done('T1')) + '\n```', '{"status":"completed","taskId":"T1"', '{"status"', '```json\n{"status":"completed"', '{"status":"completed","summary":"illegal\\\'apostrophe"}']) {
+    assert.throws(() => parseResult(valid + '\n' + extra), /Invalid child response/);
+    assert.throws(() => parseResult(extra + '\n' + valid), /Invalid child response/);
+  }
 });
 
 test('quota failure excludes only affected provider and preserves weighted routing', () => {
@@ -276,6 +358,60 @@ test('a saved attempt receipt advances exactly once without reprompting its comp
  const before=await fs.readFile(file,'utf8');
  await f.run({action:'resume',runId:state.id,input:'Already complete'},f.context);
  assert.equal(await fs.readFile(file,'utf8'),before,'completed runs are not rewritten');
+});
+
+test('explicit resume revalidates a rejected receipt without prompting its already completed child', async t => {
+  const f = await fixture(t, [plan, new Error('Previous parser rejected surrounding prose braces'), done('T2')]);
+  const paused = JSON.parse(await f.run({ action: 'start', adr: 'ADR.md' }, f.context));
+  const base = path.join(f.root, 'runs', paused.runId);
+  const file = path.join(base, 'state.json');
+  const state = JSON.parse(await fs.readFile(file, 'utf8'));
+  state.attempt.status = 'rejected';
+  await fs.writeFile(file, JSON.stringify(state));
+  const receiptPath = path.join(base, 'attempt-' + state.attempt.id + '.json');
+  await fs.writeFile(receiptPath, JSON.stringify({ ...state.attempt, status: 'admitted', response: fencedCompletion(done('T1')) }));
+  const receiptBefore = await fs.readFile(receiptPath, 'utf8');
+  const completed = JSON.parse(await f.run({ action: 'resume', runId: state.id, input: 'Recheck the intact saved completion using the updated parser' }, f.context));
+  assert.equal(completed.status, 'completed');
+  assert.deepEqual(f.calls.filter(call => call[0] === 'prompt').map(call => call[1].path.id), ['s1', 's2', 's3']);
+  assert.equal(await fs.readFile(receiptPath, 'utf8'), receiptBefore, 'the original receipt is immutable');
+  const final = JSON.parse(await fs.readFile(file, 'utf8'));
+  assert.deepEqual(final.results.map(result => result.taskId), ['T1', 'T2']);
+  assert.equal(final.results[0].sessionId, state.child);
+  assert.equal(final.results[0].model, state.attempt.model);
+});
+
+test('an explicitly resumed malformed rejected receipt stays intact and requires a fresh child response', async t => {
+  const malformed = '```json\n' + JSON.stringify({ ...done('T1'), summary: "Preserved O'Neil" }).replace("O'Neil", "O\\'Neil") + '\n```';
+  const f = await fixture(t, [plan, async () => malformed, done('T1'), done('T2')]);
+  const paused = JSON.parse(await f.run({ action: 'start', adr: 'ADR.md' }, f.context));
+  assert.equal(paused.status, 'paused');
+  assert.match(paused.reason, /Invalid child response/);
+  const base = path.join(f.root, 'runs', paused.runId);
+  const state = JSON.parse(await fs.readFile(path.join(base, 'state.json'), 'utf8'));
+  assert.equal(state.attempt.status, 'rejected');
+  const receiptPath = path.join(base, 'attempt-' + state.attempt.id + '.json');
+  const receiptBefore = await fs.readFile(receiptPath, 'utf8');
+  const completed = JSON.parse(await f.run({ action: 'resume', runId: state.id, input: 'Return an intact JSON reply without invalid escaping' }, f.context));
+  assert.equal(completed.status, 'completed');
+  assert.deepEqual(f.calls.filter(call => call[0] === 'prompt').map(call => call[1].path.id), ['s1', 's2', 's2', 's3']);
+  assert.equal(await fs.readFile(receiptPath, 'utf8'), receiptBefore);
+  assert.equal(JSON.parse(receiptBefore).response, malformed);
+});
+
+test('rejected cached completion must still pass every unchanged task evidence gate on explicit resume', async t => {
+  const missingEvidence = fencedCompletion({ ...done('T1'), evidence: [] });
+  const f = await fixture(t, [plan, async () => missingEvidence, done('T1'), done('T2')]);
+  const paused = JSON.parse(await f.run({ action: 'start', adr: 'ADR.md' }, f.context));
+  assert.equal(paused.status, 'paused');
+  assert.match(paused.reason, /Missing completion evidence/);
+  const state = JSON.parse(await f.run({ action: 'status', runId: paused.runId }, f.context));
+  const receiptPath = path.join(f.root, 'runs', state.id, 'attempt-' + state.attempt.id + '.json');
+  const receiptBefore = await fs.readFile(receiptPath, 'utf8');
+  const completed = JSON.parse(await f.run({ action: 'resume', runId: state.id, input: 'Provide actual evidence for the original DoD' }, f.context));
+  assert.equal(completed.status, 'completed');
+  assert.deepEqual(f.calls.filter(call => call[0] === 'prompt').map(call => call[1].path.id), ['s1', 's2', 's2', 's3']);
+  assert.equal(await fs.readFile(receiptPath, 'utf8'), receiptBefore);
 });
 
 test('completed native output can be recovered without a receipt or duplicate task prompt', async t => {

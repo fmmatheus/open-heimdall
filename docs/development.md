@@ -82,6 +82,19 @@ provider-module paths. A scoped dependency override uses the tested native plugi
 version. Credentials resolve through the active OpenCode account and stay
 transient; caches retain normalized quota fields and hashed account scope.
 
+For the OpenChamber Claude Code provider, use `claude-code/opus` for planning
+and pair executor models such as `claude-code/sonnet` with
+`quotaProvider = "claude-code"`. Model names and variants must be available in
+your configured OpenCode integration. Execution uses Claude Code's existing
+login through the installed provider; no token import into OpenCode is needed.
+Heimdall reads that login's current quota without copying, refreshing or writing
+credentials. Expired or refresh-due credentials pause the run for manual refresh
+in Claude Code and explicit resume. Quota requests share a short cache and respect
+rate-limit cooldowns.
+
+See the [live Claude Code coordinator validation](validation/claude-code-coordinator-smoke.md)
+for execution, concurrency, token tracking and recovery observations.
+
 ## Current limits
 
 - The standalone baseline keeps one active run per configured state directory
@@ -94,7 +107,8 @@ transient; caches retain normalized quota fields and hashed account scope.
   confirmed. Provider quota
   windows influence model choice; arbitrary user token windows are not implemented.
 - `timeoutMinutes` emits a warning and does not enforce a hard deadline.
-- Planning currently requires available Anthropic quota. Account authentication
+- Planning requires available quota for the configured Claude provider (`anthropic`
+  or `claude-code`). Account authentication
   and model availability still come from the configured OpenCode environment.
 - Phone deployment and the independent watchdog service are not included. The
   runner's saved receipts and reserved-recovery checks remain intact.

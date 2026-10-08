@@ -24,6 +24,16 @@ test('configuration defaults leave limits disabled and paths relative to the sel
   assert.match(await fs.readFile(configuration.plannerPromptPath, 'utf8'), /planned/);
   assert.deepEqual(await fs.readdir(f.directory), ['.heimdall.toml'], 'checking configuration does not create run files');
 });
+
+test('Claude Code candidates use the shared Claude login quota source', async t => {
+  const content = '[workflow]\nplannerModel = "claude-code/opus"\n[[workflow.executorCandidates]]\nkey = "sonnet"\nquotaProvider = "claude-code"\nmodel = "claude-code/sonnet"\n';
+  const f = await fixture(t, content);
+  assert.equal((await f.load()).settings.executorCandidates[0].quotaProvider, 'claude-code');
+  for (const invalid of [content.replace('quotaProvider = "claude-code"', 'quotaProvider = "anthropic"'), content.replace('model = "claude-code/sonnet"', 'model = "anthropic/sonnet"')]) {
+    await fs.writeFile(f.file, invalid);
+    await assert.rejects(f.load(), /Claude Code candidates must pair/);
+  }
+});
 test('configured state, prompt and quota-package paths avoid machine-specific defaults', async t => {
   const f = await fixture(t, minimal + 'packagePath = "local-quota"\n[paths]\nstate = "runtime/workflows"\nplannerPrompt = "prompts/plan.md"\nexecutorPrompt = "prompts/execute.md"\n[opencode]\nbaseUrl = "http://127.0.0.1:4321"\npasswordEnvironmentVariable = "TEST_OPENCODE_PASSWORD"\n');
   const c = await f.load();

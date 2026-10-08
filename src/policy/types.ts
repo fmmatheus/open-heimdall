@@ -6,6 +6,7 @@ export interface ExecutorCandidate {
 }
 
 export interface QuotaSettings {
+  plannerModel?: string;
   minQuotaRemainingPercent: number;
   fiveHourQuotaWeight?: number;
   executorCandidates?: ExecutorCandidate[];
@@ -53,7 +54,7 @@ export interface QuotaEvent {
   at: string;
   provider: string;
   errorCode: string;
-  action: 'reconnect_in_openchamber' | 'cooldown_skip' | 'exclude_from_selection';
+  action: 'reconnect_in_openchamber' | 'refresh_claude_code_manually' | 'cooldown_skip' | 'exclude_from_selection';
   retryAt?: number;
 }
 

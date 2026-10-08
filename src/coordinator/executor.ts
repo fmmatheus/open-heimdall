@@ -116,7 +116,8 @@ export function createManagedExecutor({ getRun, connection = {}, preflightTimeou
         id: run.parentSessionId, agent: 'adr-orchestrator', model, title: 'Heimdall ' + run.id,
         location: { directory: run.worktreePath }, metadata: { heimdallRunId: run.id },
       });
-      if (!record(created) || created.id !== run.parentSessionId || created.agent !== 'adr-orchestrator' || !record(created.location) || created.location.directory !== run.worktreePath || !record(created.metadata) || created.metadata.heimdallRunId !== run.id || !record(created.model) || created.model.providerID !== model.providerID || created.model.id !== model.id || created.model.variant !== model.variant) throw new Error('Created native parent does not match the reserved managed identity');
+      // Native 2.0.22 session projection names an omitted variant "default".
+      if (!record(created) || created.id !== run.parentSessionId || created.agent !== 'adr-orchestrator' || !record(created.location) || created.location.directory !== run.worktreePath || !record(created.metadata) || created.metadata.heimdallRunId !== run.id || !record(created.model) || created.model.providerID !== model.providerID || created.model.id !== model.id || created.model.variant !== (model.variant ?? 'default')) throw new Error('Created native parent does not match the reserved managed identity');
       const observed = await snapshot(api, run.parentSessionId);
       verifySession(observed, run);
       const text = managedPrompt(run);
