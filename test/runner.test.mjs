@@ -143,8 +143,9 @@ test('ordinary error pauses without fallback or next task', async t => {
   assert.equal(f.calls.filter(c => c[0] === 'prompt').length, 2);
 });
 test('elapsed time emits one warning and allows task completion without abort', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
   const f = await fixture(t, [async () => {
-    await new Promise(resolve => setTimeout(resolve, 30));
+    t.mock.timers.tick(30);
     return {data:{parts:[{type:'text',text:JSON.stringify(plan)}]}};
   }, done('T1'), done('T2')], {timeoutMinutes:0.0001});
   const notices = [];
@@ -154,6 +155,7 @@ test('elapsed time emits one warning and allows task completion without abort', 
   assert.equal(f.calls.filter(c => c[0] === 'abort').length,0);
   assert.equal(notices.filter(n => n.metadata.warning).length,1);
   const state = JSON.parse(await fs.readFile(path.join(f.root,'runs',result.runId,'state.json'),'utf8'));
+  assert.deepEqual(Object.keys(state.timeWarnings), ['s1']);
   assert.match(state.timeWarnings.s1.message,/warning only/);
 });
 
