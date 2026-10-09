@@ -11,7 +11,8 @@ const record = (value: unknown): value is Record<string, unknown> => value !== n
 const missing = (error: unknown): boolean => record(error) && error.code === 'ENOENT';
 
 // An ambient repository override must not redirect a command away from its cwd.
-function gitEnvironment(): NodeJS.ProcessEnv {
+// Read-only: GIT_OPTIONAL_LOCKS=0 keeps status/diff from refreshing (writing) the index.
+export function gitEnvironment(): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = { ...process.env, GIT_OPTIONAL_LOCKS: '0' };
   for (const name of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_CONFIG', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS']) delete environment[name];
   for (const name of Object.keys(environment)) if (/^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(name)) delete environment[name];

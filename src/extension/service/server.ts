@@ -2,7 +2,8 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
 import { adapterErrorMessage, CoordinatorAdapterError } from './coordinator.js';
 import type { AdapterErrorKind, CoordinatorAdapter } from './coordinator.js';
-import { projectionRoutes } from './routes.js';
+import { projectionRoutes, reviewRoutes } from './routes.js';
+import type { ReviewRoutesOptions } from './routes.js';
 
 /** Stay below the host's 256000 character GUEST_REQUEST_RESPONSE_MAX. */
 export const MAX_RESPONSE_BYTES = 200000;
@@ -57,11 +58,14 @@ export interface ExtensionServerOptions {
   routes?: Route[];
   now?: () => Date;
   maxResponseBytes?: number;
+  /** Where managed worktrees live; defaults to the coordinator configuration (`configPath`, then the usual lookup). */
+  loadConfiguration?: ReviewRoutesOptions['loadConfiguration'];
+  configPath?: string;
 }
 
 const digest = (value: string) => createHash('sha256').update(value).digest();
 
-export function builtInRoutes(options: Pick<ExtensionServerOptions, 'adapter' | 'now'>): Route[] {
+export function builtInRoutes(options: Pick<ExtensionServerOptions, 'adapter' | 'now' | 'loadConfiguration' | 'configPath'>): Route[] {
   const now = options.now ?? (() => new Date());
   return [
     { method: 'GET', path: '/health', handler: () => ({ ok: true }) },
@@ -79,6 +83,7 @@ export function builtInRoutes(options: Pick<ExtensionServerOptions, 'adapter' | 
       },
     },
     ...projectionRoutes({ adapter: options.adapter, now: options.now }),
+    ...reviewRoutes({ adapter: options.adapter, now: options.now, loadConfiguration: options.loadConfiguration, configPath: options.configPath }),
   ];
 }
 

@@ -159,4 +159,77 @@ export interface ChangeFeed {
   fetchedAt: string;
 }
 
+/** Limits of the worktree review engine; all lists and texts are bounded by the service. */
+export const REVIEW_LIMITS = {
+  /** Changed feature files listed per review. */
+  files: 500,
+  /** Generated runtime artifacts listed per review. */
+  generated: 100,
+  /** Longest path (UTF-8 bytes) the review lists or accepts. */
+  pathBytes: 1024,
+  /** Largest diff text returned for one file. */
+  diffBytes: 64 * 1024,
+  /** Review responses are shrunk to fit this many bytes (response cap is 200000). */
+  responseBytes: 150000,
+} as const;
+
+/**
+ * `ready`: the managed worktree was inspected. The other states explain why it was not, without an error:
+ * `queued-no-worktree` (not created yet), `worktree-missing` (should exist but is gone) and
+ * `worktree-mismatch` (path, branch, ownership or base commit do not match the coordinator's record).
+ */
+export type ReviewState = 'ready' | 'queued-no-worktree' | 'worktree-missing' | 'worktree-mismatch';
+
+export type ReviewChange = 'added' | 'modified' | 'deleted' | 'type-changed' | 'unmerged' | 'untracked';
+
+export interface ReviewFile {
+  path: string;
+  change: ReviewChange;
+  /** Null when git does not count lines (binary) or the file is untracked (not read for the list). */
+  additions: number | null;
+  deletions: number | null;
+  /** Null when unknown (untracked files are only classified when opened). */
+  binary: boolean | null;
+  /** Bytes on disk, known only for untracked files. */
+  size: number | null;
+}
+
+export interface ReviewResponse {
+  state: ReviewState;
+  /** A fixed sentence explaining a state other than `ready`; null when ready. */
+  message: string | null;
+  baseCommit: string;
+  branch: string;
+  /** Current HEAD of the managed worktree; null unless ready. */
+  head: string | null;
+  /** Changed feature files, sorted by path. */
+  files: ReviewFile[];
+  /** Heimdall runtime artifacts inside the worktree: never feature code, listed apart. */
+  generated: ReviewFile[];
+  counts: { files: number; generated: number; additions: number; deletions: number; binary: number };
+  truncated: boolean;
+  fetchedAt: string;
+}
+
+export type ReviewFileView = 'diff' | 'binary' | 'deleted' | 'missing' | 'generated' | 'unsupported';
+
+export interface ReviewFileResponse {
+  state: ReviewState;
+  message: string | null;
+  baseCommit: string;
+  path: string;
+  change: ReviewChange | null;
+  view: ReviewFileView | null;
+  binary: boolean;
+  /** The diff exceeded the per-file cap; `text` holds only its beginning. */
+  large: boolean;
+  truncated: boolean;
+  additions: number | null;
+  deletions: number | null;
+  size: number | null;
+  /** Unified diff text against the base commit; render as text only. */
+  text: string;
+  fetchedAt: string;
+}
+
 export interface ErrorBody { error: { kind: string; message: string } }
