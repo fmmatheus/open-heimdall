@@ -17,26 +17,19 @@ import { createPanelStore } from './store.js';
 import type { PanelState } from './store.js';
 import {
   ALL_FILTER,
+  DEFAULT_DETAIL_TAB,
   bannerInfo,
-  blockerInfo,
-  currentTaskText,
   detailPlaceholder,
   detailTabs,
   emptyInfo,
-  limitRows,
   listNotice,
-  modelRows,
-  phaseText,
-  progressInfo,
   projectFilterOptions,
   runRows,
-  statusBadge,
   statusFilterOptions,
+  summaryInfo,
   taskRows,
+  technicalSections,
   truncationNotice,
-  usageInfo,
-  formatAge,
-  formatTime,
 } from './view-model.js';
 import type { Badge, DetailTabId, LabeledRow } from './view-model.js';
 import { reviewView } from './review-view.js';
@@ -68,8 +61,8 @@ function node<K extends keyof HTMLElementTagNameMap>(tag: K, className?: string,
 
 /** Extension points for other tasks. Each renderer receives the loaded detail and a container to fill. */
 export interface DetailExtensions {
-  /** T7: "open session" actions, drawn at the end of the Overview tab. */
-  sessionActions?: (detail: RunDetail, container: HTMLElement) => void;
+  /** Session actions, drawn in the summary above the tabs (`data-slot="summary-actions"`). */
+  summaryActions?: (detail: RunDetail, container: HTMLElement) => void;
   /** Replacement renderers for a tab; ids must be listed in DETAIL_TABS in view-model.ts. */
   tabs?: Partial<Record<DetailTabId, (detail: RunDetail, container: HTMLElement) => void>>;
 }
@@ -134,13 +127,15 @@ function mountPanel(): void {
     size: 'sm',
     onClick: () => goBack(),
   });
-  let tab: DetailTabId = 'overview';
+  let tab: DetailTabId = DEFAULT_DETAIL_TAB;
   const expandedTasks = new Set<string>();
   let detailHandles: Array<{ dispose: () => void }> = [];
   let renderedDetail: RunDetail | null = null;
   let renderedKey = '';
   /** Repaints the Review tab in place; set only while that tab is drawn. */
   let reviewPainter: ((state: PanelState) => void) | null = null;
+  /** Refreshes the summary's "Updated … ago" line between polls; set while a detail is drawn. */
+  let updatedPainter: (() => void) | null = null;
   const painted = { project: '', status: '', rows: '' };
 
   const focusList = (): void => {
@@ -174,6 +169,7 @@ function mountPanel(): void {
     detailHandles = [];
     renderedDetail = null;
     reviewPainter = null;
+    updatedPainter = null;
     detailContent.replaceChildren();
   };
 
@@ -201,50 +197,66 @@ function mountPanel(): void {
     return el;
   }
 
-  function drawOverview(detail: RunDetail, body: HTMLElement): void {
-    const status = section(body, 'Status');
-    const head = node('div');
-    head.style.display = 'flex';
-    head.style.alignItems = 'center';
-    head.style.gap = '8px';
-    badge(head, statusBadge(detail));
-    head.append(node('span', 'hm-text', phaseText(detail)));
-    status.append(head);
-    const blocker = blockerInfo(detail.blocker);
-    if (blocker) {
-      const box = node('div', 'hm-blocker');
-      box.dataset.tone = blocker.tone;
-      box.setAttribute('role', 'note');
-      box.append(node('p', 'hm-blocker-title', blocker.title));
-      box.append(node('p', 'hm-text', blocker.reason));
-      if (blocker.resolution) {
-        box.append(node('p', 'hm-label', 'Recorded resolution'), node('p', 'hm-text', blocker.resolution));
-      }
-      status.append(box);
-    }
+  /**
+   * Persistent summary above the tabs: one status badge, progress and current action, models, recorded
+   * usage and budget, the recorded blocker, and a slot for session actions. Troubleshooting data lives in
+   * the Technical details tab.
+   */
+  function drawSummary(detail: RunDetail, container: HTMLElement): void {
+    const info = summaryInfo(detail, Date.now());
+    const box = node('section', 'hm-summary');
+    box.setAttribute('aria-label', 'Run summary');
+    box.append(node('h2', 'hm-detail-title', info.label));
+    const head = node('div', 'hm-summary-head');
+    head.append(node('span', 'hm-text', info.project));
+    badge(head, info.badge);
+    box.append(head);
 
-    const progress = section(body, 'Progress');
-    const info = progressInfo(detail);
-    if (info.value === null) progress.append(node('p', 'hm-text', info.label));
-    else {
+    if (info.progress.value !== null) {
       const slot = node('div');
-      progress.append(slot);
-      detailHandles.push(mountProgress(slot, { value: info.value, tone: info.tone, label: info.label }));
+      box.append(slot);
+      detailHandles.push(mountProgress(slot, { value: info.progress.value, tone: info.progress.tone, label: info.headline }));
+    } else {
+      box.append(node('p', 'hm-text', info.headline));
     }
+    for (const line of [...info.models, ...info.usage]) box.append(node('p', 'hm-meta', line));
+    const updated = node('p', 'hm-meta', info.updated);
+    updated.title = info.updatedExact;
+    box.append(updated);
+    updatedPainter = () => {
+      const next = summaryInfo(detail, Date.now());
+      updated.textContent = next.updated;
+    };
 
-    const current = section(body, 'Current task');
-    current.append(node('p', 'hm-text', currentTaskText(detail)));
-
-    const models = section(body, 'Models');
-    rows(models, modelRows(detail.models));
+    if (info.blocker) {
+      const blocker = node('div', 'hm-blocker');
+      blocker.dataset.tone = info.blocker.tone;
+      blocker.setAttribute('role', 'note');
+      blocker.append(node('p', 'hm-blocker-title', info.blocker.title));
+      blocker.append(node('p', 'hm-text', info.blocker.reason));
+      if (info.blocker.resolution) {
+        blocker.append(node('p', 'hm-label', 'Recorded resolution'), node('p', 'hm-text', info.blocker.resolution));
+      }
+      box.append(blocker);
+    }
 
     const slot = node('div', 'hm-slot');
-    slot.dataset.slot = 'session-actions';
-    body.append(slot);
-    extensions.sessionActions?.(detail, slot);
+    slot.dataset.slot = 'summary-actions';
+    box.append(slot);
+    extensions.summaryActions?.(detail, slot);
+    container.append(box);
   }
 
-  /** Session actions for the Overview tab: open the run's existing sessions, or explain why they cannot be opened. */
+  /** Technical details tab: every recorded model, usage, limit and identifier, with exact UTC times. */
+  function drawTechnical(detail: RunDetail, body: HTMLElement): void {
+    for (const entry of technicalSections(detail)) {
+      const box = section(body, entry.title);
+      rows(box, entry.rows);
+      if (entry.note) box.append(node('p', 'hm-meta', entry.note));
+    }
+  }
+
+  /** Sessions tab: open the run's existing sessions, or explain why they cannot be opened. */
   function drawSessions(detail: RunDetail, container: HTMLElement): void {
     disposeSessions();
     const gen = sessionGen;
@@ -307,19 +319,6 @@ function mountPanel(): void {
       });
     }
     check();
-  }
-
-  function drawUsage(detail: RunDetail, body: HTMLElement): void {
-    const usage = usageInfo(detail.usage);
-    const totals = section(body, 'Usage');
-    rows(totals, [
-      { label: 'Reported tokens', value: usage.reported },
-      { label: 'Uncached', value: usage.uncached },
-    ]);
-    totals.append(node('p', 'hm-meta', usage.note));
-    if (usage.sessions.length > 0) rows(totals, usage.sessions);
-    const limits = section(body, 'Limits');
-    rows(limits, limitRows(detail.limits));
   }
 
   function drawTasks(detail: RunDetail, body: HTMLElement): void {
@@ -528,17 +527,16 @@ function mountPanel(): void {
   }
 
   const drawers: Record<DetailTabId, (detail: RunDetail, body: HTMLElement) => void> = {
-    overview: drawOverview,
-    usage: drawUsage,
+    sessions: drawSessions,
     tasks: drawTasks,
     review: drawReview,
+    details: drawTechnical,
   };
 
   function drawDetail(detail: RunDetail): void {
     disposeDetail();
     renderedDetail = detail;
-    detailContent.append(node('h2', 'hm-detail-title', detail.label));
-    detailContent.append(node('p', 'hm-meta', `${detail.projectName} · updated ${formatAge(detail.updatedAt, Date.now())} (${formatTime(detail.updatedAt)})`));
+    drawSummary(detail, detailContent);
     const notice = truncationNotice(detail);
     if (notice) detailContent.append(node('p', 'hm-meta', notice));
     const tabRoot = node('div');
@@ -571,6 +569,7 @@ function mountPanel(): void {
       return;
     }
     if (state.detail === renderedDetail && renderedKey === 'detail') {
+      updatedPainter?.();
       reviewPainter?.(state);
       return;
     }
@@ -616,7 +615,7 @@ function mountPanel(): void {
       statusSelect.update({ value: statusValue });
     }
 
-    const rowsData = runRows(state.runs);
+    const rowsData = runRows(state.runs, Date.now());
     const rowsKey = JSON.stringify(rowsData);
     if (rowsKey !== painted.rows) {
       painted.rows = rowsKey;
@@ -648,8 +647,6 @@ function mountPanel(): void {
       });
     }
   }
-
-  extensions.sessionActions = drawSessions;
 
   // Keep "x s ago" fresh without waiting for the next state change.
   setInterval(() => render(store.getState()), 15000);

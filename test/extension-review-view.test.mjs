@@ -54,7 +54,7 @@ const fileSlice = (path, data, extra = {}) => ({ path, loading: false, data, err
 // ----- view models -----
 
 test('Review is a tab of the run detail', () => {
-  assert.deepEqual(detailTabs(null).map(tab => tab.id), ['overview', 'usage', 'tasks', 'review']);
+  assert.deepEqual(detailTabs(null).map(tab => tab.id), ['sessions', 'tasks', 'review', 'details']);
   assert.equal(detailTabs(null).find(tab => tab.id === 'review').label, 'Review');
 });
 
