@@ -53,6 +53,9 @@ Use the `id` returned by `project add` as `PROJECT_ID`, and the `id` returned by
 See [setup and recovery](docs/coordinator.md) and [model/authentication configuration](docs/development.md#opencode-adapter)
 for connection options, compatibility limits, and existing workflow separation.
 
+To watch and review runs inside OpenChamber 2.1.0, see the read-only
+[OpenChamber extension guide](docs/openchamber-extension.md).
+
 ## Why Heimdall?
 
 The opt-in development coordinator allows multiple features and runs to progress concurrently in the same project or across different projects. Each run handles one task at a time in its own Git worktree, subject to global and per-project limits.

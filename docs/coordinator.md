@@ -121,6 +121,9 @@ checkpoint connection open. Unresolved execution can keep draining open until
 reconciled. Abrupt process loss can interrupt checkpoint writes; reservations
 remain held for inspection after restart.
 
+Runs can also be watched and reviewed read-only from OpenChamber 2.1.0; see the
+[OpenChamber extension guide](openchamber-extension.md).
+
 ## Remaining limits
 
 - SQLite uses Node's built-in `node:sqlite`, still experimental on Node 22.
