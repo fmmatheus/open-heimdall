@@ -126,7 +126,7 @@ test('service rejects every request without the exact bearer token and binds loo
 test('route table: unknown paths are 404, wrong methods 405, traversal never reaches a handler', async t => {
   const f = await fixture(t);
   const server = await listening(t, { token: SERVICE_TOKEN, adapter: createCoordinatorAdapter({ configPath: f.configPath }) });
-  for (const target of ['/runs/x/resume', '/../etc/passwd', '/%2e%2e/etc/passwd', '/runs/%2e%2e/%2e%2e/health', '/health/', '//health', '/health/..', '/.%2e/health', '/status/extra', '/%2fhealth', '/\\health', '/', '/projects', '/runs']) {
+  for (const target of ['/runs/x/resume', '/../etc/passwd', '/%2e%2e/etc/passwd', '/runs/%2e%2e/%2e%2e/health', '/health/', '//health', '/health/..', '/.%2e/health', '/status/extra', '/%2fhealth', '/\\health', '/', '/runs/x/y', '/projects/x']) {
     for (const method of ['GET', 'POST']) {
       const response = await call(server, { method, path: target });
       assert.equal(response.status, 404, `${method} ${target}`);
@@ -148,7 +148,7 @@ test('request bodies are rejected unless a POST route registers them, and are ca
     adapter: createCoordinatorAdapter({ configPath: f.configPath }),
     routes: [
       { method: 'POST', path: '/echo', body: {}, handler: context => { seen.push(context.body); return new Reply(201, { got: context.body }); } },
-      { method: 'GET', path: '/runs/:id', handler: context => ({ id: context.params.id, query: context.query.get('q') }) },
+      { method: 'GET', path: '/items/:id', handler: context => ({ id: context.params.id, query: context.query.get('q') }) },
       { method: 'GET', path: '/boom', handler: () => { throw new Error(`secret ${SERVICE_TOKEN} at /Users/x/stack`); } },
       { method: 'GET', path: '/big', handler: () => ({ data: 'x'.repeat(250000) }) },
     ],
@@ -161,9 +161,9 @@ test('request bodies are rejected unless a POST route registers them, and are ca
   assert.equal(oversize.status, 413);
   assert.equal(seen.length, 1);
   // POST to a GET-only route is 405 and its body is never parsed.
-  assert.equal((await call(server, { method: 'POST', path: '/runs/abc', body: 'z'.repeat(40000) })).status, 405);
+  assert.equal((await call(server, { method: 'POST', path: '/items/abc', body: 'z'.repeat(40000) })).status, 405);
 
-  assert.deepEqual((await call(server, { path: '/runs/abc?q=1' })).json, { id: 'abc', query: '1' });
+  assert.deepEqual((await call(server, { path: '/items/abc?q=1' })).json, { id: 'abc', query: '1' });
 
   const boom = await call(server, { path: '/boom' });
   assert.equal(boom.status, 500);

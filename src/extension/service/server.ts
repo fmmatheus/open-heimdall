@@ -2,6 +2,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
 import { adapterErrorMessage, CoordinatorAdapterError } from './coordinator.js';
 import type { AdapterErrorKind, CoordinatorAdapter } from './coordinator.js';
+import { projectionRoutes } from './routes.js';
 
 /** Stay below the host's 256000 character GUEST_REQUEST_RESPONSE_MAX. */
 export const MAX_RESPONSE_BYTES = 200000;
@@ -77,6 +78,7 @@ export function builtInRoutes(options: Pick<ExtensionServerOptions, 'adapter' | 
         }
       },
     },
+    ...projectionRoutes({ adapter: options.adapter, now: options.now }),
   ];
 }
 
