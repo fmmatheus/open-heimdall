@@ -13,6 +13,7 @@ import { CoordinatorAdapterError } from '../dist/extension/service/coordinator.j
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SECRET = 'owner-token-' + 'f00dfeed'.repeat(6);
+const OMC_MARKER = 'omc-marker-' + 'badc0de5'.repeat(4);
 const SERVICE_TOKEN = 'svc-' + 'c0ffee11'.repeat(8);
 const CAP = 200000;
 
@@ -38,6 +39,8 @@ async function source(t) {
   };
   for (const [name, content] of Object.entries(base)) await fs.writeFile(path.join(repository, name), content);
   await fs.writeFile(path.join(repository, 'bin.dat'), Buffer.from([0, 1, 2, 3, 0, 255]));
+  await fs.mkdir(path.join(repository, '.omc'));
+  await fs.writeFile(path.join(repository, '.omc', 'state.json'), '{"committed":true}\n');
   commitAll(repository, 'Base');
   const found = await inspectProject(repository);
   const project = { ...found, id: 'project-1', configPath: path.join(found.directory, '.heimdall.toml'), concurrency: 2, createdAt: Date.now() };
@@ -95,6 +98,14 @@ async function populate(f, run) {
   await write('big.txt', lines(20000, 'changed line'));
   await write('control.txt', '\u0001'.repeat(100000));
   await write('.opencode/agents/custom.md', 'a real feature agent\n');
+  // Agent runtime metadata (never feature changes) next to genuine code, dotfiles and look-alike paths.
+  await write('.omc/project-memory.json', JSON.stringify({ marker: OMC_MARKER }));
+  await write('.omc/sessions/abc.json', JSON.stringify({ marker: OMC_MARKER }));
+  await write('.omc/state.json', JSON.stringify({ committed: false, marker: OMC_MARKER }));
+  await write('src/new-feature.ts', 'export const feature = 1;\n');
+  await write('.eslintrc.json', '{}\n');
+  await write('.omcx', 'not runtime\n');
+  await write('docs/.omc/note.md', 'nested look-alike\n');
   // Generated runtime artifacts.
   await write('.heimdall/managed.json', JSON.stringify({ ownerToken: SECRET }));
   await write('.heimdall/feature.md', 'feature body');
@@ -130,6 +141,7 @@ test('review lists committed, staged, unstaged and untracked changes against the
     'a.txt': 'modified', 'bin.dat': 'modified', 'big.txt': 'modified', 'blob.bin': 'untracked', 'committed.txt': 'added', 'control.txt': 'untracked',
     'deleted.txt': 'deleted', 'linkdir': 'untracked', 'linkfile': 'untracked', 'new.txt': 'untracked', 'staged.txt': 'modified', 'stagednew.txt': 'added',
     'unstaged.txt': 'modified', '.opencode/agents/custom.md': 'untracked',
+    'src/new-feature.ts': 'untracked', '.eslintrc.json': 'untracked', '.omcx': 'untracked', 'docs/.omc/note.md': 'untracked',
   });
   assert.deepEqual(paths(review.files), [...paths(review.files)].sort());
   const byName = Object.fromEntries(review.files.map(entry => [entry.path, entry]));
@@ -141,17 +153,22 @@ test('review lists committed, staged, unstaged and untracked changes against the
   assert.equal(byName['bin.dat'].additions, null);
   assert.equal(byName['new.txt'].size, 'untracked line 1\nuntracked line 2'.length);
   assert.equal(byName['deleted.txt'].deletions, 2);
-  assert.equal(review.counts.files, 14);
+  assert.equal(review.counts.files, 18);
   assert.equal(review.counts.binary, 1);
   assert.equal(review.truncated, false);
   assert.ok(Buffer.byteLength(JSON.stringify(review)) < CAP);
 
   // Generated runtime artifacts are grouped apart and never presented as feature code.
   assert.deepEqual(paths(review.generated), [
-    '.heimdall/feature.md', '.heimdall/managed.json', '.heimdall/state/x.json', '.opencode/agents/adr-executor.md',
-    '.opencode/agents/adr-orchestrator.md', '.opencode/agents/adr-planner.md', '.opencode/plugins/heimdall.ts',
+    '.heimdall/feature.md', '.heimdall/managed.json', '.heimdall/state/x.json', '.omc/project-memory.json', '.omc/sessions/abc.json', '.omc/state.json',
+    '.opencode/agents/adr-executor.md', '.opencode/agents/adr-orchestrator.md', '.opencode/agents/adr-planner.md', '.opencode/plugins/heimdall.ts',
   ]);
-  assert.equal(review.counts.generated, 7);
+  assert.equal(review.counts.generated, 10);
+  // The runtime group never leaks into feature counts, and the tracked-then-edited runtime file has no line counts.
+  assert.ok(!paths(review.files).some(name => name === '.omc' || name.startsWith('.omc/')));
+  assert.ok(byName['src/new-feature.ts'] && byName['.eslintrc.json'] && byName['.omcx'] && byName['docs/.omc/note.md']);
+  assert.equal(review.counts.additions, review.files.reduce((sum, entry) => sum + (entry.additions ?? 0), 0));
+  assert.ok(!JSON.stringify(review).includes(OMC_MARKER), 'runtime contents are never relayed');
   for (const entry of review.files) assert.equal(isGeneratedPath(entry.path, run.settings), false, entry.path);
   assert.ok(review.generated.every(entry => entry.additions === null && entry.binary === null));
 
@@ -162,18 +179,37 @@ test('review lists committed, staged, unstaged and untracked changes against the
   assert.ok(!text.includes(run.worktreePath));
 });
 
+test('isGeneratedPath treats only top-level .omc as runtime metadata', () => {
+  const settings = { plannerAgent: 'adr-planner', executorAgent: 'adr-executor' };
+  for (const name of ['.omc', '.omc/', '.omc/project-memory.json', '.omc/sessions/abc.json', '.omc/state.json', '.omc/a/b/c', '.heimdall', '.heimdall/managed.json', '.opencode/plugins/heimdall.ts', '.opencode/agents/adr-planner.md']) {
+    assert.equal(isGeneratedPath(name, settings), true, name);
+  }
+  for (const name of ['.omcx', '.omc-x/y', '.omcx/y', 'foo/.omc/x', 'docs/.omc/note.md', 'src/a.omc', 'omc/x', 'src/.omc', '.eslintrc.json', '.gitignore', '.github/workflows/ci.yml', '.opencode/agents/custom.md', '.opencode/plugins/other.ts', 'src/new-feature.ts', '.heimdallx']) {
+    assert.equal(isGeneratedPath(name, settings), false, name);
+  }
+});
+
 test('a clean working tree still shows the commits the run made', async t => {
   const f = await source(t);
   const run = await managedRun(f, 'run-clean');
   await fs.writeFile(path.join(run.worktreePath, 'a.txt'), 'alpha\nfrom a commit\n');
   await fs.writeFile(path.join(run.worktreePath, 'added.txt'), 'added in a commit\n');
   await fs.rm(path.join(run.worktreePath, 'deleted.txt'));
+  await fs.writeFile(path.join(run.worktreePath, '.omc', 'state.json'), `{"edited":"${OMC_MARKER}"}\n`);
+  await fs.mkdir(path.join(run.worktreePath, '.omc', 'sessions'));
+  await fs.writeFile(path.join(run.worktreePath, '.omc', 'sessions', 'abc.json'), OMC_MARKER);
   commitAll(run.worktreePath, 'Only commits');
   assert.equal(git(run.worktreePath, ['status', '--porcelain']), '', 'working tree is clean');
   const review = await reviewRun(run, f.project, f.configuration);
   assert.equal(review.state, 'ready');
   assert.deepEqual(changes(review.files), { 'a.txt': 'modified', 'added.txt': 'added', 'deleted.txt': 'deleted' });
-  assert.deepEqual(review.generated, []);
+  assert.equal(review.counts.files, 3);
+  assert.deepEqual(changes(review.generated), { '.omc/sessions/abc.json': 'added', '.omc/state.json': 'modified' });
+  assert.equal(review.counts.generated, 2);
+  assert.ok(!JSON.stringify(review).includes(OMC_MARKER));
+  const runtimeFile = await reviewFile(run, f.project, f.configuration, '.omc/state.json');
+  assert.equal(runtimeFile.view, 'generated');
+  assert.equal(runtimeFile.text, '');
 
   const file = await reviewFile(run, f.project, f.configuration, 'a.txt');
   assert.equal(file.view, 'diff');
@@ -252,11 +288,17 @@ test('per-file diffs are bounded and expose binary, deleted, large and unsupport
   assert.ok(Buffer.byteLength(JSON.stringify(control)) < CAP);
 
   // Generated artifacts expose no contents at all.
-  for (const name of ['.heimdall/managed.json', '.heimdall/feature.md', '.opencode/plugins/heimdall.ts', '.opencode/agents/adr-planner.md']) {
+  for (const name of ['.heimdall/managed.json', '.heimdall/feature.md', '.opencode/plugins/heimdall.ts', '.opencode/agents/adr-planner.md', '.omc/project-memory.json', '.omc/sessions/abc.json', '.omc/state.json']) {
     const generated = await open(name);
     assert.equal(generated.view, 'generated', name);
     assert.equal(generated.text, '', name);
+    assert.ok(!JSON.stringify(generated).includes(OMC_MARKER), name);
   }
+  // Look-alikes and ordinary code are feature files with real diffs.
+  assert.match((await open('src/new-feature.ts')).text, /\+export const feature = 1;/);
+  assert.equal((await open('.eslintrc.json')).view, 'diff');
+  assert.equal((await open('.omcx')).view, 'diff');
+  assert.equal((await open('docs/.omc/note.md')).view, 'diff');
   assert.ok(!JSON.stringify(await open('.heimdall/managed.json')).includes(SECRET));
 });
 
@@ -394,7 +436,7 @@ test('reviews leave status, HEAD, branch, index, stash list and worktree registr
   for (let round = 0; round < 2; round++) {
     await reviewRun(run, f.project, f.configuration);
     for (const entry of files) await reviewFile(run, f.project, f.configuration, entry.path);
-    for (const name of ['.heimdall/managed.json', '.opencode/plugins/heimdall.ts']) await reviewFile(run, f.project, f.configuration, name);
+    for (const name of ['.heimdall/managed.json', '.opencode/plugins/heimdall.ts', '.omc/project-memory.json', '.omc/sessions/abc.json', '.omc/state.json']) await reviewFile(run, f.project, f.configuration, name);
   }
   await assert.rejects(reviewFile(run, f.project, f.configuration, 'README.md'), ReviewRequestError);
   const after = await snapshot(f, run);
@@ -470,18 +512,21 @@ test('review routes return bounded responses and refuse bad paths', async t => {
   assert.equal(list.json.state, 'ready');
   assert.equal(list.json.baseCommit, f.baseCommit);
   assert.equal(list.json.branch, 'heimdall/run/run-route');
-  assert.equal(list.json.files.length, 14);
-  assert.equal(list.json.generated.length, 7);
+  assert.equal(list.json.files.length, 18);
+  assert.equal(list.json.generated.length, 10);
   for (const text of [list.text]) {
     assert.ok(!text.includes(SECRET));
+    assert.ok(!text.includes(OMC_MARKER));
     assert.ok(!text.includes(f.state));
     assert.ok(!text.includes(run.worktreePath));
     assert.ok(!text.includes('worktreePath'));
   }
 
-  for (const name of ['a.txt', 'new.txt', 'deleted.txt', 'bin.dat', 'big.txt', 'control.txt', '.heimdall/managed.json']) {
+  for (const name of ['a.txt', 'new.txt', 'deleted.txt', 'bin.dat', 'big.txt', 'control.txt', '.heimdall/managed.json', '.omc/project-memory.json', '.omc/sessions/abc.json', '.omc/state.json']) {
     const file = await call(server, `/runs/run-route/review/file?path=${encodeURIComponent(name)}`);
     assert.equal(file.status, 200, name);
+    assert.ok(!file.text.includes(OMC_MARKER), name);
+    if (name.startsWith('.omc/')) { assert.equal(file.json.view, 'generated', name); assert.equal(file.json.text, '', name); }
     assert.ok(Buffer.byteLength(file.text) < CAP, name);
     assert.equal(file.json.path, name);
     assert.ok(!file.text.includes(SECRET));

@@ -15,8 +15,8 @@ export const REVIEW_TAB_LABEL = 'Review';
 /** Shown on every review that is not loading: what is compared, and why Heimdall draws it itself. */
 export const COMPARISON_NOTE = 'This compares the run\'s base commit with the current managed worktree, including commits, staged and unstaged edits and untracked files. OpenChamber\'s commit view shows a single commit and cannot represent that baseline, so Heimdall shows the diff here instead.';
 
-export const RUNTIME_GROUP_LABEL = 'Heimdall runtime files';
-export const RUNTIME_GROUP_NOTE = 'Written by Heimdall into every managed worktree. They are not feature changes and their contents are not shown.';
+export const RUNTIME_GROUP_LABEL = 'Runtime metadata (not feature changes)';
+export const RUNTIME_GROUP_NOTE = 'Heimdall and agent runtime files written into the managed worktree, such as .heimdall and .omc. They are not feature changes and their contents are not shown.';
 
 /** Largest number of diff lines drawn for one file; the service already caps the text at 64 KiB. */
 export const MAX_DIFF_LINES = 2000;
@@ -195,7 +195,7 @@ const VIEW_MESSAGES = {
   binary: 'Binary file – no text diff is shown.',
   missing: 'This file is no longer in the worktree. It may have been removed since the list loaded; refresh the review to update the list.',
   unsupported: 'This path is a symbolic link, a special file or otherwise cannot be shown safely, so its contents are not displayed.',
-  generated: 'Heimdall runtime file – its contents are not shown.',
+  generated: 'Runtime metadata file – its contents are not shown.',
   empty: 'No text changes to show (for example an empty file or a change that only affects the file mode).',
   deletedBinary: 'This binary file was deleted in the worktree – no text diff is shown.',
   deletedNoText: 'This file was deleted in the worktree.',

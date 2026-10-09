@@ -15,6 +15,7 @@ import { readCoordinatorToken } from '../dist/coordinator/token.js';
 const execFileAsync = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SERVICE_TOKEN = 'svc-' + 'd00dfeed'.repeat(8);
+const OMC_MARKER = 'omc-marker-' + 'badc0de5'.repeat(4);
 const CAP = 200000;
 
 const git = (directory, args) => execFileSync('git', args, { cwd: directory, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -88,6 +89,9 @@ test('built service answers run, change, review and diff requests for a real tem
   await fs.writeFile(path.join(checkout, 'untracked.txt'), 'untracked file\n');
   await fs.writeFile(path.join(checkout, 'big.txt'), Array.from({ length: 20000 }, (_, index) => `changed line ${index}\n`).join(''));
   await fs.rm(path.join(checkout, 'README.md'));
+  // Agent runtime metadata left in the checkout: classified as runtime, contents never read.
+  await fs.mkdir(path.join(checkout, '.omc'));
+  await fs.writeFile(path.join(checkout, '.omc', 'project-memory.json'), JSON.stringify({ marker: OMC_MARKER }));
 
   const gitState = () => ({
     status: execFileSync('git', ['status', '--porcelain=v2', '-z', '--untracked-files=all'], { cwd: checkout, encoding: 'utf8' }),
@@ -174,6 +178,12 @@ test('built service answers run, change, review and diff requests for a real tem
   responses.push(generated);
   assert.equal(generated.json?.view, 'generated');
   assert.equal(generated.json?.text, '');
+  const omc = await get(`/runs/${run.id}/review/file?path=.omc/project-memory.json`);
+  assert.equal(omc.status, 200);
+  assert.equal(omc.json.view, 'generated');
+  assert.equal(omc.json.text, '');
+  assert.deepEqual(review.json.generated.map(file => file.path).filter(name => name.startsWith('.omc/')), ['.omc/project-memory.json']);
+  assert.ok(!review.json.files.some(file => file.path.startsWith('.omc')));
   for (const [method, target] of [['POST', `/runs/${run.id}/resume`], ['POST', `/runs/${run.id}/reconcile`], ['POST', '/runs'], ['POST', '/projects'], ['DELETE', `/runs/${run.id}`]]) {
     const refused = await call(port, target, { method });
     assert.ok([404, 405].includes(refused.status), `${method} ${target}: ${refused.status}`);
@@ -181,7 +191,7 @@ test('built service answers run, change, review and diff requests for a real tem
 
   // No secret ever appears in a response or on the console, and nothing changed.
   for (const response of responses) {
-    for (const secret of [key, ownerToken, SERVICE_TOKEN]) assert.equal(response.text.includes(secret), false);
+    for (const secret of [key, ownerToken, SERVICE_TOKEN, OMC_MARKER]) assert.equal(response.text.includes(secret), false);
   }
   assert.equal(output, '');
   assert.deepEqual(gitState(), gitBefore);

@@ -89,9 +89,13 @@ function agentNames(settings: unknown): Set<string> {
   return names;
 }
 
-/** Runtime assets the coordinator writes into every managed checkout (see prepareRuntime). */
+/**
+ * Runtime metadata, not feature changes: assets the coordinator writes into every managed checkout (see prepareRuntime)
+ * and the agent runtime's own state directory. Only top-level `.omc` matches; `.omcx`, `docs/.omc/x` and `a.omc` are code.
+ */
 export function isGeneratedPath(filePath: string, settings: unknown): boolean {
   if (filePath === '.heimdall' || filePath.startsWith('.heimdall/')) return true;
+  if (filePath === '.omc' || filePath.startsWith('.omc/')) return true;
   if (filePath === '.opencode/plugins/heimdall.ts') return true;
   for (const name of agentNames(settings)) if (filePath === `.opencode/agents/${name}.md`) return true;
   return false;
@@ -153,8 +157,8 @@ async function collect(checkout: string, run: ReviewRun, timeoutMs: number): Pro
   const options = { maxBuffer: LIST_BUFFER, timeoutMs };
   const [nameStatus, numstat, untracked, head] = await Promise.all([
     runGit(checkout, ['diff', ...DIFF_FLAGS, '--name-status', '-z', base, '--'], options),
-    // Sizes never read the runtime directory, which holds the run's owner token.
-    runGit(checkout, ['diff', ...DIFF_FLAGS, '--numstat', '-z', base, '--', '.', ':(exclude).heimdall'], options),
+    // Line counts never touch runtime directories: `.heimdall` holds the run's owner token, `.omc` is agent runtime state.
+    runGit(checkout, ['diff', ...DIFF_FLAGS, '--numstat', '-z', base, '--', '.', ':(exclude).heimdall', ':(exclude).omc'], options),
     runGit(checkout, ['ls-files', '--others', '--exclude-standard', '-z'], options),
     runGit(checkout, ['rev-parse', 'HEAD'], { maxBuffer: 1024, timeoutMs }),
   ]);

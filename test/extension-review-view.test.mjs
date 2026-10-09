@@ -115,11 +115,14 @@ test('generated runtime artifacts are a separate collapsed group and never in th
   const view = reviewView(slice({ data: review({ files: [file('src/a.ts')], generated, counts: { files: 1, generated: 2, additions: 1, deletions: 0, binary: 0 } }) }));
   assert.deepEqual(view.files.map(row => row.id), ['src/a.ts']);
   assert.equal(view.generated.label, RUNTIME_GROUP_LABEL);
-  assert.equal(view.generated.label, 'Heimdall runtime files');
+  assert.equal(view.generated.label, 'Runtime metadata (not feature changes)');
   assert.equal(view.generated.collapsed, true);
   assert.equal(view.generated.count, 2);
   assert.deepEqual(view.generated.rows.map(row => row.path), ['.heimdall/managed.json', '.opencode/plugins/heimdall.ts']);
   assert.match(view.generated.note, /contents are not shown/);
+  assert.match(view.generated.note, /Heimdall/);
+  assert.match(view.generated.note, /\.heimdall/);
+  assert.match(view.generated.note, /\.omc/);
   assert.equal(view.header.counts.untracked, 0, 'generated files are not feature counts');
   // The count reflects what exists even when the listing was shortened.
   assert.equal(generatedGroup({ generated: [], counts: { generated: 5 } }).count, 5);
@@ -208,6 +211,32 @@ test('deleted file: removed lines shown with a note; a binary or textless deleti
   assert.match(plain.message, /deleted/);
 });
 
+test('agent runtime metadata is excluded from the change summary and counted only in its collapsed group', async () => {
+  const runtime = ['.omc/project-memory.json', '.omc/sessions/abc.json'].map(name => file(name, 'untracked', { additions: null, deletions: null }));
+  const feature = [file('src/new-feature.ts', 'untracked', { additions: null, deletions: null, size: 30 }), file('src/a.ts')];
+  const view = reviewView(slice({ data: review({ files: feature, generated: runtime, counts: { files: 2, generated: 2, additions: 1, deletions: 0, binary: 0 } }) }));
+  assert.deepEqual(view.files.map(row => row.id), ['src/new-feature.ts', 'src/a.ts']);
+  assert.equal(view.generated.count, 2);
+  assert.equal(view.generated.collapsed, true);
+  assert.deepEqual(view.generated.rows.map(row => row.path), ['.omc/project-memory.json', '.omc/sessions/abc.json']);
+  assert.deepEqual(view.header.counts, { added: 0, modified: 1, deleted: 0, untracked: 1, other: 0 });
+  assert.equal(view.header.summary, '1 modified · 1 untracked');
+  assert.doesNotMatch(view.header.summary, /3|4/);
+
+  // Only runtime metadata changed: nothing counts as a feature change, yet the group is still offered.
+  const only = reviewView(slice({ data: review({ files: [], generated: runtime, counts: { files: 0, generated: 2, additions: 0, deletions: 0, binary: 0 } }) }));
+  assert.equal(only.header.summary, 'No changes');
+  assert.equal(only.emptyText, 'No files differ from the base commit.');
+  assert.equal(only.generated.count, 2);
+
+  // The panel draws the group closed, and the "Changed files (N)" title counts feature rows only.
+  const main = await readFile(join(fileURLToPath(new URL('..', import.meta.url)), 'src', 'extension', 'panel', 'main.ts'), 'utf8');
+  assert.match(main, /node\('details', 'hm-generated'\)/);
+  assert.doesNotMatch(main, /generatedBox\.open\s*=\s*true|generatedBox\.setAttribute\('open'/);
+  assert.match(main, /`Changed files \(\$\{view\.files\.length\}\)`/);
+  assert.doesNotMatch(main, /Changed files \(\$\{[^}]*generated/);
+});
+
 test('missing, unsupported and generated files each get an explicit message', () => {
   const missing = diffView(fileSlice('x', fileResponse({ path: 'x', change: 'untracked', view: 'missing', text: '' })));
   assert.equal(missing.mode, 'message');
@@ -216,7 +245,8 @@ test('missing, unsupported and generated files each get an explicit message', ()
   const unsupported = diffView(fileSlice('x', fileResponse({ path: 'x', change: 'untracked', view: 'unsupported', text: '' })));
   assert.match(unsupported.message, /symbolic link/);
   const generated = diffView(fileSlice('.heimdall/x', fileResponse({ path: '.heimdall/x', view: 'generated', text: '' })));
-  assert.match(generated.message, /Heimdall runtime file/);
+  assert.match(generated.message, /Runtime metadata file/);
+  assert.match(generated.message, /contents are not shown/);
   assert.equal(diffView(fileSlice('x', fileResponse({ view: 'diff', text: '' }))).mode, 'message');
   assert.match(diffView(fileSlice('x', fileResponse({ view: 'diff', text: '' }))).message, /No text changes/);
 });
