@@ -14,8 +14,13 @@ submission creates managed worktrees and adds their Git registry entries.
 
 Build the package with Node.js 22.19 or newer. Use a separate development Git
 project with a valid [project configuration](../examples/heimdall.toml). Set its
-existing local OpenCode **2.0.22** URL and provide the configured password in the
-coordinator's environment. Provider credentials remain in OpenCode.
+existing local OpenCode **2.0.22** connection URL. For OpenChamber Desktop, use
+its local HTTP port and set `authentication = "openchamber"` in `[opencode]`.
+Heimdall uses Desktop's existing client token from
+`~/.config/openchamber/settings.json` (or `OPENCHAMBER_DATA_DIR`), verifies the
+selected port matches, and keeps the token out of project/run configuration.
+For a direct OpenCode server, provide the configured password in the coordinator's
+environment. Provider credentials remain in OpenCode.
 
 For an explicitly passwordless loopback server, set
 `authentication = "none"` in `[opencode]`. This omits authorization and does not

@@ -100,6 +100,17 @@ test('local authentication defaults to basic and no-auth must be explicitly sele
   await assert.rejects(configured.readSettings(), /connection settings requires reloading/);
   for (const value of ['"disabled"', 'false', '1']) {
     const bad = await fixture(t, minimal + '[opencode]\nauthentication = ' + value + '\n');
-    await assert.rejects(bad.load(), /authentication must be basic or none/);
+    await assert.rejects(bad.load(), /authentication must be basic, none, or openchamber/);
   }
+});
+
+
+test('Desktop authentication persists only the selected connection mode and requires reload on changes', async t => {
+  const f = await fixture(t, minimal + '[opencode]\nauthentication = "openchamber"\nbaseUrl = "http://127.0.0.1:4096"\n');
+  const c = await f.load();
+  assert.deepEqual(c.opencode, { baseUrl: 'http://127.0.0.1:4096', authentication: 'openchamber', passwordEnvironmentVariable: 'OPENCODE_PASSWORD' });
+  await fs.writeFile(f.file, minimal + '[opencode]\nauthentication = "basic"\nbaseUrl = "http://127.0.0.1:4096"\n');
+  await assert.rejects(c.readSettings(), /connection settings requires reloading/);
+  const inline = await fixture(t, minimal + '[opencode]\nauthentication = "openchamber"\ndesktopLocalClientToken = "synthetic-token"\n');
+  await assert.rejects(inline.load(), /Unknown opencode setting/);
 });

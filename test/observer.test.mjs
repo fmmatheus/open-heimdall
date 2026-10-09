@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import path from 'node:path';
 import { createAPI, connect, snapshot, createObserver } from '../dist/opencode/observer.js';
 
 const baseUrl = 'http://127.0.0.1:4096';
@@ -128,4 +129,92 @@ test('basic mode preserves passwords exactly; missing auth or remote no-auth nev
     assert.equal(options.headers.Authorization, 'Basic ' + Buffer.from('opencode:   ').toString('base64'));
     return Response.json(info());
   } });
+});
+
+
+const desktopSettings = overrides => JSON.stringify({ desktopLocalPort: 4096, desktopLocalClientToken: 'synthetic-desktop-token', ...overrides });
+const desktopConnection = overrides => ({ baseUrl, authentication: 'openchamber', environment: {}, openchamber: { homeDirectory: '/synthetic/home', readFile: async () => desktopSettings() }, ...overrides });
+
+test('Desktop connection uses its selected settings and forwards authenticated native requests intact', async () => {
+  const calls = [], files = [];
+  const worktree = '/workspace/social feed_日本';
+  const environment = new Proxy({ OPENCHAMBER_DATA_DIR: '  /synthetic/desktop-profile  ' }, { get(target, key) {
+    assert.equal(key, 'OPENCHAMBER_DATA_DIR', 'Desktop auth never reads an OpenCode password');
+    return target[key];
+  } });
+  const api = await connect(worktree, 'ses_child', desktopConnection({ environment,
+    openchamber: { readFile: async (file, encoding) => { files.push({ file, encoding }); return desktopSettings({ desktopLocalClientToken: ' synthetic-desktop-token ' }); } },
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      if (url.pathname === '/api/info') return Response.json(info());
+      if (url.pathname === '/api/session/ses_child') return Response.json({ data: { ...session(), location: { directory: worktree } } });
+      return Response.json({ data: [{ id: 'msg_reserved', metadata: { heimdallRunId: 'run_reserved' } }], cursor: { next: 'native-cursor' } });
+    },
+  }));
+  const body = { id: 'msg_reserved', text: 'Feature', metadata: { heimdallRunId: 'run_reserved' }, delivery: 'queue', resume: false };
+  assert.deepEqual(await api.request('/api/session/ses_child/prompt', { method: 'POST', body }), [{ id: 'msg_reserved', metadata: { heimdallRunId: 'run_reserved' } }]);
+  assert.deepEqual((await api.request('/api/session/ses_child/message', { raw: true })).cursor, { next: 'native-cursor' });
+  assert.deepEqual(files, [{ file: path.join('/synthetic/desktop-profile', 'settings.json'), encoding: 'utf8' }]);
+  assert.equal(api.version, '2.0.22');
+  assert.equal(api.pid, 44, 'metadata belongs to the native server, not the Desktop proxy');
+  assert.equal(JSON.parse(calls[2].options.body).metadata.heimdallRunId, body.metadata.heimdallRunId);
+  assert.deepEqual(JSON.parse(calls[2].options.body), body);
+  for (const call of calls) {
+    assert.equal(call.url.origin, new URL(baseUrl).origin);
+    assert.equal(call.url.searchParams.get('location[directory]'), worktree);
+    assert.equal(call.options.headers.Authorization, 'Bearer synthetic-desktop-token');
+    assert.equal(call.options.headers['x-opencode-directory'], encodeURIComponent(worktree));
+    assert.equal(call.options.headers['x-opencode-directory-encoding'], 'uri');
+    assert.equal(call.options.redirect, 'error');
+    assert.ok(call.options.signal instanceof AbortSignal);
+  }
+  assert.ok(!JSON.stringify(api).includes('synthetic-desktop-token'));
+});
+
+test('Desktop uses the default settings path and rejects another local port before any request', async () => {
+  let selected;
+  const options = desktopConnection({ openchamber: { homeDirectory: '/synthetic/home', readFile: async file => { selected = file; return desktopSettings(); } }, fetchImpl: async () => Response.json(info()) });
+  await connect(directory, undefined, options);
+  assert.equal(selected, path.join('/synthetic/home', '.config', 'openchamber', 'settings.json'));
+  await assert.rejects(connect(directory, undefined, { ...options, baseUrl: 'http://127.0.0.1:4321', fetchImpl: async () => assert.fail('Mismatched Desktop port must not request') }), /match the Desktop local port/);
+  for (const port of [0, 65536, 4096.5, '4096', null]) {
+    await assert.rejects(connect(directory, undefined, desktopConnection({ openchamber: { readFile: async () => desktopSettings({ desktopLocalPort: port }) }, fetchImpl: async () => assert.fail('Invalid Desktop port must not request') })), /match the Desktop local port/);
+  }
+});
+
+test('Desktop rejects invalid origins before accessing its settings or transmitting its token', async () => {
+  for (const value of ['http://external.example:4096', 'https://127.0.0.1:4096', 'http://user:password@localhost:4096', 'http://localhost:4096/api/', 'http://localhost:4096?token=secret']) {
+    await assert.rejects(connect(directory, undefined, desktopConnection({ baseUrl: value, openchamber: { readFile: async () => assert.fail('Invalid origin must not read Desktop settings') }, fetchImpl: async () => assert.fail('Invalid origin must not request') })), /local .*HTTP/);
+  }
+});
+
+test('missing Desktop settings or token fails safely without an unauthenticated fallback', async () => {
+  const read = async () => { throw new Error('synthetic-desktop-token'); };
+  for (const readFile of [read, async () => '{synthetic-desktop-token', async () => '[]', ...[undefined, '', '   ', 'unsafe\ntoken'].map(token => async () => desktopSettings({ desktopLocalClientToken: token }))]) {
+    await assert.rejects(connect(directory, undefined, desktopConnection({ openchamber: { readFile }, fetchImpl: async () => assert.fail('Missing Desktop credentials must not request') })), error => {
+      assert.match(error.message, /OpenChamber Desktop/);
+      assert.ok(!error.message.includes('synthetic-desktop-token'));
+      assert.ok(!JSON.stringify(error).includes('synthetic-desktop-token'));
+      return true;
+    });
+  }
+});
+
+test('Desktop transport retains safe native HTTP errors and server/session validation', async () => {
+  for (const status of [401, 403, 404, 503]) {
+    await assert.rejects(connect(directory, undefined, desktopConnection({ fetchImpl: async () => new Response('synthetic-desktop-token', { status }) })), error => error.status === status && error.message === 'OpenCode API HTTP ' + status && !JSON.stringify(error).includes('synthetic-desktop-token'));
+  }
+  await assert.rejects(connect(directory, undefined, desktopConnection({ fetchImpl: async () => { throw new Error('synthetic-desktop-token'); } })), /unreachable or timed out/);
+  await assert.rejects(connect(directory, undefined, desktopConnection({ fetchImpl: async () => Response.json({ ...info(), version: 'different' }) })), /supported OpenCode/);
+  await assert.rejects(connect(directory, 'ses_child', desktopConnection({ fetchImpl: async url => Response.json(url.pathname === '/api/info' ? info() : { data: { ...session(), id: 'another' } }) })), /identity/);
+  await assert.rejects(connect(directory, 'ses_child', desktopConnection({ fetchImpl: async url => Response.json(url.pathname === '/api/info' ? info() : { data: { ...session(), location: { directory: '/other' } } }) })), /different project/);
+});
+
+test('Basic and no-auth do not access Desktop settings or add its directory encoding marker', async () => {
+  for (const authentication of ['basic', 'none']) {
+    await connect(directory, undefined, { ...connection, authentication, openchamber: { readFile: async () => assert.fail('Other authentication modes must not read Desktop settings') }, fetchImpl: async (_url, options) => {
+      assert.equal(Object.hasOwn(options.headers, 'x-opencode-directory-encoding'), false);
+      return Response.json(info());
+    } });
+  }
 });

@@ -1,9 +1,11 @@
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
+import { readDesktopConnection } from './openchamber.js';
+import type { DesktopClientConnection, DesktopConnectionOptions } from './openchamber.js';
 import type { ObservedSession, SessionAPI, SessionObserver, SessionSnapshot } from './types.js';
 
 export const supportedOpenCodeVersion = '2.0.22';
-export type OpenCodeAuthentication = 'basic' | 'none';
+export type OpenCodeAuthentication = 'basic' | 'none' | 'openchamber';
 
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
 
@@ -16,18 +18,21 @@ function localURL(value: string): URL {
   return url;
 }
 
-export function createAPI({ baseUrl, password, authentication = 'basic', directory, fetchImpl = fetch }: {
+export function createAPI({ baseUrl, password, authentication = 'basic', desktop, directory, fetchImpl = fetch }: {
   baseUrl: string;
   password?: string;
   authentication?: OpenCodeAuthentication;
+  desktop?: DesktopClientConnection;
   directory: string;
   fetchImpl?: typeof fetch;
 }): SessionAPI {
   const base = localURL(baseUrl);
-  if (!['basic', 'none'].includes(authentication) || !directory || (authentication === 'basic' && (typeof password !== 'string' || !password))) throw new Error('Invalid configured OpenCode connection');
+  if (!['basic', 'none', 'openchamber'].includes(authentication) || !directory || (authentication === 'basic' && (typeof password !== 'string' || !password))) throw new Error('Invalid configured OpenCode connection');
+  if (authentication === 'openchamber' && (base.protocol !== 'http:' || !desktop || !Number.isInteger(desktop.port) || Number(base.port || 80) !== desktop.port || !desktop.token || /[\x00-\x20\x7f]/.test(desktop.token))) throw new Error('Invalid configured OpenChamber Desktop connection');
   const headers = {
     'Content-Type': 'application/json',
     ...(authentication === 'basic' ? { Authorization: 'Basic ' + Buffer.from('opencode:' + password).toString('base64') } : {}),
+    ...(authentication === 'openchamber' ? { Authorization: 'Bearer ' + desktop!.token, 'x-opencode-directory-encoding': 'uri' } : {}),
     'x-opencode-directory': encodeURIComponent(directory),
   };
   return {
@@ -57,9 +62,10 @@ export interface ConnectionOptions {
   environment?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
   readFS?: Pick<typeof fs, 'realpath'>;
+  openchamber?: DesktopConnectionOptions;
 }
 
-/** Uses the explicit loopback endpoint; no-auth connections never resolve a password. */
+/** Uses the explicit loopback endpoint and only its selected authentication source. */
 export async function connect(directory: string, sessionID?: string, {
   baseUrl,
   authentication = 'basic',
@@ -67,12 +73,14 @@ export async function connect(directory: string, sessionID?: string, {
   environment = process.env,
   fetchImpl = fetch,
   readFS = fs,
+  openchamber,
 }: ConnectionOptions = {}): Promise<SessionAPI> {
   if (!baseUrl) throw new Error('Configure opencode.baseUrl before executing a workflow');
-  if (!['basic', 'none'].includes(authentication)) throw new Error('Invalid OpenCode authentication mode');
+  if (!['basic', 'none', 'openchamber'].includes(authentication)) throw new Error('Invalid OpenCode authentication mode');
   const password = authentication === 'basic' ? environment[passwordEnvironmentVariable] : undefined;
   if (authentication === 'basic' && (typeof password !== 'string' || !password)) throw new Error('Set the configured OpenCode password environment variable');
-  const api = createAPI({ baseUrl, password, authentication, directory, fetchImpl });
+  const desktop = authentication === 'openchamber' ? await readDesktopConnection(localURL(baseUrl), environment, openchamber) : undefined;
+  const api = createAPI({ baseUrl, password, authentication, desktop, directory, fetchImpl });
   const info = await api.request('/api/info');
   if (!record(info) || info.version !== supportedOpenCodeVersion || !Number.isInteger(info.pid) || (info.pid as number) < 1) {
     throw new Error('Configured server does not match supported OpenCode ' + supportedOpenCodeVersion);

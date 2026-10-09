@@ -47,8 +47,12 @@ settings requires reloading this plugin in its own development environment.
 
 The native adapter targets OpenCode and `@opencode/plugin` **2.0.22**. It uses a
 real parent tool context and the effective native `subagent` tool. Configure the
-existing local managed server's URL in `[opencode]` and supply its password through
-the named environment variable. The adapter validates server version, session
+existing local connection's URL in `[opencode]`. For OpenChamber Desktop, set
+`authentication = "openchamber"` and use Desktop's local HTTP port. Heimdall
+reads the existing Desktop client token from `~/.config/openchamber/settings.json`
+(or `OPENCHAMBER_DATA_DIR`) and sends it only to that matching loopback port; no
+password needs to be copied. For a direct OpenCode server, supply its password
+through the named environment variable. The adapter validates server version, session
 identity and project directory. It does not harvest passwords from processes.
 Explicitly passwordless loopback servers can use `authentication = "none"` in
 `[opencode]`; password authentication remains the default.
