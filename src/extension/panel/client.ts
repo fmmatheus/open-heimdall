@@ -1,9 +1,9 @@
-import { RUN_STATUSES } from '../shared/protocol.js';
-import type { ChangeFeed, ProjectsResponse, RunResponse, RunsResponse, WireRunStatus } from '../shared/protocol.js';
+import { MATCH_LIMITS, RUN_STATUSES } from '../shared/protocol.js';
+import type { ChangeFeed, DirectoryMatch, ProjectsResponse, RunResponse, RunsResponse, WireRunStatus } from '../shared/protocol.js';
 
 /** The slice of the SDK host the panel uses; injectable so tests can record every request. */
 export interface PanelHost {
-  serviceRequest(request: { method: 'GET'; path: string; query?: Record<string, string> }): Promise<{ status: number; body: string }>;
+  serviceRequest(request: { method: 'GET' | 'POST'; path: string; query?: Record<string, string>; body?: string }): Promise<{ status: number; body: string }>;
   serviceStatus(): Promise<{ status: string }>;
 }
 
@@ -16,6 +16,10 @@ const RUN_PATH = /^\/runs\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 export function isAllowedPath(path: string): boolean {
   return FIXED_PATHS.has(path) || RUN_PATH.test(path);
 }
+
+/** The single POST route: a pure lookup that compares directories and returns ids only. */
+export const MATCH_PATH = '/directories/match';
+export const isAllowedPostPath = (path: string): boolean => path === MATCH_PATH;
 
 /**
  * `offline`: the coordinator (or the host link) is not answering; keep retrying.
@@ -103,6 +107,11 @@ export interface PanelClient {
   /** A null cursor asks for the starting cursor; the service answers `resync: true`. */
   changes(cursor: string | null): Promise<ChangeFeed>;
   serviceStatus(): Promise<'stopped' | 'starting' | 'ready' | 'failed' | 'unknown'>;
+  /**
+   * Canonical-identity lookup of OpenChamber directories. Result is aligned with the input; a directory the
+   * service cannot accept (relative, too long, NUL) is never sent and counts as unmatched.
+   */
+  matchDirectories(directories: string[]): Promise<DirectoryMatch[]>;
 }
 
 function expectArray(value: unknown): unknown[] {
@@ -110,12 +119,24 @@ function expectArray(value: unknown): unknown[] {
   return value;
 }
 
+function isSendableDirectory(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= MATCH_LIMITS.pathChars && !value.includes('\0') && (value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value) || value.startsWith('\\\\'));
+}
+
+/** Keep only well-formed ids from a match entry; anything else counts as no match. */
+function sanitizeMatch(value: unknown): DirectoryMatch {
+  const entry = typeof value === 'object' && value !== null ? value as { projectId?: unknown; runId?: unknown } : {};
+  const match: DirectoryMatch = {};
+  if (typeof entry.projectId === 'string' && IDENTIFIER.test(entry.projectId)) match.projectId = entry.projectId;
+  if (match.projectId !== undefined && typeof entry.runId === 'string' && IDENTIFIER.test(entry.runId)) match.runId = entry.runId;
+  return match;
+}
+
 export function createPanelClient(host: PanelHost): PanelClient {
-  async function get(path: string, query?: Record<string, string>): Promise<Record<string, unknown>> {
-    if (!isAllowedPath(path)) throw toError('BAD_PATH', BAD_RESPONSE);
+  async function send(request: { method: 'GET' | 'POST'; path: string; query?: Record<string, string>; body?: string }): Promise<Record<string, unknown>> {
     let result: { status: number; body: string };
     try {
-      result = await host.serviceRequest(query && Object.keys(query).length > 0 ? { method: 'GET', path, query } : { method: 'GET', path });
+      result = await host.serviceRequest(request);
     } catch (error) {
       throw mapHostFailure(error);
     }
@@ -123,6 +144,16 @@ export function createPanelClient(host: PanelHost): PanelClient {
     const parsed = parseObject(result.body);
     if (!parsed) throw toError('invalid-response', BAD_RESPONSE);
     return parsed;
+  }
+
+  async function get(path: string, query?: Record<string, string>): Promise<Record<string, unknown>> {
+    if (!isAllowedPath(path)) throw toError('BAD_PATH', BAD_RESPONSE);
+    return send(query && Object.keys(query).length > 0 ? { method: 'GET', path, query } : { method: 'GET', path });
+  }
+
+  async function post(path: string, body: string): Promise<Record<string, unknown>> {
+    if (!isAllowedPostPath(path)) throw toError('BAD_PATH', BAD_RESPONSE);
+    return send({ method: 'POST', path, body });
   }
 
   return {
@@ -149,6 +180,18 @@ export function createPanelClient(host: PanelHost): PanelClient {
       const body = await get('/changes', cursor === null ? undefined : { cursor });
       if (typeof body.cursor !== 'string' || !Array.isArray(body.changedRunIds) || typeof body.resync !== 'boolean') throw toError('invalid-response', BAD_RESPONSE);
       return body as unknown as ChangeFeed;
+    },
+    async matchDirectories(directories) {
+      const matches: DirectoryMatch[] = directories.map(() => ({}));
+      const sendable = directories.flatMap((directory, index) => isSendableDirectory(directory) ? [index] : []);
+      for (let start = 0; start < sendable.length; start += MATCH_LIMITS.directories) {
+        const batch = sendable.slice(start, start + MATCH_LIMITS.directories);
+        const body = await post(MATCH_PATH, JSON.stringify({ directories: batch.map(index => directories[index]) }));
+        const returned: unknown = body.matches;
+        if (!Array.isArray(returned) || returned.length !== batch.length) throw toError('invalid-response', BAD_RESPONSE);
+        batch.forEach((index, position) => { matches[index] = sanitizeMatch(returned[position]); });
+      }
+      return matches;
     },
     async serviceStatus() {
       try {

@@ -233,3 +233,18 @@ export interface ReviewFileResponse {
 }
 
 export interface ErrorBody { error: { kind: string; message: string } }
+
+/** Limits of `POST /directories/match`. */
+export const MATCH_LIMITS = {
+  directories: 200,
+  /** Longest accepted directory, in characters. */
+  pathChars: 1024,
+} as const;
+
+/**
+ * One entry per requested directory, in request order. An empty object means "no match". `projectId` is the
+ * Heimdall project whose canonical directory is the same directory; `runId` is also set when the directory is
+ * that run's managed worktree. Nothing else about the directory is ever returned.
+ */
+export interface DirectoryMatch { projectId?: string; runId?: string }
+export interface DirectoryMatchResponse { matches: DirectoryMatch[] }

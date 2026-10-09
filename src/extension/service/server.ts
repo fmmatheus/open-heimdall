@@ -2,12 +2,15 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
 import { adapterErrorMessage, CoordinatorAdapterError } from './coordinator.js';
 import type { AdapterErrorKind, CoordinatorAdapter } from './coordinator.js';
+import { directoryRoutes } from './projects.js';
 import { projectionRoutes, reviewRoutes } from './routes.js';
 import type { ReviewRoutesOptions } from './routes.js';
 
 /** Stay below the host's 256000 character GUEST_REQUEST_RESPONSE_MAX. */
 export const MAX_RESPONSE_BYTES = 200000;
+/** Default body cap for a POST route; a route may ask for more with `body.maxBytes`, up to the hard limit. */
 export const MAX_REQUEST_BODY_BYTES = 16 * 1024;
+export const MAX_ROUTE_BODY_BYTES = 512 * 1024;
 
 export type ErrorKind = AdapterErrorKind | 'unauthorized' | 'not-found' | 'method-not-allowed' | 'invalid-request' | 'payload-too-large' | 'response-too-large' | 'internal-error';
 
@@ -46,7 +49,7 @@ export interface Route {
   method: 'GET' | 'POST';
   /** Literal segments or `:name` parameters, e.g. `/runs/:id`. */
   path: string;
-  /** POST routes must opt in to a request body; it is capped at this many bytes (default 16 KiB, never more). */
+  /** POST routes must opt in to a request body; it is capped at this many bytes (default 16 KiB, never more than 512 KiB). */
   body?: { maxBytes?: number };
   handler(context: RouteContext): Promise<unknown> | unknown;
 }
@@ -83,6 +86,7 @@ export function builtInRoutes(options: Pick<ExtensionServerOptions, 'adapter' | 
       },
     },
     ...projectionRoutes({ adapter: options.adapter, now: options.now }),
+    ...directoryRoutes({ adapter: options.adapter }),
     ...reviewRoutes({ adapter: options.adapter, now: options.now, loadConfiguration: options.loadConfiguration, configPath: options.configPath }),
   ];
 }
@@ -166,7 +170,7 @@ export function createExtensionServer(options: ExtensionServerOptions): http.Ser
     }
 
     const context: RouteContext = { params: selected.params!, query };
-    if (selected.route.body) context.body = await readBody(request, Math.min(selected.route.body.maxBytes ?? MAX_REQUEST_BODY_BYTES, MAX_REQUEST_BODY_BYTES));
+    if (selected.route.body) context.body = await readBody(request, Math.min(selected.route.body.maxBytes ?? MAX_REQUEST_BODY_BYTES, MAX_ROUTE_BODY_BYTES));
     const result = await selected.route.handler(context);
     if (result instanceof Reply) send(response, result.status, result.body);
     else send(response, 200, result);

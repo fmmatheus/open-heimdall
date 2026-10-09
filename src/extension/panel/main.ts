@@ -10,6 +10,9 @@ import {
   mountSelect,
   mountTabs,
 } from '@openchamber/sdk/ui';
+import { createPanelClient } from './client.js';
+import { createNavigation } from './navigation.js';
+import type { NavigationView } from './navigation.js';
 import { createPanelStore } from './store.js';
 import type { PanelState } from './store.js';
 import {
@@ -152,7 +155,17 @@ function mountPanel(): void {
     }
   });
 
+  const navigation = createNavigation({ host, matcher: createPanelClient(host) });
+  let sessionHandles: Array<{ dispose: () => void }> = [];
+  let sessionGen = 0;
+  const disposeSessions = (): void => {
+    sessionGen++;
+    for (const handle of sessionHandles) handle.dispose();
+    sessionHandles = [];
+  };
+
   const disposeDetail = (): void => {
+    disposeSessions();
     for (const handle of detailHandles) handle.dispose();
     detailHandles = [];
     renderedDetail = null;
@@ -224,6 +237,71 @@ function mountPanel(): void {
     slot.dataset.slot = 'session-actions';
     body.append(slot);
     extensions.sessionActions?.(detail, slot);
+  }
+
+  /** Session actions for the Overview tab: open the run's existing sessions, or explain why they cannot be opened. */
+  function drawSessions(detail: RunDetail, container: HTMLElement): void {
+    disposeSessions();
+    const gen = sessionGen;
+    const shell = section(container, 'Sessions');
+    const status = node('p', 'hm-text', 'Checking which sessions OpenChamber has loaded…');
+    status.setAttribute('role', 'status');
+    const body = node('div', 'hm-sessions');
+    const feedback = node('p', 'hm-text');
+    feedback.setAttribute('role', 'alert');
+    feedback.hidden = true;
+    shell.append(status, body, feedback);
+
+    const known = store.getState().projects.find(entry => entry.id === detail.projectId);
+    const project = { id: detail.projectId, name: known?.name ?? detail.projectName, directory: known?.directory ?? null };
+    function paint(result: NavigationView): void {
+      for (const handle of sessionHandles) handle.dispose();
+      sessionHandles = [];
+      body.replaceChildren();
+      status.textContent = result.message ?? '';
+      status.hidden = result.message === null;
+      if (result.copyText !== null) {
+        const copy = node('code', 'hm-copy', result.copyText);
+        copy.tabIndex = 0;
+        copy.setAttribute('aria-label', `Project directory: ${result.copyText}`);
+        body.append(copy);
+      }
+      for (const entry of result.targets) {
+        const row = node('div', 'hm-session');
+        const slot = node('div');
+        row.append(slot);
+        sessionHandles.push(mountButton(slot, {
+          label: entry.actionLabel,
+          variant: 'outline',
+          size: 'sm',
+          disabled: !entry.enabled,
+          onClick: () => {
+            void navigation.open(result, entry.target.key).then(outcome => {
+              if (gen !== sessionGen) return;
+              feedback.textContent = outcome.message ?? '';
+              feedback.hidden = outcome.message === null;
+            });
+          },
+        }));
+        if (result.state === 'listed' && entry.note) row.append(node('p', 'hm-meta', entry.note));
+        body.append(row);
+      }
+      if (result.canRefresh) {
+        const slot = node('div');
+        body.append(slot);
+        sessionHandles.push(mountButton(slot, { label: 'Refresh sessions', variant: 'ghost', size: 'sm', onClick: () => check() }));
+      }
+    }
+
+    function check(): void {
+      feedback.hidden = true;
+      status.hidden = false;
+      status.textContent = 'Checking which sessions OpenChamber has loaded…';
+      void navigation.load(detail, project).then(result => {
+        if (gen === sessionGen) paint(result);
+      });
+    }
+    check();
   }
 
   function drawUsage(detail: RunDetail, body: HTMLElement): void {
@@ -395,6 +473,8 @@ function mountPanel(): void {
       });
     }
   }
+
+  extensions.sessionActions = drawSessions;
 
   // Keep "x s ago" fresh without waiting for the next state change.
   setInterval(() => render(store.getState()), 15000);
