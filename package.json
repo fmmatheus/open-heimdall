@@ -26,7 +26,8 @@
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test test/*.test.mjs",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "build:extension": "npm run build && node scripts/build-extension.mjs"
   },
   "dependencies": {
     "@opencode/plugin": "2.0.22",
@@ -39,7 +40,9 @@
     }
   },
   "devDependencies": {
+    "@openchamber/sdk": "2.1.0",
     "@types/node": "22.20.5",
+    "esbuild": "0.28.2",
     "typescript": "7.0.2"
   }
 }

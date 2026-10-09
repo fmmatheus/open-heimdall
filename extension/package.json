@@ -1,0 +1,38 @@
+{
+  "name": "@open-heimdall/openchamber-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Read-only Heimdall run visibility and review panel for OpenChamber",
+  "openchamber": {
+    "apiVersion": 1,
+    "engines": {
+      "openchamber": ">=2.1.0"
+    },
+    "contributes": {
+      "panel": {
+        "id": "heimdall",
+        "name": "Heimdall",
+        "icon": "eye",
+        "entry": "panel/index.html"
+      },
+      "capabilities": ["sessions"],
+      "service": {
+        "entry": "service/main.js",
+        "runtime": "host",
+        "permissions": {
+          "exec": ["git"],
+          "sockets": [
+            {
+              "id": "coordinator",
+              "candidates": {
+                "darwin": ["~/.local/state/heimdall/coordinator.sock"],
+                "linux": ["~/.local/state/heimdall/coordinator.sock"]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}
