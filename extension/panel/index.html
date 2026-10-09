@@ -4,11 +4,58 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Heimdall</title>
+    <style>
+      /* Colors come from the host theme variables that applyHostReady writes (--oc-*), so light and dark both work. */
+      html, body { margin: 0; padding: 0; background: var(--oc-bg, transparent); color: var(--oc-fg, inherit); }
+      #app { display: flex; flex-direction: column; gap: 10px; padding: 10px; box-sizing: border-box; min-height: 100vh; }
+      h1 { margin: 0; font-size: 1rem; font-weight: 600; }
+      .hm-section > h2 { margin: 0 0 6px; font-size: 0.8125rem; font-weight: 600; color: var(--oc-muted, inherit); text-transform: uppercase; letter-spacing: 0.03em; }
+      [hidden] { display: none !important; }
+      .hm-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+      .hm-filters { display: flex; flex-wrap: wrap; gap: 8px; }
+      .hm-filters > * { flex: 1 1 120px; min-width: 0; }
+      .hm-notice { margin: 0; font-size: 0.75rem; color: var(--oc-muted, inherit); }
+      .hm-detail { display: flex; flex-direction: column; gap: 12px; }
+      .hm-detail-title { margin: 0; font-size: 0.9375rem; font-weight: 600; overflow-wrap: anywhere; }
+      .hm-meta { margin: 0; font-size: 0.75rem; color: var(--oc-muted, inherit); overflow-wrap: anywhere; }
+      .hm-section { display: flex; flex-direction: column; gap: 6px; padding-bottom: 10px; border-bottom: 1px solid var(--oc-border, transparent); }
+      .hm-rows { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; margin: 0; }
+      .hm-row { display: flex; flex-direction: column; gap: 1px; }
+      .hm-row dt { font-size: 0.75rem; color: var(--oc-muted, inherit); }
+      .hm-row dd { margin: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+      .hm-text { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+      .hm-blocker { padding: 8px 10px; border: 1px solid var(--oc-border, transparent); border-radius: 8px; border-left: 3px solid var(--oc-warning, currentColor); }
+      .hm-blocker[data-tone="error"] { border-left-color: var(--oc-error, currentColor); }
+      .hm-blocker-title { margin: 0 0 4px; font-weight: 600; }
+      .hm-task { border: 1px solid var(--oc-border, transparent); border-radius: 8px; padding: 6px 8px; }
+      .hm-task > summary { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+      .hm-task-title { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+      .hm-task-body { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+      .hm-evidence { display: flex; flex-direction: column; gap: 4px; padding: 6px; border-radius: 6px; background: var(--oc-muted-surface, transparent); }
+      .hm-evidence-head { display: flex; align-items: center; gap: 8px; }
+      .hm-label { font-size: 0.75rem; color: var(--oc-muted, inherit); margin: 0; }
+      .hm-slot:empty { display: none; }
+    </style>
   </head>
   <body>
     <main id="app" role="region" aria-label="Heimdall runs">
-      <h1>Heimdall</h1>
-      <div id="content"></div>
+      <div class="hm-header">
+        <h1>Heimdall</h1>
+      </div>
+      <div id="banner" aria-live="polite"></div>
+      <section id="list-view" aria-label="Run list">
+        <div class="hm-filters" id="filters">
+          <div id="filter-project"></div>
+          <div id="filter-status"></div>
+        </div>
+        <p class="hm-notice" id="list-notice" hidden></p>
+        <div id="run-list"></div>
+        <div id="list-empty"></div>
+      </section>
+      <section id="detail-view" aria-label="Run detail" hidden>
+        <div id="detail-back"></div>
+        <div id="detail-content" class="hm-detail"></div>
+      </section>
     </main>
     <script src="main.js"></script>
   </body>
