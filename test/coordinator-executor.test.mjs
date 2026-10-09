@@ -14,7 +14,7 @@ function fixture(run = runFixture(), connectionOverrides = {}) {
   sessions.set(parent.id, parent);
   const fetchImpl = async (url, options = {}) => {
     const body = options.body ? JSON.parse(options.body) : undefined;
-    calls.push({ method: options.method ?? 'GET', route: url.pathname, body, directory: url.searchParams.get('location[directory]'), authenticated: Object.hasOwn(options.headers ?? {}, 'Authorization') });
+    calls.push({ method: options.method ?? 'GET', route: url.pathname, body, directory: url.searchParams.get('location[directory]'), authenticated: Object.hasOwn(options.headers ?? {}, 'Authorization'), headers: options.headers });
     if (url.pathname === '/api/info') return Response.json({ version: '2.0.22', pid: 44 });
     if (url.pathname === '/api/plugin') {
       const cold = coldReads > 0; if (cold) coldReads--;
@@ -200,4 +200,18 @@ test('persisted authentication wins over a shared connection override, including
   const none = fixture(explicit, { authentication: 'basic', environment: new Proxy({}, { get: () => assert.fail('Explicit none must not read a password') }) });
   await none.executor.launch(none.run);
   assert.ok(none.calls.every(call => call.authenticated === false));
+});
+
+
+test('saved Desktop mode reaches managed native launch with token-free run metadata', async () => {
+  const run = runFixture();
+  run.specification.opencode.authentication = 'openchamber';
+  const environment = new Proxy({}, { get: (_target, key) => { assert.equal(key, 'OPENCHAMBER_DATA_DIR'); return undefined; } });
+  const f = fixture(run, { authentication: 'basic', environment, openchamber: { homeDirectory: '/synthetic/home', readFile: async () => JSON.stringify({ desktopLocalPort: 4096, desktopLocalClientToken: 'synthetic-desktop-token' }) } });
+  await f.executor.launch(run);
+  assert.ok(f.calls.every(call => call.headers.Authorization === 'Bearer synthetic-desktop-token' && call.headers['x-opencode-directory-encoding'] === 'uri'));
+  assert.ok(!JSON.stringify(run.specification).includes('synthetic-desktop-token'));
+  const created = f.calls.find(call => call.method === 'POST' && call.route === '/api/session');
+  assert.deepEqual(created.body.metadata, { heimdallRunId: run.id });
+  assert.deepEqual(f.calls.filter(call => call.route.endsWith('/prompt')).map(call => call.body.resume), [false, true]);
 });

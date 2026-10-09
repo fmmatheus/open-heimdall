@@ -14,7 +14,7 @@ export interface Configuration {
   planRoot: string;
   settings: RunnerSettings;
   readSettings?: () => Promise<RunnerSettings>;
-  opencode: { baseUrl?: string; passwordEnvironmentVariable: string; authentication?: 'basic' | 'none' };
+  opencode: { baseUrl?: string; passwordEnvironmentVariable: string; authentication?: 'basic' | 'none' | 'openchamber' };
 }
 
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value) && !(value instanceof Date);
@@ -109,7 +109,7 @@ export async function loadConfiguration({ projectDirectory = process.cwd(), conf
   const relativePlans = path.relative(directory, planRoot);
   if (relativePlans === '..' || relativePlans.startsWith('..' + path.sep) || path.isAbsolute(relativePlans)) throw new Error('paths.plans must remain inside the project; configure it explicitly when state is external');
   const authentication = opencode.authentication ?? 'basic';
-  if (authentication !== 'basic' && authentication !== 'none') throw new Error('opencode.authentication must be basic or none');
+  if (authentication !== 'basic' && authentication !== 'none' && authentication !== 'openchamber') throw new Error('opencode.authentication must be basic, none, or openchamber');
   const passwordEnvironmentVariable = text(opencode.passwordEnvironmentVariable, 'opencode.passwordEnvironmentVariable', 'OPENCODE_PASSWORD');
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(passwordEnvironmentVariable)) throw new Error('passwordEnvironmentVariable must be an environment variable name');
   const baseUrl = opencode.baseUrl === undefined ? undefined : text(opencode.baseUrl, 'opencode.baseUrl');

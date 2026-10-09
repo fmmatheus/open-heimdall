@@ -30,6 +30,8 @@ cp -n examples/coordinator.toml ~/.config/heimdall/coordinator.toml
 
 Edit your project's `.heimdall.toml` with your models and OpenCode server URL.
 For Claude Code models, set the executor's `quotaProvider = "claude-code"`.
+For OpenChamber Desktop, use its local HTTP port as the URL and set
+`authentication = "openchamber"`; Heimdall uses Desktop's existing client token.
 For password authentication, supply the existing server password as
 `OPENCODE_PASSWORD` in the terminal that starts the coordinator.
 

@@ -33,8 +33,11 @@ plans = ".heimdall/plans"
 # executorPrompt = "my-prompts/executor.md"
 
 [opencode]
-# Set the local origin of the existing OpenChamber-managed OpenCode 2.0.22.
+# Set the local origin of your existing OpenCode 2.0.22 connection.
 # baseUrl = "http://127.0.0.1:4096"
+# For OpenChamber Desktop, use its local HTTP port and existing client token:
+# authentication = "openchamber"
+# For a direct Basic-authenticated OpenCode server (the default):
 passwordEnvironmentVariable = "OPENCODE_PASSWORD"
 # Keep the password in the runtime environment, never in this file.
 # Explicitly opt in only for a passwordless loopback server:
