@@ -1,8 +1,46 @@
 # OpenChamber extension
 
-A read-only Heimdall panel for OpenChamber. It lists coordinator runs, shows a
-run's tasks, models, usage and limits, opens the run's existing OpenCode
-sessions, and reviews the files a run changed in its managed worktree.
+A read-only Heimdall panel for OpenChamber (version **0.1.1**). It lists
+coordinator runs, shows a compact overview of each run, opens the run's existing
+OpenCode sessions, and reviews the files a run changed in its managed worktree.
+
+## Reading a run
+
+Selecting a run shows a compact **overview**: label, project, one status badge,
+progress and current action, planner and task models, recorded usage and budget,
+and when it was last updated (relative time plus your local date). Below it are
+the tabs **Sessions**, **Tasks**, **Review** and **Technical details**.
+
+- **Technical details** holds the exact UTC times, every configured and
+  candidate model, the quota check, commit, branch and per-session usage.
+- **Review** shows feature changes against the run's base commit. A collapsed
+  **Runtime metadata (not feature changes)** group lists Heimdall and agent
+  runtime files (`.heimdall`, `.omc`, and the generated `.opencode` plugin and
+  agent files). They are never modified, and their contents are never shown.
+- **Long text.** Task summaries, handoffs, evidence and blocker text are
+  shortened in the list. Where text was shortened, a **Show full …** button
+  loads more of it on demand (still read-only; up to 32,000 characters for
+  summaries, handoffs and blocker text, less for titles, models and evidence
+  details). If even that is cut, the panel says so. If the plan
+  changed since the run was loaded, it offers **Refresh**.
+- **Keyboard.** Tab reaches every control; Enter or Space activates it. Arrow
+  keys move through the run list and tabs, and **Escape** returns to the run
+  list. Colours follow the OpenChamber theme (light and dark).
+
+## Opening sessions
+
+When OpenChamber lists them, **Open planner** (only while planning), **Open
+current task** and **Open parent** appear in the overview; completed task
+sessions are under **Sessions**, and each task has **Open session**. Nothing is
+created: a session that OpenChamber does not list is never opened.
+
+| Sessions state | What to do |
+| --- | --- |
+| Project not added | The run's project folder is not in OpenChamber. Choose **Copy project folder**, add that folder through OpenChamber's project controls, then **Refresh sessions**. |
+| Discovery pending | OpenChamber is still loading sessions. Wait or **Refresh sessions**. |
+| Session not discovered | OpenChamber does not list some recorded sessions yet. **Refresh sessions**. |
+| Session unavailable / listing failed | Sessions could not be listed. **Refresh sessions**. |
+| Permission | The sessions permission was not granted. Allow it in **Settings → Extensions**, then **Refresh sessions**. |
 
 ## Requirements
 
@@ -47,7 +85,9 @@ configuration location. The extension manifest also declares the default socket
   events) plus a local directory-matching route. It never submits, resumes,
   reconciles, cancels or registers anything.
 - The panel never creates sessions or prompts; the only host calls are listing
-  projects and sessions and opening an existing session.
+  projects and sessions, opening an existing session, and `writeClipboard` (the
+  **Copy project folder** button copies the project's directory; it needs no
+  permission).
 - Review runs read-only `git` (diff, status, untracked listing) and makes no
   git mutations. File diffs are requested only for paths returned by the review
   list, and responses are size-bounded.
@@ -66,8 +106,7 @@ configuration location. The extension manifest also declares the default socket
 | No coordinator connection / coordinator is not running | Start the coordinator. Panel retries automatically; stale data stays visible, marked stale. |
 | Coordinator refused the credentials | Restart the coordinator so the key matches. |
 | Coordinator configuration is not valid | Fix `~/.config/heimdall/coordinator.toml`. |
-| Project not added | The run's project is not in OpenChamber. Add its directory (shown as copyable text) through OpenChamber's project UI. |
-| Session not discovered | OpenChamber has not listed the managed-worktree sessions yet. Use **Refresh sessions**; nothing is opened or created until listed. |
+| Sessions states | See [Opening sessions](#opening-sessions). |
 | Worktree missing / mismatch (Review) | The managed worktree was removed or no longer matches the run. Diffs cannot be produced. |
 
 ## Limitations
@@ -80,41 +119,34 @@ configuration location. The extension manifest also declares the default socket
 - Whether OpenChamber lists managed-worktree sessions under the source project
   is unverified; see the manual check below.
 
-## Manual verification (owner checklist)
+## Manual verification (owner checklist, 0.1.1)
 
-Uses the existing completed `test_app` run. Do not stop the live coordinator.
-Automated tests cover behaviour with fakes; every live UI check below is
-**PENDING — not yet performed**.
+Uses completed runs. Do not stop the live coordinator. Automated tests cover
+behaviour with fakes; every live UI check below is **PENDING — not yet
+performed**. Record results in the
+[validation record](validation/openchamber-extension.md#live-ui-verification-011).
 
-Let `W` be the run's worktree and `B` its base commit (`run show RUN_ID`).
+Let `W` be a run's worktree and `B` its base commit (`run show RUN_ID`).
 
-1. Build in a separate checkout: `npm ci --ignore-scripts && npm run build:extension`.
-   **PENDING — not yet performed.** Expect `dist/openchamber-extension` with
-   `package.json`, `panel/index.html`, `panel/main.js`, `service/main.js`.
-2. Install the folder (steps above) and approve the permissions.
-   **PENDING — not yet performed.** Expect the Heimdall panel to load.
-3. Offline messaging: only if the coordinator is already down, expect "No
-   coordinator connection" with start guidance. Otherwise skip.
+1. **Activate the new folder.** Build output is `dist/openchamber-extension` of
+   the 0.1.1 worktree. In **Settings → Extensions** add it as a separate install
+   (or switch from the 0.1.0 folder deliberately), approve sessions and the
+   local service, and confirm the version is 0.1.1.
    **PENDING — not yet performed.**
-4. Record `git -C W status --porcelain` and the `test_app` run status before
-   continuing. **PENDING — not yet performed.**
-5. Find the `test_app` run using the project and status filters.
+2. **Overview.** Open a completed run: one status badge, models, usage, local
+   date, and Technical details with exact UTC times.
    **PENDING — not yet performed.**
-6. Verify the label, status **succeeded**, completed/total tasks, models,
-   usage and limits against `run show RUN_ID`.
+3. **Session opening.** Open the parent, the current (running run) and a
+   completed task session. **PENDING — not yet performed.**
+4. **Project-missing flow.** For a project not in OpenChamber: **Copy project
+   folder**, add it, **Refresh sessions**. **PENDING — not yet performed.**
+5. **Diff inspection.** In **Review**, compare the file list with
+   `git -C W diff --stat B` plus untracked files; confirm `.omc` and `.heimdall`
+   sit only in the collapsed runtime group; open several diffs.
    **PENDING — not yet performed.**
-7. If the panel says the project is not added, add the `test_app` directory via
-   OpenChamber's project UI, then Refresh. **PENDING — not yet performed.**
-8. Open the parent session and a completed task session. Expect the existing
-   sessions to open. If not listed, expect "session not discovered" guidance
-   (this is the H4 check). **PENDING — not yet performed.**
-9. Open **Review**. Expect the changed files to equal
-   `git -C W diff --stat B` plus `git -C W ls-files --others --exclude-standard`
-   (Heimdall runtime files appear in a separate generated group).
+6. **Keyboard and themes.** Tab through summary actions, tabs and task toggles;
+   Enter or Space activate them; Escape returns to the list; check light and
+   dark themes. **PENDING — not yet performed.**
+7. **Unchanged state.** `git -C W status --porcelain` and the run status are the
+   same before and after, and no new OpenChamber sessions exist.
    **PENDING — not yet performed.**
-10. Open several diffs, including any binary, deleted or large file, and
-    compare with `git -C W diff B -- <path>`. **PENDING — not yet performed.**
-11. Re-run `git -C W status --porcelain`; expect identical output to step 4.
-    **PENDING — not yet performed.**
-12. Confirm no new OpenChamber sessions were created and the run status is
-    unchanged (`run show RUN_ID`). **PENDING — not yet performed.**

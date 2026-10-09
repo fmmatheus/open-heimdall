@@ -276,13 +276,15 @@ function mountPanel(): void {
   };
 
   /** A toggle for one shortened field: a ghost button that says what it shows and which region it controls. */
-  function toggleButton(parent: HTMLElement, handles: Array<{ dispose: () => void }>, key: string, toggle: NonNullable<FieldDisplay['toggle']>, controls: string, onClick: () => void): void {
+  function toggleButton(parent: HTMLElement, handles: Array<{ dispose: () => void }>, key: string, toggle: NonNullable<FieldDisplay['toggle']>, controls: string, owner: string, onClick: () => void): void {
     const slot = node('span');
     parent.append(slot);
     handles.push(mountButton(slot, { label: toggle.label, variant: 'ghost', size: 'sm', onClick }));
     const button = slot.querySelector<HTMLElement>('button');
     if (!button) return;
     button.dataset.toggleKey = key;
+    // The visible label repeats for every task, so the accessible name adds whose text it controls.
+    button.setAttribute('aria-label', `${toggle.label} (${owner})`);
     button.setAttribute('aria-expanded', String(toggle.expanded));
     button.setAttribute('aria-controls', controls);
   }
@@ -297,6 +299,7 @@ function mountPanel(): void {
       const slot = node('span');
       actions.append(slot);
       handles.push(mountButton(slot, { label: 'Refresh', variant: 'outline', size: 'sm', onClick: () => store.refreshDetail() }));
+      slot.querySelector<HTMLElement>('button')?.setAttribute('aria-label', 'Refresh the run detail');
       parent.append(actions);
     }
   }
@@ -384,7 +387,7 @@ function mountPanel(): void {
           blockerBody.replaceChildren();
           const toggle = (name: BlockerField, shown: FieldDisplay['toggle']): void => {
             if (shown === null) return;
-            toggleButton(blockerBody, blockerHandles, name, shown, 'hm-blocker-content', () => {
+            toggleButton(blockerBody, blockerHandles, name, shown, 'hm-blocker-content', 'blocker', () => {
               const now = store.getState();
               const loaded = now.content.runId === detail.id && now.content.blocker?.data != null;
               if (loaded && revealedBlocker.has(name)) revealedBlocker.delete(name);
@@ -556,7 +559,7 @@ function mountPanel(): void {
           content.replaceChildren();
           const toggle = (field: ShortenedField, shown: FieldDisplay['toggle']): void => {
             if (shown === null) return;
-            toggleButton(content, handles, field, shown, contentId, () => {
+            toggleButton(content, handles, field, shown, contentId, `task ${task.id}`, () => {
               const now = store.getState();
               const loaded = now.content.runId === detail.id && now.content.tasks[task.index]?.data != null;
               if (loaded && revealed.has(field)) revealed.delete(field);
@@ -798,6 +801,8 @@ function mountPanel(): void {
       onChange: next => {
         tab = next as DetailTabId;
         drawDetail(detail);
+        // The tab strip is rebuilt with the detail; keep keyboard focus on the selected tab.
+        detailContent.querySelector<HTMLElement>(`[role="tab"][data-id="${next}"]`)?.focus();
       },
     });
     detailHandles.push(handle);

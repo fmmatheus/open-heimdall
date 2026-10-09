@@ -24,6 +24,7 @@ test('extension build produces an installable OpenChamber package', async () => 
     assert.equal(result.ok, true, JSON.stringify(result));
     const manifest = result.manifest;
     assert.equal(manifest.apiVersion, 1);
+    assert.equal(JSON.parse(await readFile(join(out, 'package.json'), 'utf8')).version, '0.1.1');
     assert.equal(manifest.contributes.panel.id, 'heimdall');
     assert.equal(manifest.contributes.panel.entry, 'panel/index.html');
     assert.deepEqual(manifest.contributes.capabilities, ['sessions']);

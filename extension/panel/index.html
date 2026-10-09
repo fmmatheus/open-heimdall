@@ -61,6 +61,28 @@
       .hm-diff-line[data-kind="del"] { background: color-mix(in srgb, var(--oc-error, #cf222e) 18%, transparent); }
       .hm-diff-line[data-kind="hunk"] { color: var(--oc-info, var(--oc-muted, inherit)); background: var(--oc-muted-surface, transparent); }
       .hm-diff-line[data-kind="meta"], .hm-diff-line[data-kind="note"] { color: var(--oc-muted, inherit); }
+
+      /* Sidebar width (about 320-420 px): long ids, paths, branches and model names wrap instead of widening the panel. */
+      body { overflow-wrap: anywhere; line-height: 1.45; }
+      #app, .hm-detail, .hm-summary, .hm-review, .hm-sessions, .hm-section, .hm-task, .hm-task-body, .hm-content { min-width: 0; }
+      .hm-summary-head > .hm-text { flex: 1 1 8rem; min-width: 0; }
+      .hm-task > summary > .hm-task-title { line-height: 1.35; }
+      .hm-actions > *, .hm-content > * { max-width: 100%; }
+      .hm-actions button, .hm-content button { white-space: normal; text-align: left; }
+      .hm-review-bar { flex-wrap: wrap; }
+      .hm-evidence-head > .hm-text { min-width: 0; }
+      .hm-generated-list, .hm-diff-path, .hm-copy { overflow-wrap: anywhere; word-break: break-word; }
+
+      /* Keyboard focus is always visible on the controls this panel draws itself (SDK components draw their own ring). */
+      summary:focus-visible, .hm-copy:focus-visible, .hm-diff:focus-visible, .hm-status:focus-visible, .hm-text:focus-visible {
+        outline: 2px solid var(--oc-focus, currentColor);
+        outline-offset: 2px;
+        border-radius: 4px;
+      }
+      button:focus-visible, [role="tab"]:focus-visible, [role="listbox"]:focus-visible {
+        outline: 2px solid var(--oc-focus, currentColor);
+        outline-offset: 2px;
+      }
     </style>
   </head>
   <body>

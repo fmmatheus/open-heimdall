@@ -963,3 +963,65 @@ test('the panel sources write run text safely and never mention a saved run stat
   assert.match(main, /aria-controls/);
   assert.doesNotMatch(main, /innerHTML|insertAdjacentHTML/);
 });
+
+// ----- usability: stylesheet and accessibility wiring -----
+
+async function panelStyle() {
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const html = await readFile(join(root, 'extension', 'panel', 'index.html'), 'utf8');
+  const match = /<style>([\s\S]*?)<\/style>/.exec(html);
+  assert.ok(match, 'panel stylesheet present');
+  return match[1].replace(/\/\*[\s\S]*?\*\//g, '');
+}
+
+test('panel stylesheet defines visible focus styles from host theme variables', async () => {
+  const css = await panelStyle();
+  assert.match(css, /:focus-visible/);
+  const rules = css.match(/[^{}]*:focus-visible[^{}]*\{[^}]*\}/g) ?? [];
+  assert.ok(rules.length >= 2, 'focus rules');
+  for (const rule of rules) assert.match(rule, /outline:\s*2px solid var\(--oc-focus, currentColor\)/, rule);
+  // The custom focusables drawn by main.ts: details summaries, the copy path block and the diff region.
+  const selectors = rules.join('\n');
+  for (const target of ['summary', '.hm-copy', '.hm-diff', 'button']) assert.ok(selectors.includes(target), target);
+});
+
+test('panel stylesheet uses no hard-coded colours outside var(--oc-*) fallbacks', async () => {
+  const css = await panelStyle();
+  // Remove every var(...) expression (its fallback may name a colour), then nothing colour-like may remain.
+  let rest = css;
+  for (let previous = ''; previous !== rest;) {
+    previous = rest;
+    rest = rest.replace(/var\([^()]*\)/g, '');
+  }
+  assert.doesNotMatch(rest, /#[0-9a-fA-F]{3,8}\b/);
+  assert.doesNotMatch(rest, /\b(?:rgb|rgba|hsl|hsla|hwb|lab|lch|oklab|oklch)\(/);
+  assert.doesNotMatch(rest, /(?<![-\w])(?:white|black|red|green|blue|gray|grey|orange|yellow|purple)(?![-\w])/);
+  // Every var() the panel reads is a host variable with its own fallback.
+  for (const reference of css.match(/var\(--[a-z-]+/g) ?? []) assert.match(reference, /var\(--oc-/);
+  // Long ids, paths and model names wrap at sidebar width.
+  assert.match(css, /overflow-wrap:\s*anywhere/);
+});
+
+test('interactive controls have accessible names, aria-expanded, live feedback and an Escape path', async () => {
+  const dir = fileURLToPath(new URL('../src/extension/panel/', import.meta.url));
+  const main = (await readFile(join(dir, 'main.ts'), 'utf8')).replace(/\/\*[\s\S]*?\*\//g, '');
+  // Repeated toggles carry whose text they control; the task id is part of the accessible name.
+  assert.match(main, /setAttribute\('aria-label', `\$\{toggle\.label\} \(\$\{owner\}\)`\)/);
+  assert.match(main, /`task \$\{task\.id\}`/);
+  assert.match(main, /setAttribute\('aria-expanded', String\(toggle\.expanded\)\)/);
+  assert.match(main, /setAttribute\('aria-controls', controls\)/);
+  // Feedback: polite status for progress and results, alert for failures.
+  assert.match(main, /setAttribute\('role', status\.kind === 'loading' \? 'status' : 'alert'\)/);
+  assert.match(main, /target\.setAttribute\('role', 'status'\)/);
+  assert.match(main, /message\.setAttribute\('role', 'alert'\)/);
+  // Repeated session buttons and the shortened-text refresh are named.
+  assert.match(main, /'Refresh the run detail'/);
+  assert.match(main, /ariaLabel/);
+  // Keyboard: Escape returns to the list; switching tabs keeps focus on the selected tab.
+  assert.match(main, /event\.key === 'Escape' && store\.getState\(\)\.selectedRunId !== null[\s\S]{0,120}goBack\(\)/);
+  assert.match(main, /queueMicrotask\(focusList\)/);
+  assert.match(main, /\[role="tab"\]\[data-id="\$\{next\}"\]`\)\?\.focus\(\)/);
+  // Custom focusables are reachable by keyboard.
+  assert.match(main, /copy\.tabIndex = 0/);
+  assert.match(main, /pre\.tabIndex = 0/);
+});
