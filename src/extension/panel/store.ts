@@ -1,7 +1,9 @@
 import { createPanelClient, IDENTIFIER, mapHostFailure } from './client.js';
 import type { PanelClient, PanelError, PanelHost, RunFilters } from './client.js';
 import { RUN_STATUSES } from '../shared/protocol.js';
-import type { ProjectSummary, ReviewFileResponse, ReviewResponse, RunDetail, RunSummary, WireRunStatus } from '../shared/protocol.js';
+import type {
+  BlockerContentResponse, ProjectSummary, ReviewFileResponse, ReviewResponse, RunDetail, RunSummary, TaskContentResponse, WireRunStatus,
+} from '../shared/protocol.js';
 
 export type ConnectionState = 'connecting' | 'online' | 'offline' | 'service-unavailable';
 
@@ -31,6 +33,27 @@ export interface ReviewSlice {
 
 export const EMPTY_REVIEW: ReviewSlice = { runId: null, loading: false, data: null, error: null, stale: false, selectedPath: null, file: null };
 
+/** One piece of on-demand content: requested, loaded or failed. Absent from the slice until the user asks for it. */
+export interface ContentEntry<T> {
+  loading: boolean;
+  data: T | null;
+  /** Fixed sentence when loading failed; the user can ask again. */
+  error: string | null;
+}
+
+/**
+ * Full text of shortened task fields and of the blocker, loaded only when the user asks. It belongs to `runId`
+ * and is dropped when another run is selected or the run's progress changes.
+ */
+export interface ContentSlice {
+  runId: string | null;
+  /** By 0-based plan position. */
+  tasks: Readonly<Record<number, ContentEntry<TaskContentResponse>>>;
+  blocker: ContentEntry<BlockerContentResponse> | null;
+}
+
+export const EMPTY_CONTENT: ContentSlice = { runId: null, tasks: {}, blocker: null };
+
 export interface PanelState {
   connection: ConnectionState;
   /** Fixed user-facing sentence about the connection; null while online. */
@@ -50,6 +73,7 @@ export interface PanelState {
   /** Set when the selected run could not be loaded for a reason other than the connection. */
   detailError: string | null;
   review: ReviewSlice;
+  content: ContentSlice;
   cursor: string | null;
   /** Consecutive failed polls; drives the backoff. */
   failures: number;
@@ -90,6 +114,15 @@ export interface PanelStore {
   refreshReview(): void;
   /** Open the diff of a file. Ignored unless `path` is in the review list currently held. */
   selectReviewFile(path: string | null): void;
+  /**
+   * Load more of one task's text, once per run detail. Ignored unless the selected run's detail lists a task at
+   * `index` (its 0-based plan position); asking again while loading or after success does nothing.
+   */
+  loadTaskContent(runId: string, index: number): void;
+  /** Load more of the blocker reason and resolution, once per run detail. */
+  loadBlockerContent(runId: string): void;
+  /** Drop loaded content and reload the selected run now (the task list may have changed). */
+  refreshDetail(): void;
   /** Stop all timers and ignore every in-flight response. */
   dispose(): void;
 }
@@ -127,7 +160,7 @@ export function createPanelStore(options: PanelStoreOptions): PanelStore {
     connection: 'connecting', message: null, hint: null, lastSuccessAt: null, stale: false,
     projects: [], runs: [], runsTotal: 0, runsTruncated: false,
     filters: { projectId: null, status: null }, selectedRunId: null, detail: null, detailError: null,
-    review: EMPTY_REVIEW, cursor: null, failures: 0, nextAttemptAt: null,
+    review: EMPTY_REVIEW, content: EMPTY_CONTENT, cursor: null, failures: 0, nextAttemptAt: null,
   };
   const listeners = new Set<(state: PanelState) => void>();
   let disposed = false;
@@ -141,6 +174,8 @@ export function createPanelStore(options: PanelStoreOptions): PanelStore {
   let detailGen = 0;
   let reviewGen = 0;
   let reviewFileGen = 0;
+  // Bumped whenever loaded content is dropped; a content response applies only to the generation it was asked in.
+  let contentGen = 0;
   let reviewVisible = false;
   let projectsGen = 0;
 
@@ -215,7 +250,12 @@ export function createPanelStore(options: PanelStoreOptions): PanelStore {
     try {
       const response = await client.run(id);
       if (disposed || gen !== detailGen) return;
-      update({ detail: response.run, detailError: null });
+      // Loaded text stays valid while the run's plan and progress do; when they move, it is dropped.
+      const before = state.detail;
+      const moved = before === null || before.id !== response.run.id || before.completed !== response.run.completed
+        || before.total !== response.run.total || before.status !== response.run.status;
+      if (moved) contentGen++;
+      update(moved ? { detail: response.run, detailError: null, content: EMPTY_CONTENT } : { detail: response.run, detailError: null });
     } catch (caught) {
       const error = mapHostFailure(caught);
       if (disposed || gen !== detailGen) return;
@@ -278,6 +318,59 @@ export function createPanelStore(options: PanelStoreOptions): PanelStore {
       if (error.category !== 'request') throw error;
     }
     if (reopen !== null) await loadReviewFile(reopen, id);
+  }
+
+  /** The selected run's slice, started afresh when it belonged to another run. */
+  const contentOf = (runId: string): ContentSlice => (state.content.runId === runId ? state.content : { ...EMPTY_CONTENT, runId });
+
+  /** Resolves true only when the service answered; skipped and stale loads resolve false. */
+  async function loadTaskContent(runId: string, index: number): Promise<boolean> {
+    const detail = state.detail;
+    // Only tasks the loaded detail lists are ever requested.
+    if (disposed || state.selectedRunId !== runId || detail === null || detail.id !== runId) return false;
+    if (!detail.tasks.some(task => task.index === index)) return false;
+    const existing = contentOf(runId).tasks[index];
+    if (existing && (existing.loading || existing.data !== null)) return false;
+    const gen = contentGen;
+    const put = (entry: ContentEntry<TaskContentResponse>): void => {
+      const base = contentOf(runId);
+      update({ content: { ...base, tasks: { ...base.tasks, [index]: entry } } });
+    };
+    put({ loading: true, data: null, error: null });
+    try {
+      const response = await client.taskContent(runId, index);
+      if (disposed || gen !== contentGen || state.content.runId !== runId) return false;
+      put({ loading: false, data: response, error: null });
+      return true;
+    } catch (caught) {
+      const error = mapHostFailure(caught);
+      if (disposed || gen !== contentGen || state.content.runId !== runId) return false;
+      put({ loading: false, data: null, error: error.message });
+      if (error.category !== 'request') throw error;
+      return false;
+    }
+  }
+
+  async function loadBlockerContent(runId: string): Promise<boolean> {
+    const detail = state.detail;
+    if (disposed || state.selectedRunId !== runId || detail === null || detail.id !== runId || detail.blocker === null) return false;
+    const existing = contentOf(runId).blocker;
+    if (existing && (existing.loading || existing.data !== null)) return false;
+    const gen = contentGen;
+    const put = (entry: ContentEntry<BlockerContentResponse>): void => { update({ content: { ...contentOf(runId), blocker: entry } }); };
+    put({ loading: true, data: null, error: null });
+    try {
+      const response = await client.blockerContent(runId);
+      if (disposed || gen !== contentGen || state.content.runId !== runId) return false;
+      put({ loading: false, data: response, error: null });
+      return true;
+    } catch (caught) {
+      const error = mapHostFailure(caught);
+      if (disposed || gen !== contentGen || state.content.runId !== runId) return false;
+      put({ loading: false, data: null, error: error.message });
+      if (error.category !== 'request') throw error;
+      return false;
+    }
   }
 
   const reviewLoad = (): void => { void loadReview().then(standaloneSuccess, standaloneFailure); };
@@ -392,10 +485,10 @@ export function createPanelStore(options: PanelStoreOptions): PanelStore {
       if (runId !== null && !IDENTIFIER.test(runId)) return;
       const id = runId;
       if (id === state.selectedRunId) return;
-      detailGen++; reviewGen++; reviewFileGen++;
+      detailGen++; reviewGen++; reviewFileGen++; contentGen++;
       // The tab announces itself again once the new run is drawn.
       reviewVisible = false;
-      update({ selectedRunId: id, detail: null, detailError: null, review: EMPTY_REVIEW });
+      update({ selectedRunId: id, detail: null, detailError: null, review: EMPTY_REVIEW, content: EMPTY_CONTENT });
       if (id !== null) void loadDetail().then(standaloneSuccess, standaloneFailure);
     },
     setReviewVisible(visible) {
@@ -420,9 +513,23 @@ export function createPanelStore(options: PanelStoreOptions): PanelStore {
       if (!listed(state.review, path)) return;
       void loadReviewFile(path, runId).then(standaloneSuccess, standaloneFailure);
     },
+    loadTaskContent(runId, index) {
+      if (disposed || !IDENTIFIER.test(runId) || !Number.isInteger(index)) return;
+      void loadTaskContent(runId, index).then(answered => { if (answered) standaloneSuccess(); }, standaloneFailure);
+    },
+    loadBlockerContent(runId) {
+      if (disposed || !IDENTIFIER.test(runId)) return;
+      void loadBlockerContent(runId).then(answered => { if (answered) standaloneSuccess(); }, standaloneFailure);
+    },
+    refreshDetail() {
+      if (disposed || state.selectedRunId === null) return;
+      contentGen++;
+      update({ content: EMPTY_CONTENT });
+      void loadDetail().then(standaloneSuccess, standaloneFailure);
+    },
     dispose() {
       disposed = true;
-      cycleGen++; runsGen++; detailGen++; projectsGen++; reviewGen++; reviewFileGen++;
+      cycleGen++; runsGen++; detailGen++; projectsGen++; reviewGen++; reviewFileGen++; contentGen++;
       if (pollTimer !== null) timers.clearTimeout(pollTimer);
       if (staleTimer !== null) timers.clearTimeout(staleTimer);
       pollTimer = null;

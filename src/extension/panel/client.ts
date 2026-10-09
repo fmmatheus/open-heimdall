@@ -1,5 +1,8 @@
-import { MATCH_LIMITS, REVIEW_LIMITS, RUN_STATUSES } from '../shared/protocol.js';
-import type { ChangeFeed, DirectoryMatch, ProjectsResponse, ReviewFileResponse, ReviewResponse, RunResponse, RunsResponse, WireRunStatus } from '../shared/protocol.js';
+import { CONTENT_LIMITS, MATCH_LIMITS, REVIEW_LIMITS, RUN_STATUSES } from '../shared/protocol.js';
+import type {
+  BlockerContentResponse, ChangeFeed, DirectoryMatch, ProjectsResponse, ReviewFileResponse, ReviewResponse, RunResponse, RunsResponse,
+  TaskContentResponse, WireRunStatus,
+} from '../shared/protocol.js';
 
 /** The slice of the SDK host the panel uses; injectable so tests can record every request. */
 export interface PanelHost {
@@ -11,7 +14,7 @@ export const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
 /** The only service routes the panel may request. All are GET. */
 const FIXED_PATHS = new Set(['/projects', '/runs', '/changes']);
-const RUN_PATH = /^\/runs\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}(?:\/review(?:\/file)?)?$/;
+const RUN_PATH = /^\/runs\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}(?:\/(?:review(?:\/file)?|blocker|tasks\/(?:0|[1-9][0-9]{0,5})))?$/;
 
 export function isAllowedPath(path: string): boolean {
   return FIXED_PATHS.has(path) || RUN_PATH.test(path);
@@ -111,6 +114,13 @@ export interface PanelClient {
    * checks that it is well-formed, so a path typed or guessed elsewhere never reaches the service from the store.
    */
   reviewFile(id: string, path: string): Promise<ReviewFileResponse>;
+  /**
+   * More of one task's recorded text, by 0-based plan position. Only called when the user asks to see more;
+   * the answer is checked to belong to the requested run and position.
+   */
+  taskContent(id: string, index: number): Promise<TaskContentResponse>;
+  /** More of the recorded blocker reason and resolution. */
+  blockerContent(id: string): Promise<BlockerContentResponse>;
   /** A null cursor asks for the starting cursor; the service answers `resync: true`. */
   changes(cursor: string | null): Promise<ChangeFeed>;
   serviceStatus(): Promise<'stopped' | 'starting' | 'ready' | 'failed' | 'unknown'>;
@@ -149,6 +159,67 @@ const REVIEW_GIT_FAILURE: Mapped = { category: 'request', message: 'Git could no
 function reviewFailure(error: unknown): never {
   const mapped = mapHostFailure(error);
   if (mapped.code === 'internal-error' || mapped.code === 'HTTP_500') throw toError('internal-error', REVIEW_GIT_FAILURE);
+  throw mapped;
+}
+
+const TASK_INDEX_MAX = 999999;
+const TASK_CLIP_KEYS = ['title', 'summary', 'handoff', 'model', 'evidenceCount', 'evidenceText'] as const;
+const TASK_STATES = ['done', 'current', 'pending'];
+
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
+const textWithin = (value: unknown, max: number): boolean => typeof value === 'string' && value.length <= max;
+const nullableTextWithin = (value: unknown, max: number): boolean => value === null || textWithin(value, max);
+const flags = (value: unknown, keys: readonly string[]): boolean => isRecord(value) && keys.every(key => typeof value[key] === 'boolean');
+
+function isEvidence(value: unknown, limits: { gate: number; detail: number }): boolean {
+  return isRecord(value)
+    && nullableTextWithin(value.gateId, 128)
+    && nullableTextWithin(value.gate, limits.gate)
+    && (value.passed === null || typeof value.passed === 'boolean')
+    && textWithin(value.detail, limits.detail);
+}
+
+/** Exact shape check of a task content answer, bound to the run and position that were asked for. */
+function isTaskContent(body: Record<string, unknown>, id: string, index: number): boolean {
+  const limits = body.limits;
+  if (!isRecord(limits)) return false;
+  const { title, model, text, gate, detail, evidence } = limits;
+  if (![title, model, text, gate, detail, evidence].every(value => typeof value === 'number' && Number.isInteger(value) && value >= 0)) return false;
+  if ((model as number) > CONTENT_LIMITS.model || (title as number) > CONTENT_LIMITS.title || (text as number) > CONTENT_LIMITS.text || (gate as number) > CONTENT_LIMITS.gate
+    || (detail as number) > CONTENT_LIMITS.detail || (evidence as number) > CONTENT_LIMITS.evidence) return false;
+  return body.runId === id
+    && body.index === index
+    && textWithin(body.taskId, 128)
+    && textWithin(body.title, title as number)
+    && typeof body.state === 'string' && TASK_STATES.includes(body.state)
+    && nullableTextWithin(body.summary, text as number)
+    && nullableTextWithin(body.handoff, text as number)
+    && nullableTextWithin(body.model, model as number)
+    && Array.isArray(body.evidence) && body.evidence.length <= (evidence as number)
+    && body.evidence.every(item => isEvidence(item, { gate: gate as number, detail: detail as number }))
+    && typeof body.evidenceTotal === 'number' && Number.isInteger(body.evidenceTotal) && body.evidenceTotal >= body.evidence.length
+    && flags(body.clipped, TASK_CLIP_KEYS)
+    && typeof body.complete === 'boolean';
+}
+
+function isBlockerContent(body: Record<string, unknown>, id: string): boolean {
+  const limit = body.limit;
+  if (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 0 || limit > CONTENT_LIMITS.reason) return false;
+  return body.runId === id
+    && typeof body.status === 'string' && (RUN_STATUSES as readonly string[]).includes(body.status)
+    && textWithin(body.reason, limit)
+    && typeof body.reasonRecorded === 'boolean'
+    && nullableTextWithin(body.resolution, limit)
+    && flags(body.clipped, ['reason', 'resolution'])
+    && typeof body.complete === 'boolean';
+}
+
+const CONTENT_FAILURE: Mapped = { category: 'request', message: 'Heimdall could not load the full text.', hint: null };
+
+/** A failure of one on-demand content request stays local to the text being expanded. */
+function contentFailure(error: unknown): never {
+  const mapped = mapHostFailure(error);
+  if (mapped.code === 'internal-error' || mapped.code === 'HTTP_500') throw toError('internal-error', CONTENT_FAILURE);
   throw mapped;
 }
 
@@ -210,6 +281,21 @@ export function createPanelClient(host: PanelHost): PanelClient {
       try { body = await get(`/runs/${id}/review/file`, { path }); } catch (error) { return reviewFailure(error); }
       if (typeof body.state !== 'string' || typeof body.path !== 'string' || typeof body.text !== 'string') throw toError('invalid-response', BAD_RESPONSE);
       return body as unknown as ReviewFileResponse;
+    },
+    async taskContent(id, index) {
+      if (!IDENTIFIER.test(id)) throw toError('not-found', SERVICE_ERRORS['not-found']!);
+      if (!Number.isInteger(index) || index < 0 || index > TASK_INDEX_MAX) throw toError('invalid-request', SERVICE_ERRORS['invalid-request']!);
+      let body: Record<string, unknown>;
+      try { body = await get(`/runs/${id}/tasks/${index}`); } catch (error) { return contentFailure(error); }
+      if (!isTaskContent(body, id, index)) throw toError('invalid-response', BAD_RESPONSE);
+      return body as unknown as TaskContentResponse;
+    },
+    async blockerContent(id) {
+      if (!IDENTIFIER.test(id)) throw toError('not-found', SERVICE_ERRORS['not-found']!);
+      let body: Record<string, unknown>;
+      try { body = await get(`/runs/${id}/blocker`); } catch (error) { return contentFailure(error); }
+      if (!isBlockerContent(body, id)) throw toError('invalid-response', BAD_RESPONSE);
+      return body as unknown as BlockerContentResponse;
     },
     async changes(cursor) {
       const body = await get('/changes', cursor === null ? undefined : { cursor });

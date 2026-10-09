@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { CoordinatorAdapterError } from '../dist/extension/service/coordinator.js';
 import { createExtensionServer, listenExtensionServer } from '../dist/extension/service/server.js';
-import { detailRun, phaseOf, runLabel, summarizeRun } from '../dist/extension/service/projection.js';
+import { blockerContent, detailRun, phaseOf, runLabel, summarizeRun, taskContent } from '../dist/extension/service/projection.js';
 import { createChangeTracker } from '../dist/extension/service/events.js';
 
 const SERVICE_TOKEN = 'svc-' + 'c3d4e5f6'.repeat(8);
@@ -209,7 +209,7 @@ test('queued, preparing and planning runs project without a checkpoint or task l
 
 test('blockers use only recorded reasons and say so when none was recorded', () => {
   const paused = detailRun(fixtures.paused(), project);
-  assert.deepEqual(paused.blocker, { status: 'paused', reason: 'Executor quota is below the minimum', reasonRecorded: true, resolution: 'Resume after the quota window resets' });
+  assert.deepEqual(paused.blocker, { status: 'paused', reason: 'Executor quota is below the minimum', reasonRecorded: true, resolution: 'Resume after the quota window resets', reasonClipped: false, resolutionClipped: false });
   assert.equal(paused.currentTask.id, 'T2');
   assert.equal(paused.tasks[1].state, 'current');
 
@@ -577,7 +577,7 @@ test('a failed coordinator call surfaces as a service error and leaves the curso
 test('projection routes are read-only GET routes', async t => {
   const adapter = makeAdapter({ runs: routeRuns() });
   const server = await listening(t, { adapter });
-  for (const target of ['/projects', '/runs', '/runs/run_p', '/changes']) {
+  for (const target of ['/projects', '/runs', '/runs/run_p', '/changes', '/runs/run_p/tasks/0', '/runs/run_p/blocker']) {
     const response = await new Promise((resolve, reject) => {
       const request = http.request({ host: '127.0.0.1', port: server.address().port, method: 'POST', path: target, headers: { Authorization: `Bearer ${SERVICE_TOKEN}` } }, res => { res.resume(); res.on('end', () => resolve(res.statusCode)); });
       request.on('error', reject);
@@ -586,4 +586,249 @@ test('projection routes are read-only GET routes', async t => {
     assert.equal(response, 405, target);
   }
   assert.deepEqual(adapter.state.calls, []);
+});
+
+/* ---------- per-field shortening and on-demand content ---------- */
+
+const NO_CLIPS = { title: false, summary: false, handoff: false, model: false, evidenceCount: false, evidenceText: false };
+
+test('detail flags exactly which fields of a task were shortened', () => {
+  const run = fixtures.succeeded();
+  run.checkpoint.results[0].summary = 'S'.repeat(5000);
+  run.checkpoint.results[1].handoff = 'H'.repeat(5000);
+  run.checkpoint.results[2].evidence = Array.from({ length: 80 }, (_, index) => ({ gateId: `G${index}`, gate: 'g', passed: true, detail: 'D'.repeat(1000) }));
+  const view = detailRun(run, project);
+  assert.deepEqual(view.tasks.map(task => task.index), [0, 1, 2]);
+  assert.deepEqual(view.tasks[0].clipped, { ...NO_CLIPS, summary: true });
+  assert.deepEqual(view.tasks[1].clipped, { ...NO_CLIPS, handoff: true });
+  assert.deepEqual(view.tasks[2].clipped, { ...NO_CLIPS, evidenceCount: true, evidenceText: true });
+  assert.deepEqual(view.tasks.map(task => task.truncated), [true, true, true], 'the combined flag stays');
+
+  const clean = detailRun(fixtures.succeeded(), project);
+  assert.deepEqual(clean.tasks.map(task => task.clipped), [NO_CLIPS, NO_CLIPS, NO_CLIPS]);
+  assert.deepEqual(clean.capped, { tasks: false, sessions: false, candidates: false, usageSessions: false });
+  assert.equal(clean.blocker, null);
+});
+
+test('blocker and capped-list flags are reported separately', () => {
+  const run = fixtures.paused();
+  run.reason = 'R'.repeat(5000);
+  const paused = detailRun(run, project);
+  assert.equal(paused.blocker.reasonClipped, true);
+  assert.equal(paused.blocker.resolutionClipped, false);
+  assert.equal(paused.truncated, true);
+
+  const big = detailRun(oversizedRun(), project);
+  assert.equal(big.capped.tasks, true);
+  assert.equal(big.capped.usageSessions, true);
+  assert.equal(big.blocker.reasonClipped && big.blocker.resolutionClipped, true);
+});
+
+test('taskContent returns longer text and says whether anything is still cut', () => {
+  const run = fixtures.succeeded();
+  run.checkpoint.results[0].summary = 'S'.repeat(5000) + 'TAIL-MARKER';
+  const listed = detailRun(run, project).tasks[0];
+  assert.equal(listed.clipped.summary, true);
+  assert.ok(!listed.summary.includes('TAIL-MARKER'));
+
+  const full = taskContent(run, 0);
+  assert.equal(full.complete, true);
+  assert.equal(full.index, 0);
+  assert.equal(full.taskId, 'T1');
+  assert.equal(full.runId, 'run_1');
+  assert.ok(full.summary.endsWith('TAIL-MARKER'));
+  assert.deepEqual(full.clipped, NO_CLIPS);
+  assert.equal(full.evidenceTotal, 1);
+
+  const short = taskContent(fixtures.succeeded(), 1);
+  assert.equal(short.complete, true);
+  assert.equal(short.summary, 'Done 2');
+});
+
+test('taskContent fits the byte budget for a 1 MB summary and reports it as incomplete', () => {
+  const run = fixtures.succeeded();
+  run.checkpoint.results[0].summary = 'S'.repeat(1_000_000);
+  const content = taskContent(run, 0);
+  assert.equal(content.complete, false);
+  assert.equal(content.clipped.summary, true);
+  assert.ok(content.summary.length > 5000 && content.summary.length <= content.limits.text);
+  assert.ok(Buffer.byteLength(JSON.stringify({ ...content, fetchedAt: '2026-01-01T00:00:00.000Z' })) <= 200000);
+});
+
+test('taskContent is null for positions without a task and never carries internals', () => {
+  assert.equal(taskContent(fixtures.succeeded(), 3), null);
+  assert.equal(taskContent(fixtures.succeeded(), -1), null);
+  assert.equal(taskContent(fixtures.succeeded(), 1.5), null);
+  assert.equal(taskContent(fixtures.queued(), 0), null);
+  const text = JSON.stringify(taskContent(fixtures.succeeded(), 0));
+  for (const forbidden of FORBIDDEN) assert.ok(!text.includes(forbidden), `task content leaks ${forbidden}`);
+});
+
+test('blockerContent returns the recorded text, only for blocked runs', () => {
+  const run = fixtures.paused();
+  run.reason = 'R'.repeat(5000) + 'REASON-TAIL';
+  const content = blockerContent(run);
+  assert.equal(content.complete, true);
+  assert.ok(content.reason.endsWith('REASON-TAIL'));
+  assert.equal(content.resolution, 'Resume after the quota window resets');
+  assert.equal(content.status, 'paused');
+
+  const huge = fixtures.paused();
+  huge.reason = 'R'.repeat(1_000_000);
+  huge.resolution = 'X'.repeat(1_000_000);
+  const bounded = blockerContent(huge);
+  assert.equal(bounded.complete, false);
+  assert.deepEqual(bounded.clipped, { reason: true, resolution: true });
+  assert.ok(Buffer.byteLength(JSON.stringify({ ...bounded, fetchedAt: '2026-01-01T00:00:00.000Z' })) <= 200000);
+
+  assert.equal(blockerContent(fixtures.succeeded()), null);
+  assert.equal(blockerContent(makeRun({ status: 'running', reason: 'stale' })), null);
+  const none = blockerContent(fixtures.failedNoReason());
+  assert.equal(none.reasonRecorded, false);
+  for (const forbidden of FORBIDDEN) assert.ok(!JSON.stringify(content).includes(forbidden), `blocker content leaks ${forbidden}`);
+});
+
+test('content routes serve bounded GET answers and reject bad input', async t => {
+  const big = makeRun({ ...fixtures.succeeded(), id: 'run_big' });
+  big.checkpoint.results[0].summary = 'S'.repeat(1_000_000);
+  const paused = makeRun({ ...fixtures.paused(), id: 'run_paused' });
+  paused.reason = 'R'.repeat(3000) + 'REASON-TAIL';
+  const adapter = makeAdapter({ runs: [big, paused, makeRun({ ...fixtures.succeeded(), id: 'run_ok' })] });
+  const server = await listening(t, { adapter });
+
+  const large = await call(server, '/runs/run_big/tasks/0');
+  assert.equal(large.status, 200);
+  assert.ok(Buffer.byteLength(large.text) < 200000, `${Buffer.byteLength(large.text)} bytes`);
+  assert.equal(large.json.complete, false);
+  assert.equal(large.json.clipped.summary, true);
+  assert.equal(typeof large.json.fetchedAt, 'string');
+
+  const short = await call(server, '/runs/run_ok/tasks/1');
+  assert.equal(short.status, 200);
+  assert.equal(short.json.complete, true);
+  assert.equal(short.json.summary, 'Done 2');
+  assert.equal(short.json.taskId, 'T2');
+  for (const forbidden of FORBIDDEN) assert.ok(!short.text.includes(forbidden) && !large.text.includes(forbidden), `route leaks ${forbidden}`);
+
+  const blocker = await call(server, '/runs/run_paused/blocker');
+  assert.equal(blocker.status, 200);
+  assert.equal(blocker.json.complete, true);
+  assert.ok(blocker.json.reason.endsWith('REASON-TAIL'));
+
+  for (const target of ['/runs/run_ok/tasks/abc', '/runs/run_ok/tasks/-1', '/runs/run_ok/tasks/01', '/runs/run_ok/tasks/1.5', '/runs/run_ok/tasks/1e2', '/runs/run_ok/tasks/1234567']) {
+    const bad = await call(server, target);
+    assert.equal(bad.status, 400, target);
+    assert.equal(bad.json.error.kind, 'invalid-request');
+  }
+  for (const target of ['/runs/run_ok/tasks/3', '/runs/run_ok/tasks/99999', '/runs/run_unknown/tasks/0', '/runs/run_ok/blocker', '/runs/run_unknown/blocker', `/runs/${'a'.repeat(129)}/blocker`, `/runs/${'a'.repeat(129)}/tasks/0`]) {
+    const missing = await call(server, target);
+    assert.equal(missing.status, 404, target);
+    assert.equal(missing.json.error.kind, 'not-found');
+  }
+});
+
+/* ---------- gaps: large blocker route, exclusion of internals, remaining flags ---------- */
+
+const COORDINATOR_KEY = 'COORDINATOR-KEY-SECRET';
+const RUNTIME_MARKER = 'RUNTIME-FILE-CONTENTS-SECRET';
+const RAW_KEYS = ['"checkpoint"', '"specification"', '"binding"', '"caller"', '"quotaSelection"', '"resumeBinding"', '"feature"', '"settings"'];
+
+/** A run whose unprojected fields all carry markers: none of them may reach a content response. */
+function leakyRun(overrides = {}) {
+  const run = makeRun({
+    ...fixtures.paused(), id: 'run_leaky',
+    binding: { sessionID: 'ses_parent', coordinatorKey: COORDINATOR_KEY },
+    resumeBinding: { sessionID: 'ses_parent', coordinatorKey: COORDINATOR_KEY },
+    ...overrides,
+  });
+  run.checkpoint.coordinatorKey = COORDINATOR_KEY;
+  run.checkpoint.caller = { sessionID: 'ses_parent', coordinatorKey: COORDINATOR_KEY };
+  run.checkpoint.specification = { body: BODY_MARKER };
+  run.checkpoint.quotaSelection = { key: COORDINATOR_KEY };
+  run.checkpoint.runtimeFiles = { '.heimdall/managed.json': RUNTIME_MARKER, '.omc/project-memory.json': RUNTIME_MARKER };
+  run.checkpoint.results[0].ownerToken = OWNER_TOKEN;
+  run.checkpoint.results[0].runtimeFile = RUNTIME_MARKER;
+  return run;
+}
+
+test('content routes return strictly more of a 1 MB blocker than the detail clip, bounded, and complete for short text', async t => {
+  const huge = makeRun({ ...fixtures.paused(), id: 'run_hugeblock', reason: 'R'.repeat(1_000_000) + 'REASON-TAIL', resolution: 'X'.repeat(1_000_000) + 'RESOLUTION-TAIL' });
+  const adapter = makeAdapter({ runs: [huge, makeRun({ ...fixtures.paused(), id: 'run_shortblock' })] });
+  const server = await listening(t, { adapter });
+  const listed = detailRun(huge, project).blocker;
+  assert.equal(listed.reasonClipped && listed.resolutionClipped, true);
+
+  const response = await call(server, '/runs/run_hugeblock/blocker');
+  assert.equal(response.status, 200);
+  assert.ok(Buffer.byteLength(response.text) < 200000, `${Buffer.byteLength(response.text)} bytes`);
+  assert.equal(response.json.complete, false);
+  assert.deepEqual(response.json.clipped, { reason: true, resolution: true });
+  assert.ok(response.json.reason.length > listed.reason.length && response.json.reason.length > 2000, 'strictly more reason than the detail shows');
+  assert.ok(response.json.resolution.length > listed.resolution.length && response.json.resolution.length > 2000, 'strictly more resolution than the detail shows');
+  assert.ok(response.json.reason.length <= response.json.limit && response.json.resolution.length <= response.json.limit);
+
+  const short = await call(server, '/runs/run_shortblock/blocker');
+  assert.equal(short.status, 200);
+  assert.equal(short.json.complete, true);
+  assert.deepEqual(short.json.clipped, { reason: false, resolution: false });
+  assert.equal(short.json.resolution, 'Resume after the quota window resets');
+
+  const task = fixtures.succeeded();
+  task.id = 'run_hugetask';
+  task.checkpoint.results[0].summary = 'S'.repeat(1_000_000);
+  const taskServer = await listening(t, { adapter: makeAdapter({ runs: [task] }) });
+  const taskResponse = await call(taskServer, '/runs/run_hugetask/tasks/0');
+  const listedTask = detailRun(task, project).tasks[0];
+  assert.equal(taskResponse.json.complete, false);
+  assert.ok(taskResponse.json.summary.length > listedTask.summary.length, 'strictly more summary than the detail shows');
+});
+
+test('content responses never carry keys, tokens, prompts, raw checkpoint keys or runtime-file contents', async t => {
+  const leaky = leakyRun();
+  const adapter = makeAdapter({ runs: [leaky] });
+  const server = await listening(t, { adapter });
+  const forbidden = [...FORBIDDEN, COORDINATOR_KEY, RUNTIME_MARKER, 'coordinatorKey', 'runtimeFile', 'ownerToken', 'project-memory', 'managed.json', ...RAW_KEYS];
+  const responses = [
+    await call(server, '/runs/run_leaky/blocker'),
+    await call(server, '/runs/run_leaky/tasks/0'),
+    await call(server, '/runs/run_leaky/tasks/1'),
+  ];
+  assert.deepEqual(responses.map(response => response.status), [200, 200, 200]);
+  for (const response of responses) {
+    for (const item of forbidden) assert.ok(!response.text.includes(item), `content response leaks ${item}`);
+  }
+  // The same holds for the functions behind the routes, for every position the plan lists.
+  const direct = [blockerContent(leaky), ...[0, 1, 2].map(index => taskContent(leaky, index))].map(value => JSON.stringify(value));
+  for (const text of direct) for (const item of forbidden) assert.ok(!text.includes(item), `projection leaks ${item}`);
+});
+
+test('every remaining task, blocker and list limit is flagged separately', () => {
+  const run = fixtures.succeeded();
+  run.checkpoint.tasks[0].title = 'T'.repeat(500);
+  run.checkpoint.results[1].model = 'M'.repeat(500);
+  const view = detailRun(run, project);
+  assert.deepEqual(view.tasks[0].clipped, { ...NO_CLIPS, title: true });
+  assert.deepEqual(view.tasks[1].clipped, { ...NO_CLIPS, model: true });
+  assert.deepEqual(view.tasks[2].clipped, NO_CLIPS);
+  const full = taskContent(run, 0);
+  assert.equal(full.title.length, 500);
+  assert.equal(full.clipped.title, false);
+  assert.equal(taskContent(run, 1).model.length, 500);
+
+  const resolution = fixtures.paused();
+  resolution.resolution = 'Q'.repeat(5000);
+  const onlyResolution = detailRun(resolution, project).blocker;
+  assert.equal(onlyResolution.reasonClipped, false);
+  assert.equal(onlyResolution.resolutionClipped, true);
+
+  const many = fixtures.succeeded();
+  many.checkpoint.results = Array.from({ length: 130 }, (_, index) => result(index + 1, { taskId: 'T1', sessionId: `child-${index}` }));
+  many.settings = { ...settings, executorCandidates: Array.from({ length: 30 }, (_, index) => ({ key: `k${index}`, quotaProvider: 'openai', model: `openai/model-${index}` })) };
+  const capped = detailRun(many, project);
+  assert.equal(capped.capped.sessions, true);
+  assert.equal(capped.capped.candidates, true);
+  assert.equal(capped.sessions.completed.length, 100);
+  assert.equal(capped.models.candidates.length, 20);
+  assert.equal(capped.capped.tasks, false);
+  assert.equal(capped.truncated, true);
 });

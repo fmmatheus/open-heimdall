@@ -2,16 +2,21 @@ import { loadCoordinatorConfiguration } from '../../coordinator/config.js';
 import type { CoordinatorConfiguration } from '../../coordinator/config.js';
 import type { ProjectRecord } from '../../coordinator/types.js';
 import { LIMITS, RUN_STATUSES } from '../shared/protocol.js';
-import type { ChangeFeed, ProjectsResponse, ReviewFileResponse, ReviewResponse, RunResponse, RunsResponse, RunSummary, WireRunStatus } from '../shared/protocol.js';
+import type {
+  BlockerContentResponse, ChangeFeed, ProjectsResponse, ReviewFileResponse, ReviewResponse, RunResponse, RunsResponse, RunSummary,
+  TaskContentResponse, WireRunStatus,
+} from '../shared/protocol.js';
 import { CoordinatorAdapterError } from './coordinator.js';
 import type { CoordinatorAdapter } from './coordinator.js';
 import { createChangeTracker, InvalidCursorError } from './events.js';
-import { detailRun, summarizeProject, summarizeRun } from './projection.js';
+import { blockerContent, detailRun, summarizeProject, summarizeRun, taskContent } from './projection.js';
 import { reviewFile, reviewRun, ReviewGitError, ReviewRequestError, validReviewPath } from './review.js';
 import { HttpError } from './server.js';
 import type { Route } from './server.js';
 
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+/** A plan position: digits only, no sign, no leading zero, at most six digits. */
+const TASK_INDEX = /^(?:0|[1-9][0-9]{0,5})$/;
 
 function single(query: URLSearchParams, name: string): string | undefined {
   const values = query.getAll(name);
@@ -70,6 +75,32 @@ export function projectionRoutes(options: { adapter: CoordinatorAdapter; now?: (
         if (!IDENTIFIER.test(id)) throw new HttpError(404, 'not-found', 'No such Heimdall run.');
         const [run, projects] = await Promise.all([adapter.run(id), adapter.projects()]);
         return { run: detailRun(run, directories(projects).get(run.projectId)), fetchedAt: now().toISOString() };
+      },
+    },
+    {
+      // Read-only: more of one task's recorded text. `:index` is the 0-based plan position, digits only.
+      method: 'GET', path: '/runs/:id/tasks/:index',
+      async handler({ params }): Promise<TaskContentResponse> {
+        const id = params.id!;
+        if (!IDENTIFIER.test(id)) throw new HttpError(404, 'not-found', 'No such Heimdall run.');
+        const raw = params.index!;
+        // Rejected before the coordinator is consulted.
+        if (!TASK_INDEX.test(raw)) throw new HttpError(400, 'invalid-request', 'The task index must be a whole number.');
+        const run = await adapter.run(id);
+        const content = taskContent(run, Number(raw));
+        if (content === null) throw new HttpError(404, 'not-found', 'No such task in this Heimdall run.');
+        return { ...content, fetchedAt: now().toISOString() };
+      },
+    },
+    {
+      // Read-only: the recorded reason and resolution of a paused, failed or reconciliation-required run.
+      method: 'GET', path: '/runs/:id/blocker',
+      async handler({ params }): Promise<BlockerContentResponse> {
+        const id = params.id!;
+        if (!IDENTIFIER.test(id)) throw new HttpError(404, 'not-found', 'No such Heimdall run.');
+        const content = blockerContent(await adapter.run(id));
+        if (content === null) throw new HttpError(404, 'not-found', 'This Heimdall run has no recorded blocker.');
+        return { ...content, fetchedAt: now().toISOString() };
       },
     },
     {

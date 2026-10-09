@@ -15,7 +15,11 @@ import {
   evidenceRow,
   DEFAULT_DETAIL_TAB,
   DETAIL_TABS,
+  blockerDisplay,
   budgetText,
+  detailNotice,
+  shortenedFields,
+  taskDisplay,
   currentActionText,
   formatAge,
   formatCount,
@@ -177,6 +181,7 @@ test('paused run: warning badge and recorded reason shown verbatim', () => {
   assert.deepEqual(progressInfo(run), { value: 40, label: '2 of 5 tasks complete', tone: 'warning' });
   assert.deepEqual(blockerInfo(run.blocker), {
     title: 'Run is paused', tone: 'warning', reason: 'Token budget reached for T3', resolution: 'Raise maxRunTokens',
+    reasonClipped: false, resolutionClipped: false,
   });
 });
 
@@ -825,4 +830,136 @@ test('panel wiring: one shared navigation load feeds summary actions, the sessio
     assert.equal(hostCalls.includes(name), false, name);
     assert.equal(new RegExp(`\\b${name}\\b`).test(main), false, name);
   }
+});
+
+/* ---------- on-demand task and blocker text ---------- */
+
+const NO_CLIPS = { title: false, summary: false, handoff: false, model: false, evidenceCount: false, evidenceText: false };
+const LIMITS_USED = { title: 2000, model: 1000, text: 32000, gate: 2000, detail: 8000, evidence: 200 };
+const clippedTask = (clipped, extra = {}) => ({
+  index: 0, id: 'T1', title: 'Scaffold', state: 'done', summary: 'start of the summary…', handoff: null,
+  evidence: [{ gateId: 'G1', gate: 'npm test', passed: true, detail: 'ok…' }], sessionId: null, model: null, truncated: true,
+  clipped: { ...NO_CLIPS, ...clipped }, ...extra,
+});
+const loadedTask = (extra = {}) => ({
+  runId: 'run_1', index: 0, taskId: 'T1', title: 'Scaffold', state: 'done', summary: 'start of the summary and the rest TAIL-MARKER', handoff: null, model: null,
+  evidence: [{ gateId: 'G1', gate: 'npm test', passed: true, detail: 'ok and all of it' }], evidenceTotal: 1, clipped: NO_CLIPS, complete: true,
+  limits: LIMITS_USED, fetchedAt: 'x', ...extra,
+});
+const entryOf = data => ({ loading: false, data, error: null });
+const rowOf = clipped => taskRows([clippedTask(clipped)])[0];
+
+test('only shortened fields get a toggle, and rows carry the plan position', () => {
+  assert.deepEqual(shortenedFields(NO_CLIPS), []);
+  assert.deepEqual(shortenedFields({ ...NO_CLIPS, summary: true, evidenceText: true, evidenceCount: true }), ['summary', 'evidence']);
+  const row = rowOf({ summary: true });
+  assert.equal(row.index, 0);
+  assert.deepEqual(row.shortened, ['summary']);
+  const display = taskDisplay(row, undefined, new Set());
+  assert.equal(display.summary.toggle.label, 'Show full summary');
+  assert.equal(display.summary.toggle.expanded, false);
+  assert.equal(display.summary.text, 'start of the summary…');
+  assert.match(display.summary.note, /summary is shortened/);
+  assert.equal(display.handoff.toggle, null);
+  assert.equal(display.title.toggle, null);
+  assert.equal(display.evidence.toggle, null);
+  assert.equal(display.status, null);
+  // Older answers without index or clip flags still render.
+  const legacy = taskRows([{ id: 'T9', title: 'x', state: 'pending', summary: null, handoff: null, evidence: [], sessionId: null, model: null, truncated: false }])[0];
+  assert.deepEqual([legacy.index, legacy.shortened], [0, []]);
+});
+
+test('toggling reveals the loaded text with its tail and hides it again', () => {
+  const row = rowOf({ summary: true });
+  const loading = taskDisplay(row, { loading: true, data: null, error: null }, new Set(['summary']));
+  assert.equal(loading.summary.text, 'start of the summary…', 'nothing is revealed before the text arrives');
+  assert.deepEqual(loading.status, { kind: 'loading', text: 'Loading the full text…', refresh: false });
+
+  const shown = taskDisplay(row, entryOf(loadedTask()), new Set(['summary']));
+  assert.ok(shown.summary.text.endsWith('TAIL-MARKER'));
+  assert.deepEqual(shown.summary.toggle, { label: 'Hide full summary', expanded: true });
+  assert.equal(shown.summary.note, null, 'complete text needs no note');
+  assert.equal(shown.status, null);
+
+  const hidden = taskDisplay(row, entryOf(loadedTask()), new Set());
+  assert.equal(hidden.summary.text, 'start of the summary…');
+  assert.equal(hidden.summary.toggle.label, 'Show full summary');
+});
+
+test('incomplete content states the limit instead of pretending to be whole', () => {
+  const row = rowOf({ summary: true });
+  const partial = loadedTask({ summary: 'x'.repeat(31999) + '…', clipped: { ...NO_CLIPS, summary: true }, complete: false });
+  const shown = taskDisplay(row, entryOf(partial), new Set(['summary']));
+  assert.match(shown.summary.note, /Showing the first 31,999 characters; the rest exceeds what the panel can load\./);
+
+  const evidenceRow = rowOf({ evidenceCount: true });
+  const manyEvidence = taskDisplay(evidenceRow, entryOf(loadedTask({ evidenceTotal: 500, clipped: { ...NO_CLIPS, evidenceCount: true }, complete: false })), new Set(['evidence']));
+  assert.match(manyEvidence.evidence.note, /Showing 1 of 500 evidence items/);
+  assert.equal(manyEvidence.evidence.toggle.label, 'Hide full evidence');
+  const revealed = taskDisplay(evidenceRow, entryOf(loadedTask()), new Set(['evidence']));
+  assert.equal(revealed.evidence.rows[0].detail, 'ok and all of it');
+  assert.equal(taskDisplay(evidenceRow, undefined, new Set()).evidence.rows[0].detail, 'ok…');
+});
+
+test('a task whose identity changed is reported and offers a refresh instead of showing other text', () => {
+  const row = rowOf({ summary: true });
+  const moved = taskDisplay(row, entryOf(loadedTask({ taskId: 'T7', summary: 'SOMEONE ELSE' })), new Set(['summary']));
+  assert.equal(moved.summary.text, 'start of the summary…');
+  assert.equal(moved.status.kind, 'changed');
+  assert.equal(moved.status.refresh, true);
+  assert.match(moved.status.text, /task list changed/);
+  assert.ok(!JSON.stringify(moved).includes('SOMEONE ELSE'));
+
+  const failed = taskDisplay(row, { loading: false, data: null, error: 'Heimdall could not load the full text.' }, new Set(['summary']));
+  assert.deepEqual(failed.status, { kind: 'error', text: 'Heimdall could not load the full text.', refresh: false });
+});
+
+test('blocker text can be expanded the same way', () => {
+  const info = blockerInfo({ status: 'paused', reason: 'cut…', reasonRecorded: true, resolution: 'Resume…', reasonClipped: true, resolutionClipped: true });
+  assert.deepEqual([info.reasonClipped, info.resolutionClipped], [true, true]);
+  const before = blockerDisplay(info, null, new Set());
+  assert.equal(before.reason.text, 'cut…');
+  assert.equal(before.reason.toggle.label, 'Show full reason');
+  assert.equal(before.resolution.toggle.label, 'Show full resolution');
+  const content = { runId: 'run_1', status: 'paused', reason: 'cut and the REASON-TAIL', reasonRecorded: true, resolution: 'Resume and the RESOLUTION-TAIL', clipped: { reason: false, resolution: true }, complete: false, limit: 32000, fetchedAt: 'x' };
+  const after = blockerDisplay(info, entryOf(content), new Set(['reason', 'resolution']));
+  assert.ok(after.reason.text.endsWith('REASON-TAIL'));
+  assert.equal(after.reason.note, null);
+  assert.match(after.resolution.note, /Showing the first 31,999 characters/);
+  assert.equal(after.reason.toggle.label, 'Hide full reason');
+
+  const plain = blockerDisplay(blockerInfo({ status: 'paused', reason: 'short', reasonRecorded: true, resolution: null, reasonClipped: false, resolutionClipped: false }), null, new Set());
+  assert.equal(plain.reason.toggle, null);
+  assert.equal(plain.resolution.toggle, null);
+});
+
+test('the shortened-text notice names what was cut and how to see it, never a saved state', () => {
+  assert.equal(detailNotice(detail()), null);
+  const tasksClipped = detail({ tasks: [clippedTask({ summary: true }), clippedTask({ handoff: true }, { index: 1, id: 'T2' })], truncated: true });
+  const notice = detailNotice(tasksClipped);
+  assert.match(notice, /Text was shortened in 2 tasks\./);
+  assert.match(notice, /expand a task and choose Show full/);
+
+  const blocker = detailNotice(detail({ blocker: { status: 'paused', reason: 'x', reasonRecorded: true, resolution: null, reasonClipped: true, resolutionClipped: false }, truncated: true }));
+  assert.match(blocker, /blocker text was shortened/);
+
+  const capped = detailNotice(detail({
+    capped: { tasks: true, sessions: false, candidates: true, usageSessions: true }, total: 150, truncated: true,
+  }));
+  assert.match(capped, /Only the first 2 tasks are listed\. The plan has 150\./);
+  assert.match(capped, /model candidates/);
+  assert.match(capped, /usage totals still count all of them/);
+
+  assert.match(detailNotice(detail({ truncated: true })), /long values/);
+  for (const text of [notice, blocker, capped]) assert.doesNotMatch(text, /saved run state/i);
+});
+
+test('the panel sources write run text safely and never mention a saved run state', async () => {
+  const dir = fileURLToPath(new URL('../src/extension/panel/', import.meta.url));
+  const main = await readFile(join(dir, 'main.ts'), 'utf8');
+  const model = await readFile(join(dir, 'view-model.ts'), 'utf8');
+  assert.doesNotMatch(main + model, /saved run state/i);
+  assert.match(main, /aria-expanded/);
+  assert.match(main, /aria-controls/);
+  assert.doesNotMatch(main, /innerHTML|insertAdjacentHTML/);
 });

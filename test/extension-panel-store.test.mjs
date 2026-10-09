@@ -561,3 +561,196 @@ test('the client refuses malformed ids before touching the host', async () => {
   await filteredClient.runs({ projectId: '../x', status: 'nope' });
   assert.deepEqual(filtered, [{ method: 'GET', path: '/runs' }]);
 });
+
+/* ---------- on-demand task and blocker content ---------- */
+
+const NO_CLIPS = { title: false, summary: false, handoff: false, model: false, evidenceCount: false, evidenceText: false };
+const taskOf = (index, extra = {}) => ({
+  index, id: `T${index + 1}`, title: `Task ${index + 1}`, state: 'done', summary: 'short…', handoff: null, evidence: [], sessionId: null, model: null,
+  truncated: true, clipped: { ...NO_CLIPS, summary: true }, ...extra,
+});
+const taskContentOf = (runId, index, extra = {}) => ({
+  runId, index, taskId: `T${index + 1}`, title: `Task ${index + 1}`, state: 'done', summary: `full summary ${index} TAIL`, handoff: null, model: null,
+  evidence: [], evidenceTotal: 0, clipped: NO_CLIPS, complete: true,
+  limits: { title: 2000, model: 1000, text: 32000, gate: 2000, detail: 8000, evidence: 200 }, fetchedAt: 'x', ...extra,
+});
+const blockerOfRun = { status: 'paused', reason: 'cut…', reasonRecorded: true, resolution: null, reasonClipped: true, resolutionClipped: false };
+const blockerContentOf = runId => ({
+  runId, status: 'paused', reason: 'full reason TAIL', reasonRecorded: true, resolution: null, clipped: { reason: false, resolution: false }, complete: true, limit: 32000, fetchedAt: 'x',
+});
+
+function contentFixture() {
+  const f = fixture();
+  f.service.details.run_1 = { ...detailOf('run_1'), status: 'paused', blocker: blockerOfRun, tasks: [taskOf(0), taskOf(1)] };
+  f.service.details.run_2 = { ...detailOf('run_2'), tasks: [taskOf(0)] };
+  f.service.respond = request => {
+    const task = /^\/runs\/([^/]+)\/tasks\/(\d+)$/.exec(request.path);
+    if (task) return { status: 200, body: JSON.stringify(taskContentOf(task[1], Number(task[2]))) };
+    const blocker = /^\/runs\/([^/]+)\/blocker$/.exec(request.path);
+    if (blocker) return { status: 200, body: JSON.stringify(blockerContentOf(blocker[1])) };
+    return null;
+  };
+  const contentPaths = () => f.service.requests.map(request => request.path).filter(path => /\/(tasks\/\d+|blocker)$/.test(path));
+  return { ...f, contentPaths };
+}
+
+test('content is requested only when asked, once per run detail', async () => {
+  const { store, clock, contentPaths } = contentFixture();
+  store.start();
+  await clock.advance(0);
+  store.select('run_1');
+  await clock.advance(0);
+  assert.deepEqual(contentPaths(), [], 'selecting a run never loads task text');
+  assert.deepEqual(store.getState().content, { runId: null, tasks: {}, blocker: null });
+
+  store.loadTaskContent('run_1', 1);
+  await clock.advance(0);
+  assert.deepEqual(contentPaths(), ['/runs/run_1/tasks/1']);
+  const entry = store.getState().content.tasks[1];
+  assert.equal(entry.loading, false);
+  assert.equal(entry.data.summary, 'full summary 1 TAIL');
+  assert.equal(store.getState().content.runId, 'run_1');
+
+  store.loadTaskContent('run_1', 1);
+  store.loadTaskContent('run_1', 1);
+  await clock.advance(0);
+  assert.deepEqual(contentPaths(), ['/runs/run_1/tasks/1'], 'a loaded task is not requested again');
+
+  store.loadBlockerContent('run_1');
+  store.loadBlockerContent('run_1');
+  await clock.advance(0);
+  assert.deepEqual(contentPaths(), ['/runs/run_1/tasks/1', '/runs/run_1/blocker']);
+  assert.equal(store.getState().content.blocker.data.reason, 'full reason TAIL');
+  store.dispose();
+});
+
+test('only tasks and blockers the loaded detail lists are requested', async () => {
+  const { store, clock, contentPaths, service } = contentFixture();
+  store.start();
+  await clock.advance(0);
+  store.loadTaskContent('run_1', 0);
+  await clock.advance(0);
+  assert.deepEqual(contentPaths(), [], 'no run selected');
+  store.select('run_2');
+  await clock.advance(0);
+  store.loadTaskContent('run_1', 0);
+  store.loadTaskContent('run_2', 5);
+  store.loadTaskContent('run_2', -1);
+  store.loadTaskContent('run_2', 1.5);
+  store.loadTaskContent('../x', 0);
+  store.loadBlockerContent('run_2');
+  store.loadBlockerContent('run_1');
+  await clock.advance(0);
+  assert.deepEqual(contentPaths(), [], 'out-of-range, unselected and blocker-less requests are ignored');
+  assert.equal(service.requests.every(request => request.method === 'GET'), true);
+  store.dispose();
+});
+
+test('a response for a run that is no longer selected is ignored', async () => {
+  const { store, clock, service, contentPaths } = contentFixture();
+  store.start();
+  await clock.advance(0);
+  store.select('run_1');
+  await clock.advance(0);
+  let release;
+  service.intercept = request => (request.path.endsWith('/tasks/0') ? new Promise(resolve => { release = resolve; }) : undefined);
+  store.loadTaskContent('run_1', 0);
+  await clock.advance(0);
+  assert.equal(store.getState().content.tasks[0].loading, true);
+  store.select('run_2');
+  await clock.advance(0);
+  release();
+  await clock.advance(0);
+  assert.equal(store.getState().selectedRunId, 'run_2');
+  assert.deepEqual(store.getState().content, { runId: null, tasks: {}, blocker: null }, 'nothing of run_1 is kept');
+  assert.deepEqual(contentPaths(), ['/runs/run_1/tasks/0']);
+  store.dispose();
+});
+
+test('loaded content survives polls that change nothing and is dropped when progress moves', async () => {
+  const { store, clock, service } = contentFixture();
+  store.start();
+  await clock.advance(0);
+  store.select('run_1');
+  await clock.advance(0);
+  store.loadTaskContent('run_1', 0);
+  await clock.advance(0);
+  const loaded = store.getState().content;
+  service.change(['run_1'], {});
+  await clock.advance(POLL);
+  assert.equal(store.getState().content, loaded, 'same plan and progress keeps the cache');
+
+  service.details.run_1 = { ...service.details.run_1, completed: 2 };
+  service.change(['run_1']);
+  await clock.advance(POLL);
+  assert.deepEqual(store.getState().content, { runId: null, tasks: {}, blocker: null });
+  store.dispose();
+});
+
+test('a failed content request stays local to the text and can be retried', async () => {
+  const { store, clock, service, contentPaths } = contentFixture();
+  store.start();
+  await clock.advance(0);
+  store.select('run_1');
+  await clock.advance(0);
+  service.respond = request => (/\/tasks\/0$/.test(request.path) ? { status: 500, body: JSON.stringify({ error: { kind: 'internal-error', message: SECRET } }) } : null);
+  store.loadTaskContent('run_1', 0);
+  await clock.advance(0);
+  const failed = store.getState().content.tasks[0];
+  assert.equal(failed.data, null);
+  assert.equal(failed.loading, false);
+  assert.equal(failed.error, 'Heimdall could not load the full text.');
+  assert.ok(!JSON.stringify(store.getState()).includes('RAW-SECRET'));
+  assert.equal(store.getState().connection, 'online', 'the connection is not blamed');
+
+  service.respond = request => (/\/tasks\/0$/.test(request.path) ? { status: 200, body: JSON.stringify(taskContentOf('run_1', 0)) } : null);
+  store.loadTaskContent('run_1', 0);
+  await clock.advance(0);
+  assert.equal(store.getState().content.tasks[0].data.taskId, 'T1');
+  assert.equal(store.getState().content.tasks[0].error, null);
+  assert.equal(contentPaths().length, 2);
+  store.dispose();
+});
+
+test('refreshDetail drops loaded content and reloads the run', async () => {
+  const { store, clock, service, paths } = contentFixture();
+  store.start();
+  await clock.advance(0);
+  store.select('run_1');
+  await clock.advance(0);
+  store.loadTaskContent('run_1', 0);
+  await clock.advance(0);
+  const before = service.requests.length;
+  store.refreshDetail();
+  await clock.advance(0);
+  assert.deepEqual(store.getState().content, { runId: null, tasks: {}, blocker: null });
+  assert.deepEqual(paths(before), ['/runs/run_1']);
+  store.dispose();
+});
+
+test('the client allows only the exact content paths and checks the shape of the answers', async () => {
+  for (const path of ['/runs/run_1/tasks/0', '/runs/run_1/tasks/12', '/runs/run_1/tasks/999999', '/runs/run_1/blocker']) assert.equal(isAllowedPath(path), true, path);
+  for (const path of ['/runs/run_1/tasks', '/runs/run_1/tasks/', '/runs/run_1/tasks/-1', '/runs/run_1/tasks/01', '/runs/run_1/tasks/1000000', '/runs/run_1/tasks/1/x', '/runs/run_1/tasks/a', '/runs/run_1/tasks/1?x=1', '/runs/run_1/blocker/', '/runs/run_1/blocker/x', '/runs/run_1/blockers', '/runs/../tasks/0', '/runs//tasks/0']) {
+    assert.equal(isAllowedPath(path), false, path);
+  }
+  const seen = [];
+  const answer = body => ({ async serviceRequest(request) { seen.push(request); return { status: 200, body: JSON.stringify(body) }; } });
+
+  const good = createPanelClient(answer(taskContentOf('run_1', 2)));
+  assert.equal((await good.taskContent('run_1', 2)).taskId, 'T3');
+  assert.deepEqual(seen.map(request => [request.method, request.path]), [['GET', '/runs/run_1/tasks/2']]);
+  await assert.rejects(good.taskContent('run_1', 1), error => error.code === 'invalid-response', 'a different position is refused');
+  await assert.rejects(createPanelClient(answer(taskContentOf('run_9', 2))).taskContent('run_1', 2), error => error.code === 'invalid-response');
+  await assert.rejects(createPanelClient(answer(taskContentOf('run_1', 2, { clipped: { title: true } }))).taskContent('run_1', 2), error => error.code === 'invalid-response');
+  await assert.rejects(createPanelClient(answer(taskContentOf('run_1', 2, { summary: 'x'.repeat(32001) }))).taskContent('run_1', 2), error => error.code === 'invalid-response');
+  await assert.rejects(createPanelClient(answer({})).taskContent('run_1', 0), error => error.code === 'invalid-response');
+  const before = seen.length;
+  for (const index of [-1, 1.5, 1000000, Number.NaN]) await assert.rejects(good.taskContent('run_1', index));
+  await assert.rejects(good.taskContent('../x', 0));
+  await assert.rejects(good.blockerContent('a/b'));
+  assert.equal(seen.length, before, 'invalid arguments never reach the host');
+
+  assert.equal((await createPanelClient(answer(blockerContentOf('run_1'))).blockerContent('run_1')).reason, 'full reason TAIL');
+  await assert.rejects(createPanelClient(answer(blockerContentOf('run_2'))).blockerContent('run_1'), error => error.code === 'invalid-response');
+  await assert.rejects(createPanelClient(answer({ ...blockerContentOf('run_1'), clipped: {} })).blockerContent('run_1'), error => error.code === 'invalid-response');
+});

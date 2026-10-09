@@ -37,6 +37,9 @@
       .hm-evidence-head { display: flex; align-items: center; gap: 8px; }
       .hm-label { font-size: 0.75rem; color: var(--oc-muted, inherit); margin: 0; }
       .hm-slot:empty { display: none; }
+      .hm-content { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+      .hm-content:empty { display: none; }
+      .hm-content > .hm-text, .hm-content > .hm-meta { align-self: stretch; }
       .hm-sessions { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
       .hm-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
       .hm-completed { border: 1px solid var(--oc-border, transparent); border-radius: 8px; padding: 6px 8px; align-self: stretch; }

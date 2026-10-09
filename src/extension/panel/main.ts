@@ -20,6 +20,8 @@ import {
   ALL_FILTER,
   DEFAULT_DETAIL_TAB,
   bannerInfo,
+  blockerDisplay,
+  detailNotice,
   detailPlaceholder,
   detailTabs,
   emptyInfo,
@@ -28,11 +30,11 @@ import {
   runRows,
   statusFilterOptions,
   summaryInfo,
+  taskDisplay,
   taskRows,
   technicalSections,
-  truncationNotice,
 } from './view-model.js';
-import type { Badge, DetailTabId, LabeledRow } from './view-model.js';
+import type { Badge, BlockerField, ContentStatus, DetailTabId, FieldDisplay, LabeledRow, ShortenedField } from './view-model.js';
 import { reviewView } from './review-view.js';
 import type { DiffView, ReviewView } from './review-view.js';
 import { RUN_STATUSES } from '../shared/protocol.js';
@@ -137,6 +139,13 @@ function mountPanel(): void {
   let reviewPainter: ((state: PanelState) => void) | null = null;
   /** Refreshes the summary's "Updated … ago" line between polls; set while a detail is drawn. */
   let updatedPainter: (() => void) | null = null;
+  /** Repaint the blocker and task text in place when the store's on-demand content changes. */
+  let contentPainters: Array<(state: PanelState) => void> = [];
+  let paintedContent: PanelState['content'] | null = null;
+  /** Fields the user asked to see in full, for the run drawn; dropped when another run is drawn. */
+  let revealedRun = '';
+  const revealedTaskFields = new Map<string, Set<ShortenedField>>();
+  const revealedBlocker = new Set<BlockerField>();
   const painted = { project: '', status: '', rows: '' };
 
   const focusList = (): void => {
@@ -261,8 +270,44 @@ function mountPanel(): void {
     renderedDetail = null;
     reviewPainter = null;
     updatedPainter = null;
+    contentPainters = [];
+    paintedContent = null;
     detailContent.replaceChildren();
   };
+
+  /** A toggle for one shortened field: a ghost button that says what it shows and which region it controls. */
+  function toggleButton(parent: HTMLElement, handles: Array<{ dispose: () => void }>, key: string, toggle: NonNullable<FieldDisplay['toggle']>, controls: string, onClick: () => void): void {
+    const slot = node('span');
+    parent.append(slot);
+    handles.push(mountButton(slot, { label: toggle.label, variant: 'ghost', size: 'sm', onClick }));
+    const button = slot.querySelector<HTMLElement>('button');
+    if (!button) return;
+    button.dataset.toggleKey = key;
+    button.setAttribute('aria-expanded', String(toggle.expanded));
+    button.setAttribute('aria-controls', controls);
+  }
+
+  /** Loading is announced politely, failures as alerts; a changed plan offers Refresh. */
+  function statusNode(parent: HTMLElement, handles: Array<{ dispose: () => void }>, status: ContentStatus): void {
+    const text = node('p', 'hm-meta', status.text);
+    text.setAttribute('role', status.kind === 'loading' ? 'status' : 'alert');
+    parent.append(text);
+    if (status.refresh) {
+      const actions = node('div', 'hm-actions');
+      const slot = node('span');
+      actions.append(slot);
+      handles.push(mountButton(slot, { label: 'Refresh', variant: 'outline', size: 'sm', onClick: () => store.refreshDetail() }));
+      parent.append(actions);
+    }
+  }
+
+  /** Repaint `target` with `paint`, keeping keyboard focus on the same toggle. */
+  function repaintKeepingFocus(target: HTMLElement, paint: () => void): void {
+    const active = document.activeElement;
+    const key = active instanceof HTMLElement && target.contains(active) ? active.dataset.toggleKey ?? null : null;
+    paint();
+    if (key !== null) target.querySelector<HTMLElement>(`[data-toggle-key="${key}"]`)?.focus();
+  }
 
   function badge(parent: HTMLElement, value: Badge): void {
     const slot = node('span');
@@ -324,10 +369,43 @@ function mountPanel(): void {
       blocker.dataset.tone = info.blocker.tone;
       blocker.setAttribute('role', 'note');
       blocker.append(node('p', 'hm-blocker-title', info.blocker.title));
-      blocker.append(node('p', 'hm-text', info.blocker.reason));
-      if (info.blocker.resolution) {
-        blocker.append(node('p', 'hm-label', 'Recorded resolution'), node('p', 'hm-text', info.blocker.resolution));
-      }
+      const blockerInfo = info.blocker;
+      const blockerBody = node('div', 'hm-content');
+      blockerBody.id = 'hm-blocker-content';
+      blocker.append(blockerBody);
+      let blockerHandles: Array<{ dispose: () => void }> = [];
+      const paintBlocker = (state: PanelState): void => {
+        const entry = state.content.runId === detail.id ? state.content.blocker : null;
+        if (!entry) revealedBlocker.clear();
+        const view = blockerDisplay(blockerInfo, entry, revealedBlocker);
+        repaintKeepingFocus(blockerBody, () => {
+          for (const handle of blockerHandles) handle.dispose();
+          blockerHandles = [];
+          blockerBody.replaceChildren();
+          const toggle = (name: BlockerField, shown: FieldDisplay['toggle']): void => {
+            if (shown === null) return;
+            toggleButton(blockerBody, blockerHandles, name, shown, 'hm-blocker-content', () => {
+              const now = store.getState();
+              const loaded = now.content.runId === detail.id && now.content.blocker?.data != null;
+              if (loaded && revealedBlocker.has(name)) revealedBlocker.delete(name);
+              else { revealedBlocker.add(name); store.loadBlockerContent(detail.id); }
+              paintBlocker(store.getState());
+            });
+          };
+          blockerBody.append(node('p', 'hm-text', view.reason.text));
+          if (view.reason.note) blockerBody.append(node('p', 'hm-meta', view.reason.note));
+          toggle('reason', view.reason.toggle);
+          if (view.resolution.text) {
+            blockerBody.append(node('p', 'hm-label', 'Recorded resolution'), node('p', 'hm-text', view.resolution.text));
+            if (view.resolution.note) blockerBody.append(node('p', 'hm-meta', view.resolution.note));
+            toggle('resolution', view.resolution.toggle);
+          }
+          if (view.status) statusNode(blockerBody, blockerHandles, view.status);
+        });
+      };
+      contentPainters.push(paintBlocker);
+      detailHandles.push({ dispose: () => { for (const handle of blockerHandles) handle.dispose(); blockerHandles = []; } });
+      paintBlocker(store.getState());
       box.append(blocker);
     }
 
@@ -453,30 +531,75 @@ function mountPanel(): void {
       });
       const summary = node('summary');
       badge(summary, task.badge);
-      summary.append(node('span', 'hm-task-title', `${task.id}: ${task.title}`));
+      const titleText = node('span', 'hm-task-title', `${task.id}: ${task.title}`);
+      summary.append(titleText);
       details.append(summary);
       const inner = node('div', 'hm-task-body');
       const sessionSlot = node('div', 'hm-slot');
       sessionSlots.set(task.id, sessionSlot);
       inner.append(sessionSlot);
-      if (task.summary) inner.append(node('p', 'hm-label', 'Summary'), node('p', 'hm-text', task.summary));
-      if (task.handoff) inner.append(node('p', 'hm-label', 'Handoff'), node('p', 'hm-text', task.handoff));
-      if (task.model) inner.append(node('p', 'hm-label', 'Model'), node('p', 'hm-text', task.model));
-      if (task.evidence.length > 0) {
-        inner.append(node('p', 'hm-label', 'Evidence'));
-        for (const evidence of task.evidence) {
-          const box = node('div', 'hm-evidence');
-          const row = node('div', 'hm-evidence-head');
-          badge(row, evidence.badge);
-          row.append(node('span', 'hm-text', [evidence.gateId, evidence.gate].filter(Boolean).join(': ') || 'Check'));
-          box.append(row);
-          if (evidence.detail) box.append(node('p', 'hm-text', evidence.detail));
-          inner.append(box);
-        }
-      } else if (task.badge.label === 'Done') {
-        inner.append(node('p', 'hm-meta', 'No evidence was recorded for this task.'));
-      }
-      if (task.truncated) inner.append(node('p', 'hm-meta', 'Some text for this task was shortened.'));
+      const content = node('div', 'hm-content');
+      const contentId = `hm-task-content-${task.index}`;
+      content.id = contentId;
+      inner.append(content);
+      let handles: Array<{ dispose: () => void }> = [];
+      const revealed = revealedTaskFields.get(task.id) ?? new Set<ShortenedField>();
+      revealedTaskFields.set(task.id, revealed);
+      const paintTask = (state: PanelState): void => {
+        const entry = state.content.runId === detail.id ? state.content.tasks[task.index] : undefined;
+        if (!entry) revealed.clear();
+        const view = taskDisplay(task, entry, revealed);
+        titleText.textContent = `${task.id}: ${view.title.text ?? task.title}`;
+        repaintKeepingFocus(content, () => {
+          for (const handle of handles) handle.dispose();
+          handles = [];
+          content.replaceChildren();
+          const toggle = (field: ShortenedField, shown: FieldDisplay['toggle']): void => {
+            if (shown === null) return;
+            toggleButton(content, handles, field, shown, contentId, () => {
+              const now = store.getState();
+              const loaded = now.content.runId === detail.id && now.content.tasks[task.index]?.data != null;
+              if (loaded && revealed.has(field)) revealed.delete(field);
+              else { revealed.add(field); store.loadTaskContent(detail.id, task.index); }
+              paintTask(store.getState());
+            });
+          };
+          const text = (label: string, field: Exclude<ShortenedField, 'evidence'>, shown: FieldDisplay): void => {
+            if (shown.text === null && shown.toggle === null) return;
+            content.append(node('p', 'hm-label', label));
+            if (shown.text !== null) content.append(node('p', 'hm-text', shown.text));
+            if (shown.note) content.append(node('p', 'hm-meta', shown.note));
+            toggle(field, shown.toggle);
+          };
+          if (view.title.toggle !== null) text('Title', 'title', view.title);
+          text('Summary', 'summary', view.summary);
+          text('Handoff', 'handoff', view.handoff);
+          text('Model', 'model', view.model);
+          if (view.evidence.rows.length > 0) {
+            content.append(node('p', 'hm-label', 'Evidence'));
+            for (const evidence of view.evidence.rows) {
+              const box = node('div', 'hm-evidence');
+              const row = node('div', 'hm-evidence-head');
+              const slot = node('span');
+              row.append(slot);
+              handles.push(mountBadge(slot, { label: evidence.badge.label, tone: evidence.badge.tone }));
+              row.append(node('span', 'hm-text', [evidence.gateId, evidence.gate].filter(Boolean).join(': ') || 'Check'));
+              box.append(row);
+              if (evidence.detail) box.append(node('p', 'hm-text', evidence.detail));
+              content.append(box);
+            }
+            if (view.evidence.note) content.append(node('p', 'hm-meta', view.evidence.note));
+            toggle('evidence', view.evidence.toggle);
+          } else if (task.badge.label === 'Done') {
+            content.append(node('p', 'hm-meta', 'No evidence was recorded for this task.'));
+          }
+          if (task.truncated && task.shortened.length === 0) content.append(node('p', 'hm-meta', 'Some identifiers in this task were shortened.'));
+          if (view.status) statusNode(content, handles, view.status);
+        });
+      };
+      contentPainters.push(paintTask);
+      detailHandles.push({ dispose: () => { for (const handle of handles) handle.dispose(); handles = []; } });
+      paintTask(store.getState());
       details.append(inner);
       body.append(details);
     }
@@ -658,9 +781,14 @@ function mountPanel(): void {
   function drawDetail(detail: RunDetail): void {
     disposeDetail();
     renderedDetail = detail;
+    if (revealedRun !== detail.id) {
+      revealedRun = detail.id;
+      revealedTaskFields.clear();
+      revealedBlocker.clear();
+    }
     ensureNavigation(detail);
     drawSummary(detail, detailContent);
-    const notice = truncationNotice(detail);
+    const notice = detailNotice(detail);
     if (notice) detailContent.append(node('p', 'hm-meta', notice));
     const tabRoot = node('div');
     detailContent.append(tabRoot);
@@ -677,6 +805,7 @@ function mountPanel(): void {
     body.setAttribute('role', 'tabpanel');
     detailContent.append(body);
     (extensions.tabs?.[tab] ?? drawers[tab])(detail, body);
+    paintedContent = store.getState().content;
     // The store loads the review only while its tab is showing.
     store.setReviewVisible(tab === 'review');
   }
@@ -695,6 +824,11 @@ function mountPanel(): void {
     if (state.detail === renderedDetail && renderedKey === 'detail') {
       updatedPainter?.();
       reviewPainter?.(state);
+      // Text is rebuilt only when the on-demand content changed, not on every poll.
+      if (state.content !== paintedContent) {
+        paintedContent = state.content;
+        for (const paint of contentPainters) paint(state);
+      }
       return;
     }
     renderedKey = 'detail';

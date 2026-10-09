@@ -29,6 +29,23 @@ export const LIMITS = {
   labelScan: 16384,
 } as const;
 
+/**
+ * Larger limits of the on-demand content routes (`/runs/:id/tasks/:index`, `/runs/:id/blocker`). The service
+ * shrinks them, step by step, until one response fits `LIMITS.detailBytes`; each response says which limits it used.
+ */
+export const CONTENT_LIMITS = {
+  title: 2000,
+  model: 1000,
+  /** Summary and handoff, in characters. */
+  text: 32000,
+  gate: 2000,
+  /** One evidence detail. */
+  detail: 8000,
+  /** Blocker reason and resolution. */
+  reason: 32000,
+  evidence: 200,
+} as const;
+
 export const RUN_STATUSES = ['queued', 'preparing', 'running', 'paused', 'succeeded', 'failed', 'reconciliation-required'] as const;
 export type WireRunStatus = typeof RUN_STATUSES[number];
 
@@ -65,6 +82,9 @@ export interface Blocker {
   reason: string;
   reasonRecorded: boolean;
   resolution: string | null;
+  /** The recorded reason / resolution was longer than shown here; `GET /runs/:id/blocker` returns more. */
+  reasonClipped: boolean;
+  resolutionClipped: boolean;
 }
 
 export interface ModelChoice { model: string | null; variant: string | null }
@@ -111,7 +131,19 @@ export interface EvidenceView {
   detail: string;
 }
 
+/** Which fields of one task were shortened. `evidenceCount`: items dropped; `evidenceText`: gate or detail text cut. */
+export interface TaskClips {
+  title: boolean;
+  summary: boolean;
+  handoff: boolean;
+  model: boolean;
+  evidenceCount: boolean;
+  evidenceText: boolean;
+}
+
 export interface TaskView {
+  /** 0-based position in the plan; the argument of `GET /runs/:id/tasks/:index`. */
+  index: number;
   id: string;
   title: string;
   state: 'done' | 'current' | 'pending';
@@ -120,7 +152,21 @@ export interface TaskView {
   evidence: EvidenceView[];
   sessionId: string | null;
   model: string | null;
+  /** True when anything in this task was shortened; `clipped` says what. */
   truncated: boolean;
+  clipped: TaskClips;
+}
+
+/** Lists cut at their limits in a run detail. */
+export interface ListCaps {
+  /** More tasks in the plan than are listed. */
+  tasks: boolean;
+  /** More completed task sessions than are listed. */
+  sessions: boolean;
+  /** More model candidates than are listed. */
+  candidates: boolean;
+  /** More usage sessions than are itemised; totals still count them all. */
+  usageSessions: boolean;
 }
 
 export interface SessionRef { id: string; taskId: string | null }
@@ -141,6 +187,52 @@ export interface RunDetail extends RunSummary {
   review: { baseCommit: string; branch: string };
   /** True when any text, list or task in this projection was shortened. */
   truncated: boolean;
+  capped: ListCaps;
+}
+
+/** The limits one content response was built with; text longer than these was cut and ends with an ellipsis. */
+export interface ContentLimitsUsed {
+  title: number;
+  model: number;
+  text: number;
+  gate: number;
+  detail: number;
+  evidence: number;
+}
+
+/** Answer of `GET /runs/:id/tasks/:index`: more of one task's recorded text, within the guest-service limits. */
+export interface TaskContentResponse {
+  runId: string;
+  index: number;
+  /** Identity of the task at `index`, so the panel can tell that the plan changed under it. */
+  taskId: string;
+  title: string;
+  state: TaskView['state'];
+  summary: string | null;
+  handoff: string | null;
+  model: string | null;
+  evidence: EvidenceView[];
+  /** Evidence items recorded for the task, including any not returned. */
+  evidenceTotal: number;
+  clipped: TaskClips;
+  /** Nothing was shortened: this is everything recorded for the task. */
+  complete: boolean;
+  limits: ContentLimitsUsed;
+  fetchedAt: string;
+}
+
+/** Answer of `GET /runs/:id/blocker`. */
+export interface BlockerContentResponse {
+  runId: string;
+  status: WireRunStatus;
+  reason: string;
+  reasonRecorded: boolean;
+  resolution: string | null;
+  clipped: { reason: boolean; resolution: boolean };
+  complete: boolean;
+  /** Characters allowed per field in this response. */
+  limit: number;
+  fetchedAt: string;
 }
 
 export interface ProjectsResponse { projects: ProjectSummary[]; fetchedAt: string }

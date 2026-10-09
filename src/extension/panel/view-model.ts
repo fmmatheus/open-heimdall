@@ -4,16 +4,19 @@
  * tasks, summaries, evidence, reasons, model names) passes through unchanged; main.ts renders it with
  * textContent only. Nothing here infers a result: a missing value is reported as missing.
  */
-import type { PanelState } from './store.js';
+import type { ContentEntry, PanelState } from './store.js';
 import { RUN_STATUSES } from '../shared/protocol.js';
 import type {
   Blocker,
+  BlockerContentResponse,
   EvidenceView,
   LimitsView,
   ModelChoice,
   ModelsView,
   RunDetail,
   RunSummary,
+  TaskClips,
+  TaskContentResponse,
   TaskView,
   UsageView,
   WireRunStatus,
@@ -353,6 +356,9 @@ export interface BlockerInfo {
   /** The recorded reason, verbatim, or NO_REASON_TEXT. */
   reason: string;
   resolution: string | null;
+  /** The recorded text is longer than shown; the panel can load more. */
+  reasonClipped: boolean;
+  resolutionClipped: boolean;
 }
 
 const BLOCKER_TITLES: Partial<Record<WireRunStatus, string>> = {
@@ -368,6 +374,8 @@ export function blockerInfo(blocker: Blocker | null): BlockerInfo | null {
     tone: blocker.status === 'failed' ? 'error' : 'warning',
     reason: blocker.reasonRecorded && blocker.reason !== '' ? blocker.reason : NO_REASON_TEXT,
     resolution: blocker.resolution,
+    reasonClipped: blocker.reasonClipped === true,
+    resolutionClipped: blocker.resolutionClipped === true,
   };
 }
 
@@ -391,6 +399,8 @@ export function evidenceRow(evidence: EvidenceView): EvidenceRow {
 }
 
 export interface TaskRow {
+  /** 0-based plan position; what the content route is asked for. */
+  index: number;
   id: string;
   title: string;
   badge: Badge;
@@ -399,6 +409,23 @@ export interface TaskRow {
   evidence: EvidenceRow[];
   model: string | null;
   truncated: boolean;
+  clipped: TaskClips;
+  /** The fields whose text can be loaded in full, in display order. */
+  shortened: ShortenedField[];
+}
+
+export type ShortenedField = 'title' | 'summary' | 'handoff' | 'model' | 'evidence';
+
+const NO_CLIPS: TaskClips = { title: false, summary: false, handoff: false, model: false, evidenceCount: false, evidenceText: false };
+
+export function shortenedFields(clips: TaskClips): ShortenedField[] {
+  const fields: ShortenedField[] = [];
+  if (clips.title) fields.push('title');
+  if (clips.summary) fields.push('summary');
+  if (clips.handoff) fields.push('handoff');
+  if (clips.model) fields.push('model');
+  if (clips.evidenceCount || clips.evidenceText) fields.push('evidence');
+  return fields;
 }
 
 const TASK_BADGES: Record<TaskView['state'], Badge> = {
@@ -408,7 +435,10 @@ const TASK_BADGES: Record<TaskView['state'], Badge> = {
 };
 
 export function taskRows(tasks: readonly TaskView[]): TaskRow[] {
-  return tasks.map(task => ({
+  return tasks.map((task, position) => {
+    const clipped = task.clipped ?? NO_CLIPS;
+    return {
+    index: task.index ?? position,
     id: task.id,
     title: task.title,
     badge: TASK_BADGES[task.state],
@@ -417,7 +447,10 @@ export function taskRows(tasks: readonly TaskView[]): TaskRow[] {
     evidence: task.evidence.map(evidenceRow),
     model: task.model,
     truncated: task.truncated,
-  }));
+    clipped,
+    shortened: shortenedFields(clipped),
+    };
+  });
 }
 
 export function currentTaskText(detail: Pick<RunDetail, 'status' | 'phase' | 'currentTask'>): string {
@@ -484,8 +517,156 @@ export function technicalSections(detail: RunDetail): TechnicalSection[] {
   ];
 }
 
-export function truncationNotice(detail: Pick<RunDetail, 'truncated'>): string | null {
-  return detail.truncated ? 'Some text or lists in this run were shortened to fit. Open the saved run state for the full record.' : null;
+/**
+ * What was shortened in the run detail and what the user can do about it. Names the sections (Tasks, the
+ * blocker, lists) and never points at anything outside the panel. Null when nothing was shortened.
+ */
+export function detailNotice(detail: Pick<RunDetail, 'truncated' | 'tasks' | 'total' | 'blocker' | 'capped' | 'sessions' | 'models' | 'usage'>): string | null {
+  const sentences: string[] = [];
+  const capped = detail.capped;
+  if (capped?.tasks) {
+    const total = detail.total !== null && detail.total > detail.tasks.length ? ` The plan has ${detail.total}.` : '';
+    sentences.push(`Only the first ${detail.tasks.length} tasks are listed.${total}`);
+  }
+  const shortened = detail.tasks.filter(task => shortenedFields(task.clipped ?? NO_CLIPS).length > 0).length;
+  if (shortened > 0) {
+    sentences.push(`Text was shortened in ${shortened} ${shortened === 1 ? 'task' : 'tasks'}. Open the Tasks tab, expand a task and choose Show full to load more.`);
+  }
+  if (detail.blocker && (detail.blocker.reasonClipped || detail.blocker.resolutionClipped)) {
+    sentences.push('The blocker text was shortened. Choose Show full reason in the run summary.');
+  }
+  if (capped?.sessions) sentences.push(`Only the first ${detail.sessions.completed.length} completed task sessions are listed.`);
+  if (capped?.candidates) sentences.push(`Only the first ${detail.models.candidates.length} model candidates are listed in Technical details.`);
+  if (capped?.usageSessions) sentences.push(`Only the first ${detail.usage.sessions.length} sessions are itemised in Technical details; the usage totals still count all of them.`);
+  if (sentences.length === 0 && detail.truncated) {
+    sentences.push('Some long values, such as identifiers or model names, were shortened to fit.');
+  }
+  return sentences.length === 0 ? null : sentences.join(' ');
+}
+
+// ----- on-demand content -----
+
+const FIELD_NAMES: Record<ShortenedField, string> = { title: 'title', summary: 'summary', handoff: 'handoff', model: 'model', evidence: 'evidence' };
+
+/** Characters of a field that survive a cut at `limit`: the cut keeps one place for the ellipsis. */
+const shownChars = (limit: number): number => Math.max(0, limit - 1);
+const limitNote = (limit: number): string => `Showing the first ${formatCount(shownChars(limit))} characters; the rest exceeds what the panel can load.`;
+
+export interface ContentStatus {
+  /** `loading` is announced politely (role=status); `error` and `changed` are alerts. */
+  kind: 'loading' | 'error' | 'changed';
+  text: string;
+  /** Offer a Refresh action (the task list moved under the panel). */
+  refresh: boolean;
+}
+
+export interface FieldDisplay {
+  field: ShortenedField;
+  /** Text to show now: what the list carries, or the loaded full text once revealed. Null when nothing is recorded. */
+  text: string | null;
+  /** The toggle button; null when the field was not shortened. */
+  toggle: { label: string; expanded: boolean } | null;
+  /** Which part was shortened, or why even the loaded text stops. */
+  note: string | null;
+}
+
+const toggleLabel = (field: ShortenedField, expanded: boolean): string =>
+  field === 'evidence' ? (expanded ? 'Hide full evidence' : 'Show full evidence') : `${expanded ? 'Hide' : 'Show'} full ${FIELD_NAMES[field]}`;
+
+function contentStatus(entry: ContentEntry<unknown> | undefined, mismatch: boolean): ContentStatus | null {
+  if (entry?.loading) return { kind: 'loading', text: 'Loading the full text…', refresh: false };
+  if (entry?.error) return { kind: 'error', text: entry.error, refresh: false };
+  if (mismatch) {
+    return { kind: 'changed', text: 'The task list changed since this run was loaded, so the full text is not shown. Refresh to see the current tasks.', refresh: true };
+  }
+  return null;
+}
+
+export interface TaskDisplay {
+  title: FieldDisplay;
+  summary: FieldDisplay;
+  handoff: FieldDisplay;
+  model: FieldDisplay;
+  evidence: { rows: EvidenceRow[]; toggle: FieldDisplay['toggle']; note: string | null };
+  status: ContentStatus | null;
+}
+
+/**
+ * What one task row shows. `entry` is the task's on-demand content (absent until requested) and `revealed` the
+ * fields the user asked to see in full. Loaded content is used only when it belongs to this very task: a
+ * different id at the same position means the plan changed, which is reported instead of shown.
+ */
+export function taskDisplay(row: TaskRow, entry: ContentEntry<TaskContentResponse> | undefined, revealed: ReadonlySet<ShortenedField>): TaskDisplay {
+  const data = entry?.data ?? null;
+  const mismatch = data !== null && data.taskId !== row.id;
+  const full = data !== null && !mismatch ? data : null;
+  const field = (name: Exclude<ShortenedField, 'evidence'>, current: string | null, limit: (content: TaskContentResponse) => number): FieldDisplay => {
+    if (!row.shortened.includes(name)) return { field: name, text: current, toggle: null, note: null };
+    const expanded = full !== null && revealed.has(name);
+    const loaded = expanded && full !== null ? full[name] : null;
+    return {
+      field: name,
+      text: loaded ?? current,
+      toggle: { label: toggleLabel(name, expanded), expanded },
+      note: expanded && full !== null
+        ? (full.clipped[name] ? limitNote(limit(full)) : null)
+        : `The ${FIELD_NAMES[name]} is shortened here.`,
+    };
+  };
+  let evidenceNote: string | null = null;
+  let evidenceToggle: FieldDisplay['toggle'] = null;
+  let evidenceRows = row.evidence;
+  if (row.shortened.includes('evidence')) {
+    const expanded = full !== null && revealed.has('evidence');
+    evidenceToggle = { label: toggleLabel('evidence', expanded), expanded };
+    if (expanded && full !== null) {
+      evidenceRows = full.evidence.map(evidenceRow);
+      const notes: string[] = [];
+      if (full.clipped.evidenceCount) notes.push(`Showing ${formatCount(full.evidence.length)} of ${formatCount(full.evidenceTotal)} evidence items; the rest exceeds what the panel can load.`);
+      if (full.clipped.evidenceText) notes.push(limitNote(full.limits.detail));
+      evidenceNote = notes.length > 0 ? notes.join(' ') : null;
+    } else {
+      evidenceNote = 'Some evidence is shortened here.';
+    }
+  }
+  return {
+    title: field('title', row.title, content => content.limits.title),
+    summary: field('summary', row.summary, content => content.limits.text),
+    handoff: field('handoff', row.handoff, content => content.limits.text),
+    model: field('model', row.model, content => content.limits.model),
+    evidence: { rows: evidenceRows, toggle: evidenceToggle, note: evidenceNote },
+    status: contentStatus(entry, mismatch),
+  };
+}
+
+export type BlockerField = 'reason' | 'resolution';
+
+export interface BlockerDisplay {
+  reason: { text: string; toggle: FieldDisplay['toggle']; note: string | null };
+  resolution: { text: string | null; toggle: FieldDisplay['toggle']; note: string | null };
+  status: ContentStatus | null;
+}
+
+/** Same rules as `taskDisplay`, for the recorded reason and resolution in the run summary. */
+export function blockerDisplay(info: BlockerInfo, entry: ContentEntry<BlockerContentResponse> | null | undefined, revealed: ReadonlySet<BlockerField>): BlockerDisplay {
+  const full = entry?.data ?? null;
+  const part = (name: BlockerField, current: string | null, clipped: boolean): { text: string | null; toggle: FieldDisplay['toggle']; note: string | null } => {
+    if (!clipped) return { text: current, toggle: null, note: null };
+    const expanded = full !== null && revealed.has(name);
+    const label = `${expanded ? 'Hide' : 'Show'} full ${name}`;
+    return {
+      text: expanded && full !== null ? (name === 'reason' ? full.reason : full.resolution) : current,
+      toggle: { label, expanded },
+      note: expanded && full !== null
+        ? (full.clipped[name] ? limitNote(full.limit) : null)
+        : `The ${name} is shortened here.`,
+    };
+  };
+  return {
+    reason: part('reason', info.reason, info.reasonClipped) as BlockerDisplay['reason'] & { text: string },
+    resolution: part('resolution', info.resolution, info.resolutionClipped),
+    status: contentStatus(entry ?? undefined, false),
+  };
 }
 
 // ----- connection, stale and empty states -----

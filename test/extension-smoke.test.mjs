@@ -80,6 +80,20 @@ test('built service answers run, change, review and diff requests for a real tem
   const ownerToken = run.ownerToken;
   assert.ok(ownerToken && ownerToken.length > 8);
 
+  // A recorded plan with one finished task whose summary is longer than the detail projection shows.
+  // Written straight to the fixture database: the fixture run was never bound to a native parent session.
+  const longSummary = `${'S'.repeat(5000)}SMOKE-TAIL`;
+  const checkpoint = {
+    id: run.id, status: 'running', adr: 'feature.md', parent: 'ses_fixture', caller: { sessionID: 'ses_fixture' }, branch: run.branch, baseline: run.baseCommit,
+    index: 1, phase: 'executor', child: 'child-2', settings: run.settings,
+    tasks: [
+      { id: 'T1', title: 'First task', brief: 'SMOKE-BRIEF', dependsOn: [], dod: ['gate one'] },
+      { id: 'T2', title: 'Second task', brief: 'SMOKE-BRIEF', dependsOn: ['T1'], dod: ['gate two'] },
+    ],
+    results: [{ status: 'completed', taskId: 'T1', summary: longSummary, handoff: 'next', sessionId: 'child-1', model: 'anthropic/fixture', evidence: [{ gateId: 'G1', gate: 'gate one', passed: true, detail: 'proved' }] }],
+  };
+  service.store.db.prepare('UPDATE runs SET checkpoint_json = ? WHERE id = ?').run(JSON.stringify(checkpoint), run.id);
+
   // Committed, staged, unstaged, untracked, deleted and large changes in the managed worktree.
   const checkout = run.worktreePath;
   await fs.writeFile(path.join(checkout, 'edit.txt'), 'original\ncommitted line\n');
@@ -142,6 +156,30 @@ test('built service answers run, change, review and diff requests for a real tem
   assert.equal(detail.status, 200);
   assert.equal(detail.json.run.id, run.id);
   assert.equal(detail.json.run.status, 'running');
+
+  // On-demand content routes answer from the built bundle.
+  const listedTask = detail.json.run.tasks[0];
+  assert.equal(listedTask.clipped.summary, true);
+  const content = await get(`/runs/${run.id}/tasks/0`);
+  assert.equal(content.status, 200);
+  assert.equal(content.json.runId, run.id);
+  assert.equal(content.json.taskId, 'T1');
+  assert.equal(content.json.complete, true);
+  assert.ok(content.json.summary.endsWith('SMOKE-TAIL') && content.json.summary.length > listedTask.summary.length, 'more of the real summary than the detail shows');
+  assert.ok(!content.text.includes('SMOKE-BRIEF'));
+  const pendingTask = await get(`/runs/${run.id}/tasks/1`);
+  assert.equal(pendingTask.status, 200);
+  assert.equal(pendingTask.json.taskId, 'T2');
+  const noTask = await get(`/runs/${run.id}/tasks/2`);
+  assert.equal(noTask.status, 404);
+  assert.equal(noTask.json.error.kind, 'not-found');
+  const badIndex = await get(`/runs/${run.id}/tasks/abc`);
+  assert.equal(badIndex.status, 400);
+  assert.equal(badIndex.json.error.kind, 'invalid-request');
+  const noBlocker = await get(`/runs/${run.id}/blocker`);
+  assert.equal(noBlocker.status, 404);
+  const refusedContent = await call(port, `/runs/${run.id}/tasks/0`, { method: 'POST' });
+  assert.ok([404, 405].includes(refusedContent.status), `POST tasks: ${refusedContent.status}`);
 
   const changes = await get('/changes');
   assert.equal(changes.status, 200);

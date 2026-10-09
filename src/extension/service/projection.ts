@@ -1,9 +1,10 @@
 import path from 'node:path';
 import type { ProjectRecord } from '../../coordinator/types.js';
 import { LIMITS, RUN_STATUSES } from '../shared/protocol.js';
+import { CONTENT_LIMITS } from '../shared/protocol.js';
 import type {
-  Blocker, EvidenceView, LimitsView, ModelChoice, ModelsView, ProjectSummary, RunDetail, RunPhase, RunSummary,
-  SessionUsage, TaskRef, TaskView, UsageView, WireRunStatus,
+  Blocker, BlockerContentResponse, ContentLimitsUsed, EvidenceView, LimitsView, ListCaps, ModelChoice, ModelsView, ProjectSummary,
+  RunDetail, RunPhase, RunSummary, SessionUsage, TaskClips, TaskContentResponse, TaskRef, TaskView, UsageView, WireRunStatus,
 } from '../shared/protocol.js';
 import type { PublicRun } from './coordinator.js';
 
@@ -38,16 +39,19 @@ function clip(value: string, max: number): Clipped {
   return { text: `${value.slice(0, end).replace(CONTROL, ' ')}…`, truncated: true };
 }
 
-/** Tracks whether any clipped value in one projection was shortened. */
+/** Tracks whether any clipped value in one projection was shortened, and which lists were cut. */
 class Budget {
   truncated = false;
-  clip(value: unknown, max: number): string | null {
+  readonly capped: ListCaps = { tasks: false, sessions: false, candidates: false, usageSessions: false };
+  /** Clip and say whether this very value was shortened (`text` is null when the value is not a string). */
+  info(value: unknown, max: number): { text: string | null; clipped: boolean } {
     const raw = text(value);
-    if (raw === undefined) return null;
+    if (raw === undefined) return { text: null, clipped: false };
     const result = clip(raw, max);
     if (result.truncated) this.truncated = true;
-    return result.text;
+    return { text: result.text, clipped: result.truncated };
   }
+  clip(value: unknown, max: number): string | null { return this.info(value, max).text; }
   clipOr(value: unknown, max: number, fallback: string): string { return this.clip(value, max) ?? fallback; }
 }
 
@@ -138,17 +142,21 @@ export function summarizeRun(run: PublicRun, project: { directory?: string } | u
 
 const NO_REASON = 'The coordinator did not record a reason for this status.';
 
-function blockerOf(run: PublicRun, budget: Budget): Blocker | null {
+function blockerOf(run: PublicRun, budget: Budget, limit: number = LIMITS.reason): Blocker | null {
   const status = statusOf(run);
   if (status !== 'paused' && status !== 'failed' && status !== 'reconciliation-required') return null;
   const checkpoint = record(run.checkpoint);
   const recorded = [run.reason, checkpoint?.reason].map(value => text(value)).find(value => value !== undefined && value.trim() !== '');
   const resolution = [run.resolution, checkpoint?.resolution].map(value => text(value)).find(value => value !== undefined && value.trim() !== '');
+  const reason = budget.info(recorded, limit);
+  const shortResolution = budget.info(resolution, limit);
   return {
     status,
-    reason: recorded === undefined ? NO_REASON : budget.clipOr(recorded, LIMITS.reason, NO_REASON),
+    reason: reason.text ?? NO_REASON,
     reasonRecorded: recorded !== undefined,
-    resolution: resolution === undefined ? null : budget.clip(resolution, LIMITS.reason),
+    resolution: shortResolution.text,
+    reasonClipped: reason.clipped,
+    resolutionClipped: shortResolution.clipped,
   };
 }
 
@@ -170,7 +178,7 @@ function modelsOf(run: PublicRun, settings: Loose, budget: Budget): ModelsView {
     const candidate = record(entry);
     const model = budget.clip(candidate?.model, LIMITS.model);
     if (!candidate || model === null) continue;
-    if (candidates.length >= LIMITS.candidates) { budget.truncated = true; break; }
+    if (candidates.length >= LIMITS.candidates) { budget.truncated = true; budget.capped.candidates = true; break; }
     candidates.push({ key: budget.clipOr(candidate.key, LIMITS.model, model), model, variant: budget.clip(candidate.variant, LIMITS.model) });
   }
   return {
@@ -199,7 +207,7 @@ function usageOf(run: PublicRun, budget: Budget): UsageView {
   for (const id of ids) {
     reportedTotal += count(reported[id]);
     uncachedTotal += count(uncached[id]);
-    if (sessions.length >= LIMITS.sessions) { budget.truncated = true; continue; }
+    if (sessions.length >= LIMITS.sessions) { budget.truncated = true; budget.capped.usageSessions = true; continue; }
     const role: SessionUsage['role'] = taskSessions.has(id) ? 'task'
       : id === child ? (phase === 'planner' ? 'planner' : phase === 'executor' ? 'task' : 'unknown')
         : 'unknown';
@@ -228,60 +236,181 @@ function limitsOf(run: PublicRun, settings: Loose): LimitsView {
 }
 
 /** Per-task text limits; detailRun steps down through these until the whole projection fits its byte budget. */
-interface Profile { title: number; text: number; gate: number; detail: number; evidence: number }
+interface Profile { title: number; model: number; text: number; gate: number; detail: number; evidence: number }
 const PROFILES: Profile[] = [
-  { title: LIMITS.title, text: LIMITS.text, gate: LIMITS.gate, detail: LIMITS.detail, evidence: LIMITS.evidencePerTask },
-  { title: 120, text: 600, gate: 200, detail: 200, evidence: 10 },
-  { title: 80, text: 200, gate: 80, detail: 100, evidence: 3 },
-  { title: 60, text: 0, gate: 0, detail: 0, evidence: 0 },
+  { title: LIMITS.title, model: LIMITS.model, text: LIMITS.text, gate: LIMITS.gate, detail: LIMITS.detail, evidence: LIMITS.evidencePerTask },
+  { title: 120, model: LIMITS.model, text: 600, gate: 200, detail: 200, evidence: 10 },
+  { title: 80, model: LIMITS.model, text: 200, gate: 80, detail: 100, evidence: 3 },
+  { title: 60, model: LIMITS.model, text: 0, gate: 0, detail: 0, evidence: 0 },
 ];
 
-function evidenceOf(value: unknown, budget: Budget, profile: Profile): EvidenceView[] {
-  const items = list(value);
-  if (items.length > profile.evidence) budget.truncated = true;
-  return items.slice(0, profile.evidence).flatMap(entry => {
+interface EvidenceResult { items: EvidenceView[]; total: number; countClipped: boolean; textClipped: boolean }
+
+function evidenceOf(value: unknown, budget: Budget, profile: Profile): EvidenceResult {
+  const entries = list(value);
+  const countClipped = entries.length > profile.evidence;
+  if (countClipped) budget.truncated = true;
+  let textClipped = false;
+  const items = entries.slice(0, profile.evidence).flatMap(entry => {
     const item = record(entry);
     if (!item) return [];
+    const gate = budget.info(item.gate, profile.gate);
+    const detail = budget.info(item.detail, profile.detail);
+    if (gate.clipped || detail.clipped) textClipped = true;
     return [{
       gateId: budget.clip(item.gateId, LIMITS.taskId),
-      gate: budget.clip(item.gate, profile.gate),
+      gate: gate.text,
       passed: typeof item.passed === 'boolean' ? item.passed : null,
-      detail: budget.clipOr(item.detail, profile.detail, ''),
+      detail: detail.text ?? '',
     }];
   });
+  return { items, total: entries.length, countClipped, textClipped };
+}
+
+/** What a task's text is built from; read once per projection. */
+interface TaskSource {
+  checkpoint: Loose | undefined;
+  tasks: unknown[];
+  results: Loose[];
+  index: number | undefined;
+  active: boolean;
+}
+
+function taskSource(run: PublicRun): TaskSource {
+  const checkpoint = record(run.checkpoint);
+  return {
+    checkpoint,
+    tasks: list(checkpoint?.tasks),
+    results: list(checkpoint?.results).map(record).filter((item): item is Loose => item !== undefined),
+    index: finite(checkpoint?.index),
+    active: checkpoint?.phase === 'executor' && statusOf(run) !== 'succeeded',
+  };
+}
+
+interface TaskBuild { view: TaskView; evidenceTotal: number }
+
+/** One task at its plan position under the given limits; null when that plan entry is not a task record. */
+function buildTask(source: TaskSource, position: number, profile: Profile): TaskBuild | null {
+  const task = record(source.tasks[position]);
+  if (!task) return null;
+  const budget = new Budget();
+  const id = budget.clipOr(task.id, LIMITS.taskId, `task-${position + 1}`);
+  const taskId = text(task.id);
+  const result = taskId === undefined ? undefined : source.results.find(item => text(item.taskId) === taskId);
+  const state: TaskView['state'] = result ? 'done' : source.active && source.index === position ? 'current' : 'pending';
+  const title = budget.info(task.title, profile.title);
+  const summary = result ? budget.info(result.summary, profile.text) : { text: null, clipped: false };
+  const handoff = result ? budget.info(result.handoff, profile.text) : { text: null, clipped: false };
+  const evidence: EvidenceResult = result ? evidenceOf(result.evidence, budget, profile) : { items: [], total: 0, countClipped: false, textClipped: false };
+  const model = result ? budget.info(result.model, profile.model)
+    : state === 'current' ? budget.info(record(source.checkpoint?.attempt)?.model ?? record(source.checkpoint?.selection)?.model, profile.model)
+      : { text: null, clipped: false };
+  const clipped: TaskClips = {
+    title: title.clipped,
+    summary: summary.clipped,
+    handoff: handoff.clipped,
+    model: model.clipped,
+    evidenceCount: evidence.countClipped,
+    evidenceText: evidence.textClipped,
+  };
+  const view: TaskView = {
+    index: position,
+    id,
+    title: title.text ?? '',
+    state,
+    summary: summary.text,
+    handoff: handoff.text,
+    evidence: evidence.items,
+    sessionId: result ? budget.clip(result.sessionId, LIMITS.identifier)
+      : state === 'current' ? budget.clip(source.checkpoint?.child, LIMITS.identifier) : null,
+    model: model.text,
+    truncated: budget.truncated,
+    clipped,
+  };
+  return { view, evidenceTotal: evidence.total };
 }
 
 function tasksOf(run: PublicRun, whole: Budget, profile: Profile): TaskView[] {
-  const checkpoint = record(run.checkpoint);
-  const tasks = list(checkpoint?.tasks);
-  const results = list(checkpoint?.results).map(record).filter((item): item is Loose => item !== undefined);
-  const index = finite(checkpoint?.index);
-  const active = checkpoint?.phase === 'executor' && statusOf(run) !== 'succeeded';
-  if (tasks.length > LIMITS.tasks) whole.truncated = true;
-  return tasks.slice(0, LIMITS.tasks).flatMap((entry, position) => {
-    const task = record(entry);
-    if (!task) return [];
-    const budget = new Budget();
-    const id = budget.clipOr(task.id, LIMITS.taskId, `task-${position + 1}`);
-    const taskId = text(task.id);
-    const result = taskId === undefined ? undefined : results.find(item => text(item.taskId) === taskId);
-    const state: TaskView['state'] = result ? 'done' : active && index === position ? 'current' : 'pending';
-    const view: TaskView = {
-      id,
-      title: budget.clipOr(task.title, profile.title, ''),
-      state,
-      summary: result ? budget.clip(result.summary, profile.text) : null,
-      handoff: result ? budget.clip(result.handoff, profile.text) : null,
-      evidence: result ? evidenceOf(result.evidence, budget, profile) : [],
-      sessionId: result ? budget.clip(result.sessionId, LIMITS.identifier)
-        : state === 'current' ? budget.clip(checkpoint?.child, LIMITS.identifier) : null,
-      model: result ? budget.clip(result.model, LIMITS.model)
-        : state === 'current' ? budget.clip(record(checkpoint?.attempt)?.model ?? record(checkpoint?.selection)?.model, LIMITS.model) : null,
-      truncated: budget.truncated,
+  const source = taskSource(run);
+  if (source.tasks.length > LIMITS.tasks) { whole.truncated = true; whole.capped.tasks = true; }
+  const views: TaskView[] = [];
+  for (let position = 0; position < Math.min(source.tasks.length, LIMITS.tasks); position++) {
+    const built = buildTask(source, position, profile);
+    if (!built) continue;
+    if (built.view.truncated) whole.truncated = true;
+    views.push(built.view);
+  }
+  return views;
+}
+
+/*
+ * On-demand content. The same builders run with larger limits; the limits step down until the response fits
+ * `LIMITS.detailBytes`. Even the smallest step keeps more than the first detail profile's text, so a loaded
+ * task never shows less than the list did.
+ */
+const CONTENT_PROFILES: Profile[] = [
+  { title: CONTENT_LIMITS.title, model: CONTENT_LIMITS.model, text: CONTENT_LIMITS.text, gate: CONTENT_LIMITS.gate, detail: CONTENT_LIMITS.detail, evidence: CONTENT_LIMITS.evidence },
+  { title: 2000, model: 1000, text: 16000, gate: 1000, detail: 4000, evidence: 100 },
+  { title: 1000, model: 500, text: 8000, gate: 500, detail: 2000, evidence: 50 },
+  { title: 500, model: 400, text: 4000, gate: 300, detail: 1000, evidence: 25 },
+  { title: 400, model: 300, text: 2500, gate: 200, detail: 600, evidence: 10 },
+];
+
+const usedLimits = (profile: Profile): ContentLimitsUsed => ({ title: profile.title, model: profile.model, text: profile.text, gate: profile.gate, detail: profile.detail, evidence: profile.evidence });
+
+/** Fits the response (envelope included) to `LIMITS.detailBytes`; the envelope is a few hundred bytes at most. */
+const fits = (value: unknown): boolean => Buffer.byteLength(JSON.stringify(value)) <= LIMITS.detailBytes;
+
+/** More of one task's recorded text by 0-based plan position; null when there is no task record at that position. */
+export function taskContent(run: PublicRun, position: number): Omit<TaskContentResponse, 'fetchedAt'> | null {
+  const source = taskSource(run);
+  if (!Number.isInteger(position) || position < 0 || position >= source.tasks.length) return null;
+  let response: Omit<TaskContentResponse, 'fetchedAt'> | null = null;
+  for (const profile of CONTENT_PROFILES) {
+    const built = buildTask(source, position, profile);
+    if (!built) return null;
+    const { view } = built;
+    response = {
+      runId: clip(String(run.id ?? ''), LIMITS.identifier).text,
+      index: position,
+      taskId: view.id,
+      title: view.title,
+      state: view.state,
+      summary: view.summary,
+      handoff: view.handoff,
+      model: view.model,
+      evidence: view.evidence,
+      evidenceTotal: built.evidenceTotal,
+      clipped: view.clipped,
+      complete: !Object.values(view.clipped).some(Boolean),
+      limits: usedLimits(profile),
     };
-    if (budget.truncated) whole.truncated = true;
-    return [view];
-  });
+    if (fits(response)) break;
+  }
+  return response;
+}
+
+const BLOCKER_LIMITS = [CONTENT_LIMITS.reason, 16000, 8000, 4000, 2500];
+
+/** More of the recorded reason and resolution; null when the run has no blocker. */
+export function blockerContent(run: PublicRun): Omit<BlockerContentResponse, 'fetchedAt'> | null {
+  let response: Omit<BlockerContentResponse, 'fetchedAt'> | null = null;
+  for (const limit of BLOCKER_LIMITS) {
+    const blocker = blockerOf(run, new Budget(), limit);
+    if (blocker === null) return null;
+    response = {
+      runId: clip(String(run.id ?? ''), LIMITS.identifier).text,
+      status: blocker.status,
+      reason: blocker.reason,
+      reasonRecorded: blocker.reasonRecorded,
+      resolution: blocker.resolution,
+      clipped: { reason: blocker.reasonClipped, resolution: blocker.resolutionClipped },
+      complete: !blocker.reasonClipped && !blocker.resolutionClipped,
+      limit,
+    };
+    if (fits(response)) break;
+  }
+  return response;
 }
 
 function sessionsOf(run: PublicRun, budget: Budget): RunDetail['sessions'] {
@@ -293,7 +422,7 @@ function sessionsOf(run: PublicRun, budget: Budget): RunDetail['sessions'] {
     const id = text(result?.sessionId);
     if (!result || id === undefined || seen.has(id)) continue;
     seen.add(id);
-    if (completed.length >= LIMITS.sessions) { budget.truncated = true; break; }
+    if (completed.length >= LIMITS.sessions) { budget.truncated = true; budget.capped.sessions = true; break; }
     completed.push({ id: clip(id, LIMITS.identifier).text, taskId: budget.clip(result.taskId, LIMITS.taskId) });
   }
   return {
@@ -323,6 +452,7 @@ export function detailRun(run: PublicRun, project: { directory?: string } | unde
       sessions: sessionsOf(run, budget),
       review: { baseCommit: budget.clipOr(run.baseCommit, 64, ''), branch: budget.clipOr(run.branch, 200, '') },
       truncated: budget.truncated || profile !== PROFILES[0],
+      capped: budget.capped,
     };
     if (Buffer.byteLength(JSON.stringify(detail)) <= LIMITS.detailBytes) break;
   }
