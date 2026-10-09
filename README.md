@@ -8,6 +8,49 @@ You provide a feature. Heimdall breaks it into tasks, executes them sequentially
 
 Heimdall is designed to run as a single global service across your local Git projects, keeping workflow policy, execution coordination, and observability in one place.
 
+## Quickstart
+
+Requires Git, Node.js **22.19+**, a Git project with at least one commit, and a
+running local **OpenCode 2.0.22** server. Install from source during pre-alpha:
+
+```sh
+git clone https://github.com/fmmatheus/open-heimdall.git
+cd open-heimdall
+npm ci --ignore-scripts
+npm run build
+```
+
+Create the project and coordinator configuration:
+
+```sh
+node dist/cli.js init --project /path/to/your/project
+mkdir -p ~/.config/heimdall
+cp -n examples/coordinator.toml ~/.config/heimdall/coordinator.toml
+```
+
+Edit your project's `.heimdall.toml` with your models and OpenCode server URL.
+For Claude Code models, set the executor's `quotaProvider = "claude-code"`.
+For password authentication, supply the existing server password as
+`OPENCODE_PASSWORD` in the terminal that starts the coordinator.
+
+```sh
+node dist/cli.js coordinator serve
+```
+
+In another terminal, open the same Heimdall checkout. Write your feature request
+in a Markdown file, then register the project and submit it:
+
+```sh
+node dist/cli.js coordinator project add /path/to/your/project
+node dist/cli.js coordinator run submit PROJECT_ID --feature /path/to/feature.md
+node dist/cli.js coordinator run show RUN_ID
+```
+
+Use the `id` returned by `project add` as `PROJECT_ID`, and the `id` returned by
+`run submit` as `RUN_ID`. Each run executes tasks sequentially in its own worktree.
+See [setup and recovery](docs/coordinator.md) and [model/authentication configuration](docs/development.md#opencode-adapter)
+for connection options, compatibility limits, and existing workflow separation.
+
 ## Why Heimdall?
 
 The opt-in development coordinator allows multiple features and runs to progress concurrently in the same project or across different projects. Each run handles one task at a time in its own Git worktree, subject to global and per-project limits.
