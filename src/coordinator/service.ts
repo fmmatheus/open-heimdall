@@ -8,6 +8,7 @@ import { createManagedExecutor } from './executor.js';
 import { inspectProject, planManagedWorktree, resolveBaseCommit } from './worktrees.js';
 import { checkRuntimeConflicts, snapshotSpecification } from './runtime.js';
 import { positiveInteger } from './config.js';
+import { privateFile, readCoordinatorToken } from './token.js';
 import type { CoordinatorConfiguration } from './config.js';
 import type { ManagedExecutor, Receipt, RunRecord, StartBinding } from './types.js';
 import type { RunState } from '../workflow/types.js';
@@ -35,18 +36,7 @@ async function privateDirectory(directory: string): Promise<string> {
   return fs.realpath(directory);
 }
 
-async function privateFile(file: string): Promise<void> {
-  const stat = await fs.lstat(file);
-  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Coordinator state file must be a regular file');
-  if (process.platform !== 'win32' && ((stat.mode & 0o077) !== 0 || stat.uid !== process.getuid?.())) throw new Error('Coordinator state file must belong to this user and have mode 0600');
-}
-
-export async function readCoordinatorToken(stateDirectory: string): Promise<string> {
-  await privateFile(path.join(stateDirectory, 'coordinator.key'));
-  const token = await fs.readFile(path.join(stateDirectory, 'coordinator.key'), 'utf8');
-  if (!/^[a-f0-9]{64}$/.test(token)) throw new Error('Invalid coordinator access key');
-  return token;
-}
+export { readCoordinatorToken };
 
 async function body(request: http.IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];

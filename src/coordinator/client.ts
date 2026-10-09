@@ -1,7 +1,9 @@
 import http from 'node:http';
 
 /** HTTP/JSON uses a Unix socket or a Windows named pipe, never a public listener. */
-export function createCoordinatorClient(endpoint: string, accessToken?: string) {
+export function createCoordinatorClient(endpoint: string, accessToken?: string, options: { timeoutMs?: number } = {}) {
+  const timeoutMs = options.timeoutMs ?? 30000;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new Error('Coordinator timeout must be a positive integer');
   if (!endpoint) throw new Error('A coordinator IPC endpoint is required');
   return {
     async request(method: string, route: string, body?: unknown, ownerToken?: string): Promise<unknown> {
@@ -32,7 +34,7 @@ export function createCoordinatorClient(endpoint: string, accessToken?: string) 
             } else resolve(value);
           });
         });
-        request.setTimeout(30000, () => request.destroy(new Error('Coordinator request timed out')));
+        request.setTimeout(timeoutMs, () => request.destroy(new Error('Coordinator request timed out')));
         request.on('error', error => reject(new Error(`Coordinator unavailable: ${error.message}`)));
         request.end(payload);
       });
