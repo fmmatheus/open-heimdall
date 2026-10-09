@@ -1,5 +1,5 @@
-import { MATCH_LIMITS, RUN_STATUSES } from '../shared/protocol.js';
-import type { ChangeFeed, DirectoryMatch, ProjectsResponse, RunResponse, RunsResponse, WireRunStatus } from '../shared/protocol.js';
+import { MATCH_LIMITS, REVIEW_LIMITS, RUN_STATUSES } from '../shared/protocol.js';
+import type { ChangeFeed, DirectoryMatch, ProjectsResponse, ReviewFileResponse, ReviewResponse, RunResponse, RunsResponse, WireRunStatus } from '../shared/protocol.js';
 
 /** The slice of the SDK host the panel uses; injectable so tests can record every request. */
 export interface PanelHost {
@@ -11,7 +11,7 @@ export const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
 /** The only service routes the panel may request. All are GET. */
 const FIXED_PATHS = new Set(['/projects', '/runs', '/changes']);
-const RUN_PATH = /^\/runs\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+const RUN_PATH = /^\/runs\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}(?:\/review(?:\/file)?)?$/;
 
 export function isAllowedPath(path: string): boolean {
   return FIXED_PATHS.has(path) || RUN_PATH.test(path);
@@ -104,6 +104,13 @@ export interface PanelClient {
   projects(): Promise<ProjectsResponse>;
   runs(filters: RunFilters): Promise<RunsResponse>;
   run(id: string): Promise<RunResponse>;
+  /** Changed files of the run's managed worktree against its base commit. */
+  review(id: string): Promise<ReviewResponse>;
+  /**
+   * Bounded diff of one file. Callers must pass a path taken from the latest review list; the client only
+   * checks that it is well-formed, so a path typed or guessed elsewhere never reaches the service from the store.
+   */
+  reviewFile(id: string, path: string): Promise<ReviewFileResponse>;
   /** A null cursor asks for the starting cursor; the service answers `resync: true`. */
   changes(cursor: string | null): Promise<ChangeFeed>;
   serviceStatus(): Promise<'stopped' | 'starting' | 'ready' | 'failed' | 'unknown'>;
@@ -130,6 +137,19 @@ function sanitizeMatch(value: unknown): DirectoryMatch {
   if (typeof entry.projectId === 'string' && IDENTIFIER.test(entry.projectId)) match.projectId = entry.projectId;
   if (match.projectId !== undefined && typeof entry.runId === 'string' && IDENTIFIER.test(entry.runId)) match.runId = entry.runId;
   return match;
+}
+
+function isSendableReviewPath(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && !value.includes('\0') && new TextEncoder().encode(value).length <= REVIEW_LIMITS.pathBytes;
+}
+
+const REVIEW_GIT_FAILURE: Mapped = { category: 'request', message: 'Git could not inspect the managed worktree.', hint: null };
+
+/** A git failure inside one review request is not a connection problem; keep it local to the Review tab. */
+function reviewFailure(error: unknown): never {
+  const mapped = mapHostFailure(error);
+  if (mapped.code === 'internal-error' || mapped.code === 'HTTP_500') throw toError('internal-error', REVIEW_GIT_FAILURE);
+  throw mapped;
 }
 
 export function createPanelClient(host: PanelHost): PanelClient {
@@ -175,6 +195,21 @@ export function createPanelClient(host: PanelHost): PanelClient {
       const body = await get(`/runs/${id}`);
       if (typeof body.run !== 'object' || body.run === null) throw toError('invalid-response', BAD_RESPONSE);
       return body as unknown as RunResponse;
+    },
+    async review(id) {
+      if (!IDENTIFIER.test(id)) throw toError('not-found', SERVICE_ERRORS['not-found']!);
+      let body: Record<string, unknown>;
+      try { body = await get(`/runs/${id}/review`); } catch (error) { return reviewFailure(error); }
+      if (typeof body.state !== 'string' || !Array.isArray(body.files) || !Array.isArray(body.generated)) throw toError('invalid-response', BAD_RESPONSE);
+      return body as unknown as ReviewResponse;
+    },
+    async reviewFile(id, path) {
+      if (!IDENTIFIER.test(id)) throw toError('not-found', SERVICE_ERRORS['not-found']!);
+      if (!isSendableReviewPath(path)) throw toError('invalid-request', SERVICE_ERRORS['invalid-request']!);
+      let body: Record<string, unknown>;
+      try { body = await get(`/runs/${id}/review/file`, { path }); } catch (error) { return reviewFailure(error); }
+      if (typeof body.state !== 'string' || typeof body.path !== 'string' || typeof body.text !== 'string') throw toError('invalid-response', BAD_RESPONSE);
+      return body as unknown as ReviewFileResponse;
     },
     async changes(cursor) {
       const body = await get('/changes', cursor === null ? undefined : { cursor });

@@ -1,9 +1,35 @@
 import { createPanelClient, IDENTIFIER, mapHostFailure } from './client.js';
 import type { PanelClient, PanelError, PanelHost, RunFilters } from './client.js';
 import { RUN_STATUSES } from '../shared/protocol.js';
-import type { ProjectSummary, RunDetail, RunSummary, WireRunStatus } from '../shared/protocol.js';
+import type { ProjectSummary, ReviewFileResponse, ReviewResponse, RunDetail, RunSummary, WireRunStatus } from '../shared/protocol.js';
 
 export type ConnectionState = 'connecting' | 'online' | 'offline' | 'service-unavailable';
+
+/** The file whose diff is open in the Review tab. */
+export interface ReviewFileSlice {
+  path: string;
+  loading: boolean;
+  data: ReviewFileResponse | null;
+  /** Fixed sentence when this file's diff could not be loaded; earlier `data` for the same path is kept. */
+  error: string | null;
+}
+
+/** Review of the selected run. Everything here belongs to `runId`; selecting another run resets it. */
+export interface ReviewSlice {
+  runId: string | null;
+  /** A review request is in flight; `data` may still hold the previous answer. */
+  loading: boolean;
+  data: ReviewResponse | null;
+  /** Fixed sentence when the review could not be loaded for a reason other than the connection. */
+  error: string | null;
+  /** The latest refresh failed but `data` from an earlier one is still shown. */
+  stale: boolean;
+  /** Path of the open file; always one of `data.files`. */
+  selectedPath: string | null;
+  file: ReviewFileSlice | null;
+}
+
+export const EMPTY_REVIEW: ReviewSlice = { runId: null, loading: false, data: null, error: null, stale: false, selectedPath: null, file: null };
 
 export interface PanelState {
   connection: ConnectionState;
@@ -23,6 +49,7 @@ export interface PanelState {
   detail: RunDetail | null;
   /** Set when the selected run could not be loaded for a reason other than the connection. */
   detailError: string | null;
+  review: ReviewSlice;
   cursor: string | null;
   /** Consecutive failed polls; drives the backoff. */
   failures: number;
@@ -54,6 +81,15 @@ export interface PanelStore {
   retry(): void;
   setFilters(filters: Partial<RunFilters>): void;
   select(runId: string | null): void;
+  /**
+   * The Review tab is on screen. While it is, the review of the selected run is loaded and follows the change
+   * feed; otherwise nothing review-related is requested.
+   */
+  setReviewVisible(visible: boolean): void;
+  /** Reload the review (and the open file) now. */
+  refreshReview(): void;
+  /** Open the diff of a file. Ignored unless `path` is in the review list currently held. */
+  selectReviewFile(path: string | null): void;
   /** Stop all timers and ignore every in-flight response. */
   dispose(): void;
 }
@@ -91,7 +127,7 @@ export function createPanelStore(options: PanelStoreOptions): PanelStore {
     connection: 'connecting', message: null, hint: null, lastSuccessAt: null, stale: false,
     projects: [], runs: [], runsTotal: 0, runsTruncated: false,
     filters: { projectId: null, status: null }, selectedRunId: null, detail: null, detailError: null,
-    cursor: null, failures: 0, nextAttemptAt: null,
+    review: EMPTY_REVIEW, cursor: null, failures: 0, nextAttemptAt: null,
   };
   const listeners = new Set<(state: PanelState) => void>();
   let disposed = false;
@@ -103,6 +139,9 @@ export function createPanelStore(options: PanelStoreOptions): PanelStore {
   let cycleGen = 0;
   let runsGen = 0;
   let detailGen = 0;
+  let reviewGen = 0;
+  let reviewFileGen = 0;
+  let reviewVisible = false;
   let projectsGen = 0;
 
   function update(patch: Partial<PanelState>): void {
@@ -185,6 +224,64 @@ export function createPanelStore(options: PanelStoreOptions): PanelStore {
     }
   }
 
+  /** The open file is valid only while it is still in the list the service last returned. */
+  function listed(review: ReviewSlice, path: string): boolean {
+    return review.data !== null && review.data.files.some(file => file.path === path);
+  }
+
+  async function loadReviewFile(path: string, runId: string): Promise<void> {
+    // Only paths the service listed are ever requested.
+    if (state.review.runId !== runId || !listed(state.review, path)) return;
+    const gen = ++reviewFileGen;
+    const previous = state.review.file?.path === path ? state.review.file.data : null;
+    update({ review: { ...state.review, selectedPath: path, file: { path, loading: true, data: previous, error: null } } });
+    try {
+      const response = await client.reviewFile(runId, path);
+      if (disposed || gen !== reviewFileGen) return;
+      if (state.review.runId !== runId || state.review.selectedPath !== path) return;
+      update({ review: { ...state.review, file: { path, loading: false, data: response, error: null } } });
+    } catch (caught) {
+      const error = mapHostFailure(caught);
+      if (disposed || gen !== reviewFileGen) return;
+      if (state.review.runId !== runId || state.review.selectedPath !== path) return;
+      if (error.category === 'request') update({ review: { ...state.review, file: { path, loading: false, data: previous, error: error.message } } });
+      else {
+        update({ review: { ...state.review, file: { path, loading: false, data: previous, error: error.message } } });
+        throw error;
+      }
+    }
+  }
+
+  async function loadReview(): Promise<void> {
+    const id = state.selectedRunId;
+    if (id === null) return;
+    const gen = ++reviewGen;
+    const same = state.review.runId === id;
+    update({ review: { ...(same ? state.review : EMPTY_REVIEW), runId: id, loading: true } });
+    let reopen: string | null = null;
+    try {
+      const response = await client.review(id);
+      if (disposed || gen !== reviewGen || state.selectedRunId !== id) return;
+      const open = state.review.selectedPath;
+      const keep = open !== null && response.files.some(file => file.path === open);
+      update({
+        review: {
+          runId: id, loading: false, data: response, error: null, stale: false,
+          selectedPath: keep ? open : null, file: keep ? state.review.file : null,
+        },
+      });
+      reopen = keep ? open : null;
+    } catch (caught) {
+      const error = mapHostFailure(caught);
+      if (disposed || gen !== reviewGen || state.selectedRunId !== id) return;
+      update({ review: { ...state.review, loading: false, error: error.message, stale: state.review.data !== null } });
+      if (error.category !== 'request') throw error;
+    }
+    if (reopen !== null) await loadReviewFile(reopen, id);
+  }
+
+  const reviewLoad = (): void => { void loadReview().then(standaloneSuccess, standaloneFailure); };
+
   /** Full reload after a resync or the first load. The cursor is taken before the lists. */
   async function fullSync(gen: number, cursor: string | null): Promise<void> {
     if (cursor === null) {
@@ -192,7 +289,9 @@ export function createPanelStore(options: PanelStoreOptions): PanelStore {
       if (disposed || gen !== cycleGen) return;
       cursor = feed.cursor;
     }
-    await Promise.all([loadProjects(), loadRuns(), loadDetail()]);
+    const work = [loadProjects(), loadRuns(), loadDetail()];
+    if (reviewVisible && state.selectedRunId !== null) work.push(loadReview());
+    await Promise.all(work);
     if (disposed || gen !== cycleGen) return;
     update({ cursor });
   }
@@ -214,7 +313,10 @@ export function createPanelStore(options: PanelStoreOptions): PanelStore {
           const work: Array<Promise<void>> = [];
           if (feed.projectsChanged) work.push(loadProjects());
           if (feed.changedRunIds.length > 0) work.push(loadRuns());
-          if (state.selectedRunId !== null && feed.changedRunIds.includes(state.selectedRunId)) work.push(loadDetail());
+          if (state.selectedRunId !== null && feed.changedRunIds.includes(state.selectedRunId)) {
+            work.push(loadDetail());
+            if (reviewVisible) work.push(loadReview());
+          }
           await Promise.all(work);
           if (disposed || gen !== cycleGen) return;
           update({ cursor: feed.cursor });
@@ -290,13 +392,37 @@ export function createPanelStore(options: PanelStoreOptions): PanelStore {
       if (runId !== null && !IDENTIFIER.test(runId)) return;
       const id = runId;
       if (id === state.selectedRunId) return;
-      detailGen++;
-      update({ selectedRunId: id, detail: null, detailError: null });
+      detailGen++; reviewGen++; reviewFileGen++;
+      // The tab announces itself again once the new run is drawn.
+      reviewVisible = false;
+      update({ selectedRunId: id, detail: null, detailError: null, review: EMPTY_REVIEW });
       if (id !== null) void loadDetail().then(standaloneSuccess, standaloneFailure);
+    },
+    setReviewVisible(visible) {
+      if (disposed || visible === reviewVisible) return;
+      reviewVisible = visible;
+      if (!visible) return;
+      // Entering the tab reloads (earlier data stays on screen meanwhile); the change feed keeps it current while open.
+      if (state.selectedRunId !== null) reviewLoad();
+    },
+    refreshReview() {
+      if (disposed || state.selectedRunId === null) return;
+      reviewLoad();
+    },
+    selectReviewFile(path) {
+      if (disposed || state.review.runId === null) return;
+      const runId = state.review.runId;
+      if (path === null) {
+        reviewFileGen++;
+        update({ review: { ...state.review, selectedPath: null, file: null } });
+        return;
+      }
+      if (!listed(state.review, path)) return;
+      void loadReviewFile(path, runId).then(standaloneSuccess, standaloneFailure);
     },
     dispose() {
       disposed = true;
-      cycleGen++; runsGen++; detailGen++; projectsGen++;
+      cycleGen++; runsGen++; detailGen++; projectsGen++; reviewGen++; reviewFileGen++;
       if (pollTimer !== null) timers.clearTimeout(pollTimer);
       if (staleTimer !== null) timers.clearTimeout(staleTimer);
       pollTimer = null;

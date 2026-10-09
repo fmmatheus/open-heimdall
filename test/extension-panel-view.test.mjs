@@ -215,7 +215,7 @@ test('task rows keep done/current/pending states and their recorded text', () =>
   assert.equal(rows[0].evidence[0].outcome, 'passed');
   assert.equal(rows[1].evidence.length, 0);
   assert.equal(rows[2].truncated, true);
-  assert.deepEqual(detailTabs(detail()).map(tab => [tab.id, tab.count]), [['overview', undefined], ['usage', undefined], ['tasks', 2]]);
+  assert.deepEqual(detailTabs(detail()).map(tab => [tab.id, tab.count]), [['overview', undefined], ['usage', undefined], ['tasks', 2], ['review', undefined]]);
 });
 
 test('untrusted text stays literal in every view model', () => {

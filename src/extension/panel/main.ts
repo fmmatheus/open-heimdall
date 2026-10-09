@@ -39,6 +39,8 @@ import {
   formatTime,
 } from './view-model.js';
 import type { Badge, DetailTabId, LabeledRow } from './view-model.js';
+import { reviewView } from './review-view.js';
+import type { DiffView, ReviewView } from './review-view.js';
 import { RUN_STATUSES } from '../shared/protocol.js';
 import type { RunDetail, WireRunStatus } from '../shared/protocol.js';
 
@@ -64,11 +66,11 @@ function node<K extends keyof HTMLElementTagNameMap>(tag: K, className?: string,
   return created;
 }
 
-/** Extension points for later tasks. Each renderer receives the loaded detail and a container to fill. */
+/** Extension points for other tasks. Each renderer receives the loaded detail and a container to fill. */
 export interface DetailExtensions {
   /** T7: "open session" actions, drawn at the end of the Overview tab. */
   sessionActions?: (detail: RunDetail, container: HTMLElement) => void;
-  /** T8: extra tabs, e.g. `review`. Ids must be added to DETAIL_TABS in view-model.ts. */
+  /** Replacement renderers for a tab; ids must be listed in DETAIL_TABS in view-model.ts. */
   tabs?: Partial<Record<DetailTabId, (detail: RunDetail, container: HTMLElement) => void>>;
 }
 const extensions: DetailExtensions = {};
@@ -137,6 +139,8 @@ function mountPanel(): void {
   let detailHandles: Array<{ dispose: () => void }> = [];
   let renderedDetail: RunDetail | null = null;
   let renderedKey = '';
+  /** Repaints the Review tab in place; set only while that tab is drawn. */
+  let reviewPainter: ((state: PanelState) => void) | null = null;
   const painted = { project: '', status: '', rows: '' };
 
   const focusList = (): void => {
@@ -169,6 +173,7 @@ function mountPanel(): void {
     for (const handle of detailHandles) handle.dispose();
     detailHandles = [];
     renderedDetail = null;
+    reviewPainter = null;
     detailContent.replaceChildren();
   };
 
@@ -358,10 +363,175 @@ function mountPanel(): void {
     }
   }
 
+  /**
+   * Review tab. The structure is built once per draw; `paintReview` then updates it in place whenever the
+   * store's review slice changes, so a poll does not reset the file list's focus or the diff's scroll position.
+   * Every file name and diff line is written with textContent.
+   */
+  function drawReview(_detail: RunDetail, body: HTMLElement): void {
+    const root = node('div', 'hm-review');
+    body.append(root);
+
+    const bar = node('div', 'hm-review-bar');
+    const refreshSlot = node('div');
+    bar.append(refreshSlot);
+    const status = node('p', 'hm-meta');
+    status.setAttribute('role', 'status');
+    bar.append(status);
+    detailHandles.push(mountButton(refreshSlot, { label: 'Refresh review', variant: 'ghost', size: 'sm', onClick: () => store.refreshReview() }));
+
+    const headerBox = node('section', 'hm-section');
+    headerBox.setAttribute('aria-label', 'Review baseline');
+    const notices = node('div', 'hm-review-notices');
+    const unavailable = node('div', 'hm-blocker');
+    unavailable.setAttribute('role', 'note');
+    const filesBox = node('section', 'hm-section');
+    filesBox.setAttribute('aria-label', 'Changed files');
+    const filesTitle = node('h2', undefined, 'Changed files');
+    const listSlot = node('div');
+    const empty = node('p', 'hm-text');
+    const generatedBox = node('details', 'hm-generated');
+    const generatedSummary = node('summary');
+    const generatedNote = node('p', 'hm-meta');
+    const generatedList = node('ul', 'hm-generated-list');
+    generatedBox.append(generatedSummary, generatedNote, generatedList);
+    filesBox.append(filesTitle, listSlot, empty, generatedBox);
+    const diffBox = node('section', 'hm-section');
+    diffBox.setAttribute('aria-label', 'File diff');
+    const comparison = node('p', 'hm-meta');
+    comparison.setAttribute('role', 'note');
+    root.append(bar, notices, headerBox, unavailable, filesBox, diffBox, comparison);
+
+    const fileList = mountList(listSlot, {
+      items: [],
+      selectedId: null,
+      ariaLabel: 'Changed files',
+      emptyText: '',
+      onSelect: path => store.selectReviewFile(path),
+    });
+    detailHandles.push(fileList);
+
+    const painted = { header: '', files: '', generated: '', diff: '', selected: '' };
+
+    function paintHeader(view: ReviewView): void {
+      const key = `${view.mode}:${JSON.stringify(view.header)}`;
+      if (key === painted.header) return;
+      painted.header = key;
+      headerBox.replaceChildren();
+      headerBox.hidden = view.header === null;
+      if (view.header === null) return;
+      headerBox.append(node('h2', undefined, 'Baseline'));
+      const items: LabeledRow[] = [
+        { label: 'Base commit', value: view.header.baseCommit },
+        { label: 'Branch', value: view.header.branch },
+      ];
+      if (view.header.head !== null) items.push({ label: 'Worktree HEAD', value: view.header.head });
+      if (view.mode === 'ready') {
+        items.push({ label: 'Changes', value: view.header.lines ? `${view.header.summary} · ${view.header.lines}` : view.header.summary });
+        if (view.header.binary > 0) items.push({ label: 'Binary files', value: String(view.header.binary) });
+      }
+      rows(headerBox, items);
+      const full = headerBox.querySelector('dd');
+      if (full) full.title = view.header.baseCommitFull;
+    }
+
+    function paintGenerated(view: ReviewView): void {
+      const key = JSON.stringify(view.generated);
+      if (key === painted.generated) return;
+      painted.generated = key;
+      generatedBox.hidden = view.generated === null;
+      generatedList.replaceChildren();
+      if (view.generated === null) return;
+      generatedSummary.textContent = `${view.generated.label} (${view.generated.count})`;
+      generatedNote.textContent = view.generated.note;
+      for (const entry of view.generated.rows) {
+        generatedList.append(node('li', 'hm-generated-item', `${entry.letter} ${entry.path}`));
+      }
+    }
+
+    function paintDiff(view: ReviewView): void {
+      const key = JSON.stringify(view.diff);
+      if (key === painted.diff) return;
+      painted.diff = key;
+      diffBox.replaceChildren();
+      diffBox.hidden = view.diff === null;
+      if (view.diff !== null) drawDiff(diffBox, view.diff);
+    }
+
+    function paintReview(state: PanelState): void {
+      const view = reviewView(state.review);
+      status.textContent = view.mode === 'loading' ? 'Loading review…' : view.refreshing ? 'Refreshing…' : '';
+      status.hidden = status.textContent === '';
+      notices.replaceChildren(...view.notices.map(text => node('p', 'hm-meta', text)));
+      notices.hidden = view.notices.length === 0;
+      const problem = view.mode === 'error' || view.mode === 'unavailable';
+      unavailable.hidden = !problem;
+      unavailable.dataset.tone = view.tone;
+      unavailable.replaceChildren();
+      if (problem) {
+        if (view.title) unavailable.append(node('p', 'hm-blocker-title', view.title));
+        if (view.message) unavailable.append(node('p', 'hm-text', view.message));
+      }
+      comparison.hidden = view.mode === 'loading';
+      comparison.textContent = view.mode === 'loading' ? '' : view.note;
+
+      paintHeader(view);
+      const ready = view.mode === 'ready';
+      filesBox.hidden = !ready;
+      if (!ready) { painted.files = ''; painted.generated = ''; painted.diff = ''; diffBox.hidden = true; return; }
+      const filesKey = JSON.stringify(view.files);
+      if (filesKey !== painted.files) {
+        painted.files = filesKey;
+        fileList.update({
+          items: view.files.map(row => ({ id: row.id, title: row.title, leading: row.leading, subtitle: row.subtitle, meta: row.meta || undefined })),
+          selectedId: view.selectedPath,
+        });
+        painted.selected = view.selectedPath ?? '';
+      } else if ((view.selectedPath ?? '') !== painted.selected) {
+        painted.selected = view.selectedPath ?? '';
+        fileList.update({ selectedId: view.selectedPath });
+      }
+      listSlot.hidden = view.files.length === 0;
+      empty.hidden = view.emptyText === null;
+      empty.textContent = view.emptyText ?? '';
+      filesTitle.textContent = view.files.length > 0 ? `Changed files (${view.files.length})` : 'Changed files';
+      paintGenerated(view);
+      paintDiff(view);
+    }
+
+    reviewPainter = paintReview;
+    paintReview(store.getState());
+  }
+
+  function drawDiff(parent: HTMLElement, view: DiffView): void {
+    const title = node('h2', undefined, 'Diff');
+    parent.append(title, node('p', 'hm-diff-path', view.path));
+    if (view.stats) parent.append(node('p', 'hm-meta', view.stats));
+    for (const text of view.notices) parent.append(node('p', 'hm-meta', text));
+    if (view.mode !== 'diff') {
+      const message = node('p', 'hm-text', view.message ?? '');
+      if (view.mode === 'loading') message.setAttribute('role', 'status');
+      if (view.mode === 'error') message.setAttribute('role', 'alert');
+      parent.append(message);
+      return;
+    }
+    const pre = node('pre', 'hm-diff');
+    pre.tabIndex = 0;
+    pre.setAttribute('role', 'region');
+    pre.setAttribute('aria-label', `Diff of ${view.path}`);
+    for (const line of view.lines) {
+      const row = node('span', 'hm-diff-line', line.text);
+      row.dataset.kind = line.kind;
+      pre.append(row, document.createTextNode('\n'));
+    }
+    parent.append(pre);
+  }
+
   const drawers: Record<DetailTabId, (detail: RunDetail, body: HTMLElement) => void> = {
     overview: drawOverview,
     usage: drawUsage,
     tasks: drawTasks,
+    review: drawReview,
   };
 
   function drawDetail(detail: RunDetail): void {
@@ -386,6 +556,8 @@ function mountPanel(): void {
     body.setAttribute('role', 'tabpanel');
     detailContent.append(body);
     (extensions.tabs?.[tab] ?? drawers[tab])(detail, body);
+    // The store loads the review only while its tab is showing.
+    store.setReviewVisible(tab === 'review');
   }
 
   function renderDetail(state: PanelState): void {
@@ -398,7 +570,10 @@ function mountPanel(): void {
       detailContent.append(node('p', 'hm-text', placeholder));
       return;
     }
-    if (state.detail === renderedDetail && renderedKey === 'detail') return;
+    if (state.detail === renderedDetail && renderedKey === 'detail') {
+      reviewPainter?.(state);
+      return;
+    }
     renderedKey = 'detail';
     const scroller = document.scrollingElement;
     const top = scroller?.scrollTop ?? 0;

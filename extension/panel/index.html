@@ -38,6 +38,20 @@
       .hm-sessions { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
       .hm-session { display: flex; flex-direction: column; gap: 2px; }
       .hm-copy { display: block; padding: 4px 6px; border: 1px solid var(--oc-border, transparent); border-radius: 6px; overflow-wrap: anywhere; user-select: all; }
+      .hm-review { display: flex; flex-direction: column; gap: 12px; }
+      .hm-review-bar { display: flex; align-items: center; gap: 8px; }
+      .hm-review-notices { display: flex; flex-direction: column; gap: 4px; }
+      .hm-generated { border: 1px solid var(--oc-border, transparent); border-radius: 8px; padding: 6px 8px; margin-top: 8px; }
+      .hm-generated > summary { cursor: pointer; }
+      .hm-generated-list { margin: 6px 0 0; padding: 0; list-style: none; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.75rem; }
+      .hm-generated-item { overflow-wrap: anywhere; }
+      .hm-diff-path { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.75rem; overflow-wrap: anywhere; }
+      .hm-diff { margin: 0; padding: 6px 0; max-height: 60vh; overflow: auto; border: 1px solid var(--oc-border, transparent); border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.75rem; line-height: 1.45; tab-size: 4; }
+      .hm-diff-line { display: inline-block; min-width: 100%; box-sizing: border-box; padding: 0 8px; white-space: pre; }
+      .hm-diff-line[data-kind="add"] { background: color-mix(in srgb, var(--oc-success, #2da44e) 18%, transparent); }
+      .hm-diff-line[data-kind="del"] { background: color-mix(in srgb, var(--oc-error, #cf222e) 18%, transparent); }
+      .hm-diff-line[data-kind="hunk"] { color: var(--oc-info, var(--oc-muted, inherit)); background: var(--oc-muted-surface, transparent); }
+      .hm-diff-line[data-kind="meta"], .hm-diff-line[data-kind="note"] { color: var(--oc-muted, inherit); }
     </style>
   </head>
   <body>

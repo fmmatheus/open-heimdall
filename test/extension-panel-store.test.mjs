@@ -536,10 +536,10 @@ test('the client only requests allowlisted GET service paths', async () => {
   }
   assert.deepEqual([...new Set(service.requests.map(request => request.path.replace(/^\/runs\/.+/, '/runs/:id')))].sort(), ['/changes', '/projects', '/runs', '/runs/:id']);
 
-  for (const path of ['/runs/../x', '/runs/a/b', '/runs/', '/runs/%2e%2e', '/runs/a?b=1', '/health', '/status', '/directories/match', '/runs/run_1/review', '/runs/run_1/reconcile', '/runs/run_1/resume', '/events', '/projects/x', '']) {
+  for (const path of ['/runs/../x', '/runs/a/b', '/runs/', '/runs/%2e%2e', '/runs/a?b=1', '/health', '/status', '/directories/match', '/runs/run_1/review/', '/runs/run_1/review/file/x', '/runs/run_1/review/other', '/runs/run_1/reviews', '/runs/run_1/reconcile', '/runs/run_1/resume', '/events', '/projects/x', '']) {
     assert.equal(isAllowedPath(path), false, path);
   }
-  for (const path of ['/projects', '/runs', '/changes', '/runs/run_1', '/runs/A-b_9']) assert.equal(isAllowedPath(path), true, path);
+  for (const path of ['/projects', '/runs', '/changes', '/runs/run_1', '/runs/A-b_9', '/runs/run_1/review', '/runs/run_1/review/file']) assert.equal(isAllowedPath(path), true, path);
 });
 
 test('the client refuses malformed ids before touching the host', async () => {

@@ -294,7 +294,7 @@ export function currentTaskText(detail: Pick<RunDetail, 'status' | 'phase' | 'cu
   }
 }
 
-export const DETAIL_TABS = ['overview', 'usage', 'tasks'] as const;
+export const DETAIL_TABS = ['overview', 'usage', 'tasks', 'review'] as const;
 export type DetailTabId = typeof DETAIL_TABS[number];
 
 export function detailTabs(detail: Pick<RunDetail, 'tasks'> | null): Array<{ id: DetailTabId; label: string; count?: number }> {
@@ -302,6 +302,7 @@ export function detailTabs(detail: Pick<RunDetail, 'tasks'> | null): Array<{ id:
     { id: 'overview', label: 'Overview' },
     { id: 'usage', label: 'Usage & limits' },
     { id: 'tasks', label: 'Tasks', count: detail?.tasks.length ?? 0 },
+    { id: 'review', label: 'Review' },
   ];
 }
 
