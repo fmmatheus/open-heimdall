@@ -39,6 +39,8 @@ import {
   taskRows,
   usageInfo,
 } from '../dist/extension/panel/view-model.js';
+import { createNavigation } from '../dist/extension/panel/navigation.js';
+import { sessionsPresentation, summaryPresentation, taskSessionActions } from '../dist/extension/panel/navigation-view.js';
 
 const MARKUP = '<img src=x onerror=alert(1)>';
 const NOW = Date.parse('2026-03-09T12:00:00Z');
@@ -616,4 +618,211 @@ test('panel draws the summary (with a summary-actions slot and hook) before the 
   // The summary renders exactly one status badge.
   const summaryBody = main.slice(main.indexOf('function drawSummary'), main.indexOf('function drawTechnical'));
   assert.equal((summaryBody.match(/badge\(head/g) ?? []).length, 1);
+});
+
+// ----- actionable session navigation -----
+
+const NAV_FORBIDDEN = ['startSession', 'prompt', 'compose', 'attach', 'sessionLink', 'writeFile', 'generate', 'openSurface', 'openUrl'];
+
+function navDetail(overrides = {}) {
+  return {
+    id: 'run_1', label: 'Add billing', projectId: 'proj_a', projectName: 'alpha-app', status: 'running', phase: 'executing',
+    completed: 2, total: 4, currentTask: { id: 'T3', title: 'Wire billing' }, createdAt: 1, updatedAt: 2,
+    blocker: null, models: {}, usage: {}, limits: {},
+    tasks: [{ id: 'T1', title: 'Schema' }, { id: 'T2', title: 'Service' }, { id: 'T3', title: 'Wire billing' }],
+    sessions: { parent: 'ses_parent', current: 'ses_t3', completed: [{ id: 'ses_t1', taskId: 'T1' }, { id: 'ses_t2', taskId: 'T2' }] },
+    review: { baseCommit: 'abc', branch: 'b' }, truncated: false,
+    ...overrides,
+  };
+}
+
+/** Recording OpenChamber host and a matcher that knows one directory; forbidden methods throw. */
+function navStack({ projects = [{ id: 'oc_1', name: 'alpha', directory: '/work/alpha' }], listed = ['ses_parent', 'ses_t3', 'ses_t1', 'ses_t2'], projectsState = 'ready', failures = {} } = {}) {
+  const calls = [];
+  const host = {
+    async listProjects() { calls.push(['listProjects']); if (failures.listProjects) throw failures.listProjects; return { state: projectsState, projects }; },
+    async listSessions(id) { calls.push(['listSessions', id]); if (failures.listSessions) throw failures.listSessions; return { state: 'ready', sessions: listed.map(sid => ({ id: sid })) }; },
+    async openSession(id) { calls.push(['openSession', id]); },
+    async writeClipboard(text) { calls.push(['writeClipboard', text]); },
+  };
+  for (const name of NAV_FORBIDDEN) host[name] = () => { calls.push([`FORBIDDEN:${name}`]); throw new Error(name); };
+  const matcher = { async matchDirectories(directories) { return directories.map(directory => (directory === '/work/alpha' ? { projectId: 'proj_a' } : {})); } };
+  return { calls, navigation: createNavigation({ host, matcher }) };
+}
+
+const NAV_PROJECT = { id: 'proj_a', name: 'alpha-app', directory: '/work/alpha' };
+const grant = code => Object.assign(new Error('RAW-SECRET'), { code });
+
+test('navigation view: project missing shows one line, Copy and Refresh, a hint and no per-session buttons', async () => {
+  const { navigation } = navStack({ projects: [] });
+  const view = await navigation.load(navDetail(), NAV_PROJECT);
+  const present = sessionsPresentation(view);
+  assert.equal(present.state, 'project-not-added');
+  assert.equal(present.message, 'Sessions require this project in OpenChamber.');
+  assert.equal(present.canCopy, true);
+  assert.equal(present.canRefresh, true);
+  assert.equal(present.copyText, '/work/alpha');
+  assert.equal(present.hint, "Add the copied folder using OpenChamber's project controls.");
+  assert.deepEqual([present.primary, present.completed, present.note], [[], [], null]);
+
+  // Without a known folder there is nothing to copy; the hint still tells the user what to do.
+  const unknown = sessionsPresentation(await navigation.load(navDetail(), { ...NAV_PROJECT, directory: null }));
+  assert.equal(unknown.canCopy, false);
+  assert.equal(unknown.copyText, null);
+  assert.match(unknown.hint, /project controls/);
+  assert.deepEqual(summaryPresentation(view), { actions: [], hint: 'Sessions require this project in OpenChamber.' });
+});
+
+test('navigation view: pending, permission, other failure and not-discovered states have distinct fixed texts', async () => {
+  const pending = sessionsPresentation(await navStack({ projects: [], projectsState: 'loading' }).navigation.load(navDetail(), NAV_PROJECT));
+  assert.equal(pending.state, 'discovering');
+  assert.match(pending.message, /still loading sessions/);
+
+  const denied = sessionsPresentation(await navStack({ failures: { listProjects: grant('NOT_GRANTED') } }).navigation.load(navDetail(), NAV_PROJECT));
+  assert.equal(denied.state, 'permission-denied');
+  assert.equal(denied.message, 'Allow Heimdall to read sessions in Settings → Extensions, then Refresh sessions.');
+
+  const deniedSessions = sessionsPresentation(await navStack({ failures: { listSessions: grant('NOT_GRANTED') } }).navigation.load(navDetail(), NAV_PROJECT));
+  assert.equal(deniedSessions.state, 'permission-denied');
+
+  const timeout = sessionsPresentation(await navStack({ failures: { listProjects: grant('HOST_TIMEOUT') } }).navigation.load(navDetail(), NAV_PROJECT));
+  const other = sessionsPresentation(await navStack({ failures: { listSessions: grant('BOOM') } }).navigation.load(navDetail(), NAV_PROJECT));
+  assert.equal(timeout.state, 'unavailable');
+  assert.match(timeout.message, /did not answer in time/);
+  assert.equal(other.state, 'unavailable');
+  assert.match(other.message, /could not list sessions/);
+
+  const missing = sessionsPresentation(await navStack({ listed: ['ses_parent'] }).navigation.load(navDetail(), NAV_PROJECT));
+  assert.equal(missing.state, 'listed');
+  assert.equal(missing.note, '3 of 4 recorded sessions are not listed by OpenChamber yet.');
+  assert.equal(missing.canRefresh, true);
+
+  const texts = [pending.message, denied.message, timeout.message, other.message, missing.note, sessionsPresentation(null).message];
+  assert.equal(new Set(texts).size, texts.length, 'every state says something different');
+  for (const present of [pending, denied, deniedSessions, timeout, other]) {
+    assert.equal(present.canRefresh, true);
+    assert.deepEqual([present.primary, present.completed, present.canCopy, present.copyText], [[], [], false, null]);
+  }
+  assert.deepEqual(sessionsPresentation(null).message, 'Checking which sessions OpenChamber has loaded…');
+});
+
+test('navigation view: no state ever describes a disabled per-session button', async () => {
+  const stacks = [
+    navStack({ projects: [] }), navStack({ projects: [], projectsState: 'loading' }), navStack({ projects: [], projectsState: 'error' }),
+    navStack({ failures: { listProjects: grant('NOT_GRANTED') } }), navStack({ failures: { listSessions: grant('X') } }), navStack({ listed: [] }), navStack({ listed: ['ses_t1'] }), navStack(),
+  ];
+  for (const { navigation } of stacks) {
+    const view = await navigation.load(navDetail(), NAV_PROJECT);
+    const present = sessionsPresentation(view);
+    const summary = summaryPresentation(view);
+    const everyAction = [...present.primary, ...present.completed, ...summary.actions, ...taskSessionActions(view).values()];
+    const enabledKeys = new Set(view.targets.filter(entry => entry.enabled && entry.state === 'found').map(entry => entry.target.key));
+    for (const entry of everyAction) assert.ok(enabledKeys.has(entry.key), `${view.state}: ${entry.key} is an enabled, found target`);
+    assert.equal(JSON.stringify([present, summary]).includes('disabled'), false, view.state);
+    if (view.state !== 'listed') assert.deepEqual(everyAction, [], view.state);
+  }
+});
+
+test('navigation view: listed sessions offer only found actions that open the recorded ids', async () => {
+  const { navigation, calls } = navStack();
+  const view = await navigation.load(navDetail(), NAV_PROJECT);
+  const present = sessionsPresentation(view);
+  assert.deepEqual(present.primary.map(action => [action.key, action.text]), [['parent', 'Open parent'], ['current', 'Open current task T3']]);
+  assert.deepEqual(present.completed.map(action => [action.key, action.text]), [['completed:ses_t1', 'Open T1: Schema'], ['completed:ses_t2', 'Open T2: Service']]);
+  assert.equal(present.note, null);
+  assert.equal(present.canRefresh, false);
+  assert.equal(summaryPresentation(view).actions.length, 2);
+
+  for (const action of [...present.primary, ...present.completed]) assert.equal((await navigation.open(view, action.key)).ok, true);
+  assert.deepEqual(calls.filter(entry => entry[0] === 'openSession').map(entry => entry[1]), ['ses_parent', 'ses_t3', 'ses_t1', 'ses_t2']);
+
+  // A planner is offered only while planning, from the current child.
+  const planning = navDetail({ phase: 'planning', currentTask: null, sessions: { parent: 'ses_parent', current: 'ses_plan', completed: [] } });
+  const planView = await navStack({ listed: ['ses_parent', 'ses_plan'] }).navigation.load(planning, NAV_PROJECT);
+  assert.deepEqual(summaryPresentation(planView).actions.map(action => action.text), ['Open parent', 'Open planner']);
+  const paused = await navStack({ listed: ['ses_parent', 'ses_plan'] }).navigation.load({ ...planning, phase: 'paused' }, NAV_PROJECT);
+  assert.deepEqual(summaryPresentation(paused).actions.map(action => action.text), ['Open parent']);
+});
+
+test('navigation view: partly listed sessions give grouped note, found actions only; unlisted primary gets a hint', async () => {
+  const partial = await navStack({ listed: ['ses_t3', 'ses_t1'] }).navigation.load(navDetail(), NAV_PROJECT);
+  const present = sessionsPresentation(partial);
+  assert.deepEqual(present.primary.map(action => action.key), ['current']);
+  assert.deepEqual(present.completed.map(action => action.key), ['completed:ses_t1']);
+  assert.equal(present.note, '2 of 4 recorded sessions are not listed by OpenChamber yet.');
+  assert.deepEqual([...taskSessionActions(partial).keys()].sort(), ['T1', 'T3']);
+
+  const none = await navStack({ listed: [] }).navigation.load(navDetail(), NAV_PROJECT);
+  assert.deepEqual(summaryPresentation(none), { actions: [], hint: "The run's sessions are not listed by OpenChamber yet." });
+  assert.equal(sessionsPresentation(none).note, '4 of 4 recorded sessions are not listed by OpenChamber yet.');
+  const one = await navStack({ listed: [] }).navigation.load(navDetail({ sessions: { parent: 'ses_parent', current: null, completed: [] } }), NAV_PROJECT);
+  assert.equal(sessionsPresentation(one).note, '1 of 1 recorded session is not listed by OpenChamber yet.');
+});
+
+test('navigation view: task rows get an Open session action keyed by task id; the current task wins', async () => {
+  const view = await navStack().navigation.load(navDetail(), NAV_PROJECT);
+  const actions = taskSessionActions(view);
+  assert.deepEqual([...actions.entries()].map(([id, action]) => [id, action.key, action.text, action.ariaLabel]), [
+    ['T3', 'current', 'Open session', 'Open session for task T3'],
+    ['T1', 'completed:ses_t1', 'Open session', 'Open session for task T1'],
+    ['T2', 'completed:ses_t2', 'Open session', 'Open session for task T2'],
+  ]);
+  // A retried current task keeps pointing at the live session, not at an earlier completed attempt.
+  const retried = navDetail({ sessions: { parent: null, current: 'ses_new', completed: [{ id: 'ses_old', taskId: 'T3' }] } });
+  const retriedActions = taskSessionActions(await navStack({ listed: ['ses_new', 'ses_old'] }).navigation.load(retried, NAV_PROJECT));
+  assert.equal(retriedActions.get('T3').key, 'current');
+  assert.equal(taskSessionActions(null).size, 0);
+});
+
+test('navigation: Copy project folder through the same stack calls writeClipboard once; Refresh only lists', async () => {
+  const { navigation, calls } = navStack({ projects: [] });
+  const view = await navigation.load(navDetail(), NAV_PROJECT);
+  assert.deepEqual((await navigation.copyProjectFolder(view.copyText)), { ok: true, message: 'Copied project folder' });
+  assert.deepEqual(calls.filter(entry => entry[0] === 'writeClipboard'), [['writeClipboard', '/work/alpha']]);
+  calls.length = 0;
+  await navigation.load(navDetail(), NAV_PROJECT);
+  assert.deepEqual(calls.map(entry => entry[0]), ['listProjects']);
+  assert.deepEqual(calls.filter(entry => entry[0].startsWith('FORBIDDEN')), []);
+});
+
+test('panel wiring: one shared navigation load feeds summary actions, the sessions list and task rows with role=status feedback', async () => {
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const stripped = text => text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const main = stripped(await readFile(join(root, 'src', 'extension', 'panel', 'main.ts'), 'utf8'));
+
+  // The listing is started from one place and shared; the tabs only read the shared result.
+  assert.equal((main.match(/navigation\.load\(/g) ?? []).length, 1);
+  assert.match(main, /ensureNavigation\(detail\);\s*drawSummary\(detail, detailContent\);/);
+  assert.match(main, /extensions\.summaryActions = drawSummaryActions;/);
+  assert.match(main, /summaryPresentation\(navView\)/);
+  assert.match(main, /sessionsPresentation\(navView\)/);
+  assert.match(main, /taskSessionActions\(navView\)/);
+  // Found actions sit in the summary slot; a hint links to the Sessions tab only when nothing can be opened.
+  assert.match(main, /openSession\('summary', entry\.key\)/);
+  assert.match(main, /'See Sessions tab'/);
+  // Completed sessions are an expandable list; each task row gets its own Open session slot.
+  assert.match(main, /node\('details', 'hm-completed'\)/);
+  assert.match(main, /Completed task sessions \(/);
+  assert.match(main, /openSession\('sessions', entry\.key\)/);
+  assert.match(main, /openSession\('tasks', entry\.key\)/);
+  assert.match(main, /sessionSlots\.set\(task\.id, sessionSlot\)/);
+  // Feedback is a role=status live region; stale listings and actions are discarded.
+  assert.match(main, /const target = node\('p', 'hm-meta hm-status'[^\n]*\);\s*target\.setAttribute\('role', 'status'\)/);
+  assert.match(main, /if \(gen !== loadGen\) return;/);
+  assert.match(main, /if \(epoch === navEpoch\)/);
+  // (The diff view legitimately uses role=alert; scope the check to the session navigation code.)
+  const navCode = main.slice(0, main.indexOf('function drawDiff'));
+  assert.doesNotMatch(navCode, /role', 'alert'/);
+  // No disabled per-session buttons are drawn.
+  const nav = main.slice(main.indexOf('function drawSessions'), main.indexOf('function drawTasks'));
+  assert.doesNotMatch(nav, /disabled/);
+  assert.match(main, /Copy project folder/);
+  assert.match(main, /Refresh sessions/);
+
+  // Only these host methods are ever used by the panel entry or navigation: none of the forbidden ones.
+  const hostCalls = [...main.matchAll(/\bhost\.(\w+)\(/g)].map(entry => entry[1]);
+  for (const name of NAV_FORBIDDEN) {
+    assert.equal(hostCalls.includes(name), false, name);
+    assert.equal(new RegExp(`\\b${name}\\b`).test(main), false, name);
+  }
 });

@@ -38,7 +38,11 @@
       .hm-label { font-size: 0.75rem; color: var(--oc-muted, inherit); margin: 0; }
       .hm-slot:empty { display: none; }
       .hm-sessions { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
-      .hm-session { display: flex; flex-direction: column; gap: 2px; }
+      .hm-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+      .hm-completed { border: 1px solid var(--oc-border, transparent); border-radius: 8px; padding: 6px 8px; align-self: stretch; }
+      .hm-completed > summary { cursor: pointer; }
+      .hm-completed > .hm-actions { margin-top: 8px; }
+      .hm-status { min-height: 0; }
       .hm-copy { display: block; padding: 4px 6px; border: 1px solid var(--oc-border, transparent); border-radius: 6px; overflow-wrap: anywhere; user-select: all; }
       .hm-review { display: flex; flex-direction: column; gap: 12px; }
       .hm-review-bar { display: flex; align-items: center; gap: 8px; }

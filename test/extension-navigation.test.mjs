@@ -11,7 +11,8 @@ import { createExtensionServer, listenExtensionServer } from '../dist/extension/
 
 const SERVICE_TOKEN = 'svc-' + 'a1b2c3d4'.repeat(8);
 const SECRET = 'RAW-SECRET-/Users/x/stack';
-const FORBIDDEN = ['startSession', 'prompt', 'compose', 'attach', 'sessionLink', 'writeFile', 'generate'];
+const FORBIDDEN = ['startSession', 'prompt', 'compose', 'attach', 'sessionLink', 'writeFile', 'generate', 'openSurface', 'openUrl'];
+const ALLOWED_HOST_CALLS = ['listProjects', 'listSessions', 'openSession', 'writeClipboard'];
 
 /* ---------- fixtures ---------- */
 
@@ -106,6 +107,10 @@ function fakeOpenChamber({ projects, sessions = {}, projectsState = 'ready' } = 
       calls.push(['openSession', id]);
       if (state.failures.openSession) throw state.failures.openSession;
     },
+    async writeClipboard(text) {
+      calls.push(['writeClipboard', text]);
+      if (state.failures.writeClipboard) throw state.failures.writeClipboard;
+    },
   };
   for (const name of FORBIDDEN) {
     host[name] = () => { calls.push([`FORBIDDEN:${name}`]); throw new Error(`${name} must never be called`); };
@@ -142,7 +147,7 @@ async function stack(t, { projects, sessions, projectsState } = {}) {
 
 function assertNoForbiddenAndReadOnly({ oc, adapter, panelHost }) {
   assert.deepEqual(oc.calls.filter(entry => entry[0].startsWith('FORBIDDEN')), [], 'forbidden host methods were called');
-  for (const [name] of oc.calls) assert.ok(['listProjects', 'listSessions', 'openSession'].includes(name), name);
+  for (const [name] of oc.calls) assert.ok(ALLOWED_HOST_CALLS.includes(name), name);
   for (const name of adapter.calls) assert.ok(['projects', 'runs'].includes(name), `coordinator call ${name}`);
   for (const request of panelHost.requests) {
     if (request.method === 'POST') assert.equal(request.path, '/directories/match');
@@ -164,9 +169,19 @@ test('session targets: parent, current task while executing, completed tasks, ea
   assert.equal(targets[2].label, 'Completed T1: Schema');
 
   // The checkpoint child is the planner session while planning, and stale after a pause or finish.
-  for (const phase of ['planning', 'paused', 'succeeded', 'failed', 'queued']) {
+  for (const phase of ['planning', 'paused', 'succeeded', 'failed', 'queued', 'preparing', 'reconciliation-required']) {
     assert.equal(sessionTargets(detail({ phase })).some(target => target.kind === 'current'), false, phase);
+    assert.equal(sessionTargets(detail({ phase })).some(target => target.kind === 'planner'), phase === 'planning', phase);
   }
+  const planning = sessionTargets(detail({ phase: 'planning', currentTask: null }));
+  assert.deepEqual(planning.filter(target => target.kind === 'planner').map(target => [target.key, target.sessionId, target.buttonText]), [['planner', 'ses_t3', 'Open planner']]);
+  // Planner sessions are never derived from anything but the current child (usage rows are ignored).
+  const usageOnly = sessionTargets(detail({ phase: 'executing', sessions: { parent: null, current: null, completed: [] }, usage: { sessions: [{ id: 'ses_usage', role: 'planner' }] } }));
+  assert.deepEqual(usageOnly, []);
+  assert.deepEqual(sessionTargets(detail({ phase: 'planning', sessions: { parent: 'ses_parent', current: null, completed: [] } })).map(target => target.kind), ['parent']);
+  assert.deepEqual(targets.map(target => [target.buttonText, target.taskId]), [
+    ['Open parent', null], ['Open current task T3', 'T3'], ['Open T1: Schema', 'T1'], ['Open T2: Service', 'T2'],
+  ]);
   // A session that is both current and completed (or the parent) is offered once.
   const duplicate = sessionTargets(detail({ sessions: { parent: 'ses_a', current: 'ses_a', completed: [{ id: 'ses_a', taskId: 'T1' }, { id: 'ses_a', taskId: 'T2' }] } }));
   assert.deepEqual(duplicate.map(target => target.sessionId), ['ses_a']);
@@ -328,8 +343,7 @@ test('project-not-added: same name and equal ids do not count, and the guidance 
   });
   const view = await s.navigation.load(detail(), heimdallProject(s.dirs));
   assert.equal(view.state, 'project-not-added');
-  assert.match(view.message, /"alpha-app" is not added to OpenChamber/);
-  assert.match(view.message, /Add this project's directory/);
+  assert.equal(view.message, 'Sessions require this project in OpenChamber.');
   assert.equal(view.copyText, s.dirs.project);
   assert.equal(view.canRefresh, true);
   assert.equal(view.targets.length, 4);
@@ -419,21 +433,28 @@ test('host failures become explicit fixed messages without relaying raw text', a
 
   s.oc.state.failures.listProjects = hostError('NOT_GRANTED');
   let view = await s.navigation.load(detail(), heimdallProject(s.dirs));
-  assert.equal(view.state, 'unavailable');
-  assert.match(view.message, /not been allowed to read OpenChamber sessions/);
-  assert.match(view.message, /Settings → Extensions/);
-  assert.equal(view.targets.every(entry => entry.state === 'unavailable' && !entry.enabled), true);
+  assert.equal(view.state, 'permission-denied');
+  assert.equal(view.message, 'Allow Heimdall to read sessions in Settings → Extensions, then Refresh sessions.');
+  assert.equal(view.targets.every(entry => entry.state === 'permission-denied' && !entry.enabled), true);
+  assert.equal(view.canRefresh, true);
+  assert.equal(JSON.stringify(view).includes('RAW-SECRET'), false);
 
   s.oc.state.failures.listProjects = hostError('HOST_TIMEOUT');
   view = await s.navigation.load(detail(), heimdallProject(s.dirs));
+  assert.equal(view.state, 'unavailable', 'a timeout is not a permission failure');
   assert.match(view.message, /did not answer in time/);
 
   s.oc.state.failures.listProjects = hostError('SOMETHING_ELSE');
   view = await s.navigation.load(detail(), heimdallProject(s.dirs));
+  assert.equal(view.state, 'unavailable');
   assert.match(view.message, /could not list projects/);
 
   delete s.oc.state.failures.listProjects;
   s.oc.state.failures.listSessions = hostError('NOT_GRANTED');
+  view = await s.navigation.load(detail(), heimdallProject(s.dirs));
+  assert.equal(view.state, 'permission-denied');
+  assert.equal(view.message, 'Allow Heimdall to read sessions in Settings → Extensions, then Refresh sessions.');
+  s.oc.state.failures.listSessions = hostError('HOST_TIMEOUT');
   view = await s.navigation.load(detail(), heimdallProject(s.dirs));
   assert.equal(view.state, 'unavailable');
   assert.match(view.message, /list sessions/);
@@ -476,5 +497,78 @@ test('the navigation module names no forbidden host method', async () => {
   const source = await fs.readFile(path.join(root, 'src', 'extension', 'panel', 'navigation.ts'), 'utf8');
   for (const name of FORBIDDEN) assert.equal(new RegExp(`\\b${name}\\b`).test(source.replace(/\/\*[\s\S]*?\*\//g, '')), false, name);
   const used = [...source.matchAll(/\bhost\.(\w+)\(/g)].map(entry => entry[1]);
-  assert.deepEqual([...new Set(used)].sort(), ['listProjects', 'listSessions', 'openSession']);
+  assert.deepEqual([...new Set(used)].sort(), ['listProjects', 'listSessions', 'openSession', 'writeClipboard']);
+});
+
+/* ---------- planner, copy folder, refresh ---------- */
+
+test('planner target opens the existing planner session only while planning', async t => {
+  const s = await stack(t, { projects: dirs => [{ id: 'oc_alpha', name: 'alpha', directory: dirs.alias }], sessions: { oc_alpha: ['ses_parent', 'ses_plan'] } });
+  const planning = detail({ phase: 'planning', status: 'running', currentTask: null, sessions: { parent: 'ses_parent', current: 'ses_plan', completed: [] } });
+  const view = await s.navigation.load(planning, heimdallProject(s.dirs));
+  assert.deepEqual(view.targets.map(entry => [entry.target.key, entry.target.kind, entry.state]), [['parent', 'parent', 'found'], ['planner', 'planner', 'found']]);
+  assert.equal(view.targets[1].actionLabel, 'Open Planner session');
+  assert.deepEqual(await s.navigation.open(view, 'planner'), { ok: true, message: null });
+  assert.deepEqual(await s.navigation.open(view, 'current'), { ok: false, message: 'That session is not available to open yet.' });
+  assert.deepEqual(s.oc.calls.filter(entry => entry[0] === 'openSession'), [['openSession', 'ses_plan']]);
+
+  // Once the runner moves on, the same child id is no longer offered as a planner.
+  const after = await s.navigation.load({ ...planning, phase: 'paused' }, heimdallProject(s.dirs));
+  assert.deepEqual(after.targets.map(entry => entry.target.kind), ['parent']);
+  assertNoForbiddenAndReadOnly(s);
+});
+
+test('completed task targets are keyed by task id and open the recorded ids', async t => {
+  const s = await stack(t, { projects: dirs => [{ id: 'oc_alpha', name: 'alpha', directory: dirs.alias }], sessions: { oc_alpha: ALL_IDS } });
+  const view = await s.navigation.load(detail(), heimdallProject(s.dirs));
+  assert.deepEqual(view.targets.filter(entry => entry.target.kind === 'completed').map(entry => [entry.target.taskId, entry.target.sessionId]), [['T1', 'ses_t1'], ['T2', 'ses_t2']]);
+  assert.deepEqual(await s.navigation.open(view, 'completed:ses_t2'), { ok: true, message: null });
+  assert.deepEqual(s.oc.calls.filter(entry => entry[0] === 'openSession'), [['openSession', 'ses_t2']]);
+});
+
+test('copy project folder: one writeClipboard call with the exact directory, success and failure feedback', async t => {
+  const s = await stack(t, { projects: () => [] });
+  const ok = await s.navigation.copyProjectFolder(s.dirs.project);
+  assert.deepEqual(ok, { ok: true, message: 'Copied project folder' });
+  assert.deepEqual(s.oc.calls, [['writeClipboard', s.dirs.project]]);
+
+  for (const code of ['NOT_GRANTED', 'HOST_TIMEOUT', 'HOST_REJECTED']) {
+    s.oc.state.failures.writeClipboard = hostError(code);
+    const failed = await s.navigation.copyProjectFolder(s.dirs.project);
+    assert.equal(failed.ok, false, code);
+    assert.match(failed.message, /Select the folder path shown on this page/, code);
+    assert.equal(failed.message.includes('RAW-SECRET'), false, code);
+  }
+  assert.equal(s.oc.calls.filter(entry => entry[0] === 'writeClipboard').length, 4, 'one call per attempt');
+  assertNoForbiddenAndReadOnly(s);
+});
+
+test('copy project folder makes no host call for an unknown, empty or too long directory', async t => {
+  const s = await stack(t, { projects: () => [] });
+  for (const directory of [null, undefined, '', '   ']) {
+    const result = await s.navigation.copyProjectFolder(directory);
+    assert.equal(result.ok, false);
+    assert.match(result.message, /not known/);
+  }
+  const tooLong = await s.navigation.copyProjectFolder('/' + 'a'.repeat(32000));
+  assert.equal(tooLong.ok, false);
+  assert.match(tooLong.message, /Select the folder path/);
+  assert.deepEqual(s.oc.calls, []);
+  // Exactly at the limit is passed through unchanged.
+  const edge = '/' + 'a'.repeat(31999);
+  assert.equal((await s.navigation.copyProjectFolder(edge)).ok, true);
+  assert.deepEqual(s.oc.calls, [['writeClipboard', edge]]);
+});
+
+test('Refresh re-runs only listProjects, the directory match and listSessions', async t => {
+  const s = await stack(t, { projects: dirs => [{ id: 'oc_alpha', name: 'alpha', directory: dirs.alias }], sessions: { oc_alpha: ['ses_parent'] } });
+  await s.navigation.load(detail(), heimdallProject(s.dirs));
+  s.oc.calls.length = 0;
+  s.panelHost.requests.length = 0;
+  s.adapter.calls.length = 0;
+  const again = await s.navigation.load(detail(), heimdallProject(s.dirs));
+  assert.equal(again.state, 'listed');
+  assert.deepEqual(s.oc.calls.map(entry => entry[0]), ['listProjects', 'listSessions']);
+  assert.deepEqual(s.panelHost.requests.map(request => `${request.method} ${request.path}`), ['POST /directories/match']);
+  assert.deepEqual([...new Set(s.adapter.calls)].sort(), ['projects', 'runs']);
 });

@@ -11,8 +11,9 @@ import {
   mountTabs,
 } from '@openchamber/sdk/ui';
 import { createPanelClient } from './client.js';
-import { createNavigation } from './navigation.js';
-import type { NavigationView } from './navigation.js';
+import { createNavigation, sessionTargets } from './navigation.js';
+import type { HeimdallProjectRef, NavigationView } from './navigation.js';
+import { sessionsPresentation, summaryPresentation, taskSessionActions } from './navigation-view.js';
 import { createPanelStore } from './store.js';
 import type { PanelState } from './store.js';
 import {
@@ -154,17 +155,107 @@ function mountPanel(): void {
     }
   });
 
+  /*
+   * Session navigation is loaded once per drawn run and shared by the summary actions, the Sessions tab and the
+   * Tasks tab. `navEpoch` changes with the run (or its recorded sessions) and guards open/copy results;
+   * `loadGen` changes with every listing and guards the listing itself, so a stale result never paints.
+   */
   const navigation = createNavigation({ host, matcher: createPanelClient(host) });
-  let sessionHandles: Array<{ dispose: () => void }> = [];
-  let sessionGen = 0;
-  const disposeSessions = (): void => {
-    sessionGen++;
-    for (const handle of sessionHandles) handle.dispose();
-    sessionHandles = [];
+  let navView: NavigationView | null = null;
+  let navKey = '';
+  let navEpoch = 0;
+  let loadGen = 0;
+  let navPainters: Array<() => void> = [];
+  let navHandles: Array<{ dispose: () => void }> = [];
+  let feedback = { owner: '', text: '' };
+  const feedbackNodes = new Map<string, HTMLElement>();
+  let completedOpen = false;
+  let refocusRefresh = false;
+  const REFRESHING = 'Refreshing sessions…';
+
+  const disposeNavigation = (): void => {
+    for (const handle of navHandles) handle.dispose();
+    navHandles = [];
+  };
+  const resetNavigation = (): void => {
+    if (navKey === '') return;
+    navKey = '';
+    navView = null;
+    navEpoch++;
+    loadGen++;
+    feedback = { owner: '', text: '' };
+  };
+  const paintNavigation = (): void => {
+    disposeNavigation();
+    for (const paint of navPainters) paint();
+  };
+  /** Feedback is shown next to the action that caused it and updated in place, so focus stays on the button. */
+  const setFeedback = (owner: string, text: string): void => {
+    feedback = { owner, text };
+    for (const [id, target] of feedbackNodes) target.textContent = id === owner ? text : '';
+  };
+  const feedbackNode = (owner: string): HTMLElement => {
+    const target = node('p', 'hm-meta hm-status', feedback.owner === owner ? feedback.text : '');
+    target.setAttribute('role', 'status');
+    feedbackNodes.set(owner, target);
+    return target;
+  };
+  const navButton = (parent: HTMLElement, label: string, ariaLabel: string | undefined, variant: 'outline' | 'ghost', onClick: () => void): HTMLElement | null => {
+    const slot = node('span');
+    parent.append(slot);
+    navHandles.push(mountButton(slot, { label, variant, size: 'sm', onClick }));
+    const button = slot.querySelector<HTMLElement>('button');
+    if (ariaLabel) button?.setAttribute('aria-label', ariaLabel);
+    return button;
   };
 
+  function projectOf(detail: RunDetail): HeimdallProjectRef {
+    const known = store.getState().projects.find(entry => entry.id === detail.projectId);
+    return { id: detail.projectId, name: known?.name ?? detail.projectName, directory: known?.directory ?? null };
+  }
+
+  /** Re-lists only: listProjects, the directory match and listSessions. Never creates or changes anything. */
+  function loadNavigation(detail: RunDetail): void {
+    const gen = ++loadGen;
+    void navigation.load(detail, projectOf(detail)).then(result => {
+      if (gen !== loadGen) return;
+      navView = result;
+      if (feedback.text === REFRESHING) feedback = { owner: '', text: '' };
+      paintNavigation();
+    }, () => undefined);
+  }
+
+  function ensureNavigation(detail: RunDetail): void {
+    const key = `${detail.id}|${sessionTargets(detail).map(target => `${target.key}:${target.sessionId}`).join(',')}`;
+    if (key === navKey && navView?.state !== 'discovering') return;
+    if (key !== navKey) {
+      navKey = key;
+      navView = null;
+      navEpoch++;
+      feedback = { owner: '', text: '' };
+    }
+    loadNavigation(detail);
+  }
+
+  function openSession(owner: string, key: string): void {
+    const view = navView;
+    if (view === null) return;
+    const epoch = navEpoch;
+    void navigation.open(view, key).then(outcome => {
+      if (epoch === navEpoch) setFeedback(owner, outcome.message ?? '');
+    });
+  }
+
+  function refreshSessions(detail: RunDetail): void {
+    refocusRefresh = true;
+    setFeedback('sessions', REFRESHING);
+    loadNavigation(detail);
+  }
+
   const disposeDetail = (): void => {
-    disposeSessions();
+    disposeNavigation();
+    navPainters = [];
+    feedbackNodes.clear();
     for (const handle of detailHandles) handle.dispose();
     detailHandles = [];
     renderedDetail = null;
@@ -258,68 +349,84 @@ function mountPanel(): void {
 
   /** Sessions tab: open the run's existing sessions, or explain why they cannot be opened. */
   function drawSessions(detail: RunDetail, container: HTMLElement): void {
-    disposeSessions();
-    const gen = sessionGen;
     const shell = section(container, 'Sessions');
-    const status = node('p', 'hm-text', 'Checking which sessions OpenChamber has loaded…');
-    status.setAttribute('role', 'status');
     const body = node('div', 'hm-sessions');
-    const feedback = node('p', 'hm-text');
-    feedback.setAttribute('role', 'alert');
-    feedback.hidden = true;
-    shell.append(status, body, feedback);
+    shell.append(body);
 
-    const known = store.getState().projects.find(entry => entry.id === detail.projectId);
-    const project = { id: detail.projectId, name: known?.name ?? detail.projectName, directory: known?.directory ?? null };
-    function paint(result: NavigationView): void {
-      for (const handle of sessionHandles) handle.dispose();
-      sessionHandles = [];
+    function paint(): void {
       body.replaceChildren();
-      status.textContent = result.message ?? '';
-      status.hidden = result.message === null;
-      if (result.copyText !== null) {
-        const copy = node('code', 'hm-copy', result.copyText);
+      let refreshButton: HTMLElement | null = null;
+      const present = sessionsPresentation(navView);
+      const message = node('p', 'hm-text', present.message ?? '');
+      message.tabIndex = -1;
+      message.setAttribute('role', 'status');
+      message.hidden = present.message === null;
+      body.append(message);
+      if (present.copyText !== null) {
+        const copy = node('code', 'hm-copy', present.copyText);
         copy.tabIndex = 0;
-        copy.setAttribute('aria-label', `Project directory: ${result.copyText}`);
+        copy.setAttribute('aria-label', `Project folder: ${present.copyText}`);
         body.append(copy);
       }
-      for (const entry of result.targets) {
-        const row = node('div', 'hm-session');
-        const slot = node('div');
-        row.append(slot);
-        sessionHandles.push(mountButton(slot, {
-          label: entry.actionLabel,
-          variant: 'outline',
-          size: 'sm',
-          disabled: !entry.enabled,
-          onClick: () => {
-            void navigation.open(result, entry.target.key).then(outcome => {
-              if (gen !== sessionGen) return;
-              feedback.textContent = outcome.message ?? '';
-              feedback.hidden = outcome.message === null;
+      if (present.canCopy || present.canRefresh) {
+        const actions = node('div', 'hm-actions');
+        if (present.canCopy) {
+          navButton(actions, 'Copy project folder', undefined, 'outline', () => {
+            const epoch = navEpoch;
+            void navigation.copyProjectFolder(projectOf(detail).directory).then(result => {
+              if (epoch === navEpoch) setFeedback('sessions', result.message ?? '');
             });
-          },
-        }));
-        if (result.state === 'listed' && entry.note) row.append(node('p', 'hm-meta', entry.note));
-        body.append(row);
+          });
+        }
+        if (present.canRefresh) refreshButton = navButton(actions, 'Refresh sessions', undefined, 'ghost', () => refreshSessions(detail));
+        body.append(actions);
       }
-      if (result.canRefresh) {
-        const slot = node('div');
-        body.append(slot);
-        sessionHandles.push(mountButton(slot, { label: 'Refresh sessions', variant: 'ghost', size: 'sm', onClick: () => check() }));
+      body.append(feedbackNode('sessions'));
+      if (present.hint) body.append(node('p', 'hm-meta', present.hint));
+      if (present.primary.length > 0) body.append(node('p', 'hm-meta', 'Open the parent, planner and current task sessions from the run summary above.'));
+      if (present.note) body.append(node('p', 'hm-meta', present.note));
+      if (present.completed.length > 0) {
+        const list = node('details', 'hm-completed');
+        list.open = completedOpen;
+        list.addEventListener('toggle', () => { completedOpen = list.open; });
+        list.append(node('summary', undefined, `Completed task sessions (${present.completed.length})`));
+        const rowsBox = node('div', 'hm-actions');
+        for (const entry of present.completed) navButton(rowsBox, entry.text, entry.ariaLabel, 'outline', () => openSession('sessions', entry.key));
+        list.append(rowsBox);
+        body.append(list);
+      }
+      if (refocusRefresh && navView !== null) {
+        refocusRefresh = false;
+        (refreshButton ?? message).focus();
       }
     }
-
-    function check(): void {
-      feedback.hidden = true;
-      status.hidden = false;
-      status.textContent = 'Checking which sessions OpenChamber has loaded…';
-      void navigation.load(detail, project).then(result => {
-        if (gen === sessionGen) paint(result);
-      });
-    }
-    check();
+    navPainters.push(paint);
+    paint();
   }
+
+  /** Summary actions: Open planner / current task / parent when OpenChamber lists them, else a one-line hint. */
+  function drawSummaryActions(detail: RunDetail, slot: HTMLElement): void {
+    function paint(): void {
+      slot.replaceChildren();
+      const present = summaryPresentation(navView);
+      if (present.actions.length > 0) {
+        const actions = node('div', 'hm-actions');
+        for (const entry of present.actions) navButton(actions, entry.text, entry.ariaLabel, 'outline', () => openSession('summary', entry.key));
+        slot.append(actions, feedbackNode('summary'));
+      } else if (present.hint !== null && tab !== 'sessions') {
+        const row = node('div', 'hm-actions');
+        row.append(node('span', 'hm-meta', present.hint));
+        navButton(row, 'See Sessions tab', undefined, 'ghost', () => {
+          tab = 'sessions';
+          drawDetail(detail);
+        });
+        slot.append(row);
+      }
+    }
+    navPainters.push(paint);
+    paint();
+  }
+  extensions.summaryActions = drawSummaryActions;
 
   function drawTasks(detail: RunDetail, body: HTMLElement): void {
     const items = taskRows(detail.tasks);
@@ -327,6 +434,16 @@ function mountPanel(): void {
       body.append(node('p', 'hm-text', 'No task list has been recorded for this run.'));
       return;
     }
+    const sessionSlots = new Map<string, HTMLElement>();
+    const paintTaskSessions = (): void => {
+      const actions = taskSessionActions(navView);
+      for (const [id, slot] of sessionSlots) {
+        slot.replaceChildren();
+        const entry = actions.get(id);
+        if (entry) navButton(slot, entry.text, entry.ariaLabel, 'outline', () => openSession('tasks', entry.key));
+      }
+    };
+    body.append(feedbackNode('tasks'));
     for (const task of items) {
       const details = node('details', 'hm-task');
       details.open = expandedTasks.has(task.id);
@@ -339,6 +456,9 @@ function mountPanel(): void {
       summary.append(node('span', 'hm-task-title', `${task.id}: ${task.title}`));
       details.append(summary);
       const inner = node('div', 'hm-task-body');
+      const sessionSlot = node('div', 'hm-slot');
+      sessionSlots.set(task.id, sessionSlot);
+      inner.append(sessionSlot);
       if (task.summary) inner.append(node('p', 'hm-label', 'Summary'), node('p', 'hm-text', task.summary));
       if (task.handoff) inner.append(node('p', 'hm-label', 'Handoff'), node('p', 'hm-text', task.handoff));
       if (task.model) inner.append(node('p', 'hm-label', 'Model'), node('p', 'hm-text', task.model));
@@ -360,6 +480,8 @@ function mountPanel(): void {
       details.append(inner);
       body.append(details);
     }
+    navPainters.push(paintTaskSessions);
+    paintTaskSessions();
   }
 
   /**
@@ -536,6 +658,7 @@ function mountPanel(): void {
   function drawDetail(detail: RunDetail): void {
     disposeDetail();
     renderedDetail = detail;
+    ensureNavigation(detail);
     drawSummary(detail, detailContent);
     const notice = truncationNotice(detail);
     if (notice) detailContent.append(node('p', 'hm-meta', notice));
@@ -564,6 +687,7 @@ function mountPanel(): void {
       const key = `placeholder:${placeholder}`;
       if (key === renderedKey) return;
       renderedKey = key;
+      resetNavigation();
       disposeDetail();
       detailContent.append(node('p', 'hm-text', placeholder));
       return;
@@ -600,6 +724,7 @@ function mountPanel(): void {
       return;
     }
     renderedKey = '';
+    resetNavigation();
 
     // Components are repainted only when their inputs changed, so an open select popup or the list's
     // keyboard-active row survives the periodic polls.
