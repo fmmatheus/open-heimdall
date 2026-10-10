@@ -17,8 +17,9 @@ export function gitEnvironment() {
   return env;
 }
 
-export async function createRepository(root) {
-  const repository = assertUnder(root, path.join(root, 'repo'), 'repository');
+export async function createRepository(root, { name = 'repo', extraFiles = {} } = {}) {
+  const files = { ...FILES, ...extraFiles };
+  const repository = assertUnder(root, path.join(root, name), 'repository');
   const hooks = path.join(root, 'config', 'empty-hooks');
   fs.mkdirSync(hooks, { recursive: true, mode: 0o700 });
   fs.mkdirSync(repository, { mode: 0o700 });
@@ -27,13 +28,13 @@ export async function createRepository(root) {
     if (result.code !== 0) throw new Error(`git ${args[0]} failed: ${result.stderr.slice(0, 300)}`);
     return result.stdout.trim();
   };
-  for (const [relative, content] of Object.entries(FILES)) {
+  for (const [relative, content] of Object.entries(files)) {
     fs.mkdirSync(path.dirname(path.join(repository, relative)), { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(repository, relative), content, { flag: 'wx', mode: 0o600 });
   }
   await git(['-c', 'init.templateDir=', 'init', '-b', 'main']);
   for (const [key, value] of [['user.name', 'Heimdall Fixture'], ['user.email', 'fixture@example.invalid'], ['commit.gpgsign', 'false'], ['core.hooksPath', hooks]]) await git(['config', '--local', key, value]);
-  await git(['add', '--', ...Object.keys(FILES)]);
+  await git(['add', '--', ...Object.keys(files)]);
   await git(['commit', '-m', 'Initial live verification fixture']);
   const tests = await capture(process.execPath, ['--test', 'test/impl.test.js'], { cwd: repository });
   if (tests.code !== 0) throw new Error('Baseline fixture tests failed');
@@ -41,7 +42,7 @@ export async function createRepository(root) {
     repository,
     head: await git(['rev-parse', 'HEAD']),
     status: await git(['status', '--porcelain']),
-    hashes: Object.fromEntries(Object.keys(FILES).map(relative => [relative, sha256(fs.readFileSync(path.join(repository, relative)))])),
+    hashes: Object.fromEntries(Object.keys(files).map(relative => [relative, sha256(fs.readFileSync(path.join(repository, relative)))])),
     hooksPath: await git(['config', '--local', 'core.hooksPath']),
     gpgsign: await git(['config', '--local', 'commit.gpgsign']),
   };

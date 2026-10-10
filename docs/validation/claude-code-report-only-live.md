@@ -9,12 +9,13 @@
 | Copied provider differs only by isolation patches | Done, observed (T1) |
 | Claude CLI and provider user-state write audit | Done, read-only (T1) |
 | Enforced read-only guard over login and user state | **guard proven** (T1) |
-| Live tool-path enforcement, release, recovery | **PENDING (T2)**: not run |
-| Enablement of `claude-code` in `VERIFIED_REPORT_ONLY_PROVIDERS` | **PENDING (T3)**: still disabled |
+| Live tool-path enforcement, release, recovery | **observed (T2)**, see [Live results](#live-results-t2) |
+| Enablement of `claude-code` in `VERIFIED_REPORT_ONLY_PROVIDERS` | **PENDING (T3)**: still disabled in `src/` |
 
-Nothing in this record starts an OpenCode server or a model session. The
-real login was used only for `claude auth status` inside the guard. No
-credential was copied, printed, refreshed or written.
+T1 started no OpenCode server and no model session; T2 did, inside the guard
+and the disposable fixture only (see Live results). The real login was used
+only through the read-only guard broker. No credential was copied, printed,
+refreshed or written.
 
 ## Versions
 
@@ -58,7 +59,7 @@ Harness files:
 | `stores.mjs` | Resolve every store and refuse unless all are under the root |
 | `copy-provider.mjs` | Exclusive-create copy of the installed provider plus the two isolation patches |
 | `repo.mjs` | Disposable git repository with empty hooks path, fixture identity, no signing |
-| `server.mjs` | Guarded disposable server launcher (not started in T1) |
+| `server.mjs` | Guarded disposable server launcher (started only in T2) |
 | `guard.mjs` | Sandbox profile, launch wrapper and the disposable probe |
 | `guard-probe-inner.mjs` | Runs the probe attempts inside the wrapper |
 | `broker.mjs`, `security-shim.mjs` | Read-only Keychain broker and the `security` shim the CLI sees |
@@ -278,6 +279,121 @@ refreshed, rotated, copied or printed. No existing server, session or database
 was opened. The probe's brokers were stopped and confirmed exited. Installed
 provider hashes are unchanged.
 
-PENDING (T2): live tool-path enforcement (edit, write, shell, tests, `git commit`,
-delegation, namespaced MCP, nested code mode), owner-matched release, and
-recovery (correction, pause, cap, late-release). Not run.
+T2 (live tool-path enforcement, owner-matched release, recovery) ran after this
+outcome; its results follow.
+
+## Live results (T2)
+
+Run against the same fixture root (`/private/tmp/heimdall-0005.mZaL06`), with
+every model session on `claude-code/sonnet`. The real login was reachable only
+through the read-only guard broker.
+
+### Fixture-only configuration (no `src/` or `test/` change)
+
+The repository was built from the current worktree and the built `dist/` was
+copied into the fixture. The pieces below exist only under the fixture root:
+
+- `VERIFIED_REPORT_ONLY_PROVIDERS` patched to `['claude-code']` in the copied
+  `dist/opencode/report-only.js`. The checked-in `src/` list is unchanged and
+  `claude-code` is still not enabled there (T3).
+- A fixture plugin (`fixture/heimdall-fixture-plugin.mjs`) calling
+  `createPlugin({ reportOnly: createReportOnlyRegistry() })`.
+- An owner-only Unix control socket (`control.sock`, mode 700 root) exposing
+  `restrict`, `releaseOwned` and `has` on the live registry. It is not a model
+  tool and is not visible to any session.
+- An observer plugin (`fixture/observer-plugin.mjs`) that records tool
+  attempts, hook outcomes, permission evaluation and per-turn tool lists
+  without altering Heimdall's hooks.
+- A disposable stdio MCP server (`fixture/marker-mcp.mjs`) whose
+  `marker_write_marker` tool appends a line to a marker file outside the
+  repository, proving that a namespaced `mcp__*` call actually executed.
+- Two ADR executor agents that omit `handoff` once or always, to drive the
+  automatic correction path.
+
+### Tool-path matrix
+
+For each path the same model prompt was run in four phases on a disposable
+git repository (`repo/`): **A** unrestricted, **B** restricted in the middle of
+the turn, **C** turn started while already restricted, **D** after release.
+
+| Path (tool) | A: runs, effect present | B: call after restriction | C: tools offered | D: after release |
+| --- | --- | --- | --- | --- |
+| edit (`edit`) | yes | not completed, no effect | 13 -> 0 | yes |
+| write (`write`) | yes | not completed, no effect | 13 -> 0 | yes |
+| shell (`shell`) | yes | not completed, no effect | 13 -> 0 | yes |
+| tests (`shell`, `node --test`) | yes | not completed, no effect | 13 -> 0 | yes |
+| git commit (`shell`) | new commit | not completed, HEAD unchanged | 13 -> 0 | new commit |
+| delegation (`subagent`) | yes | not completed, no effect | 13 -> 0 | yes |
+| code mode (`execute`, calling MCP) | yes, marker +1 | not completed, marker unchanged | 13 -> 0 | yes, marker +1 |
+| nested MCP inside code mode (`mcp__*` via `execute`) | yes, marker +1 | not completed, marker unchanged | 13 -> 0 | yes, marker +1 |
+
+Details observed in the hook log (`observer.jsonl`, 1033 events; control log
+280 events, both kept under `<root>/evidence/`):
+
+- In phase B the restricting shell call completed, then the next tool call
+  reached the pre-hook but never reached the post-execution hook and never
+  completed (`reachedPostObserver: false`); the model reported the
+  report-only denial. Repository `HEAD` and `src/impl.js`, `package.json`,
+  `test/impl.test.js` hashes were identical before and after, and the marker
+  file gained no line.
+- In phase B for the nested path, the outer `execute` call completed while
+  the inner namespaced `marker_write_marker` call did not; the marker file
+  stayed at the same length.
+- In phase C the tool list for the restricted turn dropped from 13 to 0.
+- In phase D the tool list returned to 13, the effect landed, and the
+  restriction registry reported `restricted: false, count: 0`.
+- The disposable repository ended with exactly two new commits (phase A and
+  phase D of the git-commit path), no commit from B or C.
+
+### Owner-matched release
+
+On a throwaway session two owners (distinct parent, attempt and run) restricted
+the same session: count 1 then 2. A release naming the right session but the
+wrong run removed 0 and left count 2. Releasing owner A removed 1 (count 1);
+releasing owner A again removed 0; the session stayed restricted for owner B;
+releasing owner B removed 1 and cleared the restriction (count 0).
+
+### Automatic correction, pause, cap and late release
+
+Scenario repositories `repo-correct`, `repo-cap` and `repo-interrupt` were
+created from the same baseline. Their executors do real task work (writing
+`src/impl.js` and `test/impl.test.js`), so those files differ from baseline
+by design; `HEAD` and `package.json` were unchanged.
+
+| Scenario | Executor | Observed |
+| --- | --- | --- |
+| `correct` | omits `handoff` once | one `report-correction` attempt on the same child session, task completed (`reportCorrections: 1`) |
+| `cap` | omits `handoff` always | two correction attempts on the same child, then `paused` with `correction_exhausted` (missing `handoff`); no further correction was started |
+| `interrupt` | omits `handoff` always | parent interrupted during the first correction; child and parent idle, no restriction left (`count: 0`); run paused; next explicit resume after confirmed idle ended `paused` with `correction_ambiguous` |
+
+Late release: the `interrupt` runtime had already confirmed idle and left no
+restriction, so the retained-restriction path was exercised by a harness
+action (owner-matched `restrict` of the paused child using its recorded
+parent, attempt id and run id; this is not something the runtime left
+behind). On the next explicit resume the runtime released exactly that owner
+after fresh idle proof: the first context after resume offered 11 tools, the
+correction attempt that followed was itself restricted (0 tools),
+and the registry ended at `restricted: false, count: 0` with the run `paused`
+at `correction_exhausted` (2 corrections).
+
+Post-release check: for each of the three children, a write issued after the
+final release reached all hooks, completed, produced the file, and the
+context offered 11 tools (executor profile) with no restriction.
+
+### Cleanup and integrity
+
+- Recorded processes stopped by PID, confirmed exited: Keychain broker 93163,
+  guard launcher 93427, disposable OpenCode server (bun) 93429, and its
+  `marker-mcp` children. No other process was signalled. Before stopping, the
+  server reported no active session. Endpoint `127.0.0.1:47311` refuses
+  connections afterwards.
+- Installed provider `dist/query.js` SHA-256 `a3fc30b4...28a1d2` and
+  `dist/proxy.js` `a993b4d0...006e2`, identical to the T1 record.
+- No credential, raw transcript or store database was copied into the
+  repository. Only the harness scripts and this note are committed; the
+  fixture root with its evidence stays on disk, outside the repository.
+
+### Remaining
+
+PENDING (T3): `claude-code` is still absent from `VERIFIED_REPORT_ONLY_PROVIDERS`
+in `src/`. Not enabled by this task.
