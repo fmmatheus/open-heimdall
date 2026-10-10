@@ -133,12 +133,27 @@ export interface SubagentInput {
 
 export type ReportOnlyCheck = { supported: true } | { supported: false; reason: string };
 
+/** Identity of one report-only restriction: the correction attempt that took it. */
+export interface ReportOnlyOwner {
+  parent: string;
+  child: string;
+  /** The report-correction attempt ID that took the restriction. */
+  attemptId: string;
+  runId?: string;
+}
+
 /** Fail-closed capability: deny every tool call for a child while it writes a report. */
 export interface ReportOnlyCapability {
   /** Whether enforcement is verified for this model's provider. Never throws for unsupported. */
   check: (model: string, child: string) => Promise<ReportOnlyCheck>;
-  /** Restrict the child. The returned release is idempotent. */
-  restrict: (child: string) => Promise<() => Promise<void>>;
+  /** Restrict the child under an owner. The returned release is idempotent. */
+  restrict: (child: string, owner?: Omit<ReportOnlyOwner, 'child'>) => Promise<() => Promise<void>>;
+  /**
+   * Release restrictions that outlived the invocation (and backend instance) that took them. Releases only entries
+   * owned by the named correction attempts of this child/parent/run, is idempotent, and may be retried after a throw.
+   * The caller must have fresh idle proof for the child.
+   */
+  releaseRetained: (input: { child: string; parent: string; runId?: string; attemptIds: string[] }) => Promise<void>;
 }
 
 export interface RunnerBackend {

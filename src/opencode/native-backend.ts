@@ -43,9 +43,13 @@ export function createNativeBackend({ ctx, observe, pause = ms => new Promise(re
       if (!verifiedProviders.includes(provider)) return { supported: false, reason: 'Report-only enforcement is not verified for provider "' + provider + '"' };
       return { supported: true };
     },
-    async restrict(child) {
-      const release = reportOnly.restrict(child);
+    async restrict(child, owner) {
+      const release = reportOnly.restrict(child, owner && { ...owner, child });
       return async () => { release(); };
+    },
+    // The registry is shared by every adapter built for this plugin, so a recreated backend releases what an earlier one took.
+    async releaseRetained({ child, parent, runId, attemptIds }) {
+      for (const attemptId of attemptIds) reportOnly.releaseOwned({ parent, child, attemptId, runId });
     },
   };
   return {

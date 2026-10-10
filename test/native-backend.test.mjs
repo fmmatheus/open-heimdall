@@ -133,3 +133,32 @@ test('report-only restrict registers the child and the release is idempotent; re
   assert.equal(registry.has('child'), false);
   assert.equal(registry.has('other'), false);
 });
+
+test('report-only restrictions are released by owner identity, idempotently, without touching other holders', async () => {
+  const registry = allHooks(createReportOnlyRegistry());
+  const backend = createNativeBackend({ ctx: {}, observe: async () => idle(), reportOnly: registry, verifiedProviders: ['openai'] });
+  const owner = attemptId => ({ parent: 'parent', attemptId, runId: 'run' });
+  const first = await backend.reportOnly.restrict('child', owner('a1'));
+  await backend.reportOnly.restrict('child', owner('a2'));
+  await backend.reportOnly.restrict('child'); // Unowned.
+  await backend.reportOnly.restrict('other', { ...owner('a1'), runId: 'other-run' });
+  assert.equal(registry.count('child'), 3);
+  // A recreated adapter holds no closure and releases through the shared registry.
+  const recreated = createNativeBackend({ ctx: {}, observe: async () => idle(), reportOnly: registry, verifiedProviders: ['openai'] });
+  await recreated.reportOnly.releaseRetained({ child: 'child', parent: 'parent', runId: 'run', attemptIds: ['a1'] });
+  assert.equal(registry.count('child'), 2);
+  for (let i = 0; i < 3; i++) await recreated.reportOnly.releaseRetained({ child: 'child', parent: 'parent', runId: 'run', attemptIds: ['a1'] });
+  assert.equal(registry.count('child'), 2, 'repeating the cleanup never drops another holder or goes negative');
+  await first(); await first();
+  assert.equal(registry.count('child'), 2, 'the original closure is a no-op once the owner entry is gone');
+  // Wrong parent, wrong run or unknown attempt release nothing.
+  await recreated.reportOnly.releaseRetained({ child: 'child', parent: 'someone-else', runId: 'run', attemptIds: ['a2'] });
+  await recreated.reportOnly.releaseRetained({ child: 'child', parent: 'parent', runId: 'other-run', attemptIds: ['a2'] });
+  await recreated.reportOnly.releaseRetained({ child: 'child', parent: 'parent', runId: 'run', attemptIds: ['nope'] });
+  assert.equal(registry.count('child'), 2);
+  await recreated.reportOnly.releaseRetained({ child: 'child', parent: 'parent', runId: 'run', attemptIds: ['a2', 'a1'] });
+  assert.equal(registry.count('child'), 1, 'only the unowned holder remains');
+  assert.equal(registry.count('other'), 1);
+  assert.equal(registry.releaseOwned({ parent: 'parent', child: 'unknown', attemptId: 'x' }), 0);
+  assert.throws(() => registry.restrict('child', { parent: 'parent', child: 'other', attemptId: 'x' }), /must name its parent, child and attempt/);
+});

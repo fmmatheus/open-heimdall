@@ -225,6 +225,18 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
       correctionRelease = undefined;
       await release();
     };
+    /**
+     * Releases a report-only restriction that an earlier invocation or backend instance left in force. Only with fresh
+     * idle proof for the recorded child under the recorded parent; any failure throws, so the restriction stays and the
+     * run pauses before dispatching anything. The next explicit resume retries.
+     */
+    const releaseRetained = async () => {
+      const recovery = state.reportRecovery;
+      const capability = backend.reportOnly;
+      if (!capability || !state.child || !recovery?.attempts.length || recovery.child !== state.child) return;
+      await backend.assertIdle(state.child, state.parent, contextSignal(context));
+      await capability.releaseRetained({ child: state.child, parent: state.parent, runId: state.id, attemptIds: recovery.attempts });
+    };
     try {
       await lock.writeFile(JSON.stringify({ pid: process.pid, parent: context.sessionID }));
       const settings = await configuredSettings();
@@ -261,6 +273,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
         delete state.reason;
         await save(state);
         started = true;
+        await releaseRetained(); // After the fenced save, so a stale owner never releases; before any prompt is dispatched.
       } else throw new Error('Unknown action');
       await args.onLaunch?.();
       const runDir = path.join(root, 'runs', state.id);
@@ -324,9 +337,10 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
           throw new Error('Quota unavailable for the selected model ' + failed.model + '; no report correction was sent: ' + errorMessage(error));
         }
         // The restriction is taken before anything is persisted, so a refusal never consumes a correction.
-        try { correctionRelease = await capability.restrict(child); }
-        catch (error) { return stop('correction_unsupported', errorMessage(error)); }
         const id = randomUUID();
+        // The owner identity outlives this invocation, so a later invocation (or a new backend) can release it after fresh idle proof.
+        try { correctionRelease = await capability.restrict(child, { parent: state.parent, attemptId: id, runId: state.id }); }
+        catch (error) { return stop('correction_unsupported', errorMessage(error)); }
         const previous = { recovery: state.reportRecovery, attempt: state.attempt };
         failed.status = 'rejected';
         state.reportRecovery = { ...record, corrections: record.corrections + 1, mode: 'correcting', attempts: [...record.attempts, id], diagnostic };

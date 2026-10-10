@@ -6,6 +6,11 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createRunner, executorContract } from '../dist/workflow/runner.js';
 import { createReportOnlyRegistry, REPORT_ONLY_DENIAL } from '../dist/opencode/report-only.js';
+import { createNativeBackend } from '../dist/opencode/native-backend.js';
+
+const allHooks = (registry = createReportOnlyRegistry()) => { for (const hook of ['execute.before', 'context', 'permission.evaluate']) registry.setHook(hook, true); return registry; };
+/** Observed child session. Defaults to a terminal child of the fixture parent. */
+const observed = (id, over = {}) => ({ session: { id, parentID: 'parent', tokens: { input: 2, output: 3, reasoning: 4, cache: { read: 5, write: 6 } }, outcome: 'succeeded', time: { idle: 10 }, ...(over.session ?? {}) }, active: false, inbox: [], permissions: [], forms: [], ...Object.fromEntries(Object.entries(over).filter(([key]) => key !== 'session')) });
 
 const snapshot = (sonnet = 50, kimi = 40) => Object.fromEntries([['anthropic', sonnet], ['kimi', kimi]].map(([key, n]) => [key, { fetchedAt: Date.now(), entries: [{ name: '5h', percentRemaining: n }, { name: 'Weekly', percentRemaining: n }], errors: [] }]));
 const task = { id: 'T2', title: 'Two', brief: 'Do two', dependsOn: [], dod: ['first gate', 'second gate', 'third gate'] };
@@ -36,20 +41,32 @@ async function fixture(t, responses, opts = {}) {
   if (!managed) await fs.writeFile(path.join(root, 'settings.json'), JSON.stringify(settings));
   const events = [], prompts = [], tokens = { used: 0 }, controller = { current: new AbortController() };
   let n = 0, active = 0, restricted = 0;
-  const reportOnly = opts.reportOnly === false ? undefined : {
+  // `opts.native` runs the REAL native adapter and registry (`observe` supplies the child snapshot). `swapNative` recreates the adapter over a registry.
+  let native;
+  const makeNative = ({ registry, observe }) => ({ registry, observe, backend: createNativeBackend({ ctx: {}, observe: (...args) => native.observe(...args), reportOnly: registry, verifiedProviders: ['a', 'k'] }) });
+  if (opts.native) native = makeNative(opts.native);
+  const isRestricted = id => native ? native.registry.has(id) : restricted > 0;
+  const fake = opts.reportOnly === false ? undefined : {
     check: async (model, child) => { events.push(['check', model, child]); return opts.check ? opts.check(model, child) : { supported: true }; },
-    restrict: async child => {
+    restrict: async (child, owner) => {
       if (opts.restrictError) throw opts.restrictError;
       restricted++; events.push(['restrict', child]);
       let done = false;
       const release = async () => { if (done) return; done = true; restricted--; events.push(['release', child]); };
-      if (opts.registry) { const free = opts.registry.restrict(child); return async () => { free(); await release(); }; }
+      if (opts.registry) { const free = opts.registry.restrict(child, owner && { ...owner, child }); return async () => { free(); await release(); }; }
       return release;
+    },
+    // A new adapter holds no closure: it can only release through the shared registry owner entry.
+    releaseRetained: async input => {
+      events.push(['releaseRetained', input.child]);
+      if (opts.releaseError) throw opts.releaseError;
+      if (!opts.registry) return;
+      for (const attemptId of input.attemptIds) restricted -= opts.registry.releaseOwned({ parent: input.parent, child: input.child, attemptId, runId: input.runId });
     },
   };
   const backend = {
-    ...(reportOnly ? { reportOnly } : {}),
-    assertIdle: async id => { events.push(['idle', id]); await opts.onIdle?.(id); },
+    get reportOnly() { return native ? native.backend.reportOnly : fake; },
+    assertIdle: async (id, ...rest) => { events.push(['idle', id]); await opts.onIdle?.(id); if (native) await native.backend.assertIdle(id, ...rest); },
     recoverResponse: async (...args) => { events.push(['recover', args[0]]); return opts.recover ? opts.recover(...args) : undefined; },
     usage: async () => ({ used: tokens.used, uncached: tokens.used }),
     interrupt: async child => { events.push(['interrupt', child]); if (opts.interruptError) throw opts.interruptError; },
@@ -58,7 +75,7 @@ async function fixture(t, responses, opts = {}) {
       const id = input.child ?? 's' + ++n;
       await input.onStarted(id);
       assert.equal(active++, 0, 'only one active child prompt at a time');
-      const sent = { child: id, prompt: input.prompt, title: input.title, agent: input.agent, model: input.model, variant: input.variant, restricted: restricted > 0 };
+      const sent = { child: id, prompt: input.prompt, title: input.title, agent: input.agent, model: input.model, variant: input.variant, restricted: isRestricted(id) };
       prompts.push(sent); events.push(['prompt', id, sent.restricted]);
       try {
         const r = responses.shift();
@@ -92,7 +109,7 @@ async function fixture(t, responses, opts = {}) {
   const readState = async id => managed ? structuredClone(checkpoint) : JSON.parse(await fs.readFile(statePath(id), 'utf8'));
   const writeState = async (id, state) => { if (managed) checkpoint = structuredClone(state); else await fs.writeFile(statePath(id), JSON.stringify(state)); };
   const attemptFiles = async id => managed ? [...receipts.keys()] : (await fs.readdir(runDir(id))).filter(name => /^attempt-.*\.json$/.test(name));
-  return { directory, root, events, prompts, tokens, controller, run: makeRunner(), makeRunner, start, resume, readState, writeState, attemptFiles, runDir, store, active: () => restricted };
+  return { directory, root, events, prompts, tokens, controller, run: makeRunner(), makeRunner, start, resume, readState, writeState, attemptFiles, runDir, store, active: () => restricted, swapNative: next => { native = makeNative({ observe: native.observe, ...next }); } };
 }
 
 test('a format-only completion error is corrected on the same child within the bound and advances exactly once', async t => {
@@ -434,4 +451,194 @@ test('report-only restriction holds during every correction and implementation f
   const state = await f.readState(result.runId);
   assert.equal(state.results[0].reportCorrections, 1, 'runner-owned checkpoint and receipts updated');
   assert.equal((await f.attemptFiles(result.runId)).length, 3);
+});
+
+test('regression: a restriction held after an unconfirmed interrupt is released by a NEW invocation once idle is confirmed, without a plugin restart', async t => {
+  const registry = allHooks();
+  const opts = { registry, interruptError: new Error('Could not confirm child termination') };
+  const f = await fixture(t, [plan, noHandoff(), new Error('connection reset by peer'), good()], opts);
+  const paused = JSON.parse(await f.start(f.makeRunner()));
+  assert.equal(paused.status, 'paused');
+  const child = paused.childSession;
+  assert.equal(registry.has(child), true, 'the interrupt was unconfirmed: the restriction stays in force');
+  assert.equal(f.active(), 1);
+  opts.interruptError = undefined; // The child is now observably idle.
+  const ambiguous = JSON.parse(await f.resume(f.makeRunner(), paused.runId, 'I confirmed the child is now idle'));
+  assert.equal(ambiguous.status, 'paused');
+  assert.equal((await f.readState(paused.runId)).reportRecovery.diagnostic.code, 'correction_ambiguous');
+  const done = JSON.parse(await f.resume(f.makeRunner(), paused.runId, 'I inspected the output, continue'));
+  assert.equal(done.status, 'completed');
+  assert.equal(registry.has(child), false, 'the restriction must be released once idle is confirmed');
+  assert.equal(f.active(), 0);
+  assert.equal(f.prompts.at(-1).restricted, false, 'the resumed prompt is not restricted');
+});
+
+/**
+ * Runs through the REAL native adapter and registry: a correction is dispatched, its prompt fails and the interrupt
+ * cannot be confirmed, so the run pauses with the restriction still held. `view` drives what the child looks like next.
+ */
+async function pausedHolding(t, { responses = [plan, noHandoff(), new Error('connection reset by peer'), good()], registry = allHooks(), wrap, ...rest } = {}) {
+  const view = { mode: 'idle', grace: 0 };
+  const observe = async id => {
+    if (view.grace > 0) { view.grace--; return observed(id); }
+    if (view.mode === 'busy') return observed(id, { active: true });
+    if (view.mode === 'unknown') return observed(id, { session: { outcome: undefined, time: {} } });
+    if (view.mode === 'wrong-parent') return observed(id, { session: { parentID: 'someone-else' } });
+    return observed(id);
+  };
+  const opts = { native: { registry: wrap ? wrap(registry) : registry, observe }, interruptError: new Error('Could not confirm child termination'), ...rest };
+  const f = await fixture(t, responses, opts);
+  const paused = JSON.parse(await f.start(f.makeRunner()));
+  assert.equal(paused.status, 'paused');
+  assert.equal(registry.count(paused.childSession), 1, 'the unconfirmed interrupt leaves exactly one restriction');
+  opts.interruptError = undefined;
+  return { f, registry, view, opts, child: paused.childSession, runId: paused.runId, promptsBefore: f.prompts.length };
+}
+
+test('a busy, unknown-outcome or wrong-parent child keeps the restriction and dispatches nothing', async t => {
+  for (const [mode, message] of [['busy', /Session is active/], ['unknown', /no durable terminal outcome/], ['wrong-parent', /does not belong to this parent/]]) {
+    const { f, registry, view, child, runId, promptsBefore } = await pausedHolding(t);
+    view.mode = mode;
+    await assert.rejects(f.resume(f.makeRunner(), runId, 'go'), message, mode);
+    assert.equal(registry.count(child), 1, mode);
+    assert.equal(f.prompts.length, promptsBefore, mode);
+    view.mode = 'idle';
+    const again = JSON.parse(await f.resume(f.makeRunner(), runId, 'go'));
+    assert.equal(again.status, 'paused', mode);
+    assert.equal(registry.count(child), 0, mode + ': released once idle is proven');
+  }
+});
+
+test('idle is asserted again immediately before the release: a child that became busy keeps the restriction', async t => {
+  const { f, registry, view, child, runId, promptsBefore } = await pausedHolding(t);
+  view.mode = 'busy';
+  view.grace = 1; // The resume gate passes; the proof taken right before the release does not.
+  const paused = JSON.parse(await f.resume(f.makeRunner(), runId, 'go'));
+  assert.equal(paused.status, 'paused');
+  assert.match(paused.reason, /Session is active/);
+  assert.equal(registry.count(child), 1);
+  assert.equal(f.prompts.length, promptsBefore);
+});
+
+test('a failed release stays in force and pauses without dispatch; a later resume releases it', async t => {
+  const fail = { on: true };
+  const { f, registry, child, runId, promptsBefore } = await pausedHolding(t, { wrap: real => ({ ...real, releaseOwned: owner => { if (fail.on) throw new Error('release exploded'); return real.releaseOwned(owner); } }) });
+  const first = JSON.parse(await f.resume(f.makeRunner(), runId, 'go'));
+  assert.equal(first.status, 'paused');
+  assert.match(first.reason, /release exploded/);
+  assert.equal(registry.count(child), 1);
+  assert.equal(f.prompts.length, promptsBefore);
+  fail.on = false;
+  const second = JSON.parse(await f.resume(f.makeRunner(), runId, 'go'));
+  assert.equal(second.status, 'paused');
+  assert.equal((await f.readState(runId)).reportRecovery.diagnostic.code, 'correction_ambiguous');
+  assert.equal(registry.count(child), 0);
+  assert.equal(f.prompts.length, promptsBefore, 'the retry released without dispatching');
+  const third = JSON.parse(await f.resume(f.makeRunner(), runId, 'go'));
+  assert.equal(third.status, 'completed');
+  assert.equal(f.prompts.length, promptsBefore + 1);
+  assert.equal(f.prompts.at(-1).restricted, false);
+});
+
+test('a stale owner cannot release; the rotated owner releases exactly once', async t => {
+  const { f, registry, child, runId, promptsBefore } = await pausedHolding(t, { managed: true });
+  const release = registry.releaseOwned;
+  let calls = 0, removed = 0;
+  registry.releaseOwned = owner => { calls++; const n = release(owner); removed += n; return n; };
+  await assert.rejects(f.resume(f.makeRunner({ stale: true }), runId, 'go'), /Owner token is stale/);
+  assert.equal(registry.count(child), 1, 'the fenced save failed first, so nothing was released');
+  assert.equal(calls, 0);
+  assert.equal(f.prompts.length, promptsBefore);
+  const rotated = JSON.parse(await f.resume(f.makeRunner({}), runId, 'go'));
+  assert.equal(rotated.status, 'paused');
+  assert.equal(registry.count(child), 0);
+  assert.equal(removed, 1, 'one correction attempt, released once');
+  const done = JSON.parse(await f.resume(f.makeRunner({}), runId, 'go'));
+  assert.equal(done.status, 'completed');
+  assert.equal(removed, 1, 'a later resume of the same run removes nothing more');
+});
+
+test('unrelated restrictions on other children, runs and attempts stay in force', async t => {
+  const { f, registry, child, runId } = await pausedHolding(t);
+  const owner = (over = {}) => ({ parent: 'parent', child, attemptId: 'other-attempt', runId: 'other-run', ...over });
+  registry.restrict('unrelated-child', owner({ child: 'unrelated-child' }));
+  registry.restrict(child, owner()); // Same child, different run and attempt.
+  registry.restrict(child); // Unowned.
+  const done = JSON.parse(await f.resume(f.makeRunner(), runId, 'go'));
+  assert.equal(done.status, 'paused');
+  assert.equal(registry.count('unrelated-child'), 1);
+  assert.equal(registry.count(child), 2, 'only this run\'s correction attempt was released');
+  assert.equal(registry.releaseOwned(owner()), 1);
+  assert.equal(registry.count(child), 1);
+  assert.equal(registry.has('unrelated-child'), true);
+});
+
+test('a recreated native backend sharing the registry releases what the earlier backend took', async t => {
+  const { f, registry, child, runId, promptsBefore } = await pausedHolding(t);
+  f.swapNative({ registry }); // A brand new adapter holds no release closure.
+  const resumed = JSON.parse(await f.resume(f.makeRunner(), runId, 'go'));
+  assert.equal(resumed.status, 'paused');
+  assert.equal(registry.has(child), false);
+  assert.equal(f.prompts.length, promptsBefore);
+});
+
+test('a recreated plugin (fresh registry) neither crashes nor replays the correction, and claims no release', async t => {
+  const { f, registry, child, runId, promptsBefore } = await pausedHolding(t);
+  const fresh = allHooks();
+  f.swapNative({ registry: fresh });
+  const resumed = JSON.parse(await f.resume(f.makeRunner(), runId, 'go'));
+  assert.equal(resumed.status, 'paused');
+  assert.equal((await f.readState(runId)).reportRecovery.diagnostic.code, 'correction_ambiguous', 'durable state still prevents a replay');
+  assert.equal(f.prompts.length, promptsBefore, 'no duplicate prompt');
+  assert.equal(fresh.has(child), false);
+  assert.equal(registry.count(child), 1, 'the old registry was not touched or claimed released');
+});
+
+test('a recovered valid report advances exactly once, within the cap, with receipts unchanged', async t => {
+  const { f, registry, opts, child, runId, promptsBefore } = await pausedHolding(t, { managed: true });
+  opts.recover = async (id, parent, attempt) => (attempt.purpose === 'report-correction' ? JSON.stringify(good()) : undefined);
+  const before = structuredClone([...f.store.receipts.entries()]);
+  assert.equal(before.length, 2, 'planner and original executor receipts');
+  const done = JSON.parse(await f.resume(f.makeRunner(), runId, 'go'));
+  assert.equal(done.status, 'completed');
+  assert.equal(registry.count(child), 0);
+  assert.equal(f.prompts.length, promptsBefore, 'no re-dispatch');
+  const state = f.store.checkpoint;
+  assert.equal(state.results.length, 1);
+  assert.equal(state.results[0].reportCorrections, 1);
+  assert.equal(corrections(f.prompts).length, 1);
+  assert.ok(state.results[0].reportCorrections <= 2);
+  assert.equal(state.reportRecovery, undefined);
+  for (const [id, receipt] of before) assert.deepEqual(f.store.receipts.get(id), receipt, 'earlier receipts are byte-identical');
+  const correction = [...f.store.receipts.values()].find(receipt => receipt.purpose === 'report-correction');
+  assert.deepEqual(JSON.parse(correction.response), good());
+  const again = JSON.parse(await f.resume(f.makeRunner(), runId, 'go'));
+  assert.equal(again.status, 'completed');
+  assert.equal(f.store.checkpoint.results.length, 1, 'a repeated resume advances nothing');
+  assert.equal(f.store.receipts.size, 3);
+});
+
+test('unresolved work still pauses after the restriction is released', async t => {
+  const { f, registry, opts, child, runId } = await pausedHolding(t, { managed: true });
+  opts.recover = async () => JSON.stringify({ status: 'blocked', taskId: 'T2', reason: 'the work is not finished' });
+  const paused = JSON.parse(await f.resume(f.makeRunner(), runId, 'go'));
+  assert.equal(paused.status, 'paused');
+  assert.match(paused.reason, /not finished/);
+  assert.equal(registry.count(child), 0);
+  assert.deepEqual(f.store.checkpoint.results, []);
+  assert.equal(f.store.checkpoint.index, 0);
+});
+
+test('a legacy checkpoint without reportRecovery or attempt purpose still resumes', async t => {
+  const registry = allHooks();
+  const f = await fixture(t, [plan, new Error('provider exploded'), good()], { native: { registry, observe: async id => observed(id) } });
+  const paused = JSON.parse(await f.start(f.makeRunner()));
+  assert.equal(paused.status, 'paused');
+  const state = await f.readState(paused.runId);
+  delete state.reportRecovery; // A checkpoint saved before report correction existed.
+  assert.equal(state.attempt.purpose, undefined);
+  await f.writeState(paused.runId, state);
+  const done = JSON.parse(await f.resume(f.makeRunner(), paused.runId, 'go'));
+  assert.equal(done.status, 'completed');
+  assert.equal(registry.count(paused.childSession), 0);
 });
