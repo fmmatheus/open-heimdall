@@ -161,6 +161,25 @@ forces a full re-run. Verification record:
   calls, or code-mode `execute` nested calls, through the hooks, and no live
   experiment was run. Without a verified provider every `report_format` failure
   pauses as `correction_unsupported` and nothing is re-sent automatically.
+- **Restriction lifetime.** Each restriction carries an owner identity (parent,
+  child, correction attempt ID and run ID) in the plugin's in-memory registry,
+  so a later runner invocation, or a backend recreated over the same registry,
+  can release it. The restriction is **kept** while the child is busy, awaiting
+  input, in an unknown outcome or under a different parent, and whenever an
+  interruption of a failed correction could not be confirmed. It is
+  **released** only on resume, after the checkpoint owner's fenced save
+  succeeded and a fresh idle check of the recorded child and parent passed, and
+  before any prompt is sent or the task completes. A stale owner never reaches
+  the release. Release removes only the entry matching that owner, so
+  restrictions of other children, runs or holders are untouched. It is
+  idempotent; if it fails the restriction stays in force, the run pauses and the
+  next explicit resume retries. The first resume after an unconfirmed
+  interruption still pauses as `correction_ambiguous` (the restriction is
+  already released by then); the next resume sends the ordinary task prompt.
+  The registry lives in the plugin process and does not survive a restart:
+  after a restart nothing is released or assumed, the durable checkpoint is
+  reconciled instead, and `correction_ambiguous` still prevents replaying a
+  correction.
 - **Pause categories.** The pause reason and the extension distinguish
   *Invalid completion report* (resume with guidance to restate existing results;
   no new work), *Unfinished work* (do the work or make the owner decision first),
@@ -175,10 +194,18 @@ forces a full re-run. Verification record:
 
 - Automatic report correction needs an owner-verified provider
   (`VERIFIED_REPORT_ONLY_PROVIDERS` is empty); until then format-only failures
-  pause for a manual resume. Whether `claude-code` tool calls, including
-  code-mode nested calls, pass through the plugin hooks is unproven.
+  pause for a manual resume. **`claude-code` is unsupported.** Feature 0004
+  tried to verify it live and stopped at a blocker: its provider relies on the
+  real `claude` login, which cannot be used in an isolated OpenCode store
+  without touching credentials, so no denial was observed. Whether
+  `claude-code` tool calls (parked MCP calls, code-mode nested calls) pass
+  through the plugin hooks therefore stays unproven. See
+  [Provider verification](validation/completion-report-recovery.md#provider-verification-feature-0004).
 - A correction that was dispatched but never answered consumes one of the two
   attempts and is not re-sent; the next owner resume uses a normal task prompt.
+- Report-only restrictions are held in memory by the plugin process. A restart
+  loses them (nothing is released or claimed for them); recovery then relies on
+  the durable checkpoint and a manual resume.
 
 - SQLite uses Node's built-in `node:sqlite`, still experimental on Node 22.
 - Usage is unlimited by default. Existing optional caps cover cumulative child
