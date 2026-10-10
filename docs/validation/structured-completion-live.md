@@ -34,9 +34,32 @@ the installed packages' `package.json`, `node --version`, `bun --version`,
 | Node | v22.22.3 |
 | Bun | 1.4.2 |
 | macOS | 27.0.1 (build 26A434) |
-| Executable the provider used | `<mise>/installs/node/22.22.3/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe`, version 2.1.292 |
+| Executable the provider resolves (source-derived, see below) | `<mise>/installs/node/22.22.3/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe`, version 2.1.292 |
 
 These equal the versions of the feature 0005 record.
+
+How the provider executable was established, by kind of evidence:
+
+- **Source-derived resolution.** The installed provider's resolver
+  (`dist/executable-path.js`, `findBinaryOnPath` and `resolveClaudeCli`) takes
+  `claude` from `PATH` first, then `~/.local/bin/claude`, then the npm global
+  `bin`. The fixture server inherits the launcher's `PATH` (`storeEnvironment` in
+  `scripts/live/claude-report-only/lib.mjs` copies every variable except the
+  scrubbed ones, and `guard.mjs` only prepends the guard `bin` with the
+  `security` shim). The `PATH` entry that holds `claude` is
+  `<mise>/installs/node/22.22.3/bin`: the `marker-mcp` child of the server was
+  seen running as `<mise>/installs/node/22.22.3/bin/node`, so that directory was on
+  the effective `PATH`.
+- **Read-only observations, made after the run.** `<mise>/installs/node/22.22.3/bin/claude`
+  is a symlink to `../lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe`
+  (`readlink -f`), and `claude --version` in the shell reports
+  `2.1.292 (Claude Code)`, equal to the version in the fixture `manifest.json`
+  (`versions.claude`).
+- **Not recorded.** No process listing, argv or launch log of the Claude CLI
+  process spawned during the live run was retained. The path above is therefore
+  the resolver's result for the recorded `PATH`, not a captured launch, and the
+  shell `claude --version` and the provider-used executable are the same file
+  only by this resolution, not by an observed spawn.
 
 ## What changed in the harness
 
@@ -159,6 +182,19 @@ run directory in the fixture repository.
   `marker-mcp` child `67692`; earlier probe brokers `64421` and `64460` had
   already exited. Nothing else was signalled. Port `47411` refuses connections
   afterwards and no process mentioning `heimdall-0006` remains.
+- **Recording limit.** The fixture `manifest.json` lists the probe brokers
+  (64421, 64460 with `stoppedAt` and `exited: true`) and the live Keychain broker
+  66047 with only a start time; it holds no entry for the launcher, the server or
+  the `marker-mcp` child and no stop time for 66047. Retained evidence for the
+  live processes is limited to: `guard/broker.pid` (66047), `evidence/control.jsonl`
+  (the `ping` result carries the server PID 66365), the launcher/server/child
+  process listing taken before stopping (66360, 66365 with parent 66360, 67692
+  with parent 66365, all with `--root /private/tmp/heimdall-0006.jFpXF9`), and
+  the run-time idle proof (`activeAfter: []` and a parent tail ending in `idle`
+  in `evidence/e2e-structured.json`). No stop timestamp was recorded for them.
+- **Post-run review verification** (made after the run, not a historical stop
+  record): `ps -p 66047,66360,66365,67692 -o pid=,comm=` exited 1 with no rows,
+  and a loopback connection to port 47411 was refused (errno 61).
 - `HOME` and `CODEX_HOME` were not modified; no credential was copied, printed,
   refreshed or written.
 - The fixture root stays on disk, outside the repository, with its evidence. It
@@ -179,6 +215,71 @@ Run in this worktree on Node v22.22.3 after the live run, with no `src/` or
 
 ## Activation (owner)
 
-Nothing here has been done by this task: no install, activation, merge or push.
-The concrete steps are in the final owner message and in
-[the coordinator guide](../coordinator.md#structured-completion-protocol).
+**Nothing was installed, activated, merged or pushed by this task.** The steps
+below are a guide for a future quiet point and are the owner's to perform; this
+document is not permission to run them. Command and file names are taken from
+`package.json`, `docs/development.md`, `docs/coordinator.md` and
+`docs/openchamber-extension.md`.
+
+**What to review.** Branch `heimdall/run/69148546-2f20-49a0-b67f-9ad15d47b63f`,
+base `8f68642761f385c50021ba0e977e5a49c5311e82`. List the commits with
+`git log 8f68642..HEAD`: `f2d62c4` (ownership-based, guard-first harness),
+`9f42b98`, `65d1228`, `963f49a`, `8ac77ae`, `8dfc157`, `cab0358`, `4afbcd2`
+(contracts, durable receipts and gate, structured runner, bounded repair,
+negative outcomes), `575f71f` (runtime snapshot and build identity), `58deb93`
+(this record and the protocol docs) and the documentation-correction commit that
+follows it. Review and merge, if you decide to, before building.
+
+**Build from the reviewed source** (Node.js 22.19 or newer; the live run used
+v22.22.3):
+
+```sh
+npm ci --ignore-scripts
+npm run build
+npm run build:extension
+```
+
+**What each piece needs.** Do them only at a quiet point, when every workflow of
+the piece you touch is idle, and leave every original ADR, OpenCode or
+OpenChamber runtime that has ongoing work running and untouched. There is no
+unconditional global restart.
+
+1. **Standalone plugin (`@open-heimdall/core/plugin`).** It is activated per
+   project by the link described in `docs/development.md`
+   (`npm install --prefix .opencode --ignore-scripts --install-links=false <this checkout>`, then the
+   `examples/opencode/plugins/heimdall.ts` entry). A project's OpenCode loads the
+   new build only when that project's OpenCode process is restarted, so restart
+   only the runtime of a development project you chose, and only when none of its
+   workflows is running: a standalone run loads `dist` in place and its report-only
+   restrictions are in plugin memory. Do not load it beside the original
+   `adr.workflow` plugin in the same location.
+2. **Coordinator.** `node dist/cli.js coordinator serve --coordinator-config <path>`
+   (or `HEIMDALL_COORDINATOR_CONFIG`) is a separate process. Stop it only after
+   SIGINT/SIGTERM has drained its managed runs (see "Lifecycle and recovery" in
+   `docs/coordinator.md`), then start it from the new build. Runs already admitted
+   keep their earlier specification and are not pinned to a snapshot.
+3. **OpenChamber extension.** In **Settings → Extensions** (`docs/openchamber-extension.md`),
+   point the extension at the absolute path of the rebuilt
+   `dist/openchamber-extension` folder and re-enable it. Only that extension
+   service restarts; OpenChamber and OpenCode sessions are not part of it.
+
+**What becomes operational afterwards.**
+
+- **New starts** of native and coordinator-managed runs from the new build persist
+  `structured-v1`: planner and executor submit through `heimdall_submit_plan` and
+  `heimdall_submit_result`, advancement needs a durable receipt plus a confirmed
+  idle stop, and the pause codes in
+  [the coordinator guide](../coordinator.md#structured-completion-protocol) apply.
+- **Legacy runs** (persisted without a protocol) keep the prose completion path
+  and the report-only correction for `claude-code` on resume; they are not
+  converted.
+- **Immutable snapshot.** A coordinator-managed run admitted by the new build
+  launches from a run-owned read-only copy, checked before launch and resume. An
+  earlier coordinator run has none and follows its existing path.
+- **Still unproven live**, so watch the first runs: format repair and the two-retry
+  bound, negative outcomes and the `submission_*` pause codes, snapshot creation
+  and verification, coordinator persistence and owner fences, restart recovery,
+  and any run against an installed build. Only the happy path on `claude-code`
+  (planner `claude-code/opus`, executor `claude-code/sonnet`) was observed.
+- Optional: remove `/private/tmp/heimdall-0006.jFpXF9` when you no longer need its
+  evidence. It holds no committed material.
