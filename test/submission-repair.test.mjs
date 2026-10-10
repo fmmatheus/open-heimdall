@@ -1,0 +1,534 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { createRunner } from '../dist/workflow/runner.js';
+import { createDurableSubmissionGate } from '../dist/workflow/durable-submission.js';
+import { createLocalSubmissionStore } from '../dist/workflow/submission-store.js';
+import { createSubmissionSupervisor, MAX_SUBMISSION_REPAIRS } from '../dist/workflow/submission-repair.js';
+import { checkpointReportInfo, submissionRepairInfo } from '../dist/workflow/report-info.js';
+import { createPlugin } from '../dist/opencode/plugin.js';
+import { createReportOnlyRegistry, REPAIR_ONLY_DENIAL, REPORT_ONLY_DENIAL } from '../dist/opencode/report-only.js';
+import { loadConfiguration } from '../dist/config.js';
+
+const RUN = 'run-repair';
+const PLAN_TOOL = 'heimdall_submit_plan';
+const RESULT_TOOL = 'heimdall_submit_result';
+const settings = { plannerAgent: 'adr-planner', executorAgent: 'adr-executor', plannerModel: 'anthropic/planner', executorModel: 'anthropic/executor', executorFallbackModel: 'kimi/fallback', maxTasks: 10, minQuotaRemainingPercent: 10, tokenLimitsDisabled: true };
+const task = id => ({ id, title: 'Task ' + id, brief: 'Implement ' + id, dependsOn: [], dod: ['gate for ' + id] });
+const plan = (...ids) => ({ status: 'planned', planMarkdown: '# Plan', factSheet: 'Facts', tasks: ids.map(task) });
+const completed = (extra = {}) => ({ status: 'completed', summary: 'Done', handoff: 'Handoff', evidence: [{ gateId: 'G1', passed: true, detail: 'verified with a real check' }], ...extra });
+const malformed = () => ({ status: 'completed', summary: 'Done' });
+const caller = (n = 0) => ({ sessionID: 'ses_parent', id: 'call_' + n, messageID: 'msg_assistant_' + n, agent: 'adr-orchestrator', signal: new AbortController().signal });
+const goodQuota = async () => ({ anthropic: { fetchedAt: Date.now(), errors: [], entries: [{ name: '5h', percentRemaining: 80 }, { name: 'Weekly', percentRemaining: 80 }] } });
+const SPOKEN = 'All done; this chat text is for humans only.';
+const registration = () => ({ dispose: async () => {} });
+
+async function until(condition, signal, what = 'condition') {
+  const deadline = Date.now() + 3000;
+  while (!(await condition())) {
+    if (signal?.aborted) throw new Error('Run cancelled while waiting for ' + what);
+    if (Date.now() > deadline) throw new Error('Timed out waiting for ' + what);
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+}
+
+/**
+ * Structured runner wired to the REAL plugin hooks and submission tools. The scripted "model" calls tools through a
+ * host simulation that mirrors OpenCode's order: framework input check, then execute.before hooks, then the tool, then
+ * execute.after. Report-only state is the real registry and the capability restricts through it.
+ */
+async function fixture(t, script, { capability = 'verified', quota = goodQuota, usage, noProtocol = false, interruptFails = false } = {}) {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'heimdall-repair-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const root = path.join(directory, '.heimdall');
+  await fs.mkdir(root);
+  await fs.writeFile(path.join(root, 'feature.md'), 'Synthetic feature');
+  await fs.writeFile(path.join(root, 'planner.md'), 'Planner contract');
+  await fs.writeFile(path.join(root, 'executor.md'), 'Executor contract');
+  await fs.writeFile(path.join(directory, '.heimdall.toml'), '[workflow]\nplannerModel = "anthropic/test-planner"\nexecutorModel = "anthropic/test-executor"\nexecutorFallbackModel = "openai/test-fallback"\n');
+  const stateRoot = path.join(root, 'state');
+  const local = createLocalSubmissionStore(stateRoot);
+  const control = { crashed: false, saveFails: false, interruptFails };
+  const saves = [], dispatches = [], interrupts = [];
+  const prompts = new Map(), origins = new Map();
+  let children = 0;
+  const stateFile = path.join(stateRoot, 'runs', RUN, 'state.json');
+  const persistence = {
+    load: async () => local.load(RUN),
+    save: async state => {
+      if (control.saveFails) throw new Error('fenced: stale owner');
+      saves.push(structuredClone(state));
+      await fs.writeFile(stateFile + '.tmp', JSON.stringify(state));
+      await fs.rename(stateFile + '.tmp', stateFile);
+    },
+    bindStart: async () => {},
+    readReceipt: async () => null,
+    writeReceipt: async () => {},
+    readSubmission: (...args) => local.readSubmission(...args),
+    writeSubmission: (...args) => local.writeSubmission(...args),
+    readNativeOutcome: (...args) => local.readNativeOutcome(...args),
+    writeNativeOutcome: (...args) => local.writeNativeOutcome(...args),
+  };
+  const gate = createDurableSubmissionGate({
+    runId: RUN, directory, planRoot: '.heimdall/plans', origin: native => origins.get(native.messageID),
+    persistence: { load: persistence.load, readSubmission: local.readSubmission, writeSubmission: persistence.writeSubmission },
+  });
+  const reportOnly = createReportOnlyRegistry();
+  const supervisor = createSubmissionSupervisor();
+  const tools = new Map(), hooks = new Map();
+  const configuration = await loadConfiguration({ projectDirectory: directory });
+  const ctx = {
+    location: { directory }, integration: {},
+    tool: { transform: async apply => { apply({ add: value => { tools.set(value.name, value); } }); return registration(); }, hook: async (name, cb) => { hooks.set('tool.' + name, cb); return registration(); } },
+    session: { context: async () => [], hook: async (name, cb) => { hooks.set('session.' + name, cb); return registration(); } },
+    rpc: { register: async () => registration() },
+    permission: { hook: async (name, cb) => { hooks.set('permission.' + name, cb); return registration(); } },
+  };
+  const plugin = createPlugin({ configuration, reportOnly, supervisor, submissionGate: gate, observe: async () => assert.fail('no observation') });
+  const cleanup = await plugin.setup(ctx);
+  t.after(cleanup);
+  const checks = [];
+  const reportOnlyCapability = capability === 'none' ? undefined : {
+    check: async model => { checks.push(model); return capability === 'verified' ? { supported: true } : { supported: false, reason: 'not verified for this provider' }; },
+    restrict: async (child, owner, options) => {
+      const release = reportOnly.restrict(child, owner && { ...owner, child }, options);
+      return async () => { release(); };
+    },
+    releaseRetained: async ({ child, parent, runId, attemptIds }) => { for (const attemptId of attemptIds) reportOnly.releaseOwned({ parent, child, attemptId, runId }); },
+  };
+  const backend = {
+    ...(reportOnlyCapability ? { reportOnly: reportOnlyCapability } : {}),
+    assertIdle: async () => {},
+    recoverResponse: async () => SPOKEN,
+    observeDispatchPrompt: async ({ attemptId }) => prompts.get(attemptId),
+    usage: usage ?? (async () => ({ used: 0, uncached: 0 })),
+    interrupt: async () => { interrupts.push('interrupt'); if (control.interruptFails) throw new Error('Could not confirm child termination'); },
+    runSubagent: async (input, context) => {
+      const child = input.child ?? 'ses_child_' + ++children;
+      await input.onStarted(child);
+      const attemptId = /Workflow attempt: (\S+)/.exec(input.prompt)[1];
+      const promptId = 'prompt_' + (dispatches.length + 1);
+      const dispatch = { n: dispatches.length + 1, attemptId, child, promptId, agent: input.agent, prompt: input.prompt };
+      dispatches.push(dispatch);
+      prompts.set(attemptId, promptId);
+      origins.set('msg_' + promptId, promptId);
+      if (!noProtocol) await until(async () => (await local.load(RUN))?.submissionBinding?.prompt === promptId, context.signal, 'the recorded dispatch prompt');
+      const step = script.shift();
+      assert.ok(step, 'unscripted dispatch ' + dispatch.n);
+      let calls = 0;
+      /** One model tool call through the simulated host. `framework: true` makes input validation fail before any hook. */
+      const call = async (tool, value, { framework = false, parallel = false } = {}) => {
+        const meta = { sessionID: child, agent: input.agent, messageID: 'msg_' + promptId, id: 'call_' + dispatch.n + '_' + ++calls };
+        const event = { tool, ...meta, input: value };
+        let outcome;
+        if (!framework) {
+          try {
+            await hooks.get('tool.execute.before')(event);
+            const impl = tools.get(tool);
+            outcome = { status: 'completed', result: impl ? await impl.execute(value, { ...meta, signal: new AbortController().signal, progress: async () => {} }) : { output: { ran: tool } } };
+          } catch (error) { outcome = { status: 'error', error }; }
+        } else outcome = { status: 'error', error: new Error('framework input validation failed') };
+        await hooks.get('tool.execute.after')({ tool, ...meta, input: value, ...outcome });
+        if (outcome.status === 'error') throw outcome.error;
+        return outcome.result.output;
+      };
+      const visible = async names => {
+        const event = { sessionID: child, agent: input.agent, tools: Object.fromEntries(names.map(name => [name, {}])) };
+        await hooks.get('session.context')(event);
+        return Object.keys(event.tools);
+      };
+      const submitTool = input.agent === settings.plannerAgent ? PLAN_TOOL : RESULT_TOOL;
+      return step({ dispatch, call, visible, submitTool, child, input, meta: { sessionID: child, agent: input.agent } });
+    },
+  };
+  let runs = 0;
+  const build = options => createRunner({
+    directory, backend, settings, quota, persistence, workflowRoot: '.heimdall/state', planRoot: '.heimdall/plans',
+    plannerPromptPath: '.heimdall/planner.md', executorPromptPath: '.heimdall/executor.md', git: args => args[0] === 'branch' ? 'heimdall/run\n' : '', supervisor, ...options,
+  });
+  const run = build(noProtocol ? {} : { protocol: 'structured-v1' });
+  return {
+    directory, local, saves, dispatches, interrupts, reportOnly, supervisor, hooks, tools, control, checks, gate,
+    state: () => local.load(RUN),
+    start: () => run({ action: 'start', runId: RUN, adr: '.heimdall/feature.md' }, caller(++runs)).then(JSON.parse),
+    resume: (input = 'Resolved') => run({ action: 'resume', runId: RUN, input }, caller(++runs)).then(JSON.parse),
+    plansDirectory: path.join(directory, '.heimdall/plans/adr-' + RUN),
+  };
+}
+
+const speaks = text => async () => text;
+const submitOk = (payload, tool) => async ({ call, submitTool }) => {
+  const response = await call(tool ?? submitTool, payload);
+  assert.equal(response.accepted, true, JSON.stringify(response));
+  return SPOKEN;
+};
+
+// --- Registry: one exact allowance --------------------------------------------------------------------------
+
+test('a restriction keeps at most the one exact tool id; any restriction without an allowance keeps everything denied', () => {
+  const registry = createReportOnlyRegistry();
+  for (const name of ['execute.before', 'context', 'permission.evaluate']) registry.setHook(name, true);
+  assert.equal(registry.permits('c', RESULT_TOOL), false, 'an unrestricted session is not "permitted": it simply is not restricted');
+  const release = registry.restrict('c', { parent: 'p', child: 'c', attemptId: 'a', runId: 'r' }, { allow: RESULT_TOOL });
+  assert.equal(registry.has('c'), true);
+  assert.equal(registry.permits('c', RESULT_TOOL), true);
+  for (const name of [PLAN_TOOL, 'edit', 'write', 'shell', 'bash', 'subagent', 'task', 'mcp__srv__x', 'code_mode.edit', 'foo__' + RESULT_TOOL, RESULT_TOOL + '_2', RESULT_TOOL.toUpperCase(), ' ' + RESULT_TOOL, '', 'x.' + RESULT_TOOL, 'x/' + RESULT_TOOL, 'x:' + RESULT_TOOL]) {
+    assert.equal(registry.permits('c', name), false, JSON.stringify(name));
+  }
+  assert.equal(registry.permits('other', RESULT_TOOL), false);
+  // A second restriction with no allowance (the legacy report-only correction) overrides the allowance.
+  const full = registry.restrict('c', { parent: 'p', child: 'c', attemptId: 'b', runId: 'r' });
+  assert.equal(registry.permits('c', RESULT_TOOL), false);
+  full();
+  assert.equal(registry.permits('c', RESULT_TOOL), true);
+  assert.throws(() => registry.restrict('c', undefined, { allow: '' }), /one exact tool id/);
+  release();
+  assert.equal(registry.has('c'), false);
+  assert.equal(registry.permits('c', RESULT_TOOL), false);
+  // Owner-matched release removes exactly the owned restriction.
+  registry.restrict('c', { parent: 'p', child: 'c', attemptId: 'a', runId: 'r' }, { allow: RESULT_TOOL });
+  assert.equal(registry.releaseOwned({ parent: 'p', child: 'c', attemptId: 'zzz', runId: 'r' }), 0);
+  assert.equal(registry.has('c'), true);
+  assert.equal(registry.releaseOwned({ parent: 'p', child: 'c', attemptId: 'a', runId: 'r' }), 1);
+  assert.equal(registry.has('c'), false);
+});
+
+// --- Reporting-only boundary through the real hooks -------------------------------------------------------------
+
+test('the restricted boundary denies edit, write, shell, tests, git, delegation, MCP, code-mode and lookalikes, and lifts after the dispatch', async t => {
+  let boundary;
+  const f = await fixture(t, [
+    submitOk(plan('T1')),
+    async ({ call, visible, submitTool, meta }) => {
+      assert.equal((await call(submitTool, malformed())).repairable, true);
+      const all = ['edit', 'write', 'shell', 'bash', 'test', 'git', 'subagent', 'task', 'mcp__srv__edit', 'code_mode.edit', 'adr_workflow', 'foo__' + RESULT_TOOL, RESULT_TOOL + '_2', PLAN_TOOL, RESULT_TOOL];
+      boundary = { visible: await visible(all), denied: {} };
+      for (const name of all) {
+        if (name === RESULT_TOOL) continue;
+        try { await call(name, { command: 'x' }); boundary.denied[name] = 'ran'; }
+        catch (error) { boundary.denied[name] = error.message; }
+      }
+      const evaluate = action => { const event = { sessionID: meta.sessionID, agent: meta.agent, action, resources: [], effect: 'ask' }; f.hooks.get('permission.evaluate')(event); return event.effect; };
+      boundary.permissions = Object.fromEntries(['edit', 'bash', 'external_directory', RESULT_TOOL, 'foo__' + RESULT_TOOL].map(action => [action, evaluate(action)]));
+      assert.equal((await call(submitTool, completed())).accepted, true);
+      return SPOKEN;
+    },
+  ]);
+  assert.equal((await f.start()).status, 'completed');
+  assert.deepEqual(boundary.visible, [RESULT_TOOL]);
+  for (const [name, message] of Object.entries(boundary.denied)) {
+    assert.notEqual(message, 'ran', name + ' ran under the restriction');
+    assert.ok(message === REPAIR_ONLY_DENIAL || /submission denied/.test(message), name + ': ' + message);
+  }
+  assert.equal(boundary.denied.edit, REPAIR_ONLY_DENIAL);
+  assert.equal(boundary.denied['foo__' + RESULT_TOOL] === REPAIR_ONLY_DENIAL, true, 'a lookalike is denied by the restriction before it is even identified');
+  assert.deepEqual(boundary.permissions, { edit: 'deny', bash: 'deny', external_directory: 'deny', [RESULT_TOOL]: 'ask', ['foo__' + RESULT_TOOL]: 'deny' });
+  // The restriction ends with the dispatch: nothing stays restricted.
+  assert.equal(f.reportOnly.has('ses_child_2'), false);
+  assert.equal((await f.state()).submissionRepair, undefined, 'real advancement removes the repair record');
+});
+
+// --- Bounded repair: counter, durability and exhaustion ---------------------------------------------------------
+
+test('the initial submission plus two repairs are allowed, each saved before its feedback, and the third repairable failure pauses', async t => {
+  const seen = [];
+  const f = await fixture(t, [
+    submitOk(plan('T1')),
+    async ({ call, submitTool }) => {
+      for (let i = 1; i <= 3; i++) {
+        const response = await call(submitTool, malformed());
+        seen.push({ i, response, saved: (await f.state()).submissionRepair?.repairs, restricted: f.reportOnly.has('ses_child_2') });
+      }
+      return SPOKEN;
+    },
+  ]);
+  const result = await f.start();
+  assert.equal(MAX_SUBMISSION_REPAIRS, 2);
+  assert.equal(result.status, 'paused');
+  assert.equal(seen[0].response.repairsRemaining, 1);
+  assert.equal(seen[1].response.repairsRemaining, 0);
+  assert.deepEqual(seen.slice(0, 2).map(entry => entry.saved), [1, 2], 'the counter is durable before each feedback is returned');
+  assert.ok(seen.slice(0, 2).every(entry => entry.restricted), 'restricted before feedback');
+  assert.equal(seen[2].response.repairable, false);
+  assert.match(seen[2].response.message, /no repair is available/);
+  assert.match(result.reason, /more often than the bounded repair allows/);
+  const state = await f.state();
+  assert.equal(state.status, 'paused');
+  assert.equal(state.submissionRepair.repairs, 2);
+  assert.equal(state.submissionRepair.refused.code, 'exhausted');
+  assert.equal(state.reportRecovery.diagnostic.code, 'submission_repair_exhausted');
+  assert.equal(f.dispatches.length, 2, 'exhaustion never reruns anything');
+  assert.deepEqual(f.interrupts, ['interrupt']);
+  assert.equal(f.reportOnly.has('ses_child_2'), false, 'released after confirmed termination');
+  // The late/refused attempt can no longer submit.
+  const late = await f.gate.submit('executor-result', completed(), { sessionID: 'ses_child_2', agent: 'adr-executor', messageID: 'msg_prompt_2', id: 'late' });
+  assert.equal(late.code, 'unauthorized');
+  assert.equal(submissionRepairInfo(state.submissionRepair).code, 'submission_repair_exhausted');
+});
+
+test('the third attempt is accepted after two repairs and advancement removes the counter', async t => {
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool }) => {
+    assert.equal((await call(submitTool, malformed())).repairsRemaining, 1);
+    assert.equal((await call(submitTool, {})).repairsRemaining, 0);
+    assert.equal((await call(submitTool, completed())).accepted, true);
+    return SPOKEN;
+  }]);
+  assert.equal((await f.start()).status, 'completed');
+  const state = await f.state();
+  assert.equal(state.results.length, 1);
+  assert.equal(state.submissionRepair, undefined);
+  assert.ok(f.saves.some(s => s.submissionRepair?.repairs === 2));
+});
+
+test('the counter survives a crash and an explicit resume: repairs never reset, so the resumed dispatch has what is left', async t => {
+  let second;
+  const f = await fixture(t, [
+    submitOk(plan('T1')),
+    async ({ call, submitTool }) => { assert.equal((await call(submitTool, malformed())).repairsRemaining, 1); throw new Error('simulated crash of the child dispatch'); },
+    async ({ call, submitTool }) => {
+      second = await call(submitTool, malformed());
+      return SPOKEN;
+    },
+  ]);
+  const first = await f.start();
+  assert.equal(first.status, 'paused');
+  let state = await f.state();
+  assert.equal(state.submissionRepair.repairs, 1, 'persisted in the pause checkpoint');
+  const resumed = await f.resume('Fix the payload');
+  assert.equal(resumed.status, 'paused');
+  state = await f.state();
+  assert.equal(state.submissionRepair.repairs, 2, 'the resumed dispatch continued from 1, not 0');
+  assert.equal(second.repairsRemaining, 0);
+  assert.equal(f.dispatches.length, 3);
+});
+
+test('exhausted counters stay exhausted across a resume: the next malformed call is refused immediately', async t => {
+  let refusal;
+  const f = await fixture(t, [
+    submitOk(plan('T1')),
+    async ({ call, submitTool }) => { await call(submitTool, malformed()); await call(submitTool, malformed()); return SPOKEN; },
+    async ({ call, submitTool }) => { refusal = await call(submitTool, malformed()); return SPOKEN; },
+  ]);
+  assert.equal((await f.start()).status, 'paused');
+  assert.equal((await f.state()).submissionRepair.repairs, 2);
+  const resumed = await f.resume('Try again');
+  assert.equal(resumed.status, 'paused');
+  assert.equal(refusal.repairable, false);
+  assert.equal((await f.state()).submissionRepair.repairs, 2);
+  assert.equal(f.dispatches.length, 3, 'one dispatch per explicit resume and no automatic rerun');
+});
+
+test('a call the framework rejected before any Heimdall code ran spends a repair, once', async t => {
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool }) => {
+    await assert.rejects(call(submitTool, 'not an object', { framework: true }), /framework input validation/);
+    assert.equal((await f.state()).submissionRepair.repairs, 1, 'counted and saved before the model sees the framework error');
+    assert.equal(f.reportOnly.has('ses_child_2'), true);
+    await assert.rejects(call(submitTool, 7, { framework: true }), /framework input validation/);
+    assert.equal((await f.state()).submissionRepair.repairs, 2);
+    assert.equal((await call(submitTool, completed())).accepted, true);
+    return SPOKEN;
+  }]);
+  assert.equal((await f.start()).status, 'completed');
+});
+
+test('denied or unauthorized submission calls are not format failures and spend no repair', async t => {
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool, child, input }) => {
+    // The wrong tool for this kind: denied by the gate, never counted.
+    await assert.rejects(call(submitTool === RESULT_TOOL ? PLAN_TOOL : RESULT_TOOL, completed()), /submission denied/);
+    assert.equal((await f.state()).submissionRepair, undefined);
+    assert.equal(f.reportOnly.has(child), false);
+    assert.equal((await call(submitTool, completed())).accepted, true);
+    return SPOKEN;
+  }]);
+  assert.equal((await f.start()).status, 'completed');
+});
+
+// --- Planner repair ------------------------------------------------------------------------------------------
+
+test('planner repair is inline typed content: filesystem writes stay disabled and the whole plan is accepted', async t => {
+  let writeDenied;
+  const f = await fixture(t, [
+    async ({ call, submitTool }) => {
+      // Artifacts were never written, so the artifact submission cannot be read.
+      const bad = await call(submitTool, { status: 'planned', artifacts: true });
+      assert.equal(bad.accepted, false);
+      assert.equal(bad.repairable, true);
+      assert.match(bad.message, /file writes are disabled/);
+      assert.match(bad.message, /inline/);
+      try { await call('write', { path: path.join(f.plansDirectory, 'plan.md') }); writeDenied = 'ran'; } catch (error) { writeDenied = error.message; }
+      await assert.rejects(fs.stat(f.plansDirectory), /ENOENT/, 'nothing was written');
+      assert.equal((await call(submitTool, plan('T1'))).accepted, true);
+      return SPOKEN;
+    },
+    submitOk(completed()),
+  ]);
+  assert.equal((await f.start()).status, 'completed');
+  assert.equal(writeDenied, REPAIR_ONLY_DENIAL);
+});
+
+// --- Unverifiable enforcement, quota and accounting -----------------------------------------------------------
+
+for (const capability of ['none', 'unsupported']) {
+  test(`unverifiable report-only enforcement (${capability}) pauses precisely with no feedback, no restriction and no repair spent`, async t => {
+    let response;
+    const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool }) => { response = await call(submitTool, malformed()); return SPOKEN; }], { capability });
+    const result = await f.start();
+    assert.equal(result.status, 'paused');
+    assert.match(result.reason, /report-only repair cannot be enforced/);
+    assert.equal(response.repairable, false);
+    assert.equal(f.reportOnly.has('ses_child_2'), false, 'nothing was restricted');
+    const state = await f.state();
+    assert.equal(state.submissionRepair.repairs, 0);
+    assert.equal(state.submissionRepair.refused.code, 'unsupported');
+    assert.equal(state.reportRecovery.diagnostic.code, 'submission_unsupported');
+    assert.equal(f.dispatches.length, 2);
+  });
+}
+
+test('quota and token guards still run for a repair, a refusal spends nothing, and the repair does not reset accounting', async t => {
+  let quotaOk = true;
+  let used = 10;
+  let response;
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool }) => {
+    quotaOk = false;
+    response = await call(submitTool, malformed());
+    return SPOKEN;
+  }], { quota: async (...args) => quotaOk ? goodQuota(...args) : { anthropic: { fetchedAt: Date.now(), errors: ['quota unavailable'], entries: [] } }, usage: async () => ({ used, uncached: used }) });
+  const result = await f.start();
+  assert.equal(result.status, 'paused');
+  assert.equal(response.repairable, false);
+  assert.match(result.reason, /Quota|quota|unavailable/);
+  const state = await f.state();
+  assert.equal(state.submissionRepair.repairs, 0, 'a refused repair consumes no repair');
+  assert.equal(f.reportOnly.has('ses_child_2'), false);
+  assert.equal(state.usage.ses_child_2, 10, 'usage accounting is untouched');
+  assert.equal(state.reportRecovery.diagnostic.code, 'auth_or_quota');
+});
+
+test('the usage guard that runs before every tool also runs before a submission call', async t => {
+  let guarded = 0;
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool, child }) => {
+    assert.equal((await call(submitTool, malformed())).repairsRemaining, 1);
+    await call(submitTool, completed());
+    return SPOKEN;
+  }], { usage: async () => { guarded++; return { used: 1, uncached: 1 }; } });
+  assert.equal((await f.start()).status, 'completed');
+  assert.ok(guarded >= 4);
+});
+
+test('an unconfirmed termination keeps the repair restriction until a later resume proves the child idle and releases exactly it', async t => {
+  const f = await fixture(t, [
+    submitOk(plan('T1')),
+    async ({ call, submitTool }) => { await call(submitTool, malformed()); await call(submitTool, malformed()); await call(submitTool, malformed()); return SPOKEN; },
+    submitOk(completed()),
+  ], { interruptFails: true });
+  const result = await f.start();
+  assert.equal(result.status, 'paused');
+  assert.match(result.reason, /Could not confirm child termination/);
+  assert.equal(f.reportOnly.has('ses_child_2'), true, 'fail closed: still restricted');
+  const state = await f.state();
+  assert.deepEqual(state.submissionRepair.attempts.length, 1, 'the owner identity is persisted so a later invocation can release it');
+  f.control.interruptFails = false;
+  assert.equal((await f.resume('Child stopped')).status, 'completed');
+  assert.equal(f.reportOnly.has('ses_child_2'), false, 'released by owner after fresh idle proof, before the new dispatch');
+});
+
+// --- Conflicting implementation work ------------------------------------------------------------------------
+
+test('an implementation call running in parallel with the accepted submission invalidates admission', async t => {
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool, child, meta }) => {
+    // An edit starts and has not finished when the submission is accepted.
+    f.supervisor.started(child, 'call_edit_1', 'edit');
+    assert.equal((await call(submitTool, completed())).accepted, true);
+    return SPOKEN;
+  }, submitOk(completed())]);
+  const result = await f.start();
+  assert.equal(result.status, 'paused');
+  assert.match(result.reason, /ran alongside or after the accepted submission/);
+  let state = await f.state();
+  assert.equal(state.results.length, 0, 'not advanced');
+  assert.equal(state.reportRecovery.diagnostic.code, 'conflicting_work');
+  assert.equal(state.submissionRepair.conflict.kind, 'parallel');
+  assert.equal(state.submissionRepair.conflict.tool, 'edit');
+  assert.equal(checkpointReportInfo(state).code, 'conflicting_work');
+  // An explicit resume dispatches a fresh attempt; the receipt of the conflicting attempt is never admitted.
+  const resumed = await f.resume('Redo it');
+  assert.equal(resumed.status, 'completed');
+  assert.equal(f.dispatches.length, 3);
+  state = await f.state();
+  assert.equal(state.results.length, 1);
+});
+
+test('an implementation call that starts after the accepted submission also invalidates admission', async t => {
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool }) => {
+    assert.equal((await call(submitTool, completed())).accepted, true);
+    assert.equal(await call('edit', { path: 'x' }).then(() => 'ran'), 'ran');
+    return SPOKEN;
+  }]);
+  const result = await f.start();
+  assert.equal(result.status, 'paused');
+  const state = await f.state();
+  assert.equal(state.results.length, 0);
+  assert.equal(state.submissionRepair.conflict.kind, 'later');
+});
+
+test('a conflict recorded durably blocks admission of the saved receipt on a later resume too', async t => {
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool, child }) => {
+    f.supervisor.started(child, 'call_edit_1', 'edit');
+    assert.equal((await call(submitTool, completed())).accepted, true);
+    throw new Error('simulated crash after the conflicting submission');
+  }, submitOk(completed())]);
+  assert.equal((await f.start()).status, 'paused');
+  assert.equal((await f.state()).submissionRepair.conflict.attemptId.length > 0, true);
+  const resumed = await f.resume('Redo');
+  assert.equal(resumed.status, 'completed');
+  assert.equal(f.dispatches.length, 3, 'a fresh attempt ran instead of admitting the conflicting receipt');
+});
+
+// --- Legacy and projection ----------------------------------------------------------------------------------
+
+test('a legacy unversioned run never registers a repair handler and keeps the prose path', async t => {
+  let registered = 0;
+  const f = await fixture(t, [async ({ input }) => JSON.stringify({ status: 'planned', planMarkdown: '# Plan', factSheet: 'Facts', tasks: [task('T1')] })], { noProtocol: true });
+  const original = f.supervisor.register;
+  f.supervisor.register = (...args) => { registered++; return original(...args); };
+  const result = await f.start();
+  assert.equal(registered, 0);
+  assert.equal(result.status, 'paused');
+  const state = await f.state();
+  assert.equal(state.protocol, undefined);
+  assert.equal(state.submissionRepair, undefined);
+  assert.equal(state.tasks.length, 1, 'the prose plan was admitted by the legacy path');
+});
+
+test('projection renders both the legacy report record and the structured repair record, allowlisted', () => {
+  assert.equal(checkpointReportInfo(null), null);
+  assert.equal(checkpointReportInfo({}), null);
+  const legacy = checkpointReportInfo({ reportRecovery: { mode: 'paused', corrections: 2, diagnostic: { code: 'correction_exhausted', missingFields: ['summary', 'secret'] } } });
+  assert.equal(legacy.kind, undefined);
+  assert.equal(legacy.corrections, 2);
+  assert.deepEqual(legacy.missingFields, ['summary']);
+  const idle = checkpointReportInfo({ submissionRepair: { phase: 'executor', index: 0, repairs: 0, attempts: [] } });
+  assert.deepEqual(idle, { kind: 'submission', mode: 'idle', corrections: 0, limit: 2, code: null, missingFields: [], gateIds: [] });
+  const using = checkpointReportInfo({ submissionRepair: { phase: 'planner', index: 0, repairs: 99, attempts: ['a'], refused: { attemptId: 'a', code: 'exhausted', reason: 'secret reply text' } } });
+  assert.equal(using.mode, 'paused');
+  assert.equal(using.corrections, 2, 'clamped');
+  assert.equal(using.code, 'submission_repair_exhausted');
+  assert.doesNotMatch(JSON.stringify(using), /secret/);
+  assert.equal(checkpointReportInfo({ submissionRepair: { phase: 'executor', index: 0, repairs: 1, attempts: [], conflict: { attemptId: 'a', kind: 'later', tool: 'edit' } } }).code, 'conflicting_work');
+  assert.equal(checkpointReportInfo({ submissionRepair: { phase: 'bogus' }, reportRecovery: { mode: 'idle', corrections: 1 } }).corrections, 1, 'an invalid repair record falls back to the legacy record');
+  assert.equal(submissionRepairInfo('nope'), null);
+});
+
+// --- Hook details: REPORT_ONLY_DENIAL stays the message of an unallowed (legacy) restriction ---------------------
+
+test('a restriction without an allowance still denies every call with the legacy message and empties the tool list', async t => {
+  const f = await fixture(t, []);
+  f.reportOnly.restrict('legacy-child');
+  await assert.rejects(f.hooks.get('tool.execute.before')({ tool: RESULT_TOOL, sessionID: 'legacy-child', agent: 'adr-executor', messageID: 'm', id: 'c' }), error => error.message === REPORT_ONLY_DENIAL);
+  const event = { sessionID: 'legacy-child', agent: 'adr-executor', tools: { [RESULT_TOOL]: {}, edit: {} } };
+  await f.hooks.get('session.context')(event);
+  assert.deepEqual(event.tools, {});
+});

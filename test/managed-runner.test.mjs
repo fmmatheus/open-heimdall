@@ -126,7 +126,7 @@ test('managed plugin keeps native hooks but omits watchdog recovery RPC', async 
   const outsider = { sessionID: 'other-parent', agent: 'adr-orchestrator', tools: { adr_workflow: {}, subagent: {} } };
   await contextHook(outsider); assert.deepEqual(outsider.tools, {});
   await assert.rejects(registered.execute({ action: 'start' }, { ...caller(), sessionID: 'other-parent' }), /does not own/);
-  await cleanup(); assert.equal(disposed, 3);
+  await cleanup(); assert.equal(disposed, 4);
 });
 
 test('a runner without a selected protocol never writes protocol or binding state', async t => {

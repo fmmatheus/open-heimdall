@@ -4,12 +4,14 @@ import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { chooseExecutor, authExpired, executorCandidates } from '../policy/quota.js';
 
-import { classifyError, classifyResult, pauseReportRecovery, reportPauseReason, submissionPauseReason } from './report.js';
+import { classifyError, classifyResult, pauseReportRecovery, reportPauseReason, submissionPauseReason, submissionRepairPauseReason } from './report.js';
+import { MAX_SUBMISSION_REPAIRS } from './submission-repair.js';
+import type { ConflictInfo, RepairDecision, RepairHandler, RepairRequest } from './submission-repair.js';
 import { isTaskId, SUBMISSION_PROTOCOL, SUBMISSION_TOOL_IDS } from './contracts.js';
 import { closeSubmissionBinding, createLocalSubmissionStore, openSubmissionBinding, recordDispatchPrompt, submissionKindForPhase } from './submission-store.js';
 import type {
   CompletionResult, PlanResult, ProgressUpdate, ReportDiagnostic, ReportOnlyCheck, RunArguments, RunState,
-  RunnerContext, RunnerOptions, RunnerSettings, SubmissionReceipt, WorkflowResult, WorkflowTask,
+  RunnerContext, RunnerOptions, RunnerSettings, SubmissionReceipt, SubmissionRepairRecord, SubmissionRepairRefusal, WorkflowResult, WorkflowTask,
 } from './types.js';
 export type { RunnerBackend, RunnerContext, RunnerOptions, RunnerSettings } from './types.js';
 export { classifyError, classifyResult, reportPauseReason } from './report.js';
@@ -161,6 +163,7 @@ export function structuredExecutorContract(task: WorkflowTask): string {
     ...task.dod.map((gate, i) => 'G' + (i + 1) + ' = ' + gate),
     'Blocked payload: {"status":"blocked","reason":"<specific blocker and owner steps>"}',
     'Rules: evidence must already exist before you submit; report results truthfully; set passed=true only for a gate you fully proved; if any gate is unresolved, submit the blocked payload. A call the tool rejects records nothing.',
+    'A malformed call may be corrected at most twice. After the first rejection every other tool is disabled for this session, so submit the complete payload from results you already have; do no further work.',
     'After the tool acknowledges the submission, stop: reply with one short sentence and call no other tool.',
   ].join('\n');
 }
@@ -172,6 +175,7 @@ export function structuredPlannerContract(): string {
     '=== Planner submission contract (authoritative; overrides any earlier example) ===',
     'Write plan.md, facts.md and tasks.md in the planning artifact directory named above, then call the tool ' + tool + ' exactly once with {"status":"planned","artifacts":true}. The host reads and validates those files itself and snapshots them when it accepts the plan.',
     'If the plan cannot be made responsibly, call the tool with {"status":"blocked","reason":"<specific decision or prerequisite>"}.',
+    'A rejected call may be corrected at most twice. After the first rejection every other tool is disabled, including file writes: the correction is the whole plan submitted inline as {"status":"planned","planMarkdown":"...","factSheet":"...","tasks":[...]}.',
     'Your final chat text is never parsed and cannot admit a plan. Do not put the plan, fact sheet or tasks in the tool payload or the chat reply.',
     'After the tool acknowledges the submission, stop: reply with one short sentence and call no other tool.',
   ].join('\n');
@@ -197,7 +201,7 @@ export function correctionInstruction(task: WorkflowTask, number: number, diagno
 const contextSignal = (context: RunnerContext) => context.signal || context.abort;
 const callerIdentity = (context: RunnerContext) => ({ sessionID: context.sessionID, id: context.id, messageID: context.messageID, agent: context.agent });
 
-export function createRunner({ backend, directory, quota, authRefresh, guards = new Map(), git = args => execFileSync('git', args, { cwd: directory, encoding: 'utf8' }), settings: suppliedSettings, workflowRoot, settingsPath, plannerPromptPath, executorPromptPath, planRoot: suppliedPlanRoot, persistence, protocol, promptSync }: RunnerOptions) {
+export function createRunner({ backend, directory, quota, authRefresh, guards = new Map(), git = args => execFileSync('git', args, { cwd: directory, encoding: 'utf8' }), settings: suppliedSettings, workflowRoot, settingsPath, plannerPromptPath, executorPromptPath, planRoot: suppliedPlanRoot, persistence, protocol, promptSync, supervisor }: RunnerOptions) {
   if (!backend || typeof quota !== 'function') throw new Error('Native backend and quota callback are required');
   const root = path.resolve(directory, workflowRoot ?? '.opencode/adr-workflow');
   const planRoot = path.resolve(directory, suppliedPlanRoot ?? '.omo/plans');
@@ -271,10 +275,12 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
      */
     const releaseRetained = async () => {
       const recovery = state.reportRecovery;
+      const repair = state.submissionRepair;
       const capability = backend.reportOnly;
-      if (!capability || !state.child || !recovery?.attempts.length || recovery.child !== state.child) return;
+      const attemptIds = [...(recovery?.child === state.child ? recovery?.attempts ?? [] : []), ...(repair?.child === state.child ? repair?.attempts ?? [] : [])];
+      if (!capability || !state.child || !attemptIds.length) return;
       await backend.assertIdle(state.child, state.parent, contextSignal(context));
-      await capability.releaseRetained({ child: state.child, parent: state.parent, runId: state.id, attemptIds: recovery.attempts });
+      await capability.releaseRetained({ child: state.child, parent: state.parent, runId: state.id, attemptIds });
     };
     /** Names the run the lock holder owns, so the host can find the one active checkpoint without a process-local map. */
     const recordLockOwner = async () => {
@@ -411,6 +417,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
         delete next.taskStartedAt;
         delete next.taskElapsedMs;
         delete next.reportRecovery; // Real advancement only: restarts, new attempts and resumes keep the record.
+        delete next.submissionRepair; // Same for the structured repair bound: it never resets on a restart or a resume.
         if (next.submissionBinding) next.submissionBinding = closeSubmissionBinding(next.submissionBinding);
         if (planning) { next.tasks = admittedPlan!.tasks; next.phase = 'executor'; }
         else {
@@ -514,7 +521,15 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
           if (state.attempt.phase !== state.phase || state.attempt.index !== state.index || state.attempt.child !== state.child) throw new Error('Attempt does not match the current task');
           // A saved typed submission is applied without redispatching: admission needs the receipt AND a freshly confirmed native stop.
           const stored = await submissionStore.readSubmission(state.id, state.attempt.id, submissionKindForPhase(state.phase));
-          if (stored) { await admitSubmission(planning, task, stored); continue; }
+          if (stored) {
+            // Work that ran alongside or after this attempt's receipt was recorded durably: its evidence is not admitted. The
+            // explicit resume that reaches here dispatches a fresh attempt for the same task instead.
+            if (state.submissionRepair?.conflict?.attemptId === state.attempt.id) {
+              state.attempt.status = 'rejected';
+              state.submissionRepair = { ...state.submissionRepair }; delete state.submissionRepair.conflict;
+              if (state.submissionBinding) state.submissionBinding = closeSubmissionBinding(state.submissionBinding);
+            } else { await admitSubmission(planning, task, stored); continue; }
+          }
           // No submission was recorded for the interrupted attempt: only an explicit resume reaches here, and it dispatches a fresh attempt.
         }
         if (!structured && state.attempt && (state.attempt.status !== 'rejected' || recheckRejected)) {
@@ -640,6 +655,93 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
               controller.abort(error);
             });
           };
+          let unregisterRepair: (() => void) | undefined;
+          let conflicting: ConflictInfo | undefined;
+          let conflictSave: Promise<void> | undefined;
+          let repairTail: Promise<unknown> = Promise.resolve();
+          const repairCode: Record<SubmissionRepairRefusal, 'submission_repair_exhausted' | 'submission_unsupported' | 'auth_or_quota' | 'submission_refused'> = {
+            exhausted: 'submission_repair_exhausted', unsupported: 'submission_unsupported', auth_or_quota: 'auth_or_quota', unavailable: 'submission_refused',
+          };
+          const repairRecord = (): SubmissionRepairRecord => {
+            const existing = state.submissionRepair;
+            if (existing && existing.phase === state.phase && existing.index === state.index && existing.taskId === task?.id && existing.child === state.child) return existing;
+            return { phase: state.phase, index: state.index, ...(task ? { taskId: task.id } : {}), child: state.child, repairs: 0, attempts: [] };
+          };
+          /**
+           * Ends the offer of repair for this attempt. The refusal is saved (best effort) and the dispatch is aborted, so the run
+           * pauses with the exact category and nothing is rerun. The child is interrupted and, until that is confirmed, restricted.
+           */
+          const refuse = async (code: SubmissionRepairRefusal, detail: string, cause?: unknown): Promise<RepairDecision> => {
+            const subject = planning ? 'the plan' : task.id;
+            const quotaStop = code === 'auth_or_quota';
+            const category = repairCode[code];
+            const reason = category === 'auth_or_quota' ? 'Quota or authentication unavailable for the selected model; no submission repair was offered: ' + detail : submissionRepairPauseReason(category, subject, detail);
+            const stop = cause ?? new Error(reason);
+            state.submissionRepair = { ...repairRecord(), refused: { attemptId: attempt.id, code, reason: detail } };
+            // A budget or other guard error carries its own pause text; only a refusal the host decided here gets a category.
+            if (!planning && !cause) rejection = quotaStop ? { code: 'auth_or_quota' } : { code: category };
+            await save(state).catch(() => {});
+            guardError ??= stop;
+            controller.abort(stop);
+            return { feedback: false, code, message: detail };
+          };
+          const decide = async (request: RepairRequest): Promise<RepairDecision> => {
+            const child = state.child;
+            if (!child || request.kind !== submissionKindForPhase(state.phase)) return { feedback: false, code: 'unavailable', message: 'this session is not the bound child' };
+            if (controller.signal.aborted || state.submissionRepair?.refused?.attemptId === attempt.id) return { feedback: false, code: 'unavailable', message: 'this dispatch has ended' };
+            const record = repairRecord();
+            if (record.repairs >= MAX_SUBMISSION_REPAIRS) return refuse('exhausted', 'the submission was malformed ' + (record.repairs + 1) + ' times');
+            // Repair needs enforced report-only mode; an unverifiable host or model pauses here, before any feedback is sent.
+            const capability = backend.reportOnly;
+            if (!correctionRelease) {
+              let support: ReportOnlyCheck;
+              try { support = capability ? await capability.check(attempt.model, child) : { supported: false, reason: 'this backend has no report-only capability' }; }
+              catch (error) { support = { supported: false, reason: errorMessage(error) }; }
+              if (!capability || !support.supported) return refuse('unsupported', support.supported ? 'report-only enforcement is unavailable' : support.reason);
+            }
+            // The same usage and quota guards as any dispatch. A repair never resets accounting.
+            try { await checkBudget(); }
+            catch (error) { return refuse('unavailable', errorMessage(error), error); }
+            try {
+              if (planning) {
+                const snapshot = await quota(cfg);
+                const provider = attempt.model.startsWith('claude-code/') ? 'claude-code' : 'anthropic';
+                if (!snapshot[provider]?.entries?.length || snapshot[provider]!.errors?.length) throw new Error('Claude quota unavailable before the plan repair');
+              } else {
+                const same = executorCandidates(cfg).filter(candidate => candidate.model === attempt.model && (candidate.variant || undefined) === (attempt.variant || undefined));
+                if (!same.length) throw new Error('the selected model is no longer configured');
+                chooseExecutor(await quota(cfg), { ...cfg, executorCandidates: same });
+              }
+            } catch (error) { return refuse('auth_or_quota', errorMessage(error)); }
+            // Restriction first (a refusal never consumes a repair), then the durable counter, then the feedback.
+            let taken = false;
+            if (!correctionRelease) {
+              try { correctionRelease = await capability!.restrict(child, { parent: state.parent, attemptId: attempt.id, runId: state.id }, { allow: SUBMISSION_TOOL_IDS[request.kind] }); taken = true; }
+              catch (error) { return refuse('unsupported', errorMessage(error)); }
+            }
+            const previous = state.submissionRepair;
+            const next: SubmissionRepairRecord = { ...record, repairs: record.repairs + 1, attempts: record.attempts.includes(attempt.id) ? record.attempts : [...record.attempts, attempt.id] };
+            state.submissionRepair = next;
+            try { await save(state); }
+            catch (error) {
+              state.submissionRepair = previous; // A stale owner never grants a repair.
+              if (taken) await releaseCorrection().catch(() => {});
+              return refuse('unavailable', errorMessage(error));
+            }
+            return { feedback: true, used: next.repairs, remaining: MAX_SUBMISSION_REPAIRS - next.repairs };
+          };
+          const repairHandler: RepairHandler = {
+            reject(request) {
+              const pending = repairTail.then(() => decide(request));
+              repairTail = pending.catch(() => {});
+              return pending;
+            },
+            conflict(info) {
+              conflicting ??= info;
+              state.submissionRepair = { ...repairRecord(), conflict: { attemptId: attempt.id, kind: info.kind, tool: info.tool } };
+              conflictSave = save(state).catch(() => {});
+            },
+          };
           const onStarted = async (id: string) => {
             if (state.child && state.child !== id) throw new Error('Native executor changed the child session');
             if (activeStartedAt) return;
@@ -651,6 +753,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
             state.taskElapsedMs ||= 0;
             await save(state); // Native progress runs before prompt admission.
             watchPrompt();
+            if (structured && supervisor) unregisterRepair ??= supervisor.register(id, repairHandler);
             guards.set(id, checkBudget);
             await checkBudget();
             activeStartedAt = Date.now();
@@ -715,6 +818,8 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
             clearTimeout(timer);
             clearInterval(budgetTimer);
             promptStop = true;
+            unregisterRepair?.();
+            await repairTail;
             promptAbort.abort();
             await promptWatch; // No binding write may land after this dispatch ended.
             await warningWrite;
@@ -723,6 +828,15 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
             await releaseCorrection().catch(() => {}); // Fail closed: a release that cannot run leaves the restriction in force.
           }
           if (structured) {
+            // Implementation work next to or after the accepted submission means its evidence may have changed after the receipt.
+            if (state.child && supervisor) { const seen = supervisor.conflict(state.child); if (seen && !conflicting) repairHandler.conflict(seen); }
+            await conflictSave;
+            if (conflicting) {
+              attempt.status = 'rejected';
+              const reason = submissionRepairPauseReason('conflicting_work', planning ? 'the plan' : task.id, conflicting.kind === 'parallel' ? 'a tool call ran in parallel with the submission' : 'a tool call started after the submission');
+              if (!planning) rejection = { code: 'conflicting_work' };
+              throw new Error(reason);
+            }
             // The child returned. Admit only a durable typed submission; a missing one (refusal, omission, a rejected call) pauses.
             const stored = await submissionStore.readSubmission(state.id, attempt.id, submissionKindForPhase(state.phase));
             if (!stored) {

@@ -69,7 +69,7 @@ test('published V2 plugin registers native workflow, safe context hooks and rese
   await assert.rejects(rpcHandlers.recover({ runId: '../outside', child: 'child', input: 'Retry', expectedReservationAt: 1 }), /Invalid recovery reservation/);
   await assert.rejects(rpcHandlers.recover({ runId: 'existing', child: 'child', input: 'Retry', expectedReservationAt: 1 }), /no saved native caller identity/);
   await cleanup();
-  assert.equal(disposed, 4);
+  assert.equal(disposed, 5);
 });
 
 test('native role restrictions follow configuration and blank config environment uses the project default', async t => {

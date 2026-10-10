@@ -88,10 +88,12 @@ export interface Blocker {
 }
 
 /**
- * Completion-report correction state, derived only from the checkpoint's `reportRecovery`. Codes, field names and
+ * Completion-report correction or submission repair state, derived only from the checkpoint's `reportRecovery` / `submissionRepair`. Codes, field names and
  * gate IDs are allowlisted by the service; no reply text, reason text or secret ever reaches this shape.
  */
 export interface ReportView {
+  /** `submission` for format repairs of a typed submission; absent for the legacy prose-report view. */
+  kind?: 'submission';
   mode: 'idle' | 'correcting' | 'paused';
   /** Automatic corrections started for the current task. */
   corrections: number;

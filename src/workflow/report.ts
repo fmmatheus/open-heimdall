@@ -84,6 +84,26 @@ export function submissionPauseReason(code: 'submission_missing' | 'submission_u
     + 'Reconcile the child session (it must be idle with an empty inbox and a final stop); the recorded submission is kept and a resume applies it without redoing the work.';
 }
 
+const SUBJECT_ACTION = ' Inspect the child session, then resume with guidance; nothing was advanced and no repair is repeated automatically.';
+
+/**
+ * Pause reason for a typed submission whose bounded format repair ended, or whose evidence can no longer be trusted.
+ * `subject` is a task id or "the plan"; `detail` is a bounded host-owned reason, never submitted content.
+ */
+export function submissionRepairPauseReason(code: 'submission_repair_exhausted' | 'submission_refused' | 'submission_unsupported' | 'conflicting_work', subject: string, detail = ''): string {
+  const suffix = detail ? ' (' + bounded(detail, 300) + ')' : '';
+  switch (code) {
+    case 'submission_repair_exhausted':
+      return 'The submission for ' + subject + ' was rejected as malformed more often than the bounded repair allows (initial plus two repairs)' + suffix + '.' + SUBJECT_ACTION;
+    case 'submission_unsupported':
+      return 'The submission for ' + subject + ' was rejected as malformed, but report-only repair cannot be enforced for this model or host' + suffix + ', so no repair was offered.' + SUBJECT_ACTION;
+    case 'conflicting_work':
+      return 'Implementation work ran alongside or after the accepted submission for ' + subject + suffix + ', so the evidence may have changed after its receipt and was not admitted.' + SUBJECT_ACTION;
+    default:
+      return 'The submission for ' + subject + ' was rejected as malformed and no repair could be offered' + suffix + '.' + SUBJECT_ACTION;
+  }
+}
+
 /**
  * Pause reason for a rejected executor report. Contains only the category, field names, gate IDs and the
  * agent's own blocked reason or the provider error text (`detail`), never any part of a reply.
@@ -115,6 +135,11 @@ export function reportPauseReason(diagnostic: ReportDiagnostic, task: WorkflowTa
     case 'submission_missing':
     case 'submission_unconfirmed':
       return submissionPauseReason(diagnostic.code, task.id, detail);
+    case 'submission_repair_exhausted':
+    case 'submission_refused':
+    case 'submission_unsupported':
+    case 'conflicting_work':
+      return detail || submissionRepairPauseReason(diagnostic.code, task.id);
     default:
       return 'Native/provider failure: ' + bounded(detail || 'the executor did not return a reply', 300);
   }

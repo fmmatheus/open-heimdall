@@ -1,6 +1,7 @@
 import type { ExecutorSelection, QuotaSettings, QuotaSnapshot } from '../policy/types.js';
 import type { ContractRef, SubmissionKind, SUBMISSION_PROTOCOL } from './contracts.js';
 import type { DispatchPromptSync } from './prompt-sync.js';
+import type { SubmissionSupervisor } from './submission-repair.js';
 
 /** The only typed protocol so far. A run without a persisted protocol is a legacy (prose) run. */
 export type SubmissionProtocol = typeof SUBMISSION_PROTOCOL;
@@ -168,7 +169,8 @@ export interface WorkflowAttempt {
 export type ReportDiagnosticCode =
   | 'report_format' | 'unfinished_work' | 'agent_blocked' | 'identity_mismatch' | 'ambiguous_output'
   | 'native_failure' | 'auth_or_quota' | 'correction_exhausted' | 'correction_unsupported' | 'correction_ambiguous'
-  | 'submission_missing' | 'submission_unconfirmed';
+  | 'submission_missing' | 'submission_unconfirmed'
+  | 'submission_repair_exhausted' | 'submission_refused' | 'submission_unsupported' | 'conflicting_work';
 
 /** Field names and gate IDs only: never reply text. */
 export interface ReportDiagnostic {
@@ -188,6 +190,31 @@ export interface ReportRecovery {
   originalAttemptId: string;
   attempts: string[];
   diagnostic?: ReportDiagnostic;
+}
+
+/** Why the host stopped offering format repair for an attempt. The run pauses; it never reruns or switches provider. */
+export type SubmissionRepairRefusal = 'exhausted' | 'unsupported' | 'auth_or_quota' | 'unavailable';
+
+/**
+ * Durable bound on format repair of typed submissions for ONE planner phase or executor task. It lives in the
+ * checkpoint, is saved BEFORE any repair feedback is returned, and only real advancement removes it, so it
+ * survives interruption, crash and explicit resume. The initial submission is free; at most
+ * MAX_SUBMISSION_REPAIRS repairs are granted in total, however many dispatches the task needs.
+ */
+export interface SubmissionRepairRecord {
+  phase: 'planner' | 'executor';
+  index: number;
+  taskId?: string;
+  /** The child session whose restrictions `attempts` name. */
+  child?: string | null;
+  /** Format-repair opportunities granted so far (feedback returned). */
+  repairs: number;
+  /** Dispatch attempts that took a reporting-only restriction, so a later invocation can release exactly those owners. */
+  attempts: string[];
+  /** Set when an attempt's repair was refused. That attempt then pauses and accepts nothing further. */
+  refused?: { attemptId: string; code: SubmissionRepairRefusal; reason: string };
+  /** Set when an implementation call ran in parallel with, or after, the accepted submission of this attempt. */
+  conflict?: { attemptId: string; kind: 'parallel' | 'later'; tool: string };
 }
 
 export interface ProgressUpdate {
@@ -236,8 +263,11 @@ export interface ReportOnlyOwner {
 export interface ReportOnlyCapability {
   /** Whether enforcement is verified for this model's provider. Never throws for unsupported. */
   check: (model: string, child: string) => Promise<ReportOnlyCheck>;
-  /** Restrict the child under an owner. The returned release is idempotent. */
-  restrict: (child: string, owner?: Omit<ReportOnlyOwner, 'child'>) => Promise<() => Promise<void>>;
+  /**
+   * Restrict the child under an owner. The returned release is idempotent. `allow` names the one tool id that stays
+   * exposed and permitted (exact identity): the owner-bound submission tool of a structured repair.
+   */
+  restrict: (child: string, owner?: Omit<ReportOnlyOwner, 'child'>, options?: { allow?: string }) => Promise<() => Promise<void>>;
   /**
    * Release restrictions that outlived the invocation (and backend instance) that took them. Releases only entries
    * owned by the named correction attempts of this child/parent/run, is idempotent, and may be retried after a throw.
@@ -308,6 +338,8 @@ export interface RunnerOptions {
   protocol?: SubmissionProtocol;
   /** Lets the host's first model-context observation of a child trigger the dispatch-prompt watcher without waiting for its poll. */
   promptSync?: DispatchPromptSync;
+  /** Shared with the plugin hooks and the submission gate: format repair decisions and the tool-call timeline. */
+  supervisor?: SubmissionSupervisor;
 }
 
 export interface SavedCompletion extends CompletionResult {
@@ -341,6 +373,8 @@ export interface RunState {
   resolution?: string;
   reason?: string;
   reportRecovery?: ReportRecovery;
+  /** Structured runs only: the durable format-repair bound of the current planner phase or executor task. */
+  submissionRepair?: SubmissionRepairRecord;
   usage?: Record<string, number>;
   uncachedUsage?: Record<string, number>;
   tokenLimitsDisabled?: boolean;

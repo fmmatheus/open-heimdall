@@ -4,7 +4,7 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { SQLOutputValue } from 'node:sqlite';
 import { isDeepStrictEqual } from 'node:util';
-import { reportInfo } from '../workflow/report-info.js';
+import { checkpointReportInfo } from '../workflow/report-info.js';
 import type { SubmissionKind } from '../workflow/contracts.js';
 import {
   assertOutcomeMatchesCheckpoint, assertSubmissionMatchesCheckpoint, isNativeOutcome, isSubmissionKind, isSubmissionReceipt, sameOutcome, sameSubmission,
@@ -406,7 +406,7 @@ export class CoordinatorStore {
 
   saveCheckpoint(id: string, ownerToken: string, state: RunState): void {
     const encoded = serialize(state);
-    const report = reportInfo(state.reportRecovery);
+    const report = checkpointReportInfo(state);
     this.transaction(() => {
       const run = this.requireOwner(id, ownerToken);
       if (!run.binding || state.id !== run.id || state.parent !== run.parentSessionId || state.caller.sessionID !== run.parentSessionId) throw new Error('Checkpoint is not bound to this run and native parent');

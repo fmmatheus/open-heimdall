@@ -8,7 +8,7 @@ import type { Configuration } from '../config.js';
 import type { RunArguments, RunnerContext } from '../workflow/types.js';
 import type { SessionObserver } from './types.js';
 import { createObserver } from './observer.js';
-import { createReportOnlyRegistry, REPORT_ONLY_DENIAL } from './report-only.js';
+import { createReportOnlyRegistry, REPAIR_ONLY_DENIAL, REPORT_ONLY_DENIAL } from './report-only.js';
 import type { ReportOnlyRegistry } from './report-only.js';
 import { createManagedPersistence, readManagedMetadata } from './managed.js';
 import {
@@ -18,6 +18,8 @@ import {
 import type { SubmissionKind } from '../workflow/contracts.js';
 import { SUBMISSION_DENIAL } from '../workflow/submission.js';
 import { createDispatchPromptSync } from '../workflow/prompt-sync.js';
+import { createSubmissionSupervisor } from '../workflow/submission-repair.js';
+import type { SubmissionSupervisor } from '../workflow/submission-repair.js';
 import { createNativeSubmissionGate } from './submission-gate.js';
 import type { SubmissionGate } from '../workflow/submission.js';
 
@@ -39,6 +41,8 @@ export interface PluginOptions {
   reportOnly?: ReportOnlyRegistry;
   /** Owns binding and persistence of typed submissions. Defaults to the durable gate over the run's authoritative checkpoint and the host-observed call origin. */
   submissionGate?: SubmissionGate;
+  /** Format-repair decisions and the tool-call timeline shared with the runner. Injectable so tests can observe it. */
+  supervisor?: SubmissionSupervisor;
   /** Harness seams for the composed workflow; production leaves both unset. */
   quota?: WorkflowOptions['quota'];
   git?: WorkflowOptions['git'];
@@ -57,7 +61,10 @@ export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
       const reportOnly = options.reportOnly ?? createReportOnlyRegistry();
       const observe = options.observe ?? createObserver({ directory: configuration.projectDirectory, ...configuration.opencode });
       const promptSync = createDispatchPromptSync();
-      const run = metadata ? undefined : createWorkflow({ configuration, ctx, observe, guards, reportOnly, promptSync, quota: options.quota, git: options.git });
+      const supervisor = options.supervisor ?? createSubmissionSupervisor();
+      // Calls that reached execute.before. A submission call the framework rejected earlier (input validation) never does.
+      const reached = new Set<string>();
+      const run = metadata ? undefined : createWorkflow({ configuration, ctx, observe, guards, reportOnly, promptSync, supervisor, quota: options.quota, git: options.git });
       const registrations: Array<{ dispose(): Promise<void> }> = [];
       const recoveries = new Map<string, { operation: Promise<string>; controller: AbortController }>();
       const submissions = options.submissionGate ?? createNativeSubmissionGate({ configuration, ctx, metadata });
@@ -75,9 +82,20 @@ export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
             // Identity comes only from the native call context, never from the model-supplied value.
             const native = { sessionID: context.sessionID, agent: context.agent, messageID: context.messageID, id: context.id };
             if (!await permitted(kind, native.sessionID, native.agent)) throw new Error(SUBMISSION_DENIAL);
-            const response = await submissions.submit(kind, value, native);
-            if (!response.accepted && response.code === 'unauthorized') throw new Error(response.message);
-            return { output: response, content: JSON.stringify(response) };
+            supervisor.submitting(native.sessionID, native.id);
+            let accepted = false;
+            try {
+              const response = await submissions.submit(kind, value, native);
+              if (!response.accepted && response.code === 'unauthorized') throw new Error(response.message);
+              accepted = response.accepted;
+              if (response.accepted || response.code !== 'format') return { output: response, content: JSON.stringify(response) };
+              // A format rejection spends one bounded repair. The restriction and the saved counter come BEFORE this feedback.
+              const decision = await supervisor.reject(native.sessionID, { kind, errors: response.errors });
+              const answer = decision.feedback
+                ? { ...response, repairsRemaining: decision.remaining, message: response.message + (kind === 'planner-plan' ? ' Only this tool is available now and file writes are disabled: resubmit the whole plan inline as {"status":"planned","planMarkdown":...,"factSheet":...,"tasks":[...]} or the blocked payload.' : ' Only this tool is available now: correct the payload and call it again.') + ' Repairs remaining: ' + decision.remaining + '.' }
+                : { accepted: false as const, code: 'format' as const, repairable: false as const, errors: response.errors, message: 'Submission rejected and no repair is available (' + decision.message + '). Stop now; do not call any other tool.' };
+              return { output: answer, content: JSON.stringify(answer) };
+            } finally { supervisor.submitted(native.sessionID, native.id, accepted); }
           },
         });
         editor.add({
@@ -95,23 +113,41 @@ export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
               if (!current || current.runId !== metadata.runId || current.parentSessionId !== metadata.parentSessionId || current.endpoint !== metadata.endpoint) throw new Error('Managed workflow identity changed');
               const managed = createManagedPersistence(ctx.location.directory, current);
               const authorized = await managed.authorize(args, context);
-              const execute = createWorkflow({ configuration, ctx, observe, guards, reportOnly, promptSync, quota: options.quota, git: options.git, persistence: managed.persistence });
+              const execute = createWorkflow({ configuration, ctx, observe, guards, reportOnly, promptSync, supervisor, quota: options.quota, git: options.git, persistence: managed.persistence });
               text = await execute(authorized, context);
             } else text = await run!(args, context);
             return { output: JSON.parse(text) as unknown, content: text };
           },
         });
       }));
+      const submissionIds = Object.values(SUBMISSION_TOOL_IDS);
       registrations.push(await ctx.tool.hook('execute.before', async input => {
-        if (reportOnly.has(input.sessionID)) throw new Error(REPORT_ONLY_DENIAL);
+        if (submissionKindOfTool(input.tool)) reached.add(input.id);
+        // Report-only keeps at most the one exact submission tool id: anything else (lookalikes, MCP, delegation, nested) is denied here.
+        if (reportOnly.has(input.sessionID) && !reportOnly.permits(input.sessionID, input.tool)) throw new Error(submissionIds.some(id => reportOnly.permits(input.sessionID, id)) ? REPAIR_ONLY_DENIAL : REPORT_ONLY_DENIAL);
         const kind = submissionKindOfTool(input.tool);
         if (kind) { if (!await permitted(kind, input.sessionID, input.agent)) throw new Error(SUBMISSION_DENIAL); }
         else if (isLookalikeSubmissionTool(input.tool)) throw new Error(SUBMISSION_DENIAL);
-        await guards.get(input.sessionID)?.();
+        await guards.get(input.sessionID)?.(); // Usage and quota guards also run for submission calls.
+        if (!kind) supervisor.started(input.sessionID, input.id, input.tool);
+      }));
+      registrations.push(await ctx.tool.hook('execute.after', async event => {
+        supervisor.finished(event.sessionID, event.id);
+        const kind = submissionKindOfTool(event.tool);
+        const framework = kind !== undefined && event.status === 'error' && !reached.has(event.id);
+        reached.delete(event.id);
+        // The framework refused the call before any Heimdall code ran. It still spends a repair, and the restriction and
+        // the saved counter are taken here, before the model sees the framework's own error.
+        if (framework) await supervisor.reject(event.sessionID, { kind, errors: [{ path: '$', code: 'invalid_type', message: 'the call was rejected before it reached the submission tool' }] }).catch(() => undefined);
       }));
       reportOnly.setHook('execute.before', true);
       registrations.push(await ctx.session.hook('context', async event => {
-        if (reportOnly.has(event.sessionID)) { event.tools = {}; return; }
+        if (reportOnly.has(event.sessionID)) {
+          // Only a tool the restriction names exactly survives, and only while the gate still binds this session to it.
+          const bound = await submissions.exposed(event.sessionID, event.agent);
+          for (const name of Object.keys(event.tools)) if (!reportOnly.permits(event.sessionID, name) || submissionKindOfTool(name) !== bound) delete event.tools[name];
+          return;
+        }
         if (metadata && event.agent === 'adr-orchestrator') {
           if (event.sessionID !== metadata.parentSessionId) event.tools = {};
           else for (const name of Object.keys(event.tools)) if (!/^(?:.*[.:/]|.*__)?adr_workflow$/.test(name)) delete event.tools[name];
@@ -138,7 +174,7 @@ export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
       // Enforcement stays unavailable (fail closed) when the host exposes no permission hook.
       if (ctx.permission?.hook) {
         registrations.push(await ctx.permission.hook('evaluate', event => {
-          if (!reportOnly.has(event.sessionID)) return;
+          if (!reportOnly.has(event.sessionID) || reportOnly.permits(event.sessionID, event.action)) return;
           event.effect = 'deny';
           event.message = REPORT_ONLY_DENIAL;
         }));

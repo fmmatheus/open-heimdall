@@ -2,6 +2,7 @@ import type { Plugin } from '@opencode/plugin';
 import { createRunner } from './workflow/runner.js';
 import { SUBMISSION_PROTOCOL } from './workflow/contracts.js';
 import type { DispatchPromptSync } from './workflow/prompt-sync.js';
+import type { SubmissionSupervisor } from './workflow/submission-repair.js';
 import { createNativeBackend } from './opencode/native-backend.js';
 import { createObserver } from './opencode/observer.js';
 import { createQuota, refreshClaudeAuth } from './policy/quota.js';
@@ -24,6 +25,8 @@ export interface WorkflowOptions {
   /** Protocol for runs started here. Defaults to structured-v1 whenever this composes the native backend itself. */
   protocol?: RunnerOptions['protocol'];
   promptSync?: DispatchPromptSync;
+  /** Format-repair decisions and the tool timeline shared with the plugin hooks. */
+  supervisor?: SubmissionSupervisor;
 }
 
 /** Compose the extracted workflow without starting or changing an OpenCode server. */
@@ -41,7 +44,7 @@ export function createWorkflow(options: WorkflowOptions): ReturnType<typeof crea
     plannerPromptPath: configuration.plannerPromptPath, executorPromptPath: configuration.executorPromptPath,
     quota: options.quota ?? createQuota({ integration: ctx?.integration, directory: configuration.projectDirectory, workflowRoot: configuration.workflowRoot }),
     authRefresh: options.authRefresh ?? (ctx ? () => refreshClaudeAuth(ctx.integration) : undefined),
-    guards: options.guards, git: options.git, persistence: options.persistence, promptSync: options.promptSync,
+    guards: options.guards, git: options.git, persistence: options.persistence, promptSync: options.promptSync, supervisor: options.supervisor,
     // Every NEW run composed over the native OpenCode backend is structured. An injected backend (tests, harnesses) opts in explicitly.
     protocol: options.protocol ?? (options.backend ? undefined : SUBMISSION_PROTOCOL),
   });

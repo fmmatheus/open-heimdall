@@ -47,6 +47,8 @@ export function authenticateSubmissionCaller(state: RunState | null | undefined,
   if (binding.status !== 'open' || binding.protocol !== SUBMISSION_PROTOCOL || binding.runId !== state.id || binding.parent !== state.parent) return undefined;
   if (attempt.id !== binding.attemptId || attempt.phase !== binding.phase || attempt.index !== binding.index || state.phase !== binding.phase || state.index !== binding.index) return undefined;
   if (attempt.status === 'interrupted' || attempt.status === 'rejected') return undefined;
+  // A refused repair ends this attempt's right to submit, even if a call races the pause.
+  if (state.submissionRepair?.refused?.attemptId === attempt.id) return undefined;
   if (!binding.prompt) return undefined; // No host-recorded dispatch prompt: nothing can be proven current.
   if (binding.kind !== submissionKindForPhase(binding.phase) || !binding.child || binding.child !== state.child || binding.child !== attempt.child || sessionID !== binding.child) return undefined;
   const role = binding.phase === 'planner' ? state.settings.plannerAgent : state.settings.executorAgent;
