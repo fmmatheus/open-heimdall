@@ -6,6 +6,7 @@ import { chooseExecutor, authExpired, executorCandidates } from '../policy/quota
 
 import { classifyError, classifyResult, pauseReportRecovery, reportPauseReason } from './report.js';
 import { isTaskId } from './contracts.js';
+import { closeSubmissionBinding, openSubmissionBinding } from './submission-store.js';
 import type {
   CompletionResult, PlanResult, ProgressUpdate, ReportDiagnostic, ReportOnlyCheck, RunArguments, RunState,
   RunnerContext, RunnerOptions, RunnerSettings, WorkflowResult, WorkflowTask,
@@ -162,7 +163,7 @@ export function correctionInstruction(task: WorkflowTask, number: number, diagno
 const contextSignal = (context: RunnerContext) => context.signal || context.abort;
 const callerIdentity = (context: RunnerContext) => ({ sessionID: context.sessionID, id: context.id, messageID: context.messageID, agent: context.agent });
 
-export function createRunner({ backend, directory, quota, authRefresh, guards = new Map(), git = args => execFileSync('git', args, { cwd: directory, encoding: 'utf8' }), settings: suppliedSettings, workflowRoot, settingsPath, plannerPromptPath, executorPromptPath, planRoot: suppliedPlanRoot, persistence }: RunnerOptions) {
+export function createRunner({ backend, directory, quota, authRefresh, guards = new Map(), git = args => execFileSync('git', args, { cwd: directory, encoding: 'utf8' }), settings: suppliedSettings, workflowRoot, settingsPath, plannerPromptPath, executorPromptPath, planRoot: suppliedPlanRoot, persistence, protocol }: RunnerOptions) {
   if (!backend || typeof quota !== 'function') throw new Error('Native backend and quota callback are required');
   const root = path.resolve(directory, workflowRoot ?? '.opencode/adr-workflow');
   const planRoot = path.resolve(directory, suppliedPlanRoot ?? '.omo/plans');
@@ -247,7 +248,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
         const adr = await fs.realpath(path.resolve(directory, args.adr));
         const repo = await fs.realpath(directory);
         if (!adr.startsWith(repo + path.sep)) throw new Error('ADR must be inside this project');
-        state = { id: persistence ? args.runId! : randomUUID(), status: 'running', adr: args.adr, parent: context.sessionID, caller: callerIdentity(context), branch: git(['branch', '--show-current']).trim(), baseline: git(['status', '--porcelain']), index: 0, tasks: [], results: [], phase: 'planner', child: null, settings };
+        state = { id: persistence ? args.runId! : randomUUID(), status: 'running', adr: args.adr, parent: context.sessionID, caller: callerIdentity(context), branch: git(['branch', '--show-current']).trim(), baseline: git(['status', '--porcelain']), index: 0, tasks: [], results: [], phase: 'planner', child: null, settings, ...(protocol ? { protocol } : {}) };
         await fs.mkdir(path.join(root, 'runs', state.id), { recursive: !!persistence });
         await save(state);
         started = true;
@@ -439,6 +440,8 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
           const prompt = correcting ? correctionInstruction(task, state.reportRecovery!.corrections, state.reportRecovery!.diagnostic ?? { code: 'report_format' }) : (tokenLimitsDisabled ? 'Token limits disabled by owner; usage tracking remains enabled.' : 'Budget: ' + (planning ? cfg.maxPlannerTokens : cfg.maxSessionTokens) + ' reported tokens for this session, ' + cfg.maxRunTokens + ' for the ADR;') + ' ' + (timeoutMinutes > 0 ? 'Time warning after ' + cfg.timeoutMinutes + ' active minutes: continue working toward the DoD; elapsed time alone is not a blocker.' : 'No elapsed-time warning or task deadline is configured.') + ' Keep context narrow. Token limits, when enabled, still apply.\n' + instructions + '\n\nADR: ' + state.adr + '\nProject: ' + directory + '\nBranch: ' + state.branch + ' (stay on this branch; return blocked if another branch is required)\nPre-existing changes, do not overwrite or commit:\n' + state.baseline + '\nRun directory: ' + runDir + '\nPlanning artifact directory: ' + path.join(planRoot, 'adr-' + state.id) + '\n' + (planning ? '' : 'Task: ' + JSON.stringify(task) + '\nRead facts.md and ledger.md in the run directory. Do not read prior session transcripts.') + '\n' + (state.resolution ? 'Owner resolution: ' + state.resolution : '') + '\nDo not invoke other agents, background jobs, or Session Goals. Return the specified JSON as your final answer. If interrupted, reconcile files and existing completed work before continuing. Do not repeat passed checks unless affected by new changes.';
           if (!correcting) {
             state.attempt = { id: attemptID, phase: state.phase, index: state.index, child: state.child, status: 'launching', startedAt: Date.now(), model: chosen, ...(variant ? { variant } : {}) };
+            // Structured runs persist the submission authority with the attempt, in the same save, before any prompt is sent.
+            if (state.protocol) state.submissionBinding = openSubmissionBinding(state, (state.submissionBinding?.dispatch ?? 0) + 1);
             await save(state);
           }
           const attempt = state.attempt!;
@@ -459,6 +462,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
             state.child = id;
             attempt.child = id;
             attempt.status = 'admitted';
+            if (state.submissionBinding?.attemptId === attempt.id) state.submissionBinding = { ...state.submissionBinding, child: id };
             state.taskStartedAt ||= Date.now();
             state.taskElapsedMs ||= 0;
             await save(state); // Native progress runs before prompt admission.
@@ -560,6 +564,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
         delete next.taskStartedAt;
         delete next.taskElapsedMs;
         delete next.reportRecovery; // Real advancement only: restarts, new attempts and resumes keep the record.
+        if (next.submissionBinding) next.submissionBinding = closeSubmissionBinding(next.submissionBinding);
         if (planning) { next.tasks = admittedPlan!.tasks; next.phase = 'executor'; }
         else {
           next.results = [...state.results, { ...admittedCompletion!, sessionId: state.child, model: state.attempt!.model, quotaSelection: state.selection, ...(state.reportRecovery?.corrections ? { reportCorrections: state.reportRecovery.corrections } : {}) }];
@@ -573,6 +578,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
       if (!state || !started) throw error;
       state.status = 'paused';
       state.reason = errorMessage(error);
+      if (state.submissionBinding) state.submissionBinding = closeSubmissionBinding(state.submissionBinding); // A stopped run accepts no late submission.
       const failedTask = state.phase === 'executor' ? state.tasks[state.index] : undefined;
       if (rejection && failedTask) {
         state.reportRecovery = pauseReportRecovery(state.reportRecovery, { index: state.index, taskId: failedTask.id, child: state.child, attemptId: state.attempt?.id ?? '' }, rejection);

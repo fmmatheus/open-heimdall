@@ -10,6 +10,8 @@ import { EventEmitter, once } from 'node:events';
 import { createCoordinatorClient } from '../dist/coordinator/client.js';
 import { loadCoordinatorConfiguration } from '../dist/coordinator/config.js';
 import { startCoordinatorService, readCoordinatorToken } from '../dist/coordinator/service.js';
+import { createDurableSubmissionGate } from '../dist/workflow/durable-submission.js';
+import { openSubmissionBinding } from '../dist/workflow/submission-store.js';
 
 const git = (directory, args) => execFileSync('git', args, { cwd: directory, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 async function fixture(t) {
@@ -191,4 +193,56 @@ test('coordinator TOML resolves paths against its file and rejects unsupported l
   await assert.rejects(loadCoordinatorConfiguration(file), /positive integer/);
   await fs.writeFile(file, '[coordinator]\nunknown=true\n');
   await assert.rejects(loadCoordinatorConfiguration(file), /Unknown coordinator setting/);
+});
+
+test('owner-fenced submission routes store, replay and refuse by identity; the administrator cannot write them', async t => {
+  const f = await fixture(t);
+  const project = await f.client.request('POST', '/projects', { directory: f.project });
+  const queued = await f.client.request('POST', '/runs', { projectId: project.id, feature: 'Feature' });
+  await f.service().scheduler.tick();
+  const run = await settled(f.service().store, queued.id);
+  const caller = { sessionID: run.parentSessionId, id: 'native_call', messageID: 'assistant_message', agent: 'adr-orchestrator' };
+  await f.client.request('POST', `/runs/${run.id}/binding`, caller, run.ownerToken);
+  const state = { id: run.id, status: 'running', adr: '.heimdall/feature.md', parent: run.parentSessionId, caller, branch: run.branch, baseline: '', index: 0, tasks: [], results: [], phase: 'planner', child: null, settings: run.specification.settings };
+  const structured = { ...state, protocol: 'structured-v1', phase: 'executor', child: 'ses_child', tasks: [{ id: 'T1', title: 'T', brief: 'B', dependsOn: [], dod: ['gate one'] }], attempt: { id: 'attempt_1', phase: 'executor', index: 0, child: 'ses_child', status: 'admitted', startedAt: 1, model: 'anthropic/x' }, settings: { ...state.settings, plannerAgent: 'planner', executorAgent: 'executor', maxTasks: 10 } };
+  structured.submissionBinding = openSubmissionBinding(structured, 1);
+  await f.client.request('PUT', `/runs/${run.id}/checkpoint`, structured, run.ownerToken);
+  const gate = createDurableSubmissionGate({
+    runId: run.id, directory: f.temporary,
+    persistence: {
+      load: async () => structured,
+      readSubmission: async (id, attempt, kind) => f.client.request('GET', `/runs/${id}/submissions/${attempt}/${kind}`, undefined, run.ownerToken),
+      writeSubmission: async (id, receipt) => f.client.request('PUT', `/runs/${id}/submissions/${receipt.attemptId}/${receipt.kind}`, receipt, run.ownerToken),
+    },
+  });
+  const raw = { status: 'completed', summary: 'Done', handoff: 'Next', evidence: [{ gateId: 'G1', passed: true, detail: 'proved' }] };
+  const native = { sessionID: 'ses_child', agent: 'executor', messageID: 'msg_1', id: 'call_1' };
+  const route = `/runs/${run.id}/submissions/attempt_1/executor-result`;
+  assert.equal(await f.client.request('GET', route, undefined, run.ownerToken), null);
+  const ack = await gate.submit('executor-result', raw, native);
+  assert.equal(ack.accepted, true);
+  const stored = await f.client.request('GET', route, undefined, run.ownerToken);
+  assert.equal(stored.digest, ack.digest);
+  assert.deepEqual(stored.rawPayload, raw);
+  assert.deepEqual(await gate.submit('executor-result', raw, { ...native, id: 'call_2' }), ack);
+  assert.equal((await gate.submit('executor-result', { ...raw, summary: 'Changed' }, native)).code, 'conflict');
+  assert.deepEqual(await f.client.request('GET', route, undefined, run.ownerToken), stored);
+  // Route identity, other owners and the administrator.
+  await assert.rejects(f.client.request('PUT', `/runs/${run.id}/submissions/attempt_2/executor-result`, stored, run.ownerToken), /route/);
+  await assert.rejects(f.client.request('PUT', `/runs/${run.id}/submissions/attempt_1/planner-plan`, stored, run.ownerToken), /route/);
+  await assert.rejects(f.client.request('GET', `/runs/${run.id}/submissions/attempt_1/bogus`, undefined, run.ownerToken), /kind/);
+  await assert.rejects(f.client.request('PUT', route, { ...stored, rawPayload: { changed: true } }, run.ownerToken), /immutable/);
+  await assert.rejects(f.client.request('GET', route, undefined, 'wrong-token'), /authorization/);
+  await assert.rejects(f.client.request('PUT', route, stored), /Unknown coordinator route/);
+  const outcome = { outcomeVersion: 1, runId: run.id, phase: 'executor', index: 0, attemptId: 'attempt_1', child: 'ses_child', response: 'text', capturedAt: 1 };
+  assert.equal(await f.client.request('GET', `/runs/${run.id}/outcomes/attempt_1`, undefined, run.ownerToken), null);
+  assert.deepEqual(await f.client.request('PUT', `/runs/${run.id}/outcomes/attempt_1`, outcome, run.ownerToken), outcome);
+  await assert.rejects(f.client.request('PUT', `/runs/${run.id}/outcomes/attempt_2`, outcome, run.ownerToken), /route/);
+  await assert.rejects(f.client.request('PUT', `/runs/${run.id}/outcomes/attempt_1`, { ...outcome, response: 'other' }, run.ownerToken), /immutable/);
+  // The stored receipt survives a coordinator restart.
+  await f.restart();
+  assert.deepEqual(f.service().store.readSubmission(run.id, run.ownerToken, 'attempt_1', 'executor-result'), stored);
+  const events = JSON.stringify(await f.client.request('GET', '/events'));
+  assert.ok(events.includes('submission.saved'));
+  assert.ok(!events.includes('proved') && !events.includes(run.ownerToken), 'events carry no submission text or capability');
 });

@@ -91,9 +91,9 @@ test('SQLite schema is strict and versioned; authoritative global limits cannot 
   const store = f.open();
   const db = new DatabaseSync(f.databasePath);
   try {
-    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 2);
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 3);
     const tables = db.prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all();
-    assert.equal(tables.length, 6);
+    assert.equal(tables.length, 7);
     assert.ok(tables.every(row => /STRICT\s*$/i.test(row.sql)));
   } finally { db.close(); }
   assert.throws(() => new CoordinatorStore({ databasePath: f.databasePath, globalConcurrency: 3 }), /persisted/);

@@ -12,7 +12,7 @@ export interface NativeCallContext {
 export type SubmissionResponse =
   | { accepted: true; kind: SubmissionKind; outcome: PlannerOutcome | ExecutorOutcome; digest: string; message: string }
   | { accepted: false; code: 'format'; repairable: true; errors: ContractError[]; message: string }
-  | { accepted: false; code: 'unauthorized'; repairable: false; errors: []; message: string };
+  | { accepted: false; code: 'unauthorized' | 'conflict'; repairable: false; errors: []; message: string };
 
 /**
  * Port between the native submission tools and whatever owns binding and persistence. The durable

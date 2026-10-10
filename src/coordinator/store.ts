@@ -5,13 +5,27 @@ import { DatabaseSync } from 'node:sqlite';
 import type { SQLOutputValue } from 'node:sqlite';
 import { isDeepStrictEqual } from 'node:util';
 import { reportInfo } from '../workflow/report-info.js';
-import type { RunState } from '../workflow/types.js';
+import type { SubmissionKind } from '../workflow/contracts.js';
+import {
+  assertOutcomeMatchesCheckpoint, assertSubmissionMatchesCheckpoint, isNativeOutcome, isSubmissionKind, isSubmissionReceipt, sameOutcome, sameSubmission,
+} from '../workflow/submission-store.js';
+import type { NativeOutcome, RunState, SubmissionReceipt } from '../workflow/types.js';
 import type { CoordinatorEvent, ProjectRecord, Receipt, RunRecord, RunStatus, StartBinding } from './types.js';
 
 type Row = Record<string, SQLOutputValue>;
 type ProjectInput = Omit<ProjectRecord, 'id' | 'createdAt'>;
 type EnqueueInput = Pick<RunRecord, 'id' | 'projectId' | 'feature' | 'baseCommit' | 'worktreePath' | 'branch' | 'specification'>;
-const schemaVersion = 2;
+const schemaVersion = 3;
+const NATIVE_OUTCOME = 'native-outcome';
+const submissionsTable = (ifNotExists: string) => `
+  CREATE TABLE ${ifNotExists}submissions (
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    attempt_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('planner-plan','executor-result','native-outcome')),
+    submission_json TEXT NOT NULL CHECK (json_valid(submission_json)),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (run_id, attempt_id, kind)
+  ) STRICT;`;
 const transitions: Record<RunStatus, readonly RunStatus[]> = {
   queued: [],
   preparing: ['running', 'reconciliation-required'],
@@ -110,8 +124,8 @@ export class CoordinatorStore {
 
   private initialize(globalConcurrency: number): void {
     this.transaction(() => {
-      const version = Number(this.db.prepare('PRAGMA user_version').get()!.user_version);
-      if (version !== 0 && version !== 1 && version !== schemaVersion) throw new Error('Unsupported coordinator database schema version: ' + version);
+      let version = Number(this.db.prepare('PRAGMA user_version').get()!.user_version);
+      if (version < 0 || version > schemaVersion) throw new Error('Unsupported coordinator database schema version: ' + version);
       if (version === 0) {
         const existing = this.db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all();
         if (existing.length) throw new Error('Refusing to initialize a database with an unknown existing schema');
@@ -183,9 +197,9 @@ export class CoordinatorStore {
             at INTEGER NOT NULL,
             payload_json TEXT NOT NULL CHECK (json_valid(payload_json))
           ) STRICT;
-          PRAGMA user_version = 2;
         `);
         this.db.prepare('INSERT INTO coordinator_settings(singleton, global_concurrency) VALUES (1, ?)').run(globalConcurrency);
+        version = 2;
       }
       if (version === 1) {
         this.db.exec(`
@@ -195,8 +209,13 @@ export class CoordinatorStore {
             WHERE capacity_reserved = 1 OR binding_json IS NOT NULL OR checkpoint_json IS NOT NULL;
           UPDATE runs SET resume_binding_json = json_extract(checkpoint_json, '$.caller')
             WHERE launch_action = 'resume' AND capacity_reserved = 1 AND json_type(checkpoint_json, '$.caller') = 'object';
-          PRAGMA user_version = 2;
         `);
+        version = 2;
+      }
+      if (version === 2) {
+        // Additive: the new table never touches existing receipts, checkpoints or run rows.
+        this.db.exec(submissionsTable('IF NOT EXISTS ') + ' PRAGMA user_version = 3;');
+        version = 3;
       }
       const configured = Number(this.db.prepare('SELECT global_concurrency FROM coordinator_settings WHERE singleton = 1').get()!.global_concurrency);
       if (configured !== globalConcurrency) throw new Error('Global concurrency differs from the persisted coordinator setting');
@@ -393,6 +412,8 @@ export class CoordinatorStore {
       if (!run.binding || state.id !== run.id || state.parent !== run.parentSessionId || state.caller.sessionID !== run.parentSessionId) throw new Error('Checkpoint is not bound to this run and native parent');
       if (run.launchAction === 'start' && !sameBinding(run.binding, state.caller as StartBinding)) throw new Error('Checkpoint caller does not match the immutable start binding');
       if (run.launchAction === 'resume' && (!run.resumeBinding || !sameBinding(run.resumeBinding, state.caller as StartBinding))) throw new Error('Checkpoint caller does not match the claimed resume admission');
+      // The protocol is selected once, when the run starts; a later checkpoint can neither switch nor drop it.
+      if (run.checkpoint && run.checkpoint.protocol !== state.protocol) throw new Error('Run protocol is immutable once selected');
       this.db.prepare('UPDATE runs SET checkpoint_json = ?, updated_at = ? WHERE id = ?').run(encoded, Date.now(), id);
       this.event('checkpoint.saved', run, null, {
         status: state.status, phase: state.phase, index: state.index, child: state.child,
@@ -429,6 +450,70 @@ export class CoordinatorStore {
       this.db.prepare('INSERT INTO receipts(run_id, attempt_id, receipt_json, created_at) VALUES (?, ?, ?, ?)').run(id, receipt.id, encoded, Date.now());
       this.event('receipt.saved', run, null, { attemptId: receipt.id, phase: receipt.phase, index: receipt.index, child: receipt.child });
     });
+  }
+
+  readSubmission(id: string, ownerToken: string, attemptId: string, kind: SubmissionKind): SubmissionReceipt | undefined {
+    nonempty(attemptId, 'attemptId');
+    if (!isSubmissionKind(kind)) throw new Error('Unknown submission kind');
+    return this.transaction(() => {
+      this.requireOwner(id, ownerToken);
+      return this.storedSubmission<SubmissionReceipt>(id, attemptId, kind);
+    });
+  }
+
+  /**
+   * Immutable and idempotent. The owner must hold the capacity fence, the native start must be bound, and the receipt
+   * must describe the checkpoint's current open binding exactly. An identical duplicate returns the stored receipt;
+   * anything else for the same (run, attempt, kind) is rejected and the stored row is never touched.
+   */
+  writeSubmission(id: string, ownerToken: string, receipt: SubmissionReceipt): SubmissionReceipt {
+    if (!isSubmissionReceipt(receipt) || receipt.runId !== id) throw new Error('Submission identity mismatch');
+    const encoded = serialize(receipt);
+    return this.transaction(() => {
+      const run = this.requireOwner(id, ownerToken);
+      if (!run.binding) throw new Error('Submission requires a bound native start');
+      const stored = this.storedSubmission<SubmissionReceipt>(id, receipt.attemptId, receipt.kind);
+      if (stored) {
+        if (!sameSubmission(stored, receipt)) throw new Error('Saved submission is immutable');
+        return stored;
+      }
+      assertSubmissionMatchesCheckpoint(run.checkpoint, receipt);
+      this.db.prepare('INSERT INTO submissions(run_id, attempt_id, kind, submission_json, created_at) VALUES (?, ?, ?, ?, ?)')
+        .run(id, receipt.attemptId, receipt.kind, encoded, Date.now());
+      this.event('submission.saved', run, null, { attemptId: receipt.attemptId, kind: receipt.kind, phase: receipt.phase, index: receipt.index, dispatch: receipt.dispatch, digest: receipt.digest });
+      return JSON.parse(encoded) as SubmissionReceipt;
+    });
+  }
+
+  readNativeOutcome(id: string, ownerToken: string, attemptId: string): NativeOutcome | undefined {
+    nonempty(attemptId, 'attemptId');
+    return this.transaction(() => {
+      this.requireOwner(id, ownerToken);
+      return this.storedSubmission<NativeOutcome>(id, attemptId, NATIVE_OUTCOME);
+    });
+  }
+
+  writeNativeOutcome(id: string, ownerToken: string, outcome: NativeOutcome): NativeOutcome {
+    if (!isNativeOutcome(outcome) || outcome.runId !== id) throw new Error('Native outcome identity mismatch');
+    const encoded = serialize(outcome);
+    return this.transaction(() => {
+      const run = this.requireOwner(id, ownerToken);
+      if (!run.binding) throw new Error('Native outcome requires a bound native start');
+      const stored = this.storedSubmission<NativeOutcome>(id, outcome.attemptId, NATIVE_OUTCOME);
+      if (stored) {
+        if (!sameOutcome(stored, outcome)) throw new Error('Saved native outcome is immutable');
+        return stored;
+      }
+      assertOutcomeMatchesCheckpoint(run.checkpoint, outcome);
+      this.db.prepare('INSERT INTO submissions(run_id, attempt_id, kind, submission_json, created_at) VALUES (?, ?, ?, ?, ?)')
+        .run(id, outcome.attemptId, NATIVE_OUTCOME, encoded, Date.now());
+      return JSON.parse(encoded) as NativeOutcome;
+    });
+  }
+
+  private storedSubmission<T>(id: string, attemptId: string, kind: string): T | undefined {
+    const row = this.db.prepare('SELECT submission_json FROM submissions WHERE run_id = ? AND attempt_id = ? AND kind = ?').get(id, attemptId, kind);
+    return row ? JSON.parse(String(row.submission_json)) as T : undefined;
   }
 
   queueResume(id: string, input: string): RunRecord {

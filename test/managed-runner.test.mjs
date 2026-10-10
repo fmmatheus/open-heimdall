@@ -14,7 +14,7 @@ const done = { status: 'completed', taskId: 'T1', summary: 'Done', handoff: 'Han
 const caller = () => ({ sessionID: 'ses_parent', id: 'call_start', messageID: 'msg_assistant_start', agent: 'adr-orchestrator', signal: new AbortController().signal });
 const quota = async () => ({ anthropic: { fetchedAt: Date.now(), errors: [], entries: [{ name: '5h', percentRemaining: 80 }, { name: 'Weekly', percentRemaining: 80 }] } });
 
-async function fixture(t, responses = [plan, done]) {
+async function fixture(t, responses = [plan, done], options = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'heimdall-managed-runner-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const root = path.join(directory, '.heimdall');
@@ -23,10 +23,10 @@ async function fixture(t, responses = [plan, done]) {
   await fs.writeFile(path.join(root, 'planner.md'), 'Planner contract');
   await fs.writeFile(path.join(root, 'executor.md'), 'Executor contract');
   let checkpoint = null, binding = null, count = 0;
-  const receipts = new Map(), events = [], children = [];
+  const receipts = new Map(), events = [], children = [], saved = [];
   const persistence = {
     load: async () => structuredClone(checkpoint),
-    save: async state => { assert.ok(binding); checkpoint = structuredClone(state); events.push(['checkpoint', state.child, state.status]); },
+    save: async state => { assert.ok(binding); checkpoint = structuredClone(state); saved.push(structuredClone(state)); events.push(['checkpoint', state.child, state.status]); },
     bindStart: async value => { if (binding) assert.deepEqual(value, binding, 'start binding is immutable'); else binding = structuredClone(value); events.push(['binding']); },
     readReceipt: async (id, attempt) => structuredClone(receipts.get(attempt) ?? null),
     writeReceipt: async (id, receipt) => { assert.equal(checkpoint.attempt.id, receipt.id); receipts.set(receipt.id, structuredClone(receipt)); events.push(['receipt', receipt.child]); },
@@ -44,8 +44,8 @@ async function fixture(t, responses = [plan, done]) {
       return JSON.stringify(response);
     },
   };
-  const run = createRunner({ directory, backend, settings, quota, persistence, workflowRoot: '.heimdall/state', planRoot: '.heimdall/plans', plannerPromptPath: '.heimdall/planner.md', executorPromptPath: '.heimdall/executor.md', git: args => args[0] === 'branch' ? 'heimdall/run\n' : '' });
-  return { directory, root, run, persistence, receipts, children, events, get state() { return checkpoint; }, set state(value) { checkpoint = value; }, set binding(value) { binding = value; } };
+  const run = createRunner({ directory, backend, settings, quota, persistence, workflowRoot: '.heimdall/state', planRoot: '.heimdall/plans', plannerPromptPath: '.heimdall/planner.md', executorPromptPath: '.heimdall/executor.md', git: args => args[0] === 'branch' ? 'heimdall/run\n' : '', ...options });
+  return { directory, root, run, persistence, receipts, saved, children, events, get state() { return checkpoint; }, set state(value) { checkpoint = value; }, set binding(value) { binding = value; } };
 }
 
 test('managed start persists one stable ID and native binding before sequential inference', async t => {
@@ -127,4 +127,76 @@ test('managed plugin keeps native hooks but omits watchdog recovery RPC', async 
   await contextHook(outsider); assert.deepEqual(outsider.tools, {});
   await assert.rejects(registered.execute({ action: 'start' }, { ...caller(), sessionID: 'other-parent' }), /does not own/);
   await cleanup(); assert.equal(disposed, 3);
+});
+
+test('structured protocol is persisted once at start; its binding follows the attempt and child and closes on advance and pause', async t => {
+  const f = await fixture(t, [plan, { status: 'blocked', reason: 'Owner input' }, done], { protocol: 'structured-v1' });
+  assert.equal(JSON.parse(await f.run({ action: 'start', runId: 'reserved', adr: '.heimdall/feature.md' }, caller())).status, 'paused');
+  assert.ok(f.saved.every(state => state.protocol === 'structured-v1'));
+  const planning = f.saved.filter(state => state.attempt?.phase === 'planner' && state.submissionBinding);
+  assert.equal(planning[0].submissionBinding.child, null, 'the binding is saved with the attempt before any child exists');
+  assert.equal(planning[0].submissionBinding.status, 'open');
+  assert.ok(planning.some(state => state.submissionBinding.child === state.child && state.child !== null), 'the child is bound before prompt admission');
+  const executing = f.saved.filter(state => state.attempt?.phase === 'executor' && state.submissionBinding?.status === 'open');
+  assert.equal(executing[0].submissionBinding.taskId, 'T1');
+  assert.ok(executing[0].submissionBinding.dispatch > planning[0].submissionBinding.dispatch, 'every dispatch rises');
+  assert.equal(f.state.status, 'paused');
+  assert.equal(f.state.submissionBinding.status, 'closed', 'a paused run accepts no late submission');
+  // A resume never changes the protocol, even if the runner is built without one.
+  const legacyRunner = createRunner({ directory: f.directory, backend: { assertIdle: async () => {}, recoverResponse: async () => undefined, usage: async () => ({ used: 0, uncached: 0 }), interrupt: async () => {}, runSubagent: async input => { await input.onStarted(input.child); return JSON.stringify(done); } }, settings, quota, persistence: f.persistence, workflowRoot: '.heimdall/state', planRoot: '.heimdall/plans', plannerPromptPath: '.heimdall/planner.md', executorPromptPath: '.heimdall/executor.md', git: args => args[0] === 'branch' ? 'heimdall/run\n' : '' });
+  const resumed = JSON.parse(await legacyRunner({ action: 'resume', runId: 'reserved', input: 'Resolved' }, { ...caller(), id: 'call_resume', messageID: 'msg_assistant_resume' }));
+  assert.equal(resumed.status, 'completed');
+  assert.equal(f.state.protocol, 'structured-v1');
+  assert.equal(f.state.submissionBinding.status, 'closed');
+});
+
+test('a runner without a selected protocol never writes protocol or binding state', async t => {
+  const f = await fixture(t);
+  assert.equal(JSON.parse(await f.run({ action: 'start', runId: 'reserved', adr: '.heimdall/feature.md' }, caller())).status, 'completed');
+  assert.ok(f.saved.every(state => !('protocol' in state) && !('submissionBinding' in state)));
+});
+
+test('managed persistence routes submissions and outcomes under the owner fence and checks the returned identity', async t => {
+  const f = await fixture(t);
+  const identity = { endpoint: '/synthetic-coordinator.sock', runId: 'reserved', ownerToken: 'owner-one', parentSessionId: 'ses_parent' };
+  await fs.writeFile(path.join(f.root, 'managed.json'), JSON.stringify(identity));
+  const receipt = {
+    receiptVersion: 1, protocol: 'structured-v1', contract: { protocol: 'structured-v1', kind: 'executor-result', version: 1 }, kind: 'executor-result', runId: 'reserved', phase: 'executor', index: 0,
+    taskId: 'T1', attemptId: 'attempt_1', dispatch: 1, parent: 'ses_parent', child: 'ses_child', caller: { sessionID: 'ses_child', agent: 'adr-executor', messageID: 'm', callId: 'c' },
+    runtime: { packageVersion: '1.0.0', protocol: 'structured-v1' }, outcome: 'completed', rawPayload: {}, canonical: {}, digest: 'd', acceptedAt: 1,
+  };
+  const outcome = { outcomeVersion: 1, runId: 'reserved', phase: 'executor', index: 0, attemptId: 'attempt_1', child: 'ses_child', response: 'text', capturedAt: 1 };
+  const calls = [];
+  let reply = receipt;
+  const { persistence } = createManagedPersistence(f.directory, identity, { request: async (...args) => { calls.push(args); return reply; } });
+  assert.deepEqual(await persistence.writeSubmission('reserved', receipt), receipt);
+  assert.deepEqual(calls.at(-1), ['PUT', '/runs/reserved/submissions/attempt_1/executor-result', receipt, 'owner-one']);
+  assert.deepEqual(await persistence.readSubmission('reserved', 'attempt_1', 'executor-result'), receipt);
+  assert.deepEqual(calls.at(-1), ['GET', '/runs/reserved/submissions/attempt_1/executor-result', undefined, 'owner-one']);
+  reply = null;
+  assert.equal(await persistence.readSubmission('reserved', 'attempt_1', 'executor-result'), null);
+  assert.equal(await persistence.readNativeOutcome('reserved', 'attempt_1'), null);
+  reply = outcome;
+  assert.deepEqual(await persistence.writeNativeOutcome('reserved', outcome), outcome);
+  assert.deepEqual(calls.at(-1), ['PUT', '/runs/reserved/outcomes/attempt_1', outcome, 'owner-one']);
+  // Identity checks happen before anything is sent, and the coordinator's answer is checked too.
+  const sent = calls.length;
+  await assert.rejects(persistence.writeSubmission('other', receipt), /identity mismatch/);
+  await assert.rejects(persistence.writeSubmission('reserved', { ...receipt, runId: 'other' }), /identity mismatch/);
+  await assert.rejects(persistence.writeSubmission('reserved', { ...receipt, parent: 'ses_other' }), /identity mismatch/);
+  await assert.rejects(persistence.writeSubmission('reserved', { ...receipt, attemptId: '../escape' }), /identity mismatch/);
+  await assert.rejects(persistence.readSubmission('reserved', 'attempt_1', 'bogus'), /identity mismatch/);
+  await assert.rejects(persistence.readSubmission('other', 'attempt_1', 'executor-result'), /identity mismatch/);
+  await assert.rejects(persistence.writeNativeOutcome('reserved', { ...outcome, runId: 'other' }), /identity mismatch/);
+  assert.equal(calls.length, sent);
+  reply = { ...receipt, attemptId: 'attempt_2' };
+  await assert.rejects(persistence.writeSubmission('reserved', receipt), /did not confirm/);
+  await assert.rejects(persistence.readSubmission('reserved', 'attempt_1', 'executor-result'), /different identity/);
+  reply = { ...outcome, attemptId: 'attempt_2' };
+  await assert.rejects(persistence.readNativeOutcome('reserved', 'attempt_1'), /different identity/);
+  // A rotated owner token is refused before any request is made.
+  await fs.writeFile(path.join(f.root, 'managed.json'), JSON.stringify({ ...identity, ownerToken: 'owner-two' }));
+  const rotated = calls.length;
+  await assert.rejects(persistence.writeSubmission('reserved', receipt), /identity changed/);
+  assert.equal(calls.length, rotated);
 });
