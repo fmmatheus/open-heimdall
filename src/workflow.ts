@@ -5,6 +5,7 @@ import { createObserver } from './opencode/observer.js';
 import { createQuota, refreshClaudeAuth } from './policy/quota.js';
 import type { Configuration } from './config.js';
 import type { SessionObserver } from './opencode/types.js';
+import type { ReportOnlyRegistry } from './opencode/report-only.js';
 import type { RunnerBackend, RunnerOptions } from './workflow/types.js';
 
 export interface WorkflowOptions {
@@ -12,6 +13,7 @@ export interface WorkflowOptions {
   ctx?: Pick<Plugin.Context, 'tool' | 'session' | 'integration'>;
   observe?: SessionObserver;
   guards?: Map<string, () => Promise<void>>;
+  reportOnly?: ReportOnlyRegistry;
   backend?: RunnerBackend;
   quota?: RunnerOptions['quota'];
   authRefresh?: RunnerOptions['authRefresh'];
@@ -26,7 +28,7 @@ export function createWorkflow(options: WorkflowOptions): ReturnType<typeof crea
   if (!backend) {
     if (!ctx) throw new Error('A native OpenCode context or injected backend is required');
     const observe = options.observe ?? createObserver({ directory: configuration.projectDirectory, ...configuration.opencode });
-    backend = createNativeBackend({ ctx, observe });
+    backend = createNativeBackend({ ctx, observe, reportOnly: options.reportOnly });
   }
   return createRunner({
     backend, directory: configuration.projectDirectory, settings: configuration.readSettings ?? configuration.settings,

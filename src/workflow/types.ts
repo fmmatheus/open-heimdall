@@ -131,7 +131,19 @@ export interface SubagentInput {
   currentChild: () => string | null;
 }
 
+export type ReportOnlyCheck = { supported: true } | { supported: false; reason: string };
+
+/** Fail-closed capability: deny every tool call for a child while it writes a report. */
+export interface ReportOnlyCapability {
+  /** Whether enforcement is verified for this model's provider. Never throws for unsupported. */
+  check: (model: string, child: string) => Promise<ReportOnlyCheck>;
+  /** Restrict the child. The returned release is idempotent. */
+  restrict: (child: string) => Promise<() => Promise<void>>;
+}
+
 export interface RunnerBackend {
+  /** Absent means report-only enforcement is unsupported (safe-pause fallback). */
+  reportOnly?: ReportOnlyCapability;
   assertIdle: (id: string, parent?: string, signal?: AbortSignal) => Promise<unknown>;
   recoverResponse: (child: string, parent: string, attempt: WorkflowAttempt) => Promise<unknown>;
   usage: (child: string) => Promise<{ used: number; uncached: number }>;

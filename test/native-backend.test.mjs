@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createReportOnlyRegistry, VERIFIED_REPORT_ONLY_PROVIDERS } from '../dist/opencode/report-only.js';
 import { createNativeBackend, requireIdle, resolveSubagent, nativeModel } from '../dist/opencode/native-backend.js';
 
 const idle = () => ({ session: { id: 'child', parentID: 'parent', tokens: { input: 2, output: 3, reasoning: 4, cache: { read: 5, write: 6 } }, outcome: 'succeeded', time: { idle: 10 } }, active: false, inbox: [], permissions: [], forms: [] });
@@ -91,4 +92,44 @@ test('foreground native output cannot hide a truncated final response', async ()
   } }] }, session: { context: async () => [{ type: 'assistant', finish: 'length', time: { completed: 20 } }] } };
   const backend = createNativeBackend({ ctx, directory: '/project', observe: async () => idle() });
   await assert.rejects(backend.runSubagent(input([]), context()), /truncated/);
+});
+
+const allHooks = registry => { for (const name of ['execute.before', 'context', 'permission.evaluate']) registry.setHook(name, true); return registry; };
+
+test('report-only capability is absent without a registry and the default verified set excludes claude-code', async () => {
+  const backend = createNativeBackend({ ctx: {}, observe: async () => idle() });
+  assert.equal(backend.reportOnly, undefined);
+  assert.equal(VERIFIED_REPORT_ONLY_PROVIDERS.includes('claude-code'), false);
+});
+
+test('report-only check fails closed with exact reasons: no hooks, non-verified provider, bad model', async () => {
+  const registry = createReportOnlyRegistry();
+  const backend = createNativeBackend({ ctx: {}, observe: async () => idle(), reportOnly: registry, verifiedProviders: ['openai'] });
+  assert.deepEqual(await backend.reportOnly.check('openai/gpt-5', 'child'), { supported: false, reason: 'Report-only enforcement is unavailable: Heimdall plugin hooks are not registered (execute.before, context, permission.evaluate)' });
+  registry.setHook('execute.before', true); registry.setHook('context', true);
+  assert.deepEqual(await backend.reportOnly.check('openai/gpt-5', 'child'), { supported: false, reason: 'Report-only enforcement is unavailable: Heimdall plugin hooks are not registered (permission.evaluate)' });
+  allHooks(registry);
+  assert.deepEqual(await backend.reportOnly.check('claude-code/opus', 'child'), { supported: false, reason: 'Report-only enforcement is not verified for provider "claude-code"' });
+  assert.deepEqual(await backend.reportOnly.check('anthropic/claude#high', 'child'), { supported: false, reason: 'Report-only enforcement is not verified for provider "anthropic"' });
+  assert.deepEqual(await backend.reportOnly.check('not-a-model', 'child'), { supported: false, reason: 'Report-only enforcement cannot identify the provider of model "not-a-model"' });
+  assert.deepEqual(await backend.reportOnly.check('openai/gpt-5.6-sol#max', 'child'), { supported: true });
+  // The default constant is empty, so a native backend with all hooks is still unsupported.
+  const defaults = createNativeBackend({ ctx: {}, observe: async () => idle(), reportOnly: allHooks(createReportOnlyRegistry()) });
+  assert.equal((await defaults.reportOnly.check('openai/gpt-5', 'child')).supported, false);
+});
+
+test('report-only restrict registers the child and the release is idempotent; restrict fails closed without hooks', async () => {
+  const registry = createReportOnlyRegistry();
+  const backend = createNativeBackend({ ctx: {}, observe: async () => idle(), reportOnly: registry, verifiedProviders: ['openai'] });
+  await assert.rejects(backend.reportOnly.restrict('child'), /plugin hooks not registered/);
+  allHooks(registry);
+  await assert.rejects(backend.reportOnly.restrict(''), /child session is required/);
+  const first = await backend.reportOnly.restrict('child');
+  const second = await backend.reportOnly.restrict('child');
+  assert.equal(registry.has('child'), true);
+  await first(); await first();
+  assert.equal(registry.has('child'), true, 'a repeated release must not drop the second holder');
+  await second(); await second();
+  assert.equal(registry.has('child'), false);
+  assert.equal(registry.has('other'), false);
 });

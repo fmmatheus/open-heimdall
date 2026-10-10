@@ -1,4 +1,6 @@
-import type { RunnerBackend, RunnerContext, SubagentInput, WorkflowAttempt } from '../workflow/types.js';
+import type { ReportOnlyCapability, RunnerBackend, RunnerContext, SubagentInput, WorkflowAttempt } from '../workflow/types.js';
+import { VERIFIED_REPORT_ONLY_PROVIDERS } from './report-only.js';
+import type { ReportOnlyRegistry } from './report-only.js';
 import type { NativeContext, NativeTool, NativeToolContext, ObservedSession, SessionObserver, SessionSnapshot } from './types.js';
 
 const terminal = (session: ObservedSession) => ['succeeded', 'failed', 'interrupted'].includes(session.outcome ?? '') && Number.isFinite(session.time?.idle);
@@ -22,13 +24,32 @@ export function nativeModel(model: string, variant?: string): string {
   return model + (variant ? '#' + variant : '');
 }
 
-export function createNativeBackend({ ctx, observe, pause = ms => new Promise(resolve => setTimeout(resolve, ms)), cancellationWaitMs = 30000 }: {
+export function createNativeBackend({ ctx, observe, pause = ms => new Promise(resolve => setTimeout(resolve, ms)), cancellationWaitMs = 30000, reportOnly, verifiedProviders = VERIFIED_REPORT_ONLY_PROVIDERS }: {
   ctx: NativeContext;
   observe: SessionObserver;
   pause?: (ms: number) => Promise<unknown>;
   cancellationWaitMs?: number;
+  /** Shared with the plugin hooks. Omitted means no report-only capability. */
+  reportOnly?: ReportOnlyRegistry;
+  /** Providers proven to route every tool path through the hooks. Injectable for tests. */
+  verifiedProviders?: readonly string[];
 }): RunnerBackend {
+  const capability: ReportOnlyCapability | undefined = reportOnly && {
+    async check(model) {
+      const missing = reportOnly.missing();
+      if (missing.length) return { supported: false, reason: 'Report-only enforcement is unavailable: Heimdall plugin hooks are not registered (' + missing.join(', ') + ')' };
+      const provider = typeof model === 'string' ? /^([^/#]+)\/[^#]+(?:#.+)?$/.exec(model)?.[1] : undefined;
+      if (!provider) return { supported: false, reason: 'Report-only enforcement cannot identify the provider of model "' + String(model) + '"' };
+      if (!verifiedProviders.includes(provider)) return { supported: false, reason: 'Report-only enforcement is not verified for provider "' + provider + '"' };
+      return { supported: true };
+    },
+    async restrict(child) {
+      const release = reportOnly.restrict(child);
+      return async () => { release(); };
+    },
+  };
   return {
+    ...(capability ? { reportOnly: capability } : {}),
     async assertIdle(id, parent, signal) { return requireIdle(await observe(id, signal), id, parent, true); },
     async recoverResponse(id: string, parent: string, attempt: WorkflowAttempt) {
       const value = requireIdle(await observe(id), id, parent, true);
