@@ -10,6 +10,13 @@ import { createObserver } from './observer.js';
 import { createReportOnlyRegistry, REPORT_ONLY_DENIAL } from './report-only.js';
 import type { ReportOnlyRegistry } from './report-only.js';
 import { createManagedPersistence, readManagedMetadata } from './managed.js';
+import {
+  isLookalikeSubmissionTool, SUBMISSION_KINDS, SUBMISSION_TOOL_IDS, submissionInputSchema, submissionKindOfTool,
+  submissionToolDescription,
+} from '../workflow/contracts.js';
+import type { SubmissionKind } from '../workflow/contracts.js';
+import { closedSubmissionGate, SUBMISSION_DENIAL } from '../workflow/submission.js';
+import type { SubmissionGate } from '../workflow/submission.js';
 
 const actions = ['start', 'resume', 'status'];
 const inputSchema = {
@@ -27,6 +34,8 @@ export interface PluginOptions {
   observe?: SessionObserver;
   /** Report-only state shared with the backend. Injectable so tests can restrict a session. */
   reportOnly?: ReportOnlyRegistry;
+  /** Owns binding and persistence of typed submissions. Defaults to a closed gate that exposes nothing. */
+  submissionGate?: SubmissionGate;
 }
 
 export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
@@ -44,29 +53,53 @@ export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
       const run = metadata ? undefined : createWorkflow({ configuration, ctx, observe, guards, reportOnly });
       const registrations: Array<{ dispose(): Promise<void> }> = [];
       const recoveries = new Map<string, { operation: Promise<string>; controller: AbortController }>();
-      registrations.push(await ctx.tool.transform(editor => editor.add({
-        name: 'adr_workflow',
-        options: { codemode: false },
-        description: 'Plan an ADR and execute its linked tasks sequentially. Start, resume from the original parent session after resolving a blocker, or inspect saved status.',
-        input: inputSchema,
-        output: { type: 'object', additionalProperties: true },
-        async execute(value, context) {
-          if (!record(value) || typeof value.action !== 'string' || !actions.includes(value.action)) throw new Error('Unknown workflow action');
-          const args = value as unknown as RunArguments;
-          let text: string;
-          if (metadata) {
-            const current = await readManagedMetadata(ctx.location.directory);
-            if (!current || current.runId !== metadata.runId || current.parentSessionId !== metadata.parentSessionId || current.endpoint !== metadata.endpoint) throw new Error('Managed workflow identity changed');
-            const managed = createManagedPersistence(ctx.location.directory, current);
-            const authorized = await managed.authorize(args, context);
-            const execute = createWorkflow({ configuration, ctx, observe, guards, reportOnly, persistence: managed.persistence });
-            text = await execute(authorized, context);
-          } else text = await run!(args, context);
-          return { output: JSON.parse(text) as unknown, content: text };
-        },
-      })));
+      const submissions = options.submissionGate ?? closedSubmissionGate;
+      // Exact registered ids only. A caller is allowed only when the gate binds its session to this kind.
+      const permitted = async (kind: SubmissionKind, sessionID: string, agent: string) => (await submissions.exposed(sessionID, agent)) === kind;
+      registrations.push(await ctx.tool.transform(editor => {
+        // Registered before adr_workflow; each tool is only ever visible to the session its kind is bound to.
+        for (const kind of SUBMISSION_KINDS) editor.add({
+          name: SUBMISSION_TOOL_IDS[kind],
+          options: { codemode: false },
+          description: submissionToolDescription(kind),
+          input: submissionInputSchema(kind),
+          output: { type: 'object', additionalProperties: true },
+          async execute(value, context) {
+            // Identity comes only from the native call context, never from the model-supplied value.
+            const native = { sessionID: context.sessionID, agent: context.agent, messageID: context.messageID, id: context.id };
+            if (!await permitted(kind, native.sessionID, native.agent)) throw new Error(SUBMISSION_DENIAL);
+            const response = await submissions.submit(kind, value, native);
+            if (!response.accepted && response.code === 'unauthorized') throw new Error(response.message);
+            return { output: response, content: JSON.stringify(response) };
+          },
+        });
+        editor.add({
+          name: 'adr_workflow',
+          options: { codemode: false },
+          description: 'Plan an ADR and execute its linked tasks sequentially. Start, resume from the original parent session after resolving a blocker, or inspect saved status.',
+          input: inputSchema,
+          output: { type: 'object', additionalProperties: true },
+          async execute(value, context) {
+            if (!record(value) || typeof value.action !== 'string' || !actions.includes(value.action)) throw new Error('Unknown workflow action');
+            const args = value as unknown as RunArguments;
+            let text: string;
+            if (metadata) {
+              const current = await readManagedMetadata(ctx.location.directory);
+              if (!current || current.runId !== metadata.runId || current.parentSessionId !== metadata.parentSessionId || current.endpoint !== metadata.endpoint) throw new Error('Managed workflow identity changed');
+              const managed = createManagedPersistence(ctx.location.directory, current);
+              const authorized = await managed.authorize(args, context);
+              const execute = createWorkflow({ configuration, ctx, observe, guards, reportOnly, persistence: managed.persistence });
+              text = await execute(authorized, context);
+            } else text = await run!(args, context);
+            return { output: JSON.parse(text) as unknown, content: text };
+          },
+        });
+      }));
       registrations.push(await ctx.tool.hook('execute.before', async input => {
         if (reportOnly.has(input.sessionID)) throw new Error(REPORT_ONLY_DENIAL);
+        const kind = submissionKindOfTool(input.tool);
+        if (kind) { if (!await permitted(kind, input.sessionID, input.agent)) throw new Error(SUBMISSION_DENIAL); }
+        else if (isLookalikeSubmissionTool(input.tool)) throw new Error(SUBMISSION_DENIAL);
         await guards.get(input.sessionID)?.();
       }));
       reportOnly.setHook('execute.before', true);
@@ -81,6 +114,13 @@ export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
           const messages = await ctx.session.context({ sessionID: event.sessionID });
           const latest = messages.filter(m => m.type === 'user').at(-1);
           if (latest?.metadata?.adrNotification === true) event.tools = {};
+        }
+        // Submission tools survive only for the session the gate binds to that exact kind. Decorated
+        // lookalike names (namespaced or suffixed) are never ours and are always removed.
+        const bound = await submissions.exposed(event.sessionID, event.agent);
+        for (const name of Object.keys(event.tools)) {
+          const kind = submissionKindOfTool(name);
+          if (kind ? kind !== bound : isLookalikeSubmissionTool(name)) delete event.tools[name];
         }
       }));
       reportOnly.setHook('context', true);

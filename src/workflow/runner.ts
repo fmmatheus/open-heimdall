@@ -5,6 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { chooseExecutor, authExpired, executorCandidates } from '../policy/quota.js';
 
 import { classifyError, classifyResult, pauseReportRecovery, reportPauseReason } from './report.js';
+import { isTaskId } from './contracts.js';
 import type {
   CompletionResult, PlanResult, ProgressUpdate, ReportDiagnostic, ReportOnlyCheck, RunArguments, RunState,
   RunnerContext, RunnerOptions, RunnerSettings, WorkflowResult, WorkflowTask,
@@ -107,7 +108,7 @@ export function validatePlan(result: WorkflowResult, limit: number): asserts res
   if (result.tasks.length > limit) throw new Error(`Plan has ${result.tasks.length} tasks; maximum is ${limit}. Reuse saved planning artifacts and consolidate tasks without dropping scope or acceptance gates.`);
   const seen = new Set();
   for (const t of result.tasks) {
-    if (!/^[A-Za-z0-9_-]+$/.test(t.id) || seen.has(t.id) || !nonempty(t.title) || !nonempty(t.brief) || !Array.isArray(t.dependsOn) || t.dependsOn.some(d => !seen.has(d)) || !Array.isArray(t.dod) || !t.dod.length || !t.dod.every(nonempty)) throw new Error('Invalid task or dependency: ' + t.id);
+    if (!isTaskId(t.id) || seen.has(t.id) || !nonempty(t.title) || !nonempty(t.brief) || !Array.isArray(t.dependsOn) || t.dependsOn.some(d => !seen.has(d)) || !Array.isArray(t.dod) || !t.dod.length || !t.dod.every(nonempty)) throw new Error('Invalid task or dependency: ' + t.id);
     seen.add(t.id);
   }
 }

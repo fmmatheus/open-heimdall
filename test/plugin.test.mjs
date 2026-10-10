@@ -7,6 +7,8 @@ import { execFileSync } from 'node:child_process';
 import { createPlugin } from '../dist/opencode/plugin.js';
 import { createReportOnlyRegistry, REPORT_ONLY_DENIAL } from '../dist/opencode/report-only.js';
 import { loadConfiguration } from '../dist/config.js';
+import { createMemorySubmissionGate } from '../dist/workflow/submission.js';
+import { submissionInputSchema, submissionToolDescription } from '../dist/workflow/contracts.js';
 
 test('published V2 plugin registers native workflow, safe context hooks and reserved recovery RPC', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'adr-v2-plugin-'));
@@ -220,4 +222,153 @@ test('report-only registry fails closed without the permission hook and after pl
   assert.deepEqual(complete.reportOnly.missing(), []);
   await complete.cleanup();
   assert.throws(() => complete.reportOnly.restrict('child'), /plugin hooks not registered/);
+});
+
+// --- Owner-bound typed submission tools -------------------------------------------------------------------
+
+async function submissionFixture(t, { gate = true } = {}) {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'heimdall-submission-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  await fs.writeFile(path.join(directory, '.heimdall.toml'), '[workflow]\nplannerModel = "anthropic/test-planner"\nexecutorModel = "anthropic/test-executor"\nexecutorFallbackModel = "openai/test-fallback"\n');
+  const configuration = await loadConfiguration({ projectDirectory: directory });
+  const memory = createMemorySubmissionGate();
+  const tools = new Map();
+  const hooks = new Map();
+  const registration = () => ({ dispose: async () => {} });
+  const ctx = {
+    location: { directory }, integration: {},
+    tool: { transform: async apply => { apply({ add: value => { tools.set(value.name, value); } }); return registration(); }, hook: async (name, cb) => { hooks.set('tool.' + name, cb); return registration(); } },
+    session: { context: async () => [], hook: async (name, cb) => { hooks.set('session.' + name, cb); return registration(); } },
+    rpc: { register: async () => registration() },
+    permission: { hook: async (name, cb) => { hooks.set('permission.' + name, cb); return registration(); } },
+  };
+  const reportOnly = createReportOnlyRegistry();
+  const plugin = createPlugin({ configuration, reportOnly, ...(gate ? { submissionGate: memory.gate } : {}), observe: async () => assert.fail('no observation') });
+  const cleanup = await plugin.setup(ctx);
+  const names = ['heimdall_submit_plan', 'heimdall_submit_result'];
+  const lookalikes = ['foo__heimdall_submit_result', 'mcp.heimdall_submit_plan', 'srv:heimdall_submit_result', 'ns/heimdall_submit_plan'];
+  const visible = async (sessionID, agent) => {
+    const event = { sessionID, agent, tools: Object.fromEntries([...names, ...lookalikes, 'shell', 'adr_workflow'].map(name => [name, {}])) };
+    await hooks.get('session.context')(event);
+    return Object.keys(event.tools);
+  };
+  const before = (tool, sessionID, agent) => hooks.get('tool.execute.before')({ tool, sessionID, agent, messageID: 'm', id: 'c', input: {} });
+  const call = (tool, sessionID, agent, value) => tools.get(tool).execute(value, { sessionID, agent, messageID: 'm', id: 'c', signal: new AbortController().signal, progress: async () => {} });
+  return { tools, hooks, memory, reportOnly, cleanup, visible, before, call, names, lookalikes };
+}
+const planRule = { kind: 'planner-plan', limit: 7 };
+const resultRule = { kind: 'executor-result', dodCount: 1 };
+const goodResult = { status: 'completed', summary: 's', handoff: 'h', evidence: [{ gateId: 'G1', passed: true, detail: 'proved' }] };
+
+test('submission tools register with exact ids, codemode off and schemas derived from the contracts', async t => {
+  const f = await submissionFixture(t);
+  assert.deepEqual([...f.tools.keys()], ['heimdall_submit_plan', 'heimdall_submit_result', 'adr_workflow']);
+  for (const [kind, id] of [['planner-plan', 'heimdall_submit_plan'], ['executor-result', 'heimdall_submit_result']]) {
+    const tool = f.tools.get(id);
+    assert.equal(tool.options.codemode, false);
+    assert.deepEqual(tool.input, submissionInputSchema(kind));
+    assert.equal(tool.description, submissionToolDescription(kind));
+    assert.deepEqual(tool.output, { type: 'object', additionalProperties: true });
+  }
+  await f.cleanup();
+});
+
+test('submission tools are visible only to the session the gate binds for that exact kind', async t => {
+  const f = await submissionFixture(t);
+  // Nothing bound: no session sees either tool, and lookalikes are removed everywhere.
+  for (const [session, agent] of [['parent', 'adr-orchestrator'], ['other', 'build']]) assert.deepEqual(await f.visible(session, agent), ['shell', 'adr_workflow']);
+  assert.deepEqual(await f.visible('child', 'adr-planner'), ['shell']);
+  f.memory.bind({ sessionID: 'planner-child', agent: 'adr-planner', rule: planRule });
+  f.memory.bind({ sessionID: 'exec-child', agent: 'adr-executor', rule: resultRule });
+  assert.deepEqual(await f.visible('planner-child', 'adr-planner'), ['heimdall_submit_plan', 'shell']);
+  assert.deepEqual(await f.visible('exec-child', 'adr-executor'), ['heimdall_submit_result', 'shell']);
+  // Parent, unrelated, wrong-agent and other-kind sessions get neither.
+  assert.deepEqual(await f.visible('parent', 'adr-orchestrator'), ['shell', 'adr_workflow']);
+  assert.deepEqual(await f.visible('unrelated', 'build'), ['shell', 'adr_workflow']);
+  assert.deepEqual(await f.visible('planner-child', 'adr-executor'), ['shell']);
+  // Rebinding a kind makes the previous session stale.
+  f.memory.bind({ sessionID: 'exec-child-2', agent: 'adr-executor', rule: resultRule });
+  assert.deepEqual(await f.visible('exec-child', 'adr-executor'), ['shell']);
+  assert.deepEqual(await f.visible('exec-child-2', 'adr-executor'), ['heimdall_submit_result', 'shell']);
+  f.memory.release('executor-result');
+  assert.deepEqual(await f.visible('exec-child-2', 'adr-executor'), ['shell']);
+  await f.cleanup();
+});
+
+test('default plugin without a gate exposes and accepts no submission', async t => {
+  const f = await submissionFixture(t, { gate: false });
+  assert.deepEqual(await f.visible('child', 'adr-executor'), ['shell']);
+  await assert.rejects(f.before('heimdall_submit_result', 'child', 'adr-executor'), /submission denied/);
+  await assert.rejects(f.call('heimdall_submit_result', 'child', 'adr-executor', goodResult), /submission denied/);
+  await f.cleanup();
+});
+
+test('execute.before and execute deny parent, unrelated, stale, other-kind and wrong-agent calls', async t => {
+  const f = await submissionFixture(t);
+  f.memory.bind({ sessionID: 'exec-child', agent: 'adr-executor', rule: resultRule });
+  await f.before('heimdall_submit_result', 'exec-child', 'adr-executor');
+  const denied = [
+    ['heimdall_submit_result', 'parent', 'adr-orchestrator'],
+    ['heimdall_submit_result', 'unrelated', 'adr-executor'],
+    ['heimdall_submit_result', 'exec-child', 'adr-planner'],
+    ['heimdall_submit_plan', 'exec-child', 'adr-executor'],
+  ];
+  for (const [tool, session, agent] of denied) {
+    await assert.rejects(f.before(tool, session, agent), /submission denied/, `before ${tool} ${session}`);
+    await assert.rejects(f.call(tool, session, agent, goodResult), /submission denied/, `execute ${tool} ${session}`);
+  }
+  f.memory.bind({ sessionID: 'exec-child-2', agent: 'adr-executor', rule: resultRule });
+  await assert.rejects(f.before('heimdall_submit_result', 'exec-child', 'adr-executor'), /submission denied/);
+  await assert.rejects(f.call('heimdall_submit_result', 'exec-child', 'adr-executor', goodResult), /submission denied/);
+  assert.equal(f.memory.submissions.length, 0, 'denied calls reach no gate storage');
+  await f.cleanup();
+});
+
+test('lookalike tool names can neither be invoked nor whitelist the submission tools', async t => {
+  const f = await submissionFixture(t);
+  f.memory.bind({ sessionID: 'exec-child', agent: 'adr-executor', rule: resultRule });
+  for (const name of f.lookalikes) await assert.rejects(f.before(name, 'exec-child', 'adr-executor'), /submission denied/, name);
+  for (const name of f.lookalikes) await assert.rejects(f.before(name, 'parent', 'adr-orchestrator'), /submission denied/, name);
+  assert.ok(!(await f.visible('exec-child', 'adr-executor')).some(name => f.lookalikes.includes(name)));
+  // The delegation suffix filter does not touch the exact tools, and its leaf names stay filtered.
+  const event = { sessionID: 'exec-child', agent: 'adr-executor', tools: { heimdall_submit_result: {}, 'x__subagent': {}, 'y.task': {}, shell: {} } };
+  await f.hooks.get('session.context')(event);
+  assert.deepEqual(Object.keys(event.tools), ['heimdall_submit_result', 'shell']);
+  await f.cleanup();
+});
+
+test('bound child submits through the gate; identity comes from the native context, never the payload', async t => {
+  const f = await submissionFixture(t);
+  f.memory.bind({ sessionID: 'exec-child', agent: 'adr-executor', rule: resultRule });
+  // A payload naming another identity is a format error and cannot redirect the submission.
+  const spoof = await f.call('heimdall_submit_result', 'exec-child', 'adr-executor', { ...goodResult, taskId: 'T9', runId: 'other', child: 'parent' });
+  assert.equal(spoof.output.accepted, false);
+  assert.equal(spoof.output.code, 'format');
+  assert.deepEqual(spoof.output.errors.map(e => [e.path, e.code]), [['$.taskId', 'identity_field'], ['$.runId', 'identity_field'], ['$.child', 'identity_field']]);
+  assert.equal(JSON.parse(spoof.content).accepted, false);
+  const prose = await f.call('heimdall_submit_result', 'exec-child', 'adr-executor', 'I am done, all gates passed');
+  assert.equal(prose.output.errors[0].path, '$');
+  const ok = await f.call('heimdall_submit_result', 'exec-child', 'adr-executor', goodResult);
+  assert.equal(ok.output.accepted, true);
+  assert.equal(ok.output.outcome, 'completed');
+  assert.match(ok.output.digest, /^[0-9a-f]{64}$/);
+  assert.deepEqual(f.memory.submissions.map(s => [s.kind, s.sessionID, s.response.accepted]), [['executor-result', 'exec-child', false], ['executor-result', 'exec-child', false], ['executor-result', 'exec-child', true]]);
+  const unfinished = await f.call('heimdall_submit_result', 'exec-child', 'adr-executor', { ...goodResult, evidence: [{ gateId: 'G1', passed: false, detail: 'not done' }] });
+  assert.deepEqual([unfinished.output.accepted, unfinished.output.outcome], [true, 'unfinished']);
+  f.memory.bind({ sessionID: 'planner-child', agent: 'adr-planner', rule: planRule });
+  const plan = await f.call('heimdall_submit_plan', 'planner-child', 'adr-planner', { status: 'planned', artifacts: true });
+  assert.deepEqual([plan.output.accepted, plan.output.outcome], [true, 'planned']);
+  await f.cleanup();
+});
+
+test('report-only restriction wins over submission exposure until released', async t => {
+  const f = await submissionFixture(t);
+  f.memory.bind({ sessionID: 'exec-child', agent: 'adr-executor', rule: resultRule });
+  assert.deepEqual(await f.visible('exec-child', 'adr-executor'), ['heimdall_submit_result', 'shell']);
+  const release = f.reportOnly.restrict('exec-child');
+  assert.deepEqual(await f.visible('exec-child', 'adr-executor'), []);
+  await assert.rejects(f.before('heimdall_submit_result', 'exec-child', 'adr-executor'), error => error.message === REPORT_ONLY_DENIAL);
+  release();
+  await f.before('heimdall_submit_result', 'exec-child', 'adr-executor');
+  await f.cleanup();
 });
