@@ -4,11 +4,13 @@ import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { chooseExecutor, authExpired } from '../policy/quota.js';
 
+import { classifyError, classifyResult, pauseReportRecovery, reportPauseReason } from './report.js';
 import type {
-  CompletionResult, PlanResult, ProgressUpdate, RunArguments, RunState,
+  CompletionResult, PlanResult, ProgressUpdate, ReportDiagnostic, RunArguments, RunState,
   RunnerContext, RunnerOptions, RunnerSettings, WorkflowResult, WorkflowTask,
 } from './types.js';
 export type { RunnerBackend, RunnerContext, RunnerOptions, RunnerSettings } from './types.js';
+export { classifyError, classifyResult, reportPauseReason } from './report.js';
 
 const readJSON = async <T>(p: string): Promise<T> => JSON.parse(await fs.readFile(p, 'utf8')) as T;
 const errorMessage = (error: unknown): string => error instanceof Error ? error.message : String(error);
@@ -66,6 +68,28 @@ export function parseResult(response: unknown): WorkflowResult {
     if (value) return value;
   }
   throw invalidResponse();
+}
+/**
+ * Classifies why an executor completion was rejected: a thrown error, a raw native response, or an
+ * already-parsed result. Native and ambiguous-output signals come before envelope omissions.
+ */
+export function classifyCompletionFailure(task: WorkflowTask, subject: { error: unknown } | { response: unknown } | { result: WorkflowResult }): ReportDiagnostic {
+  if ('result' in subject) return classifyResult(subject.result, task);
+  if ('error' in subject) return classifyError(subject.error);
+  const response = typeof subject.response === 'string' ? { data: { parts: [{ type: 'text', text: subject.response }] } } : subject.response;
+  if (!isRecord(response)) return { code: 'ambiguous_output' };
+  const data = isRecord(response.data) ? response.data : undefined;
+  const info = isRecord(data?.info) ? data.info : undefined;
+  const nativeError = response.error || info?.error;
+  if (nativeError) {
+    let text: string;
+    try { text = typeof nativeError === 'string' ? nativeError : JSON.stringify(nativeError); } catch { text = String(nativeError); }
+    return classifyError(new Error(text));
+  }
+  if (info?.finish === 'length') return { code: 'ambiguous_output' };
+  let parsed: WorkflowResult;
+  try { parsed = parseResult(response); } catch { return { code: 'ambiguous_output' }; }
+  return classifyResult(parsed, task);
 }
 export async function loadPlanArtifacts(result: WorkflowResult, directory: string, id: string, planRoot = '.omo/plans'): Promise<WorkflowResult> {
   if (result.status !== 'planned' || result.artifacts !== true) return result;
@@ -177,6 +201,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
     catch { throw new Error('Another run owns active.lock. Check its child session before recovering a stale lock.'); }
     let state!: RunState;
     let started = false;
+    let rejection: ReportDiagnostic | undefined; // Set only when an executor completion report is rejected.
     try {
       await lock.writeFile(JSON.stringify({ pid: process.pid, parent: context.sessionID }));
       const settings = await configuredSettings();
@@ -263,7 +288,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
           if (!receipt && state.child && ['admitted', 'interrupted'].includes(state.attempt.status)) {
             let response: unknown;
             try { response = await backend.recoverResponse(state.child, state.parent, state.attempt); }
-            catch (error) { state.attempt.status = 'rejected'; throw error; }
+            catch (error) { state.attempt.status = 'rejected'; if (!planning) rejection = classifyCompletionFailure(task, { error }); throw error; }
             if (response !== undefined) {
               receipt = { ...state.attempt, response };
               await writeReceipt(state.id, receipt);
@@ -281,7 +306,10 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
               }
             } catch (error) {
               state.attempt.status = 'rejected';
-              if (!recheckRejected) throw error;
+              if (!recheckRejected) {
+                if (!planning) rejection = classifyCompletionFailure(task, { response: receipt.response });
+                throw error;
+              }
               receipt = undefined; // Explicit resume may request a fresh reply; preserve the invalid original receipt.
             }
             if (receipt) await checkBudget();
@@ -348,11 +376,13 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
             await writeReceipt(state.id, receipt);
             await atomicJSON(path.join(runDir, 'last-response.json'), response);
             try { result = parseResult(response); }
-            catch (error) { state.attempt.status = 'rejected'; throw error; }
+            catch (error) { state.attempt.status = 'rejected'; if (!planning) rejection = classifyCompletionFailure(task, { response }); throw error; }
             await checkBudget();
           } catch (error) {
             // Native cancellation may reject with a generic interruption. Preserve the guard that caused it.
             const cause = guardError ?? error;
+            // A failure before any reply (and not a budget guard or cancellation) is a native/provider failure.
+            if (!planning && !receipt && !guardError && !controller.signal.aborted) rejection = classifyCompletionFailure(task, { error: cause });
             controller.abort(cause);
             if (!receipt && state.child) state.attempt.status = 'interrupted';
             if (state.child) {
@@ -384,7 +414,10 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
         let admittedCompletion: CompletionResult | undefined;
         try {
           await atomicJSON(path.join(runDir, 'reply-' + (planning ? 'plan' : task.id) + '.json'), result);
-          if (result.status === 'blocked') throw new Error(result.reason || 'Agent blocked without a reason');
+          if (result.status === 'blocked') {
+            if (!planning) rejection = classifyCompletionFailure(task, { result });
+            throw new Error(result.reason || 'Agent blocked without a reason');
+          }
           if (planning) {
             result = await loadPlanArtifacts(result, directory, state.id, planRoot);
             validatePlan(result, cfg.maxTasks);
@@ -393,7 +426,8 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
             await fs.writeFile(path.join(runDir, 'facts.md'), result.factSheet);
             await atomicJSON(path.join(runDir, 'tasks.json'), result.tasks);
           } else {
-            validateCompletion(result, task, { requireGateIds: true });
+            try { validateCompletion(result, task, { requireGateIds: true }); }
+            catch (error) { rejection = classifyCompletionFailure(task, { result }); throw error; }
             admittedCompletion = result;
           }
         } catch (error) {
@@ -406,6 +440,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
         delete next.resolution;
         delete next.taskStartedAt;
         delete next.taskElapsedMs;
+        delete next.reportRecovery; // Real advancement only: restarts, new attempts and resumes keep the record.
         if (planning) { next.tasks = admittedPlan!.tasks; next.phase = 'executor'; }
         else {
           next.results = [...state.results, { ...admittedCompletion!, sessionId: state.child, model: state.attempt!.model, quotaSelection: state.selection }];
@@ -419,6 +454,11 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
       if (!state || !started) throw error;
       state.status = 'paused';
       state.reason = errorMessage(error);
+      const failedTask = state.phase === 'executor' ? state.tasks[state.index] : undefined;
+      if (rejection && failedTask) {
+        state.reportRecovery = pauseReportRecovery(state.reportRecovery, { index: state.index, taskId: failedTask.id, child: state.child, attemptId: state.attempt?.id ?? '' }, rejection);
+        state.reason = reportPauseReason(rejection, failedTask, state.reason);
+      }
       await save(state);
       return JSON.stringify({ runId: state.id, status: 'paused', childSession: state.child, reason: state.reason });
     } finally {

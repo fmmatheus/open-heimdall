@@ -71,6 +71,33 @@ export interface WorkflowAttempt {
   startedAt: number;
   model: string;
   variant?: string;
+  /** Absent means a task attempt, so checkpoints saved before report correction stay valid. */
+  purpose?: 'task' | 'report-correction';
+}
+
+/** Bounded reasons an executor completion report was not accepted. Only report_format is repairable. */
+export type ReportDiagnosticCode =
+  | 'report_format' | 'unfinished_work' | 'agent_blocked' | 'identity_mismatch' | 'ambiguous_output'
+  | 'native_failure' | 'auth_or_quota' | 'correction_exhausted' | 'correction_unsupported' | 'correction_ambiguous';
+
+/** Field names and gate IDs only: never reply text. */
+export interface ReportDiagnostic {
+  code: ReportDiagnosticCode;
+  missingFields?: string[];
+  gateIds?: string[];
+}
+
+/** Durable per-task completion-report recovery record. Removed only when the task really advances. */
+export interface ReportRecovery {
+  phase: 'executor';
+  index: number;
+  taskId: string;
+  child: string | null;
+  corrections: number;
+  mode: 'idle' | 'correcting' | 'paused';
+  originalAttemptId: string;
+  attempts: string[];
+  diagnostic?: ReportDiagnostic;
 }
 
 export interface ProgressUpdate {
@@ -174,6 +201,7 @@ export interface RunState {
   selection?: ExecutorSelection;
   resolution?: string;
   reason?: string;
+  reportRecovery?: ReportRecovery;
   usage?: Record<string, number>;
   uncachedUsage?: Record<string, number>;
   tokenLimitsDisabled?: boolean;

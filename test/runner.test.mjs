@@ -386,7 +386,7 @@ test('an explicitly resumed malformed rejected receipt stays intact and requires
   const f = await fixture(t, [plan, async () => malformed, done('T1'), done('T2')]);
   const paused = JSON.parse(await f.run({ action: 'start', adr: 'ADR.md' }, f.context));
   assert.equal(paused.status, 'paused');
-  assert.match(paused.reason, /Invalid child response/);
+  assert.match(paused.reason, /^Invalid completion report for T1/);
   const base = path.join(f.root, 'runs', paused.runId);
   const state = JSON.parse(await fs.readFile(path.join(base, 'state.json'), 'utf8'));
   assert.equal(state.attempt.status, 'rejected');
@@ -404,7 +404,7 @@ test('rejected cached completion must still pass every unchanged task evidence g
   const f = await fixture(t, [plan, async () => missingEvidence, done('T1'), done('T2')]);
   const paused = JSON.parse(await f.run({ action: 'start', adr: 'ADR.md' }, f.context));
   assert.equal(paused.status, 'paused');
-  assert.match(paused.reason, /Missing completion evidence/);
+  assert.match(paused.reason, /^Invalid completion report for T1.*gate entries G1/);
   const state = JSON.parse(await f.run({ action: 'status', runId: paused.runId }, f.context));
   const receiptPath = path.join(f.root, 'runs', state.id, 'attempt-' + state.attempt.id + '.json');
   const receiptBefore = await fs.readFile(receiptPath, 'utf8');
