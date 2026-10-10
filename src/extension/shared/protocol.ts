@@ -87,6 +87,22 @@ export interface Blocker {
   resolutionClipped: boolean;
 }
 
+/**
+ * Completion-report correction state, derived only from the checkpoint's `reportRecovery`. Codes, field names and
+ * gate IDs are allowlisted by the service; no reply text, reason text or secret ever reaches this shape.
+ */
+export interface ReportView {
+  mode: 'idle' | 'correcting' | 'paused';
+  /** Automatic corrections started for the current task. */
+  corrections: number;
+  /** Corrections allowed per task. */
+  limit: number;
+  /** Allowlisted diagnostic code, or null when none is recorded or it is unknown. */
+  code: string | null;
+  missingFields: string[];
+  gateIds: string[];
+}
+
 export interface ModelChoice { model: string | null; variant: string | null }
 
 export interface ModelsView {
@@ -179,6 +195,8 @@ export interface SessionsView {
 
 export interface RunDetail extends RunSummary {
   blocker: Blocker | null;
+  /** Null when the checkpoint has no report-recovery record. */
+  report: ReportView | null;
   models: ModelsView;
   usage: UsageView;
   limits: LimitsView;

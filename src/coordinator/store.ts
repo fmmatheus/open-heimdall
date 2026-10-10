@@ -4,6 +4,7 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { SQLOutputValue } from 'node:sqlite';
 import { isDeepStrictEqual } from 'node:util';
+import { reportInfo } from '../workflow/report-info.js';
 import type { RunState } from '../workflow/types.js';
 import type { CoordinatorEvent, ProjectRecord, Receipt, RunRecord, RunStatus, StartBinding } from './types.js';
 
@@ -386,6 +387,7 @@ export class CoordinatorStore {
 
   saveCheckpoint(id: string, ownerToken: string, state: RunState): void {
     const encoded = serialize(state);
+    const report = reportInfo(state.reportRecovery);
     this.transaction(() => {
       const run = this.requireOwner(id, ownerToken);
       if (!run.binding || state.id !== run.id || state.parent !== run.parentSessionId || state.caller.sessionID !== run.parentSessionId) throw new Error('Checkpoint is not bound to this run and native parent');
@@ -398,6 +400,7 @@ export class CoordinatorStore {
           reported: Object.values(state.usage ?? {}).reduce((total, used) => total + used, 0),
           uncached: Object.values(state.uncachedUsage ?? {}).reduce((total, used) => total + used, 0),
         },
+        ...(report ? { report } : {}),
       });
     });
   }

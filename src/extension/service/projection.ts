@@ -4,8 +4,9 @@ import { LIMITS, RUN_STATUSES } from '../shared/protocol.js';
 import { CONTENT_LIMITS } from '../shared/protocol.js';
 import type {
   Blocker, BlockerContentResponse, ContentLimitsUsed, EvidenceView, LimitsView, ListCaps, ModelChoice, ModelsView, ProjectSummary,
-  RunDetail, RunPhase, RunSummary, SessionUsage, TaskClips, TaskContentResponse, TaskRef, TaskView, UsageView, WireRunStatus,
+  ReportView, RunDetail, RunPhase, RunSummary, SessionUsage, TaskClips, TaskContentResponse, TaskRef, TaskView, UsageView, WireRunStatus,
 } from '../shared/protocol.js';
+import { reportInfo } from '../../workflow/report-info.js';
 import type { PublicRun } from './coordinator.js';
 
 /*
@@ -158,6 +159,11 @@ function blockerOf(run: PublicRun, budget: Budget, limit: number = LIMITS.reason
     reasonClipped: reason.clipped,
     resolutionClipped: shortResolution.clipped,
   };
+}
+
+/** Correction state from the checkpoint's `reportRecovery` only, through the shared allowlists. */
+function reportOf(run: PublicRun): ReportView | null {
+  return reportInfo(record(run.checkpoint)?.reportRecovery);
 }
 
 const choice = (model: unknown, variant: unknown, budget: Budget): ModelChoice => ({
@@ -445,6 +451,7 @@ export function detailRun(run: PublicRun, project: { directory?: string } | unde
     detail = {
       ...summary,
       blocker: blockerOf(run, budget),
+      report: reportOf(run),
       models: modelsOf(run, settings, budget),
       usage: usageOf(run, budget),
       limits: limitsOf(run, settings),

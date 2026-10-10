@@ -13,6 +13,7 @@ import type {
   LimitsView,
   ModelChoice,
   ModelsView,
+  ReportView,
   RunDetail,
   RunSummary,
   TaskClips,
@@ -64,8 +65,10 @@ export function phaseText(run: Pick<RunSummary, 'status' | 'phase' | 'currentTas
  * The detail summary's action line. It sits next to the status badge, so it never repeats the status
  * label: it says what is being worked on or where the run stopped.
  */
-export function currentActionText(run: Pick<RunSummary, 'status' | 'phase' | 'currentTask'>): string {
+export function currentActionText(run: Pick<RunSummary, 'status' | 'phase' | 'currentTask'> & { report?: ReportView | null }): string {
   const task = run.currentTask ? `${run.currentTask.id}: ${run.currentTask.title}` : null;
+  // Only a running run can be mid-correction; a paused checkpoint is never in that mode.
+  if (run.status === 'running' && run.report?.mode === 'correcting') return `Correcting report (${run.report.corrections}/${run.report.limit})`;
   switch (run.phase) {
     case 'queued': return 'Waiting for capacity';
     case 'preparing': return 'Setting up the worktree';
@@ -284,7 +287,7 @@ export function summaryInfo(detail: RunDetail, now: number, options: LocalTimeOp
     usage: [`Recorded usage: ${recordedUsageText(detail.usage)}`, `Budget: ${budgetText(detail.limits)}`],
     updated: `Updated ${ageWithLocalTime(detail.updatedAt, now, options)}`,
     updatedExact: formatTime(detail.updatedAt),
-    blocker: blockerInfo(detail.blocker),
+    blocker: blockerInfo(detail.blocker, detail.report),
   };
 }
 
@@ -352,6 +355,8 @@ export function limitRows(limits: LimitsView): LabeledRow[] {
 
 export interface BlockerInfo {
   title: string;
+  /** Set when the pause is a completion-report problem; the next step is honest about what is needed. */
+  category?: ReportCategory;
   tone: Tone;
   /** The recorded reason, verbatim, or NO_REASON_TEXT. */
   reason: string;
@@ -367,10 +372,52 @@ const BLOCKER_TITLES: Partial<Record<WireRunStatus, string>> = {
   'reconciliation-required': 'Reconciliation required',
 };
 
-export function blockerInfo(blocker: Blocker | null): BlockerInfo | null {
+export interface ReportCategory {
+  kind: 'invalid-report' | 'unfinished-work' | 'correction-exhausted' | 'correction-unavailable';
+  title: string;
+  /** What the owner can honestly do next. */
+  nextStep: string;
+  /** Field names and gate IDs the report still lacks, or null. */
+  missing: string | null;
+}
+
+const FORMAT_ONLY = 'resume with guidance to restate the results that already exist; no new work should be needed.';
+
+/** Pause category for a report problem, from the allowlisted diagnostic code alone; null for any other pause. */
+export function reportCategory(report: ReportView | null | undefined): ReportCategory | null {
+  if (!report || report.mode === 'correcting') return null;
+  const parts = [
+    report.missingFields.length > 0 ? `fields ${report.missingFields.join(', ')}` : '',
+    report.gateIds.length > 0 ? `gate entries ${report.gateIds.join(', ')}` : '',
+  ].filter(Boolean);
+  const missing = parts.length > 0 ? `Still missing: ${parts.join(' and ')}.` : null;
+  switch (report.code) {
+    case 'report_format':
+      return { kind: 'invalid-report', title: 'Invalid completion report', missing, nextStep: `Format-only fix: the reply held valid completion intent but omitted required items. Review the task session, then ${FORMAT_ONLY}` };
+    case 'ambiguous_output':
+      return { kind: 'invalid-report', title: 'Invalid completion report', missing, nextStep: `Format-only fix: the reply was truncated, not a single JSON report or had invalid gate IDs. Review the task session, then ${FORMAT_ONLY}` };
+    case 'identity_mismatch':
+      return { kind: 'invalid-report', title: 'Invalid completion report', missing, nextStep: 'Owner review: the reply did not identify this task. Check the task session and branch before resuming; sending the report again is not enough.' };
+    case 'unfinished_work':
+    case 'agent_blocked':
+      return { kind: 'unfinished-work', title: 'Unfinished work', missing, nextStep: 'Implement the missing work or make the owner decision named in the reason, then resume. Re-sending the report would not help.' };
+    case 'correction_exhausted':
+      return { kind: 'correction-exhausted', title: 'Report correction exhausted', missing, nextStep: `Owner review: ${report.corrections} of ${report.limit} automatic corrections did not produce a valid report and no more are sent. Inspect the task session, then ${FORMAT_ONLY}` };
+    case 'correction_unsupported':
+      return { kind: 'correction-unavailable', title: 'Report correction unavailable', missing, nextStep: `Automatic correction could not run: report-only tool denial is unsupported or unverified for this provider. Format-only fix: ${FORMAT_ONLY}` };
+    case 'correction_ambiguous':
+      return { kind: 'correction-unavailable', title: 'Report correction unavailable', missing, nextStep: 'Owner review: a previous correction may already have run, so none was repeated. Inspect the task session first, then resume.' };
+    default:
+      return null;
+  }
+}
+
+export function blockerInfo(blocker: Blocker | null, report?: ReportView | null): BlockerInfo | null {
   if (blocker === null) return null;
+  const category = blocker.status === 'paused' ? reportCategory(report) : null;
   return {
-    title: BLOCKER_TITLES[blocker.status] ?? 'Run is blocked',
+    title: category?.title ?? BLOCKER_TITLES[blocker.status] ?? 'Run is blocked',
+    ...(category ? { category } : {}),
     tone: blocker.status === 'failed' ? 'error' : 'warning',
     reason: blocker.reasonRecorded && blocker.reason !== '' ? blocker.reason : NO_REASON_TEXT,
     resolution: blocker.resolution,

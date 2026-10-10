@@ -5,8 +5,8 @@ const isRecord = (value: unknown): value is Record<string, unknown> => value !==
 const nonempty = (x: unknown): x is string => typeof x === 'string' && x.trim().length > 0;
 const GATE_LIMIT = 50;
 
-/** Fixed names a diagnostic may carry. Anything else never reaches a checkpoint, event or UI. */
-export const REPORT_FIELDS = ['taskId', 'summary', 'handoff', 'evidence', 'gateId', 'detail', 'passed'] as const;
+import { REPORT_FIELDS } from './report-info.js';
+export { REPORT_FIELDS };
 
 const gateNumber = (id: unknown): number => {
   const match = typeof id === 'string' ? /^G([1-9][0-9]*)$/.exec(id) : null;

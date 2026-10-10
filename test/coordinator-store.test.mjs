@@ -430,3 +430,61 @@ test('event pages are bounded and their sequence cursors preserve every committe
   assert.ok(second.every(event => event.sequence > first.at(-1).sequence));
   assert.deepEqual(store.events(second.at(-1).sequence), []);
 });
+
+const SECRET = 'sk-live-REPORT-SECRET-0123456789';
+
+function recoveryOf(overrides = {}) {
+  return {
+    phase: 'executor', index: 0, taskId: 'T1', child: 'synthetic-child', corrections: 1, mode: 'paused', originalAttemptId: 'attempt-1',
+    attempts: ['attempt-2'],
+    diagnostic: { code: 'report_format', missingFields: ['handoff'], gateIds: ['G2'] },
+    ...overrides,
+  };
+}
+
+test('checkpoint.saved carries only bounded report info and never reasons, replies, secrets or capabilities', async t => {
+  const { store, run: admitted } = await admitFixture(t);
+  const run = store.transition(admitted.id, admitted.ownerToken, admitted.version, 'running');
+  store.bindStart(run.id, run.ownerToken, binding(run));
+  const state = {
+    ...checkpoint(run), status: 'running', phase: 'executor', reason: 'reason text ' + SECRET,
+    reportRecovery: recoveryOf({
+      mode: 'correcting', corrections: 1,
+      reason: 'raw reason ' + SECRET, rawReply: 'raw reply ' + SECRET, ownerToken: SECRET, capability: SECRET, token: SECRET,
+      diagnostic: {
+        code: 'report_format', reason: 'diagnostic reason ' + SECRET, reply: SECRET, detail: SECRET,
+        missingFields: ['handoff', SECRET, 'evidence', 'password', 'handoff'],
+        gateIds: ['G2', 'G10', SECRET, 'g3', 'G0', 'G1; rm -rf', 7, null],
+      },
+    }),
+  };
+  store.saveCheckpoint(run.id, run.ownerToken, state);
+  const saved = store.events().filter(event => event.type === 'checkpoint.saved').at(-1);
+  assert.deepEqual(saved.payload.report, { mode: 'correcting', corrections: 1, limit: 2, code: 'report_format', missingFields: ['handoff', 'evidence'], gateIds: ['G2', 'G10'] });
+  assert.deepEqual(Object.keys(saved.payload).sort(), ['child', 'index', 'phase', 'report', 'status', 'usage']);
+  const text = JSON.stringify(store.events());
+  for (const excluded of [SECRET, 'raw reason', 'raw reply', 'diagnostic reason', 'ownerToken', 'capability', 'rawReply']) assert.ok(!text.includes(excluded), excluded);
+  // Statuses are untouched: the run stays running with its capacity reserved while correcting.
+  const stored = store.getRun(run.id);
+  assert.equal(stored.status, 'running');
+  assert.equal(stored.capacityReserved, true);
+});
+
+test('checkpoint.saved drops unknown codes and modes, clamps the counter and omits report info without a record', async t => {
+  const { store, run: admitted } = await admitFixture(t);
+  const run = store.transition(admitted.id, admitted.ownerToken, admitted.version, 'running');
+  store.bindStart(run.id, run.ownerToken, binding(run));
+  const events = () => store.events().filter(event => event.type === 'checkpoint.saved');
+  store.saveCheckpoint(run.id, run.ownerToken, checkpoint(run));
+  assert.equal('report' in events().at(-1).payload, false);
+  store.saveCheckpoint(run.id, run.ownerToken, { ...checkpoint(run), reportRecovery: recoveryOf({ corrections: 99, diagnostic: { code: 'made_up ' + SECRET, missingFields: 'handoff', gateIds: 'G1' } }) });
+  assert.deepEqual(events().at(-1).payload.report, { mode: 'paused', corrections: 2, limit: 2, code: null, missingFields: [], gateIds: [] });
+  store.saveCheckpoint(run.id, run.ownerToken, { ...checkpoint(run), reportRecovery: recoveryOf({ mode: 'bogus', corrections: -3 }) });
+  assert.equal('report' in events().at(-1).payload, false);
+  store.saveCheckpoint(run.id, run.ownerToken, { ...checkpoint(run), reportRecovery: 'not a record' });
+  assert.equal('report' in events().at(-1).payload, false);
+  const gates = Array.from({ length: 80 }, (_, index) => 'G' + (index + 1));
+  store.saveCheckpoint(run.id, run.ownerToken, { ...checkpoint(run), reportRecovery: recoveryOf({ diagnostic: { code: 'correction_exhausted', gateIds: gates } }) });
+  assert.equal(events().at(-1).payload.report.gateIds.length, 50);
+  assert.equal(store.getRun(run.id).status, 'running');
+});

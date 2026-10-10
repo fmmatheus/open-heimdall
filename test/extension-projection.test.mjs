@@ -5,6 +5,7 @@ import { CoordinatorAdapterError } from '../dist/extension/service/coordinator.j
 import { createExtensionServer, listenExtensionServer } from '../dist/extension/service/server.js';
 import { blockerContent, detailRun, phaseOf, runLabel, summarizeRun, taskContent } from '../dist/extension/service/projection.js';
 import { createChangeTracker } from '../dist/extension/service/events.js';
+import { summaryInfo } from '../dist/extension/panel/view-model.js';
 
 const SERVICE_TOKEN = 'svc-' + 'c3d4e5f6'.repeat(8);
 const OWNER_TOKEN = 'OWNER-TOKEN-SECRET';
@@ -831,4 +832,66 @@ test('every remaining task, blocker and list limit is flagged separately', () =>
   assert.equal(capped.models.candidates.length, 20);
   assert.equal(capped.capped.tasks, false);
   assert.equal(capped.truncated, true);
+});
+
+const REPORT_SECRET = 'sk-live-REPORT-SECRET-0123456789';
+const RAW_REPLY = 'RAW-REPLY-MARKER {"status":"completed"}';
+
+const executingWithReport = (reportRecovery, extra = {}) => makeRun({
+  status: 'running',
+  checkpoint: checkpoint({
+    phase: 'executor', index: 0, tasks: tasks(2), child: 'child-1', reportRecovery,
+    attempt: { id: 'att', phase: 'executor', index: 0, child: 'child-1', status: 'admitted', startedAt: 1, model: 'openai/exec', purpose: 'report-correction' },
+  }),
+  ...extra,
+});
+
+test('detail projects bounded report state from the checkpoint and null without a record', () => {
+  assert.equal(detailRun(fixtures.executing(), project).report, null);
+  const correcting = detailRun(executingWithReport({
+    phase: 'executor', index: 0, taskId: 'T1', child: 'child-1', corrections: 1, mode: 'correcting', originalAttemptId: 'a1', attempts: ['a2'],
+    diagnostic: { code: 'report_format', missingFields: ['handoff'], gateIds: ['G2'] },
+  }), project);
+  assert.deepEqual(correcting.report, { mode: 'correcting', corrections: 1, limit: 2, code: 'report_format', missingFields: ['handoff'], gateIds: ['G2'] });
+  assert.equal(correcting.status, 'running');
+});
+
+test('report projection drops unknown codes and fields and never carries raw replies, reasons or secrets', () => {
+  const hostile = {
+    phase: 'executor', index: 0, taskId: 'T1', child: 'child-1', corrections: 7, mode: 'paused', originalAttemptId: 'a1', attempts: ['a2'],
+    reason: REPORT_SECRET, rawReply: RAW_REPLY, ownerToken: REPORT_SECRET,
+    diagnostic: { code: 'report_format ' + REPORT_SECRET, reason: REPORT_SECRET, reply: RAW_REPLY, missingFields: ['handoff', REPORT_SECRET, RAW_REPLY], gateIds: ['G2', REPORT_SECRET, '<script>'] },
+  };
+  const run = executingWithReport(hostile, { status: 'paused', reason: 'Invalid completion report for T1' });
+  const detail = detailRun(run, project);
+  assert.deepEqual(detail.report, { mode: 'paused', corrections: 2, limit: 2, code: null, missingFields: ['handoff'], gateIds: ['G2'] });
+  const text = JSON.stringify(detail);
+  for (const leaked of [REPORT_SECRET, 'RAW-REPLY-MARKER', '<script>', 'rawReply']) assert.ok(!text.includes(leaked), leaked);
+  assert.equal(detailRun(executingWithReport({ mode: 'weird' }), project).report, null);
+  assert.equal(detailRun(executingWithReport('x'), project).report, null);
+});
+
+test('GET /runs/:id serves report state through the real service route without leaking report internals', async t => {
+  const reportRecovery = {
+    phase: 'executor', index: 0, taskId: 'T1', child: 'child-1', corrections: 2, mode: 'paused', originalAttemptId: 'a1', attempts: ['a2', 'a3'],
+    reason: REPORT_SECRET, rawReply: RAW_REPLY,
+    diagnostic: { code: 'correction_exhausted', reason: REPORT_SECRET, missingFields: ['handoff', 'evidence'], gateIds: ['G3'] },
+  };
+  const runs = [
+    executingWithReport(reportRecovery, { id: 'run_r', status: 'paused', updatedAt: 500, reason: 'Invalid completion report for T1: automatic report correction is exhausted' }),
+    { ...fixtures.executing(), id: 'run_plain' },
+  ];
+  const server = await listening(t, { adapter: makeAdapter({ runs }) });
+  const found = await call(server, '/runs/run_r');
+  assert.equal(found.status, 200);
+  assert.deepEqual(found.json.run.report, { mode: 'paused', corrections: 2, limit: 2, code: 'correction_exhausted', missingFields: ['handoff', 'evidence'], gateIds: ['G3'] });
+  for (const leaked of [REPORT_SECRET, 'RAW-REPLY-MARKER', 'rawReply', 'originalAttemptId', 'attempts', ...FORBIDDEN]) assert.ok(!found.text.includes(leaked), leaked);
+  // The panel's view model reads the very JSON the route served.
+  const info = summaryInfo(found.json.run, Date.UTC(2026, 0, 7));
+  assert.equal(info.blocker.title, 'Report correction exhausted');
+  assert.equal(info.blocker.category.kind, 'correction-exhausted');
+  assert.match(info.blocker.category.missing, /fields handoff, evidence and gate entries G3/);
+  assert.equal((await call(server, '/runs/run_plain')).json.run.report, null);
+  const list = await call(server, '/runs');
+  assert.ok(!list.text.includes('"report"'), 'the list stays summary-only');
 });

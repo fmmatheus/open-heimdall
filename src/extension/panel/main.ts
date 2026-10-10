@@ -373,6 +373,10 @@ function mountPanel(): void {
       blocker.setAttribute('role', 'note');
       blocker.append(node('p', 'hm-blocker-title', info.blocker.title));
       const blockerInfo = info.blocker;
+      if (blockerInfo.category !== undefined) {
+        blocker.append(node('p', 'hm-text', blockerInfo.category.nextStep));
+        if (blockerInfo.category.missing) blocker.append(node('p', 'hm-meta', blockerInfo.category.missing));
+      }
       const blockerBody = node('div', 'hm-content');
       blockerBody.id = 'hm-blocker-content';
       blocker.append(blockerBody);

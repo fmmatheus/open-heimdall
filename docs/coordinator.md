@@ -124,7 +124,61 @@ remain held for inspection after restart.
 Runs can also be watched and reviewed read-only from OpenChamber 2.1.0; see the
 [OpenChamber extension guide](openchamber-extension.md).
 
+## Completion-report correction
+
+An executor that finishes the work but sends a malformed report no longer
+forces a full re-run. Verification record:
+[completion-report-recovery.md](validation/completion-report-recovery.md).
+
+- **Contract footer.** Every executor prompt ends with a task-specific
+  completion contract (task ID, required fields, every `Gn` mapped to its
+  verbatim DoD item, the blocked shape). It is the last prompt text, after the
+  `Workflow attempt:` marker; planner prompts are unchanged.
+- **Classification.** A rejected reply gets a bounded code stored in the
+  checkpoint as `reportRecovery.diagnostic`: `report_format`,
+  `unfinished_work`, `agent_blocked`, `identity_mismatch`, `ambiguous_output`,
+  `native_failure`, `auth_or_quota` and the correction outcomes
+  `correction_exhausted`, `correction_unsupported`, `correction_ambiguous`.
+  Semantic signals (blocked, `passed: false`, wrong task, bad or duplicate gate
+  IDs, prose, truncation, native/auth/quota errors) are checked first; only
+  completed-intent JSON that omitted fields or gate entries is `report_format`.
+  Heimdall never repairs JSON or invents a `passed` value.
+- **Two-attempt bound.** Only `report_format` is corrected automatically, at
+  most twice per task and child, on the same idle child with the same agent,
+  model and variant. The counter and attempt ID are saved before the prompt is
+  sent and survive restarts, new attempt IDs, owner rotation and manual resume;
+  only real task advancement clears them. An unanswered correction counts. The
+  original and each correction receipt are kept as separate immutable files.
+- **Enforcement boundary.** A correction runs only after a fail-closed
+  report-only restriction is taken: the plugin denies every tool call for that
+  child (`execute.before` throws, the session tool list is emptied,
+  `permission.evaluate` denies where available) and releases it only after the
+  child is confirmed idle. Heimdall sends a correction only for a provider
+  listed in `VERIFIED_REPORT_ONLY_PROVIDERS` (`src/opencode/report-only.ts`),
+  which ships **empty**. `claude-code` is unsupported, not proven: its provider
+  plugin exposes only OpenCode's tool list and parks tool calls back to
+  OpenCode, but the local sources do not show that OpenCode core routes those
+  calls, or code-mode `execute` nested calls, through the hooks, and no live
+  experiment was run. Without a verified provider every `report_format` failure
+  pauses as `correction_unsupported` and nothing is re-sent automatically.
+- **Pause categories.** The pause reason and the extension distinguish
+  *Invalid completion report* (resume with guidance to restate existing results;
+  no new work), *Unfinished work* (do the work or make the owner decision first),
+  and *Report correction exhausted* / *unavailable* (owner review, then a
+  format-only resume). The run stays `running` with capacity reserved while a
+  correction is in flight; no database status was added. `checkpoint.saved`
+  events carry only mode, counter, limit 2, the allowlisted code, field names
+  and `G<n>` IDs, never reason text, replies, tokens or capabilities. The
+  extension shows `Correcting report (n/2)` while running.
+
 ## Remaining limits
+
+- Automatic report correction needs an owner-verified provider
+  (`VERIFIED_REPORT_ONLY_PROVIDERS` is empty); until then format-only failures
+  pause for a manual resume. Whether `claude-code` tool calls, including
+  code-mode nested calls, pass through the plugin hooks is unproven.
+- A correction that was dispatched but never answered consumes one of the two
+  attempts and is not re-sent; the next owner resume uses a normal task prompt.
 
 - SQLite uses Node's built-in `node:sqlite`, still experimental on Node 22.
 - Usage is unlimited by default. Existing optional caps cover cumulative child

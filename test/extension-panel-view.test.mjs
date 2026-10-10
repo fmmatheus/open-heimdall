@@ -21,6 +21,7 @@ import {
   shortenedFields,
   taskDisplay,
   currentActionText,
+  reportCategory,
   formatAge,
   formatCount,
   formatLocalTime,
@@ -1024,4 +1025,84 @@ test('interactive controls have accessible names, aria-expanded, live feedback a
   // Custom focusables are reachable by keyboard.
   assert.match(main, /copy\.tabIndex = 0/);
   assert.match(main, /pre\.tabIndex = 0/);
+});
+
+const report = (overrides = {}) => ({ mode: 'paused', corrections: 0, limit: 2, code: 'report_format', missingFields: [], gateIds: [], ...overrides });
+const pausedWith = (overrides, reason = 'Invalid completion report for T3') => detail({
+  status: 'paused', phase: 'paused',
+  blocker: { status: 'paused', reason, reasonRecorded: true, resolution: null, reasonClipped: false, resolutionClipped: false },
+  report: report(overrides),
+});
+
+test('a running correction shows "Correcting report (n/2)" as the current action', () => {
+  const running = detail({ report: report({ mode: 'correcting', corrections: 1, code: 'report_format' }) });
+  assert.equal(currentActionText(running), 'Correcting report (1/2)');
+  assert.equal(summaryInfo(running, NOW).headline, '2 of 5 tasks complete; Correcting report (1/2)');
+  assert.equal(currentActionText(detail({ report: report({ mode: 'correcting', corrections: 2 }) })), 'Correcting report (2/2)');
+  assert.deepEqual(statusBadge(running), { label: 'Executing', tone: 'primary' });
+  assert.equal(summaryInfo(running, NOW).blocker, null);
+  // Only a running run corrects; other statuses and idle/paused modes keep the normal action text.
+  assert.equal(currentActionText(detail({ status: 'paused', phase: 'paused', report: report({ mode: 'correcting', corrections: 1 }) })), 'Stopped at T3: Wire the API');
+  assert.equal(currentActionText(detail({ report: report({ mode: 'paused', corrections: 1 }) })), 'T3: Wire the API');
+  assert.equal(currentActionText(detail({ report: null })), 'T3: Wire the API');
+  assert.equal(currentActionText(detail()), 'T3: Wire the API');
+});
+
+test('paused report problems fall into distinct categories with honest next steps', () => {
+  const invalid = summaryInfo(pausedWith({ code: 'report_format', missingFields: ['handoff'], gateIds: ['G2'] }), NOW).blocker;
+  assert.equal(invalid.title, 'Invalid completion report');
+  assert.equal(invalid.category.kind, 'invalid-report');
+  assert.match(invalid.category.nextStep, /^Format-only fix:.*no new work should be needed/);
+  assert.equal(invalid.category.missing, 'Still missing: fields handoff and gate entries G2.');
+  assert.equal(invalid.reason, 'Invalid completion report for T3', 'the recorded reason is still shown verbatim');
+
+  const unfinished = summaryInfo(pausedWith({ code: 'unfinished_work', gateIds: ['G3'] }), NOW).blocker;
+  assert.equal(unfinished.title, 'Unfinished work');
+  assert.equal(unfinished.category.kind, 'unfinished-work');
+  assert.match(unfinished.category.nextStep, /Implement the missing work/);
+  assert.doesNotMatch(unfinished.category.nextStep, /Format-only/);
+  assert.equal(reportCategory(report({ code: 'agent_blocked' })).title, 'Unfinished work');
+
+  const exhausted = summaryInfo(pausedWith({ code: 'correction_exhausted', corrections: 2, missingFields: ['evidence'] }), NOW).blocker;
+  assert.equal(exhausted.title, 'Report correction exhausted');
+  assert.match(exhausted.category.nextStep, /^Owner review: 2 of 2 automatic corrections/);
+
+  const unsupported = summaryInfo(pausedWith({ code: 'correction_unsupported' }), NOW).blocker;
+  assert.equal(unsupported.title, 'Report correction unavailable');
+  assert.equal(unsupported.category.kind, 'correction-unavailable');
+  assert.match(unsupported.category.nextStep, /unsupported or unverified/);
+  assert.equal(reportCategory(report({ code: 'correction_ambiguous' })).title, 'Report correction unavailable');
+  assert.match(reportCategory(report({ code: 'correction_ambiguous' })).nextStep, /^Owner review:/);
+  assert.match(reportCategory(report({ code: 'identity_mismatch' })).nextStep, /^Owner review:/);
+  assert.equal(reportCategory(report({ code: 'ambiguous_output' })).title, 'Invalid completion report');
+
+  // The four titles stay distinct.
+  const titles = ['report_format', 'unfinished_work', 'correction_exhausted', 'correction_unsupported'].map(code => reportCategory(report({ code })).title);
+  assert.equal(new Set(titles).size, 4);
+});
+
+test('other pauses, unknown codes and non-paused runs keep the plain blocker', () => {
+  for (const code of ['native_failure', 'auth_or_quota', null, 'made_up_code']) {
+    const blocker = summaryInfo(pausedWith({ code }), NOW).blocker;
+    assert.equal(blocker.title, 'Run is paused', String(code));
+    assert.equal('category' in blocker, false);
+  }
+  assert.equal(reportCategory(null), null);
+  assert.equal(reportCategory(undefined), null);
+  assert.equal(reportCategory(report({ mode: 'correcting', code: 'report_format' })), null);
+  const failed = detail({ status: 'failed', phase: 'failed', blocker: { status: 'failed', reason: 'x', reasonRecorded: true, resolution: null }, report: report({ code: 'report_format' }) });
+  assert.equal(summaryInfo(failed, NOW).blocker.title, 'Run failed');
+  assert.equal(blockerInfo(failed.blocker, failed.report).title, 'Run failed');
+});
+
+test('report presentation never contains raw reply or secret strings, only allowlisted names', async () => {
+  const secret = 'sk-live-REPORT-SECRET-0123456789';
+  const info = summaryInfo(pausedWith({ code: 'report_format', missingFields: ['handoff'], gateIds: ['G2'] }), NOW);
+  const text = JSON.stringify(info);
+  assert.ok(!text.includes(secret));
+  assert.deepEqual(Object.keys(info.blocker.category).sort(), ['kind', 'missing', 'nextStep', 'title']);
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const main = await readFile(join(root, 'src', 'extension', 'panel', 'main.ts'), 'utf8');
+  assert.match(main, /blockerInfo\.category\.nextStep/);
+  assert.match(main, /blockerInfo\.category\.missing/);
 });
