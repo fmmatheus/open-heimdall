@@ -2,6 +2,7 @@ import path from 'node:path';
 import { connect, snapshot } from '../opencode/observer.js';
 import type { ConnectionOptions } from '../opencode/observer.js';
 import type { SessionAPI, SessionSnapshot } from '../opencode/types.js';
+import { verifyRuntimeSnapshot } from './runtime-snapshot.js';
 import type { ExecutorInspection, ManagedExecutor, RunRecord } from './types.js';
 
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -103,6 +104,7 @@ export function createManagedExecutor({ getRun, connection = {}, preflightTimeou
   return {
     async launch(expected) {
       const run = await current(expected, true);
+      await verifyRuntimeSnapshot(run); // Start and resume alike: nothing native is contacted for a run whose admitted runtime is not intact.
       const api = await apiFor(run);
       await preflight(api, run);
       const mutate = async (route: string, body: unknown) => {

@@ -6,10 +6,34 @@ import type { SubmissionSupervisor } from './submission-repair.js';
 /** The only typed protocol so far. A run without a persisted protocol is a legacy (prose) run. */
 export type SubmissionProtocol = typeof SUBMISSION_PROTOCOL;
 
-/** What the host knows about the code that is executing. T6 extends this with a runtime asset identity. */
+/** Content identity of the loaded package, computed from its own module location and never from the Git revision. */
+export interface RuntimeBuildIdentity {
+  packageName: string;
+  /** Contract version of every submission kind. */
+  contracts: Record<string, number>;
+  /** sha256 over the executable files of dist, the prompts and the agent files. */
+  dist: string;
+  prompts: string;
+  agents: string;
+  dependencies: {
+    /** sha256 of package-lock.json, or null when the package has none. */
+    lockfile: string | null;
+    /** Installed version of every direct runtime dependency ('missing' when absent). */
+    direct: Record<string, string>;
+    /** sha256 over the installed version of every locked runtime package. */
+    resolved: string;
+  };
+  /** sha256 over every field above plus the package version and protocol. */
+  digest: string;
+  /** True when loaded from an immutable run-owned snapshot. Not part of `digest`. */
+  snapshot: boolean;
+}
+
+/** What the host knows about the code that is executing. `build` is absent on receipts that predate it. */
 export interface RuntimeIdentity {
   packageVersion: string;
   protocol: SubmissionProtocol;
+  build?: RuntimeBuildIdentity;
 }
 
 /**
@@ -347,6 +371,8 @@ export interface RunnerOptions {
   planRoot?: string;
   /** Protocol selected for runs STARTED by this runner. A resumed run always keeps the protocol it started with. */
   protocol?: SubmissionProtocol;
+  /** Identity of the loaded runtime, recorded in the state of runs STARTED by this runner. Defaults to the executing package. */
+  runtime?: () => RuntimeIdentity;
   /** Lets the host's first model-context observation of a child trigger the dispatch-prompt watcher without waiting for its poll. */
   promptSync?: DispatchPromptSync;
   /** Shared with the plugin hooks and the submission gate: format repair decisions and the tool-call timeline. */
@@ -377,6 +403,8 @@ export interface RunState {
   settings: RunnerSettings;
   /** Set once when the run starts and never changed. Absent means the legacy prose protocol. */
   protocol?: SubmissionProtocol;
+  /** The loaded runtime when the run started. Set once for new runs only; absent means it was never recorded. */
+  runtime?: RuntimeIdentity;
   /** The current typed-submission authority of a structured run. */
   submissionBinding?: SubmissionBinding;
   attempt?: WorkflowAttempt;

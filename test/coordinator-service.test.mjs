@@ -5,13 +5,15 @@ import path from 'node:path';
 import os from 'node:os';
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { EventEmitter, once } from 'node:events';
 import { createCoordinatorClient } from '../dist/coordinator/client.js';
 import { loadCoordinatorConfiguration } from '../dist/coordinator/config.js';
 import { startCoordinatorService, readCoordinatorToken } from '../dist/coordinator/service.js';
 import { createDurableSubmissionGate } from '../dist/workflow/durable-submission.js';
 import { openSubmissionBinding, recordDispatchPrompt } from '../dist/workflow/submission-store.js';
+import { computeRuntimeIdentity, runtimeIdentity } from '../dist/workflow/runtime-identity.js';
+import { sourcePackageRoot } from '../dist/coordinator/runtime-snapshot.js';
 
 const git = (directory, args) => execFileSync('git', args, { cwd: directory, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 async function fixture(t) {
@@ -249,4 +251,25 @@ test('owner-fenced submission routes store, replay and refuse by identity; the a
   const events = JSON.stringify(await f.client.request('GET', '/events'));
   assert.ok(events.includes('submission.saved'));
   assert.ok(!events.includes('proved') && !events.includes(run.ownerToken), 'events carry no submission text or capability');
+});
+
+test('a submitted run is admitted with its runtime identity and launched from an immutable run-owned snapshot', async t => {
+  const f = await fixture(t);
+  const before = git(f.project, ['status', '--porcelain']);
+  const project = await f.client.request('POST', '/projects', { directory: f.project });
+  const submitted = await f.client.request('POST', '/runs', { projectId: project.id, feature: 'Feature' });
+  const loaded = runtimeIdentity();
+  assert.equal(Object.hasOwn(submitted, 'specification'), false, 'the specification stays private');
+  assert.equal(f.service().store.getRun(submitted.id).specification.runtime.identity.build.digest, loaded.build.digest);
+  await f.service().scheduler.tick();
+  const run = await settled(f.service().store, submitted.id);
+  assert.equal(run.status, 'running', run.reason ?? '');
+  const snapshot = path.join(path.dirname(run.worktreePath), 'runtime');
+  const shim = await fs.readFile(path.join(run.worktreePath, '.opencode/plugins/heimdall.ts'), 'utf8');
+  assert.ok(shim.includes(pathToFileURL(path.join(snapshot, 'dist/opencode/plugin.js')).href), 'the loader imports the snapshot');
+  assert.ok(shim.includes(`expectedRuntime: "${loaded.build.digest}"`));
+  assert.ok(!shim.includes(pathToFileURL(path.join(sourcePackageRoot(), 'dist/')).href), 'not the live package');
+  assert.equal(computeRuntimeIdentity(snapshot).build.digest, loaded.build.digest);
+  assert.equal(run.specification.runtime.modules, await fs.realpath(path.join(sourcePackageRoot(), 'node_modules')));
+  assert.equal(git(f.project, ['status', '--porcelain']), before, 'the source checkout is untouched');
 });

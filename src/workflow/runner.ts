@@ -6,6 +6,7 @@ import { chooseExecutor, authExpired, executorCandidates } from '../policy/quota
 
 import { classifyError, classifyResult, pauseReportRecovery, REPORT_FIELDS, reportPauseReason, submissionPauseReason, submissionRepairPauseReason } from './report.js';
 import { MAX_SUBMISSION_REPAIRS } from './submission-repair.js';
+import { runtimeIdentity } from './runtime-identity.js';
 import type { ConflictInfo, RepairDecision, RepairHandler, RepairRequest } from './submission-repair.js';
 import { isTaskId, SUBMISSION_PROTOCOL, SUBMISSION_TOOL_IDS } from './contracts.js';
 import { closeSubmissionBinding, createLocalSubmissionStore, openSubmissionBinding, recordDispatchPrompt, submissionKindForPhase } from './submission-store.js';
@@ -201,7 +202,7 @@ export function correctionInstruction(task: WorkflowTask, number: number, diagno
 const contextSignal = (context: RunnerContext) => context.signal || context.abort;
 const callerIdentity = (context: RunnerContext) => ({ sessionID: context.sessionID, id: context.id, messageID: context.messageID, agent: context.agent });
 
-export function createRunner({ backend, directory, quota, authRefresh, guards = new Map(), git = args => execFileSync('git', args, { cwd: directory, encoding: 'utf8' }), settings: suppliedSettings, workflowRoot, settingsPath, plannerPromptPath, executorPromptPath, planRoot: suppliedPlanRoot, persistence, protocol, promptSync, supervisor }: RunnerOptions) {
+export function createRunner({ backend, directory, quota, authRefresh, guards = new Map(), git = args => execFileSync('git', args, { cwd: directory, encoding: 'utf8' }), settings: suppliedSettings, workflowRoot, settingsPath, plannerPromptPath, executorPromptPath, planRoot: suppliedPlanRoot, persistence, protocol, runtime = runtimeIdentity, promptSync, supervisor }: RunnerOptions) {
   if (!backend || typeof quota !== 'function') throw new Error('Native backend and quota callback are required');
   const root = path.resolve(directory, workflowRoot ?? '.opencode/adr-workflow');
   const planRoot = path.resolve(directory, suppliedPlanRoot ?? '.omo/plans');
@@ -296,7 +297,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
         const adr = await fs.realpath(path.resolve(directory, args.adr));
         const repo = await fs.realpath(directory);
         if (!adr.startsWith(repo + path.sep)) throw new Error('ADR must be inside this project');
-        state = { id: persistence ? args.runId! : randomUUID(), status: 'running', adr: args.adr, parent: context.sessionID, caller: callerIdentity(context), branch: git(['branch', '--show-current']).trim(), baseline: git(['status', '--porcelain']), index: 0, tasks: [], results: [], phase: 'planner', child: null, settings, ...(protocol ? { protocol } : {}) };
+        state = { id: persistence ? args.runId! : randomUUID(), status: 'running', adr: args.adr, parent: context.sessionID, caller: callerIdentity(context), branch: git(['branch', '--show-current']).trim(), baseline: git(['status', '--porcelain']), index: 0, tasks: [], results: [], phase: 'planner', child: null, settings, ...(protocol ? { protocol } : {}), runtime: runtime() };
         await fs.mkdir(path.join(root, 'runs', state.id), { recursive: !!persistence });
         await save(state);
         started = true;

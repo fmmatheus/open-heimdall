@@ -18,6 +18,7 @@ import {
 import type { SubmissionKind } from '../workflow/contracts.js';
 import { SEALED_DENIAL, SUBMISSION_DENIAL } from '../workflow/submission.js';
 import { createDispatchPromptSync } from '../workflow/prompt-sync.js';
+import { runtimeIdentity } from '../workflow/runtime-identity.js';
 import { createSubmissionSupervisor } from '../workflow/submission-repair.js';
 import type { SubmissionSupervisor } from '../workflow/submission-repair.js';
 import { createNativeSubmissionGate } from './submission-gate.js';
@@ -43,6 +44,8 @@ export interface PluginOptions {
   submissionGate?: SubmissionGate;
   /** Format-repair decisions and the tool-call timeline shared with the runner. Injectable so tests can observe it. */
   supervisor?: SubmissionSupervisor;
+  /** Managed runs: the runtime digest the coordinator admitted. A plugin loaded from any other build refuses to activate. */
+  expectedRuntime?: string;
   /** Harness seams for the composed workflow; production leaves both unset. */
   quota?: WorkflowOptions['quota'];
   git?: WorkflowOptions['git'];
@@ -52,6 +55,7 @@ export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
   return Plugin.define({
     id: 'adr.workflow',
     async setup(ctx) {
+      if (options.expectedRuntime !== undefined && runtimeIdentity().build?.digest !== options.expectedRuntime) throw new Error('Heimdall runtime does not match the build admitted for this run; refusing to activate');
       const metadata = await readManagedMetadata(ctx.location.directory);
       const configuredPath = process.env.HEIMDALL_CONFIG?.trim() ? process.env.HEIMDALL_CONFIG : undefined;
       const configuration = options.configuration ?? await loadConfiguration({ projectDirectory: ctx.location.directory, configPath: options.configPath ?? (metadata ? '.heimdall/runtime.toml' : configuredPath) });

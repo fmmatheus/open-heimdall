@@ -488,3 +488,20 @@ test('checkpoint.saved drops unknown codes and modes, clamps the counter and omi
   assert.equal(events().at(-1).payload.report.gateIds.length, 50);
   assert.equal(store.getRun(run.id).status, 'running');
 });
+
+test('the recorded runtime identity is set once for new runs and an existing run is never given or stripped of one', async t => {
+  const recorded = { packageVersion: '1.2.3', protocol: 'structured-v1', build: { packageName: '@fake/core', digest: 'a'.repeat(64) } };
+  const fresh = await admitFixture(t);
+  fresh.store.bindStart(fresh.run.id, fresh.run.ownerToken, binding(fresh.run));
+  const first = { ...checkpoint(fresh.run), runtime: recorded };
+  fresh.store.saveCheckpoint(fresh.run.id, fresh.run.ownerToken, first);
+  fresh.store.saveCheckpoint(fresh.run.id, fresh.run.ownerToken, { ...first, status: 'paused', runtime: structuredClone(recorded) });
+  assert.throws(() => fresh.store.saveCheckpoint(fresh.run.id, fresh.run.ownerToken, { ...first, runtime: { ...recorded, packageVersion: '9.9.9' } }), /runtime identity is immutable/);
+  assert.throws(() => fresh.store.saveCheckpoint(fresh.run.id, fresh.run.ownerToken, { ...first, runtime: undefined }), /runtime identity is immutable/);
+  assert.deepEqual(fresh.store.getRun(fresh.run.id).checkpoint.runtime, recorded);
+  const legacy = await admitFixture(t);
+  legacy.store.bindStart(legacy.run.id, legacy.run.ownerToken, binding(legacy.run));
+  legacy.store.saveCheckpoint(legacy.run.id, legacy.run.ownerToken, checkpoint(legacy.run));
+  assert.throws(() => legacy.store.saveCheckpoint(legacy.run.id, legacy.run.ownerToken, { ...checkpoint(legacy.run), runtime: recorded }), /runtime identity is immutable/);
+  assert.equal(Object.hasOwn(legacy.store.getRun(legacy.run.id).checkpoint, 'runtime'), false, 'an existing run is not retroactively claimed');
+});

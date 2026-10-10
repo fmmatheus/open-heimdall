@@ -6,6 +6,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { stringify } from 'smol-toml';
 import { loadConfiguration } from '../config.js';
+import { admitRuntime, createRuntimeSnapshot, snapshotLoader, verifyRuntimeSnapshot } from './runtime-snapshot.js';
 import type { ProjectRecord, RunRecord, RunSpecification } from './types.js';
 
 const packageFile = (relative: string) => fileURLToPath(new URL('../../' + relative, import.meta.url));
@@ -30,6 +31,7 @@ export async function snapshotSpecification(project: ProjectRecord): Promise<Run
     fs.readFile(packageFile('examples/opencode/agents/adr-executor.md'), 'utf8'),
   ]);
   return {
+    runtime: await admitRuntime(),
     settings, plannerPrompt, executorPrompt,
     agents: { 'adr-orchestrator': orchestratorRole.replaceAll('resource: adr-planner', `resource: ${planner}`).replaceAll('resource: adr-executor', `resource: ${executor}`), [planner]: plannerRole, [executor]: executorRole },
     opencode: { baseUrl: configuration.opencode.baseUrl, passwordEnvironmentVariable: configuration.opencode.passwordEnvironmentVariable, authentication: configuration.opencode.authentication },
@@ -72,6 +74,7 @@ export async function prepareRuntime(run: RunRecord, endpoint: string): Promise<
   const root = path.join(checkout, '.heimdall');
   const metadata = { endpoint, runId: run.id, ownerToken: run.ownerToken, parentSessionId: run.parentSessionId };
   if (run.launchAction === 'resume') {
+    await verifyRuntimeSnapshot(run); // Refuse before touching anything when the admitted runtime is not intact.
     const stat = await fs.lstat(root);
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('Managed runtime directory changed');
     const target = path.join(root, 'managed.json');
@@ -95,6 +98,15 @@ export async function prepareRuntime(run: RunRecord, endpoint: string): Promise<
   const agents = await directoryInside(checkout, '.opencode/agents');
   for (const [name, content] of Object.entries(run.specification.agents)) await fs.writeFile(path.join(agents, roleName(name) + '.md'), content, { flag: 'wx', mode: 0o600 });
   const plugins = await directoryInside(checkout, '.opencode/plugins');
+  const digest = run.specification.runtime?.identity.build?.digest;
+  if (run.specification.runtime) {
+    // New runs execute an immutable run-owned copy, never the shared package's live dist.
+    if (!digest) throw new Error('Admitted runtime identity has no build digest');
+    const root = await createRuntimeSnapshot(run);
+    await fs.writeFile(path.join(plugins, 'heimdall.ts'), snapshotLoader(root, runtimeConfig, digest), { flag: 'wx', mode: 0o600 });
+    return;
+  }
+  // Runs submitted before runtime snapshots keep the live package path, explicitly unpinned.
   const plugin = pathToFileURL(fileURLToPath(new URL('../opencode/plugin.js', import.meta.url))).href;
   await fs.writeFile(path.join(plugins, 'heimdall.ts'), `import { createPlugin } from ${JSON.stringify(plugin)};\nexport default createPlugin({ configPath: ${JSON.stringify(runtimeConfig)} });\n`, { flag: 'wx', mode: 0o600 });
 }

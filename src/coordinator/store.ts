@@ -414,6 +414,8 @@ export class CoordinatorStore {
       if (run.launchAction === 'resume' && (!run.resumeBinding || !sameBinding(run.resumeBinding, state.caller as StartBinding))) throw new Error('Checkpoint caller does not match the claimed resume admission');
       // The protocol is selected once, when the run starts; a later checkpoint can neither switch nor drop it.
       if (run.checkpoint && run.checkpoint.protocol !== state.protocol) throw new Error('Run protocol is immutable once selected');
+      // The loaded runtime is recorded once, at start, for new runs only; an existing run is never given or stripped of one.
+      if (run.checkpoint && !isDeepStrictEqual(run.checkpoint.runtime, state.runtime)) throw new Error('Run runtime identity is immutable once recorded');
       this.db.prepare('UPDATE runs SET checkpoint_json = ?, updated_at = ? WHERE id = ?').run(encoded, Date.now(), id);
       this.event('checkpoint.saved', run, null, {
         status: state.status, phase: state.phase, index: state.index, child: state.child,

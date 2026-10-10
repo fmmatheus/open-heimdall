@@ -371,6 +371,7 @@ for (const [name, make] of backends) {
     assert.deepEqual(stored.caller, { sessionID: CHILD, agent: 'executor', messageID: 'msg_1', callId: 'call_1' });
     assert.deepEqual(stored.contract, { protocol: 'structured-v1', kind: 'executor-result', version: 1 });
     assert.equal(typeof stored.runtime.packageVersion, 'string');
+    assert.match(stored.runtime.build.digest, /^[0-9a-f]{64}$/, 'the receipt carries the loaded build identity');
     assert.equal(stored.runtime.protocol, 'structured-v1');
     assert.deepEqual(stored.rawPayload, raw, 'raw is exactly what was submitted');
     assert.equal('gate' in stored.rawPayload.evidence[0], false);
