@@ -154,13 +154,22 @@ forces a full re-run. Verification record:
   child (`execute.before` throws, the session tool list is emptied,
   `permission.evaluate` denies where available) and releases it only after the
   child is confirmed idle. Heimdall sends a correction only for a provider
-  listed in `VERIFIED_REPORT_ONLY_PROVIDERS` (`src/opencode/report-only.ts`),
-  which ships **empty**. `claude-code` is unsupported, not proven: its provider
-  plugin exposes only OpenCode's tool list and parks tool calls back to
-  OpenCode, but the local sources do not show that OpenCode core routes those
-  calls, or code-mode `execute` nested calls, through the hooks, and no live
-  experiment was run. Without a verified provider every `report_format` failure
-  pauses as `correction_unsupported` and nothing is re-sent automatically.
+  listed in `VERIFIED_REPORT_ONLY_PROVIDERS` (`src/opencode/report-only.ts`).
+  On this branch the list is exactly `['claude-code']`. Feature 0005 observed
+  live, in a guarded disposable OpenCode fixture (OpenCode 2.0.22, Claude Code
+  CLI 2.1.292, provider 1.3.4), that edit, write, shell, tests, `git commit`,
+  delegation, namespaced MCP calls and nested code-mode calls were denied under
+  restriction, left the files and Git `HEAD` unchanged, and worked again after
+  owner-matched release; recovery (one bounded correction, the cap, interrupt and
+  resume, failed work staying paused, late release) was also observed. Record:
+  [claude-code-report-only-live.md](validation/claude-code-report-only-live.md).
+  The live runs used a fixture-only copy of `dist` with the constant patched and
+  a fault injected into the idle observation for the retained-restriction case;
+  they were not run against an installed build of this branch. No other provider
+  has live evidence and none is listed. For any unlisted provider every
+  `report_format` failure still pauses as `correction_unsupported` and nothing is
+  re-sent automatically. Activation is an owner action: until you build and
+  install this branch, the installed runtime keeps the earlier empty list.
 - **Restriction lifetime.** Each restriction carries an owner identity (parent,
   child, correction attempt ID and run ID) in the plugin's in-memory registry,
   so a later runner invocation, or a backend recreated over the same registry,
@@ -193,13 +202,18 @@ forces a full re-run. Verification record:
 ## Remaining limits
 
 - Automatic report correction needs an owner-verified provider
-  (`VERIFIED_REPORT_ONLY_PROVIDERS` is empty); until then format-only failures
-  pause for a manual resume. **`claude-code` is unsupported.** Feature 0004
-  did not perform an authenticated live check. Its fresh Claude login store
-  had no login. Earlier smoke tests reused the existing login with isolated
-  OpenCode stores, transcript persistence disabled and user hooks disabled;
-  that does not prove protection against credential refresh or every CLI write.
-  Those protections and every supported tool path still need verification. See
+  (`VERIFIED_REPORT_ONLY_PROVIDERS`). On this branch only `claude-code` is
+  listed, from the live record in
+  [claude-code-report-only-live.md](validation/claude-code-report-only-live.md)
+  (feature 0005); it becomes operational only after you build and install the
+  branch. Any other provider pauses format-only failures for a manual resume.
+  The live proof has stated limits: authentication used the existing login
+  through a read-only guard with refresh tokens withheld, so an access token
+  that expires mid-run fails authentication instead of rotating; the retained
+  restriction case used an injected observation fault, not a real OpenCode
+  interrupt that fails to terminate a child; the receipt hashes were computed
+  after the fact; and a restriction lost to a plugin restart is not recovered.
+  The earlier feature 0004 status (no authenticated live check) is kept in
   [Provider verification](validation/completion-report-recovery.md#provider-verification-feature-0004).
 - A correction that was dispatched but never answered consumes one of the two
   attempts and is not re-sent; the next owner resume uses a normal task prompt.

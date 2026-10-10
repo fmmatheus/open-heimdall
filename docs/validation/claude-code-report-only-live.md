@@ -10,7 +10,9 @@
 | Claude CLI and provider user-state write audit | Done, read-only (T1) |
 | Enforced read-only guard over login and user state | **guard proven** (T1) |
 | Live tool-path enforcement, release, recovery | **observed (T2)**, see [Live results](#live-results-t2) |
-| Enablement of `claude-code` in `VERIFIED_REPORT_ONLY_PROVIDERS` | **PENDING (T3)**: still disabled in `src/` |
+| Enablement of `claude-code` in `VERIFIED_REPORT_ONLY_PROVIDERS` | **ENABLED on this branch**: the list is exactly `['claude-code']`; see [Decision](#decision-and-final-status) |
+| Full repository checks after the last code change | **Passed**, see [Command results](#command-results) |
+| Activation on the installed runtime | **PENDING (owner)**, see [Activation (owner)](#activation-owner) |
 
 T1 started no OpenCode server and no model session; T2 did, inside the guard
 and the disposable fixture only (see Live results). The real login was used
@@ -294,8 +296,9 @@ The repository was built from the current worktree and the built `dist/` was
 copied into the fixture. The pieces below exist only under the fixture root:
 
 - `VERIFIED_REPORT_ONLY_PROVIDERS` patched to `['claude-code']` in the copied
-  `dist/opencode/report-only.js`. The checked-in `src/` list is unchanged and
-  `claude-code` is still not enabled there (T3).
+  `dist/opencode/report-only.js`. At the time of the live runs the checked-in
+  `src/` list was empty; the same value was then enabled in `src/` by the
+  decision below, and no other source behaviour changed.
 - A fixture plugin (`fixture/heimdall-fixture-plugin.mjs`) calling
   `createPlugin({ reportOnly: createReportOnlyRegistry() })`.
 - An owner-only Unix control socket (`control.sock`, mode 700 root) exposing
@@ -488,7 +491,7 @@ unchanged (`a3fc30b4...`, `a993b4d0...`).
 
 Still not proven: nothing is claimed about a retained restriction when the real
 OpenCode interrupt itself fails to terminate a child (the fault only affects what
-the runtime observes), and enablement of `claude-code` remains T3.
+the runtime observes).
 
 ### Cleanup and integrity
 
@@ -503,7 +506,86 @@ the runtime observes), and enablement of `claude-code` remains T3.
   repository. Only the harness scripts and this note are committed; the
   fixture root with its evidence stays on disk, outside the repository.
 
-### Remaining
+## Decision and final status
 
-PENDING (T3): `claude-code` is still absent from `VERIFIED_REPORT_ONLY_PROVIDERS`
-in `src/`. Not enabled by this task.
+Every T1 and T2 live gate is recorded above as passed: store isolation, the
+credential and user-state guard, all eight tool paths denied under restriction
+with files, `HEAD` and the MCP marker unchanged, owner-matched release, an
+ordinary tool call after release, and the recovery scenarios (`correct`, `cap`,
+`interrupt`, `blocked`, `unresolved`, `retained`). No gate failed and none was
+unavailable. T3 therefore added `'claude-code'`, and nothing else, to
+`VERIFIED_REPORT_ONLY_PROVIDERS` in `src/opencode/report-only.ts`, and changed
+`test/native-backend.test.mjs` to assert that the shipped default set is exactly
+`['claude-code']`, that `claude-code/sonnet` is supported by default and that
+`openai` stays unsupported by default. No other provider is enabled.
+
+The T3 change touches only that constant (and its comment) and one test. It does
+not alter the tool dispatch, hooks or recovery code the live runs exercised, so
+the T2 evidence is not invalidated and no live run was repeated.
+
+Limits that remain, none of them a failed gate:
+
+- The retained-restriction case used a fixture-only observation fault with a
+  child that really was idle. A real OpenCode interrupt that fails to terminate a
+  child was not tested.
+- Authentication used the stored access token with refresh tokens withheld. An
+  access token that expires during a run fails authentication instead of
+  rotating. Nothing here shows a new login or account is required.
+- Receipt hashes were computed after the fact; no live before/after hashes exist.
+- The live runs used a fixture-only patched copy of `dist` and the copied
+  provider with two isolation patches (see Copied-provider diff); they were not
+  run against an installed build of this branch.
+- The guard denies writes; it does not hide credentials from reads or restrict
+  the network.
+- Report-only restrictions live in the plugin process memory; a restart loses
+  them.
+
+## Command results
+
+Run in this worktree after the last source change (the constant and the test),
+with no further source edits afterwards, on Node v22.22.3. These are the real
+results; the `dist/` build output is git-ignored.
+
+| Command | Exit | Result |
+| --- | --- | --- |
+| `npm run check` (`tsc --noEmit`) | 0 | no diagnostics |
+| `npm test` (`npm run build`, then `node --test test/*.test.mjs`) | 0 | tests 486, pass 486, fail 0, cancelled 0, skipped 0, todo 0 |
+| `npm run build` (`tsc`) | 0 | `dist/opencode/report-only.js` contains `VERIFIED_REPORT_ONLY_PROVIDERS = ['claude-code']` |
+| `npm run build:extension` | 0 | `dist/openchamber-extension/`: `package.json` 941 B, `panel/index.html` 7,797 B, `panel/main.js` 196,654 B, `service/main.js` 95,962 B |
+
+The suite size (486) and the extension artifact sizes equal the feature 0003
+record; the change does not touch the extension.
+
+Fixture-only settings (none of them in `src/` or `test/`): the patched `dist`
+copy, the synthetic quota snapshot, the control-socket and observer plugins, the
+disposable marker MCP server, the omit-`handoff`, blocked and unresolved executor
+rules, the injected `observe` wrapper with its fault, and the two copied-provider
+isolation patches. They are described under Live results and Copied-provider diff,
+live only under the fixture root, and are not part of the shipped build.
+
+## Activation (owner)
+
+Nothing here has been done by this task; installing, activating and merging are
+your actions.
+
+1. Review branch `heimdall/run/138b8157-4527-4842-8c8e-8d745af8eb48` and its
+   commits on top of `dadeb3c`: `60adf62` (harness and T1 record), `5591d83`
+   (live enforcement, release and recovery results), `a03b396` (follow-up
+   verification) and the T3 commit that enables `claude-code` and records the
+   results (`git log dadeb3c..HEAD`).
+2. Let running workflows finish (or pause them) first. Do not rebuild, replace
+   or restart the active runtime while any workflow is running: the plugin's
+   restrictions are in memory and are lost on restart.
+3. At a quiet point, build and install from this branch (`npm ci
+   --ignore-scripts`, `npm run build`, `npm run build:extension`, then your usual
+   install), and restart only your own OpenCode runtime and the Heimdall
+   extension service. No other process, session or database needs to change.
+4. Operational status: after that install and restart, automatic completion-report
+   correction **is operational for `claude-code`** (at most two corrections per
+   task, on the same idle child, with the same model and variant). Before it, the
+   installed runtime keeps the empty list and format-only failures pause as
+   `correction_unsupported`. Every other provider remains unsupported and needs a
+   manual resume.
+5. Optional: remove the disposable fixture root `/private/tmp/heimdall-0005.mZaL06`
+   when you no longer need its evidence. It holds no committed material; nothing
+   in it needs to run.

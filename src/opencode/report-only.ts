@@ -11,12 +11,13 @@ export const REPORT_ONLY_DENIAL = 'Heimdall report-only correction: every tool c
 
 /**
  * Providers whose tool paths are proven to pass through the enforcement hooks.
- * Empty on purpose: no provider has been proven live (docs/validation/completion-report-recovery.md).
- * `claude-code` stays unsupported: its tool paths are unverified at the host (parked MCP
- * calls, code-mode nested calls). Earlier isolated smoke tests reused the existing login,
- * but did not prove credential-write protections. Live verification remains pending.
+ * Only `claude-code` is listed: feature 0005 observed live, in a guarded disposable
+ * OpenCode fixture, edit, write, shell, tests, git commit, delegation, namespaced MCP and
+ * nested code-mode calls denied under restriction and working again after owner-matched
+ * release (docs/validation/claude-code-report-only-live.md). No other provider has live
+ * evidence, so none may be added from it.
  */
-export const VERIFIED_REPORT_ONLY_PROVIDERS: readonly string[] = [];
+export const VERIFIED_REPORT_ONLY_PROVIDERS: readonly string[] = ['claude-code'];
 
 export type ReportOnlyHook = 'execute.before' | 'context' | 'permission.evaluate';
 const HOOKS: readonly ReportOnlyHook[] = ['execute.before', 'context', 'permission.evaluate'];

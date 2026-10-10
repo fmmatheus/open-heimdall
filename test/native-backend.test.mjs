@@ -96,10 +96,10 @@ test('foreground native output cannot hide a truncated final response', async ()
 
 const allHooks = registry => { for (const name of ['execute.before', 'context', 'permission.evaluate']) registry.setHook(name, true); return registry; };
 
-test('report-only capability is absent without a registry and the default verified set excludes claude-code', async () => {
+test('report-only capability is absent without a registry and the default verified set is exactly claude-code', async () => {
   const backend = createNativeBackend({ ctx: {}, observe: async () => idle() });
   assert.equal(backend.reportOnly, undefined);
-  assert.equal(VERIFIED_REPORT_ONLY_PROVIDERS.includes('claude-code'), false);
+  assert.deepEqual([...VERIFIED_REPORT_ONLY_PROVIDERS], ['claude-code']);
 });
 
 test('report-only check fails closed with exact reasons: no hooks, non-verified provider, bad model', async () => {
@@ -113,9 +113,10 @@ test('report-only check fails closed with exact reasons: no hooks, non-verified 
   assert.deepEqual(await backend.reportOnly.check('anthropic/claude#high', 'child'), { supported: false, reason: 'Report-only enforcement is not verified for provider "anthropic"' });
   assert.deepEqual(await backend.reportOnly.check('not-a-model', 'child'), { supported: false, reason: 'Report-only enforcement cannot identify the provider of model "not-a-model"' });
   assert.deepEqual(await backend.reportOnly.check('openai/gpt-5.6-sol#max', 'child'), { supported: true });
-  // The default constant is empty, so a native backend with all hooks is still unsupported.
+  // The shipped default set is only claude-code: with all hooks, openai is still unsupported by default.
   const defaults = createNativeBackend({ ctx: {}, observe: async () => idle(), reportOnly: allHooks(createReportOnlyRegistry()) });
-  assert.equal((await defaults.reportOnly.check('openai/gpt-5', 'child')).supported, false);
+  assert.deepEqual(await defaults.reportOnly.check('openai/gpt-5', 'child'), { supported: false, reason: 'Report-only enforcement is not verified for provider "openai"' });
+  assert.deepEqual(await defaults.reportOnly.check('claude-code/sonnet', 'child'), { supported: true });
 });
 
 test('report-only restrict registers the child and the release is idempotent; restrict fails closed without hooks', async () => {
