@@ -2,6 +2,7 @@ import { Plugin } from '@opencode/plugin';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createWorkflow } from '../workflow.js';
+import type { WorkflowOptions } from '../workflow.js';
 import { loadConfiguration } from '../config.js';
 import type { Configuration } from '../config.js';
 import type { RunArguments, RunnerContext } from '../workflow/types.js';
@@ -15,7 +16,9 @@ import {
   submissionToolDescription,
 } from '../workflow/contracts.js';
 import type { SubmissionKind } from '../workflow/contracts.js';
-import { closedSubmissionGate, SUBMISSION_DENIAL } from '../workflow/submission.js';
+import { SUBMISSION_DENIAL } from '../workflow/submission.js';
+import { createDispatchPromptSync } from '../workflow/prompt-sync.js';
+import { createNativeSubmissionGate } from './submission-gate.js';
 import type { SubmissionGate } from '../workflow/submission.js';
 
 const actions = ['start', 'resume', 'status'];
@@ -34,8 +37,11 @@ export interface PluginOptions {
   observe?: SessionObserver;
   /** Report-only state shared with the backend. Injectable so tests can restrict a session. */
   reportOnly?: ReportOnlyRegistry;
-  /** Owns binding and persistence of typed submissions. Defaults to a closed gate that exposes nothing. */
+  /** Owns binding and persistence of typed submissions. Defaults to the durable gate over the run's authoritative checkpoint and the host-observed call origin. */
   submissionGate?: SubmissionGate;
+  /** Harness seams for the composed workflow; production leaves both unset. */
+  quota?: WorkflowOptions['quota'];
+  git?: WorkflowOptions['git'];
 }
 
 export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
@@ -50,10 +56,11 @@ export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
       const guards = new Map<string, () => Promise<void>>();
       const reportOnly = options.reportOnly ?? createReportOnlyRegistry();
       const observe = options.observe ?? createObserver({ directory: configuration.projectDirectory, ...configuration.opencode });
-      const run = metadata ? undefined : createWorkflow({ configuration, ctx, observe, guards, reportOnly });
+      const promptSync = createDispatchPromptSync();
+      const run = metadata ? undefined : createWorkflow({ configuration, ctx, observe, guards, reportOnly, promptSync, quota: options.quota, git: options.git });
       const registrations: Array<{ dispose(): Promise<void> }> = [];
       const recoveries = new Map<string, { operation: Promise<string>; controller: AbortController }>();
-      const submissions = options.submissionGate ?? closedSubmissionGate;
+      const submissions = options.submissionGate ?? createNativeSubmissionGate({ configuration, ctx, metadata });
       // Exact registered ids only. A caller is allowed only when the gate binds its session to this kind.
       const permitted = async (kind: SubmissionKind, sessionID: string, agent: string) => (await submissions.exposed(sessionID, agent)) === kind;
       registrations.push(await ctx.tool.transform(editor => {
@@ -88,7 +95,7 @@ export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
               if (!current || current.runId !== metadata.runId || current.parentSessionId !== metadata.parentSessionId || current.endpoint !== metadata.endpoint) throw new Error('Managed workflow identity changed');
               const managed = createManagedPersistence(ctx.location.directory, current);
               const authorized = await managed.authorize(args, context);
-              const execute = createWorkflow({ configuration, ctx, observe, guards, reportOnly, persistence: managed.persistence });
+              const execute = createWorkflow({ configuration, ctx, observe, guards, reportOnly, promptSync, quota: options.quota, git: options.git, persistence: managed.persistence });
               text = await execute(authorized, context);
             } else text = await run!(args, context);
             return { output: JSON.parse(text) as unknown, content: text };
@@ -115,6 +122,10 @@ export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
           const latest = messages.filter(m => m.type === 'user').at(-1);
           if (latest?.metadata?.adrNotification === true) event.tools = {};
         }
+        // The child's FIRST model context can be built before the runner's asynchronous watcher has saved the dispatch
+        // prompt. This is the host's own observation of that context, so it asks the watcher to record the prompt now
+        // (never from onStarted, which would wait on a prompt that is admitted only after it returns).
+        if ([configuration.settings.plannerAgent, configuration.settings.executorAgent].includes(event.agent)) await promptSync.settle(event.sessionID).catch(() => {});
         // Submission tools survive only for the session the gate binds to that exact kind. Decorated
         // lookalike names (namespaced or suffixed) are never ours and are always removed.
         const bound = await submissions.exposed(event.sessionID, event.agent);

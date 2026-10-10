@@ -1,4 +1,5 @@
 import type { ReportOnlyCapability, RunnerBackend, RunnerContext, SubagentInput, WorkflowAttempt } from '../workflow/types.js';
+import type { NativeOriginResolver } from '../workflow/durable-submission.js';
 import { VERIFIED_REPORT_ONLY_PROVIDERS } from './report-only.js';
 import type { ReportOnlyRegistry } from './report-only.js';
 import type { NativeContext, NativeTool, NativeToolContext, ObservedSession, SessionObserver, SessionSnapshot } from './types.js';
@@ -22,6 +23,23 @@ export async function resolveSubagent(tool: NativeContext['tool']): Promise<Nati
 export function nativeModel(model: string, variant?: string): string {
   if (typeof model !== 'string' || !/^[^/#]+\/[^#]+$/.test(model) || (variant !== undefined && (typeof variant !== 'string' || !variant || variant.includes('#')))) throw new Error('Invalid native provider/model#variant');
   return model + (variant ? '#' + variant : '');
+}
+
+/**
+ * Proves, from the host's ordered message timeline of the calling session, which user prompt a tool call descends
+ * from: the assistant message that carries the call (identified by the native message id, never by anything the
+ * model supplied) belongs to the nearest user message before it. A delayed call from an earlier dispatch on a reused
+ * child therefore resolves to the earlier prompt, and an unknown message, a foreign agent or a missing prompt yields
+ * undefined (the gate then fails closed).
+ */
+export function createNativeOriginResolver(ctx: Pick<NativeContext, 'session'>): NativeOriginResolver {
+  return async native => {
+    const messages = await ctx.session.context({ sessionID: native.sessionID as never });
+    const index = messages.findIndex(m => m.type === 'assistant' && m.id === native.messageID);
+    if (index < 0 || (messages[index] as { agent?: unknown }).agent !== native.agent) return undefined;
+    const prompt = messages.slice(0, index).filter(m => m.type === 'user').at(-1);
+    return typeof prompt?.id === 'string' && prompt.id.length > 0 ? prompt.id : undefined;
+  };
 }
 
 export function createNativeBackend({ ctx, observe, pause = ms => new Promise(resolve => setTimeout(resolve, ms)), cancellationWaitMs = 30000, reportOnly, verifiedProviders = VERIFIED_REPORT_ONLY_PROVIDERS }: {

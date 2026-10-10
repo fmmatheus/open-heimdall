@@ -197,7 +197,7 @@ export function correctionInstruction(task: WorkflowTask, number: number, diagno
 const contextSignal = (context: RunnerContext) => context.signal || context.abort;
 const callerIdentity = (context: RunnerContext) => ({ sessionID: context.sessionID, id: context.id, messageID: context.messageID, agent: context.agent });
 
-export function createRunner({ backend, directory, quota, authRefresh, guards = new Map(), git = args => execFileSync('git', args, { cwd: directory, encoding: 'utf8' }), settings: suppliedSettings, workflowRoot, settingsPath, plannerPromptPath, executorPromptPath, planRoot: suppliedPlanRoot, persistence, protocol }: RunnerOptions) {
+export function createRunner({ backend, directory, quota, authRefresh, guards = new Map(), git = args => execFileSync('git', args, { cwd: directory, encoding: 'utf8' }), settings: suppliedSettings, workflowRoot, settingsPath, plannerPromptPath, executorPromptPath, planRoot: suppliedPlanRoot, persistence, protocol, promptSync }: RunnerOptions) {
   if (!backend || typeof quota !== 'function') throw new Error('Native backend and quota callback are required');
   const root = path.resolve(directory, workflowRoot ?? '.opencode/adr-workflow');
   const planRoot = path.resolve(directory, suppliedPlanRoot ?? '.omo/plans');
@@ -276,6 +276,11 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
       await backend.assertIdle(state.child, state.parent, contextSignal(context));
       await capability.releaseRetained({ child: state.child, parent: state.parent, runId: state.id, attemptIds: recovery.attempts });
     };
+    /** Names the run the lock holder owns, so the host can find the one active checkpoint without a process-local map. */
+    const recordLockOwner = async () => {
+      await lock.truncate(0);
+      await lock.write(JSON.stringify({ pid: process.pid, parent: context.sessionID, runId: state.id }), 0);
+    };
     try {
       await lock.writeFile(JSON.stringify({ pid: process.pid, parent: context.sessionID }));
       const settings = await configuredSettings();
@@ -289,6 +294,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
         await fs.mkdir(path.join(root, 'runs', state.id), { recursive: !!persistence });
         await save(state);
         started = true;
+        await recordLockOwner();
       } else if (args.action === 'resume') {
         if (!/^[\w-]+$/.test(args.runId || '') || !nonempty(args.input)) throw new Error('Resume requires a run ID and resolution');
         state = await load(args.runId!);
@@ -313,6 +319,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
         delete state.reason;
         await save(state);
         started = true;
+        await recordLockOwner();
         await releaseRetained(); // After the fenced save, so a stale owner never releases; before any prompt is dispatched.
       } else throw new Error('Unknown action');
       await args.onLaunch?.();
@@ -600,19 +607,33 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
            */
           const watchPrompt = () => {
             if (!structured || promptWatch) return;
+            let recorded = false;
+            let tail: Promise<void> = Promise.resolve();
+            const observeOnce = async () => {
+              if (recorded || promptStop) return;
+              const child = attempt.child;
+              const found = child ? await backend.observeDispatchPrompt!({ child, parent: state.parent, attemptId: attempt.id, signal: AbortSignal.any([controller.signal, promptAbort.signal]) }) : undefined;
+              if (promptStop || recorded || !found) return;
+              if (state.submissionBinding?.attemptId !== attempt.id) throw new Error('The submission binding no longer belongs to this attempt');
+              state.submissionBinding = recordDispatchPrompt(state.submissionBinding, found);
+              recorded = true;
+              await save(state);
+            };
+            /** One serialized observation. The poll below and the host's first model-context observation share it. */
+            const settle = () => {
+              const pending = tail.then(observeOnce);
+              tail = pending.catch(() => {});
+              return pending;
+            };
+            const unregister = attempt.child && promptSync ? promptSync.register(attempt.child, settle) : undefined;
             promptWatch = (async () => {
-              while (!promptStop) {
-                const child = attempt.child;
-                const found = child ? await backend.observeDispatchPrompt!({ child, parent: state.parent, attemptId: attempt.id, signal: AbortSignal.any([controller.signal, promptAbort.signal]) }) : undefined;
-                if (promptStop) return;
-                if (found) {
-                  if (state.submissionBinding?.attemptId !== attempt.id) throw new Error('The submission binding no longer belongs to this attempt');
-                  state.submissionBinding = recordDispatchPrompt(state.submissionBinding, found);
-                  await save(state);
-                  return;
+              try {
+                while (!promptStop && !recorded) {
+                  await settle();
+                  if (recorded) return;
+                  await new Promise(resolve => setTimeout(resolve, PROMPT_POLL_MS));
                 }
-                await new Promise(resolve => setTimeout(resolve, PROMPT_POLL_MS));
-              }
+              } finally { unregister?.(); }
             })().catch(error => {
               if (promptStop) return;
               guardError ??= error;

@@ -1,5 +1,6 @@
 import type { ExecutorSelection, QuotaSettings, QuotaSnapshot } from '../policy/types.js';
 import type { ContractRef, SubmissionKind, SUBMISSION_PROTOCOL } from './contracts.js';
+import type { DispatchPromptSync } from './prompt-sync.js';
 
 /** The only typed protocol so far. A run without a persisted protocol is a legacy (prose) run. */
 export type SubmissionProtocol = typeof SUBMISSION_PROTOCOL;
@@ -305,6 +306,8 @@ export interface RunnerOptions {
   planRoot?: string;
   /** Protocol selected for runs STARTED by this runner. A resumed run always keeps the protocol it started with. */
   protocol?: SubmissionProtocol;
+  /** Lets the host's first model-context observation of a child trigger the dispatch-prompt watcher without waiting for its poll. */
+  promptSync?: DispatchPromptSync;
 }
 
 export interface SavedCompletion extends CompletionResult {
