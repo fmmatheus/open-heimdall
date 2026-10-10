@@ -10,6 +10,8 @@ import path from 'node:path';
 import { Plugin } from '@opencode/plugin';
 import { createPlugin } from '../dist/opencode/plugin.js';
 import { createReportOnlyRegistry } from '../dist/opencode/report-only.js';
+import { createObserver } from '../dist/opencode/observer.js';
+import { loadConfiguration } from '../dist/config.js';
 
 const root = process.env.HEIMDALL_FIXTURE_ROOT;
 if (!root) throw new Error('HEIMDALL_FIXTURE_ROOT is required');
@@ -17,9 +19,35 @@ const socketPath = path.join(root, 'control.sock');
 const logPath = path.join(root, 'evidence', 'control.jsonl');
 
 const registry = createReportOnlyRegistry();
-const inner = createPlugin({ reportOnly: registry });
-const releases = new Map(); // `${child}|${attemptId}` -> idempotent release returned by restrict()
+// Fixture-only observation fault (T2 retained-restriction check). The injected observer is the real createObserver; it
+// differs only for session ids the owner put in `faults` through the control socket, whose snapshot is reported
+// `active: true`. Nothing is faulted unless the control channel says so, so every other scenario sees the real observer.
+const faults = new Map(); // sessionID -> number of faulted observations
+const observers = new Map(); // project directory -> real observer
+const sessionDirectories = new Map(); // sessionID -> directory that last produced a snapshot
 const contexts = new Map(); // project directory -> plugin context (the plugin is set up once per location)
+const realObserver = async directory => {
+  if (!observers.has(directory)) {
+    const configuration = await loadConfiguration({ projectDirectory: directory });
+    observers.set(directory, createObserver({ directory: configuration.projectDirectory, ...configuration.opencode }));
+  }
+  return observers.get(directory);
+};
+const observe = async (id, signal) => {
+  const known = sessionDirectories.get(id);
+  const candidates = [...new Set([...(known ? [known] : []), ...[...contexts.keys()].reverse()])];
+  let failure;
+  let snapshot;
+  for (const directory of candidates) {
+    try { snapshot = await (await realObserver(directory))(id, signal); sessionDirectories.set(id, directory); break; } catch (error) { failure = error; }
+  }
+  if (!snapshot) throw failure ?? new Error('No fixture location can observe this session');
+  if (!faults.has(id)) return snapshot;
+  faults.set(id, faults.get(id) + 1);
+  return { ...snapshot, active: true };
+};
+const inner = createPlugin({ reportOnly: registry, observe });
+const releases = new Map(); // `${child}|${attemptId}` -> idempotent release returned by restrict()
 let server;
 const log = entry => fs.appendFileSync(logPath, JSON.stringify({ at: Date.now(), ...entry }) + '\n');
 
@@ -44,6 +72,9 @@ export default Plugin.define({
         const removed = registry.releaseOwned({ parent, child: sessionID, attemptId, runId });
         return { removed, restricted: registry.has(sessionID), count: registry.count(sessionID) };
       },
+      fault: ({ sessionID }) => { faults.set(sessionID, 0); return { faulted: [...faults] }; },
+      faultCount: ({ sessionID }) => ({ observations: faults.get(sessionID) ?? null }),
+      unfault: ({ sessionID }) => { const observations = faults.get(sessionID) ?? null; faults.delete(sessionID); return { observationsWhileFaulted: observations, faulted: [...faults] }; },
       has: ({ sessionID }) => ({ restricted: registry.has(sessionID), count: registry.count(sessionID) }),
       missing: () => ({ missing: registry.missing() }),
       tools: async ({ location }) => {

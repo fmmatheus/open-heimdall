@@ -366,19 +366,129 @@ by design; `HEAD` and `package.json` were unchanged.
 | `cap` | omits `handoff` always | two correction attempts on the same child, then `paused` with `correction_exhausted` (missing `handoff`); no further correction was started |
 | `interrupt` | omits `handoff` always | parent interrupted during the first correction; child and parent idle, no restriction left (`count: 0`); run paused; next explicit resume after confirmed idle ended `paused` with `correction_ambiguous` |
 
-Late release: the `interrupt` runtime had already confirmed idle and left no
-restriction, so the retained-restriction path was exercised by a harness
-action (owner-matched `restrict` of the paused child using its recorded
-parent, attempt id and run id; this is not something the runtime left
-behind). On the next explicit resume the runtime released exactly that owner
-after fresh idle proof: the first context after resume offered 11 tools, the
-correction attempt that followed was itself restricted (0 tools),
-and the registry ended at `restricted: false, count: 0` with the run `paused`
-at `correction_exhausted` (2 corrections).
+Owner-matched cleanup on resume (first T2 session): the `interrupt` runtime had
+already confirmed idle and released normally, so it left no restriction. The
+harness then re-created a restriction itself (owner-matched `restrict` of the
+paused child using its recorded parent, attempt id and run id). On the next
+explicit resume the runtime released exactly that owner after fresh idle proof:
+the first context after resume offered 11 tools, the correction attempt that
+followed was itself restricted (0 tools), and the registry ended at
+`restricted: false, count: 0` with the run `paused` at `correction_exhausted`
+(2 corrections). This proves owner-matched cleanup on resume. It does **not**
+prove retention after an unconfirmed interrupt; that is covered by the
+follow-up scenario `retained` below.
 
 Post-release check: for each of the three children, a write issued after the
 final release reached all hooks, completed, produced the file, and the
 context offered 11 tools (executor profile) with no restriction.
+
+### Follow-up verification (second T2 session)
+
+Run against the same fixture root and a fresh disposable server (new PIDs, same
+guard wrapper, same stores, same port 47311), with a newly started read-only
+login broker. Every session below was created by this task and was idle before
+the processes were stopped. Harness: `t2-negative-prepare.mjs`,
+`t2-negative.mjs`; evidence under `<root>/evidence/negative-*.json(l)`.
+
+Additional fixture-only settings (none in `src/`, `test/` or the installed
+packages):
+
+- `adr-executor-blocked` and `adr-executor-unresolved`: the shipped
+  `adr-executor` plus one appended rule each (blocked: reply the blocked shape
+  naming a missing owner prerequisite, change nothing; unresolved: implement
+  but do not run the tests and reply `completed` with the test gate
+  `passed:false`). The first attempt used an ADR needing an absent owner file
+  with the shipped executor; the real planner correctly refused to plan it
+  (run paused in phase `planner`), which does not exercise the executor path,
+  so that attempt is not counted.
+- The fixture plugin now injects its own `observe` through the documented
+  `createPlugin({ observe })` option. It wraps the real `createObserver` and
+  changes a result only for a session id the owner marked through the control
+  socket (`fault`), whose snapshot is then reported `active: true`. Unmarked
+  sessions get the real snapshot. Hooks are untouched.
+
+**Failed or unresolved work stays paused, no correction prompt, no
+advancement** (`blocked`, `unresolved`):
+
+| Scenario | Executor reply | Checkpoint after the run | Correction evidence |
+| --- | --- | --- | --- |
+| `blocked` | `blocked` (missing owner prerequisite) | `paused`, phase `executor`, index 0, `results: []`, diagnostic `agent_blocked` | `reportRecovery.corrections: 0`, `attempts: 0`; attempt receipts: planner task + executor task only; the child received 1 user message, not a `Report-only correction`; the child never got a restriction (11 tools every turn) |
+| `unresolved` | `completed`, gates G1 true, G2 **false**, G3 true | `paused`, phase `executor`, index 0, `results: []`, diagnostic `unfinished_work` (G2) | same: 0 corrections, 0 attempts, no correction prompt, never restricted |
+
+In both runs the repository `HEAD` was unchanged and no task result was
+recorded (no advancement). The correction path is only reachable for a
+format-only rejection (`report_format`), as in the `correct` scenario above.
+
+**Retained restriction after an unconfirmed interrupt, then genuine late idle
+proof and release** (`retained`). Fixture-only observation fault, so the
+interrupt of the correction child could not be confirmed while the child was
+genuinely interrupted:
+
+1. During a running `report-correction` attempt the child was marked faulted and
+   the parent was interrupted. The real active map showed the child (and the
+   parent) idle at once; the registry kept the child restricted
+   (`restricted: true, count: 1`).
+2. The original invocation kept polling the faulted observer for its confirmation
+   window (118 faulted observations) and then gave up: checkpoint `paused`,
+   attempt `interrupted`, reason `Could not confirm child termination and empty
+   inbox`. The restriction was still held at that point.
+3. Only then was the fault removed (the child was already idle in the real active
+   map). After a further 3 s with no invocation running, the restriction was
+   still held (`restricted: true, count: 1`): nothing releases it by itself.
+4. A new explicit `resume` released exactly the recorded owner (`parent`, child,
+   correction attempt id, run id) after fresh idle proof: the registry went to
+   `restricted: false, count: 0` and the run paused with `correction_ambiguous`
+   (counter stayed 1, no further correction prompt).
+5. An ordinary `write` sent to the same child afterwards reached every hook,
+   completed, produced the file, and the context offered 11 tools.
+
+A first `retained` run lifted the fault while the original invocation was still
+polling (its in-flight confirmation loop released the restriction within about
+300 ms). That run is kept as `negative-retained.first-run.*` and is **not** used
+as evidence of retention; the second run above waited for the original
+invocation to give up first.
+
+**Receipts and accounting for the `correct` scenario** (existing evidence,
+reused; not re-run). The run directory holds three attempt receipts, kept as
+separate files with these SHA-256 values computed after the fact (no hashes were
+recorded while the run was live, so there are no historical before/after hashes
+to compare):
+
+| File | Purpose | Child | SHA-256 |
+| --- | --- | --- | --- |
+| `attempt-65e0a35f-...json` | executor `task`, reply has no `handoff` | `ses_edbe64c8...` | `135cdc86...c383e` |
+| `attempt-c55850fa-...json` | executor `report-correction`, reply has `handoff` | same child | `30c5822d...5f6b` |
+| `attempt-ff35ad53-...json` | planner `task` | `ses_edbe68b7...` | `34003020...a8ac` |
+| `reply-T1.json` | admitted (corrected) completion report | | `eeebc302...1a29` |
+
+What this proves: the original and the corrected response are preserved
+separately in their own receipts (the first lacks `handoff`, the second has it);
+both ran on the same child session, with model `claude-code/sonnet` and no
+variant on either receipt (the fixture used the default, unspecified variant
+throughout); `state.json` shows `index` advancing 0 to 1 exactly once
+(`status: completed`, one result with `reportCorrections: 1`), and the timeline
+`recovery-correct.jsonl` records executor usage 52,239 at the start of the
+correction and 60,729 at completion (planner 48,498 throughout), i.e. usage
+accumulated across the correction rather than resetting. What it does not prove:
+that the receipt files were byte-identical at the moment they were written (no
+live hashes exist).
+
+Manifest note: the first T2 session's cleanup step overwrote the fixture
+`manifest.json` `t2` object; it was rebuilt from the recorded harness constants
+and on-disk state (flagged `restoredAfterManifestOverwrite`). No evidence file,
+receipt or repository was affected.
+
+Follow-up cleanup: the login broker (PID 43852), the final guard launcher (58201)
+and disposable server (58203) were stopped after `session.active()` returned
+`{}`; earlier follow-up launchers (47848/47850, 51049/51051, 51894/51896,
+54012/54014) were stopped or had exited on their own, each noted in the
+manifest. `pgrep -f heimdall-0005` found nothing afterwards, and port 47311
+refuses connections. Installed provider `query.js` and `proxy.js` hashes are
+unchanged (`a3fc30b4...`, `a993b4d0...`).
+
+Still not proven: nothing is claimed about a retained restriction when the real
+OpenCode interrupt itself fails to terminate a child (the fault only affects what
+the runtime observes), and enablement of `claude-code` remains T3.
 
 ### Cleanup and integrity
 
