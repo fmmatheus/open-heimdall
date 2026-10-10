@@ -49,11 +49,18 @@ export function createNativeSubmissionGate({ configuration, ctx, metadata }: {
       if (!roles().includes(agent)) return undefined;
       try { return await (await resolve()).exposed(sessionID, agent); } catch { return undefined; }
     },
-    async submit(kind, raw, native) {
+    async sealed(sessionID, agent) {
+      if (!roles().includes(agent)) return false;
+      // No identifiable active run means there is no boundary to protect; an unreadable checkpoint of an identified run is sealed.
+      let gate: SubmissionGate;
+      try { gate = await resolve(); } catch { return false; }
+      return await gate.sealed?.(sessionID, agent) ?? false;
+    },
+    async submit(kind, raw, native, boundary) {
       let gate: SubmissionGate;
       try { gate = await resolve(); }
       catch { return { accepted: false, code: 'unauthorized', repairable: false, errors: [], message: SUBMISSION_DENIAL }; }
-      return gate.submit(kind, raw, native);
+      return gate.submit(kind, raw, native, boundary);
     },
   };
 }

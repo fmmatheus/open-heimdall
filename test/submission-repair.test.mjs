@@ -11,6 +11,8 @@ import { checkpointReportInfo, submissionRepairInfo } from '../dist/workflow/rep
 import { createPlugin } from '../dist/opencode/plugin.js';
 import { createReportOnlyRegistry, REPAIR_ONLY_DENIAL, REPORT_ONLY_DENIAL } from '../dist/opencode/report-only.js';
 import { loadConfiguration } from '../dist/config.js';
+import { SEALED_DENIAL } from '../dist/workflow/submission.js';
+import { negativeSignal } from '../dist/workflow/contracts.js';
 
 const RUN = 'run-repair';
 const PLAN_TOOL = 'heimdall_submit_plan';
@@ -440,7 +442,7 @@ test('an unconfirmed termination keeps the repair restriction until a later resu
 test('an implementation call running in parallel with the accepted submission invalidates admission', async t => {
   const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool, child, meta }) => {
     // An edit starts and has not finished when the submission is accepted.
-    f.supervisor.started(child, 'call_edit_1', 'edit');
+    void f.supervisor.begin(child, 'call_edit_1', 'edit');
     assert.equal((await call(submitTool, completed())).accepted, true);
     return SPOKEN;
   }, submitOk(completed())]);
@@ -464,11 +466,13 @@ test('an implementation call running in parallel with the accepted submission in
 test('an implementation call that starts after the accepted submission also invalidates admission', async t => {
   const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool }) => {
     assert.equal((await call(submitTool, completed())).accepted, true);
-    assert.equal(await call('edit', { path: 'x' }).then(() => 'ran'), 'ran');
+    // The sealed boundary denies it outright: the call never runs, and the refused attempt is still recorded as a conflict.
+    await assert.rejects(call('edit', { path: 'x' }), error => error.message === SEALED_DENIAL);
     return SPOKEN;
   }]);
   const result = await f.start();
   assert.equal(result.status, 'paused');
+  assert.match(result.reason, /ran alongside or after the accepted submission/);
   const state = await f.state();
   assert.equal(state.results.length, 0);
   assert.equal(state.submissionRepair.conflict.kind, 'later');
@@ -476,8 +480,13 @@ test('an implementation call that starts after the accepted submission also inva
 
 test('a conflict recorded durably blocks admission of the saved receipt on a later resume too', async t => {
   const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool, child }) => {
-    f.supervisor.started(child, 'call_edit_1', 'edit');
+    void f.supervisor.begin(child, 'call_edit_1', 'edit');
     assert.equal((await call(submitTool, completed())).accepted, true);
+    // The conflict is already durable when the receipt is acknowledged: a crash right here loses nothing.
+    const durable = await f.state();
+    assert.equal(durable.submissionRepair.conflict.kind, 'parallel');
+    assert.equal(durable.submissionRepair.sealed.attemptId, durable.attempt.id);
+    assert.ok(await f.local.readSubmission(RUN, durable.attempt.id, 'executor-result'), 'the conflicted receipt exists');
     throw new Error('simulated crash after the conflicting submission');
   }, submitOk(completed())]);
   assert.equal((await f.start()).status, 'paused');
@@ -485,6 +494,227 @@ test('a conflict recorded durably blocks admission of the saved receipt on a lat
   const resumed = await f.resume('Redo');
   assert.equal(resumed.status, 'completed');
   assert.equal(f.dispatches.length, 3, 'a fresh attempt ran instead of admitting the conflicting receipt');
+});
+
+// --- Negative outcomes take precedence over format repair ---------------------------------------------------------
+
+const unfinishedEvidence = (extra = {}) => ({ gateId: 'G1', passed: false, detail: 'the check failed', ...extra });
+const explicitNegatives = [
+  ['an unpassed gate with the handoff omitted', { status: 'completed', summary: 'Done', evidence: [unfinishedEvidence()] }, 'unfinished_work', ['G1'], ['handoff'], /Unfinished work for T1: gates G1/],
+  ['an unpassed gate with its detail missing', { status: 'completed', summary: 'Done', handoff: 'H', evidence: [{ gateId: 'G1', passed: false }] }, 'unfinished_work', ['G1'], ['detail'], /Unfinished work for T1/],
+  ['an unpassed gate beside an out-of-range gate id', { status: 'completed', summary: 'Done', handoff: 'H', evidence: [unfinishedEvidence(), { gateId: 'G9', passed: true, detail: 'y' }] }, 'unfinished_work', ['G1'], ['gateId'], /Unfinished work for T1/],
+  ['an unpassed gate with an invalid gate id and an unknown field', { status: 'completed', summary: 'Done', handoff: 'H', extra: 1, evidence: [unfinishedEvidence({ gateId: 'one' })] }, 'unfinished_work', [], ['gateId'], /Unfinished work for T1/],
+  ['blocked without a reason', { status: 'blocked' }, 'agent_blocked', [], ['reason'], /the agent reported blocked: Agent blocked without a reason/],
+  ['blocked with a blank reason and an unknown field', { status: 'blocked', reason: '  ', note: 1 }, 'agent_blocked', [], ['reason'], /Agent blocked without a reason/],
+  ['blocked with its reason and an unknown field', { status: 'blocked', reason: 'Need the owner credentials', extra: 1 }, 'agent_blocked', [], [], /the agent reported blocked: Need the owner credentials/],
+];
+
+for (const [name, payload, code, gateIds, fields, reason] of explicitNegatives) {
+  test(`${name} is recorded as the outcome and never offered for repair`, async t => {
+    const answers = [];
+    const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool }) => {
+      answers.push(await call(submitTool, payload));
+      // The attempt accepts nothing further, not even a valid result.
+      await assert.rejects(call(submitTool, completed()), /submission denied/);
+      return SPOKEN;
+    }, submitOk(completed())]);
+    const result = await f.start();
+    assert.equal(result.status, 'paused');
+    assert.match(result.reason, reason);
+    assert.equal(answers[0].accepted, false);
+    assert.equal(answers[0].code, 'negative');
+    assert.equal(answers[0].repairable, false);
+    assert.equal('repairsRemaining' in answers[0], false, 'no repair feedback');
+    assert.match(answers[0].message, /No repair is offered/);
+    const state = await f.state();
+    assert.equal(state.status, 'paused');
+    assert.equal(state.results.length, 0, 'nothing advanced');
+    assert.equal(state.submissionRepair.repairs, 0, 'no repair was consumed');
+    assert.equal(state.submissionRepair.negative.outcome, code === 'agent_blocked' ? 'blocked' : 'unfinished');
+    assert.equal(state.reportRecovery.diagnostic.code, code);
+    assert.deepEqual(f.checks, [], 'repair enforcement was never needed');
+    assert.equal(f.reportOnly.has('ses_child_2'), false);
+    assert.equal(f.dispatches.length, 2, 'no automatic rerun');
+    assert.equal(await f.local.readSubmission(RUN, state.attempt.id, 'executor-result') ?? null, null, 'no receipt, so nothing could be admitted');
+    const info = checkpointReportInfo(state);
+    assert.equal(info.code, code);
+    assert.equal(info.mode, 'paused');
+    assert.deepEqual(info.gateIds, gateIds);
+    assert.deepEqual(info.missingFields, fields, 'field diagnostics are preserved');
+    assert.doesNotMatch(JSON.stringify(info), /check failed|credentials/, 'the projection carries names and ids only');
+  });
+}
+
+test('an explicit negative outcome is followed by an owner resume that dispatches a fresh attempt and starts clean', async t => {
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool }) => {
+    await call(submitTool, { status: 'completed', summary: 'Done', evidence: [unfinishedEvidence()] });
+    return SPOKEN;
+  }, submitOk(completed())]);
+  assert.equal((await f.start()).status, 'paused');
+  const paused = await f.state();
+  assert.equal(paused.submissionRepair.negative.attemptId, paused.attempt.id);
+  assert.equal((await f.resume('Fixed it')).status, 'completed');
+  assert.equal(f.dispatches.length, 3);
+  assert.equal((await f.state()).results.length, 1);
+});
+
+test('a blocked planner payload without a reason is recorded, never repaired and writes nothing', async t => {
+  const answers = [];
+  const f = await fixture(t, [async ({ call, submitTool }) => { answers.push(await call(submitTool, { status: 'blocked' })); return SPOKEN; }]);
+  const result = await f.start();
+  assert.equal(result.status, 'paused');
+  assert.match(result.reason, /Agent blocked without a reason/);
+  assert.equal(answers[0].code, 'negative');
+  assert.equal(answers[0].repairable, false);
+  const state = await f.state();
+  assert.equal(state.phase, 'planner');
+  assert.equal(state.submissionRepair.repairs, 0);
+  assert.equal(state.submissionRepair.negative.outcome, 'blocked');
+  assert.equal(f.dispatches.length, 1);
+  assert.deepEqual(f.checks, []);
+});
+
+test('a negative outcome after a consumed repair keeps that count and still pauses with the real reason', async t => {
+  const answers = [];
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool }) => {
+    answers.push(await call(submitTool, malformed()));
+    answers.push(await call(submitTool, { status: 'completed', summary: 'Done', evidence: [unfinishedEvidence()] }));
+    return SPOKEN;
+  }]);
+  const result = await f.start();
+  assert.equal(result.status, 'paused');
+  assert.equal(answers[0].repairsRemaining, 1);
+  assert.equal(answers[1].code, 'negative');
+  assert.equal('repairsRemaining' in answers[1], false);
+  assert.match(result.reason, /Unfinished work for T1: gates G1/);
+  const state = await f.state();
+  assert.equal(state.submissionRepair.repairs, 1, 'the negative outcome neither consumed nor reset a repair');
+  assert.equal(checkpointReportInfo(state).code, 'unfinished_work');
+  assert.equal(f.reportOnly.has('ses_child_2'), false, 'the restriction ends with the stopped dispatch');
+  assert.equal(f.dispatches.length, 2);
+});
+
+test('a format-only failure with no explicit negative outcome is still repairable', async t => {
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool }) => {
+    const first = await call(submitTool, { status: 'completed', summary: 'Done', evidence: [{ gateId: 'G1', passed: true }] });
+    assert.equal(first.repairable, true);
+    assert.equal(first.code, 'format');
+    assert.equal((await call(submitTool, completed())).accepted, true);
+    return SPOKEN;
+  }]);
+  assert.equal((await f.start()).status, 'completed');
+});
+
+test('negativeSignal reads only explicit outcomes and carries field names, never submitted text', () => {
+  const rule = { kind: 'executor-result', dodCount: 2 };
+  const errors = [{ path: '$.handoff', code: 'missing_field', message: 'x' }, { path: '$.evidence[0].detail', code: 'missing_field', message: 'x' }, { path: '$.secret', code: 'unknown_field', message: 'x' }, { path: '$.runId', code: 'identity_field', message: 'x' }];
+  assert.deepEqual(negativeSignal(rule, { status: 'completed', evidence: [{ gateId: 'G2', passed: false }, { gateId: 'G1', passed: false }, { gateId: 'G3', passed: false }, { gateId: 'bad', passed: false }] }, errors),
+    { outcome: 'unfinished', gateIds: ['G1', 'G2'], fields: ['handoff', 'detail'] });
+  assert.equal(negativeSignal(rule, { status: 'completed', evidence: [{ gateId: 'G1', passed: 'false' }, { gateId: 'G2', passed: 0 }, { gateId: 'G3' }] }, errors), undefined, 'only an explicit boolean false counts');
+  assert.equal(negativeSignal(rule, 'status: blocked', errors), undefined);
+  assert.equal(negativeSignal(rule, { status: 'completed', evidence: 'passed:false' }, errors), undefined);
+  assert.deepEqual(negativeSignal({ kind: 'planner-plan', limit: 3 }, { status: 'blocked', reason: 'Owner needed', evidence: [{ passed: false }] }, []), { outcome: 'blocked', gateIds: [], reason: 'Owner needed', fields: [] });
+  assert.equal(negativeSignal({ kind: 'planner-plan', limit: 3 }, { status: 'planned', evidence: [{ passed: false }] }, []), undefined, 'a plan has no gates to leave unpassed');
+  assert.equal(negativeSignal(rule, { status: 'blocked', reason: { text: 'x' } }, [])?.reason, undefined);
+});
+
+// --- Durable conflict boundary ------------------------------------------------------------------------------
+
+test('the reporting boundary is saved before the receipt exists, and a call meeting it while the receipt is persisted is denied', async t => {
+  const seen = {};
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool, child }) => {
+    const original = f.local.writeSubmission;
+    f.local.writeSubmission = async (...args) => {
+      const durable = (await f.state()).submissionRepair;
+      seen.sealedBeforeReceipt = durable?.sealed?.attemptId;
+      seen.conflictBeforeReceipt = durable?.conflict;
+      // An implementation call that tries to start while the receipt is being persisted meets the sealed boundary.
+      seen.admittedDuringWrite = await f.supervisor.begin(child, 'call_edit_window', 'edit');
+      return original(...args);
+    };
+    seen.response = await call(submitTool, completed());
+    f.local.writeSubmission = original;
+    return SPOKEN;
+  }]);
+  const result = await f.start();
+  assert.equal(seen.response.accepted, true);
+  assert.equal(seen.sealedBeforeReceipt, f.dispatches[1].attemptId);
+  assert.equal(seen.conflictBeforeReceipt, undefined, 'nothing was running when the boundary was sealed');
+  assert.equal(seen.admittedDuringWrite, false);
+  assert.equal(result.status, 'paused', 'the refused call invalidates admission instead of silently changing evidence');
+  assert.match(result.reason, /ran alongside or after the accepted submission/);
+  const state = await f.state();
+  assert.equal(state.submissionRepair.conflict.kind, 'later');
+  assert.equal(state.results.length, 0);
+});
+
+test('work still running when the boundary is sealed is saved as a conflict before the receipt is written', async t => {
+  const seen = {};
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool, child }) => {
+    assert.equal(await f.supervisor.begin(child, 'call_edit_running', 'edit'), true);
+    const original = f.local.writeSubmission;
+    f.local.writeSubmission = async (...args) => { seen.beforeReceipt = (await f.state()).submissionRepair; return original(...args); };
+    await call(submitTool, completed());
+    f.local.writeSubmission = original;
+    return SPOKEN;
+  }]);
+  assert.equal((await f.start()).status, 'paused');
+  assert.equal(seen.beforeReceipt.sealed.attemptId, f.dispatches[1].attemptId);
+  assert.deepEqual(seen.beforeReceipt.conflict, { attemptId: f.dispatches[1].attemptId, kind: 'parallel', tool: 'edit' });
+});
+
+test('work that began before the submission and ended while it was processed still conflicts', async t => {
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool, child }) => {
+    await f.supervisor.begin(child, 'call_edit_short', 'edit');
+    const original = f.local.writeSubmission;
+    f.local.writeSubmission = async (...args) => { f.supervisor.finished(child, 'call_edit_short'); return original(...args); };
+    await call(submitTool, completed());
+    f.local.writeSubmission = original;
+    return SPOKEN;
+  }]);
+  const result = await f.start();
+  assert.equal(result.status, 'paused');
+  assert.equal((await f.state()).submissionRepair.conflict.kind, 'parallel');
+});
+
+test('a boundary that cannot be saved fails closed: nothing is acknowledged and later work is denied', async t => {
+  const seen = {};
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool }) => {
+    f.control.saveFails = true;
+    seen.error = await call(submitTool, completed()).then(() => undefined, error => error);
+    seen.edit = await call('edit', {}).then(() => 'ran', error => error.message);
+    return SPOKEN;
+  }]);
+  await assert.rejects(f.start(), /fenced: stale owner/);
+  f.control.saveFails = false;
+  assert.match(seen.error.message, /fenced: stale owner/);
+  assert.equal(seen.edit, SEALED_DENIAL);
+  assert.equal(await f.local.readSubmission(RUN, f.dispatches[1].attemptId, 'executor-result') ?? null, null, 'no receipt was written for an unsaved boundary');
+});
+
+test('persisted sealed state denies new implementation work when no process-local timeline survives, and only for that attempt', async t => {
+  let sealed;
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool }) => {
+    assert.equal((await call(submitTool, completed())).accepted, true);
+    sealed = await f.state();
+    return SPOKEN;
+  }]);
+  assert.equal((await f.start()).status, 'completed');
+  assert.equal(f.supervisor.tracked('ses_child_2'), false, 'the dispatch ended and its timeline is gone');
+  const stateFile = path.join(f.directory, '.heimdall/state/runs', RUN, 'state.json');
+  const late = { tool: 'edit', sessionID: 'ses_child_2', agent: 'adr-executor', messageID: 'msg_late', id: 'call_late', input: {} };
+  // The checkpoint as a crashed or reloaded host would find it: running, with the attempt sealed.
+  await fs.writeFile(stateFile, JSON.stringify(sealed));
+  await assert.rejects(f.hooks.get('tool.execute.before')(late), error => error.message === SEALED_DENIAL);
+  // A different (fresh) attempt is not sealed.
+  await fs.writeFile(stateFile, JSON.stringify({ ...sealed, attempt: { ...sealed.attempt, id: 'attempt-fresh' } }));
+  await f.hooks.get('tool.execute.before')(late);
+  // An unreadable checkpoint cannot prove the boundary is open.
+  await fs.writeFile(stateFile, '{ not json');
+  await assert.rejects(f.hooks.get('tool.execute.before')(late), error => error.message === SEALED_DENIAL);
+  // A planner or executor session of another role agent never reaches the durable check.
+  await fs.writeFile(stateFile, JSON.stringify(sealed));
+  await f.hooks.get('tool.execute.before')({ ...late, agent: 'adr-orchestrator' });
 });
 
 // --- Legacy and projection ----------------------------------------------------------------------------------

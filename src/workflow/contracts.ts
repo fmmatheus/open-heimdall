@@ -212,6 +212,17 @@ export function contractFieldNames(kind: SubmissionKind): string[] {
   return names;
 }
 
+/** Like `contractFieldNames`, but also the names of fields nested inside list items and objects. */
+function nestedFieldNames(kind: SubmissionKind): Set<string> {
+  const names = new Set<string>();
+  const visit = (spec: Spec): void => {
+    if (spec.type === 'list') visit(spec.item);
+    else if (spec.type === 'object') for (const [name, field] of Object.entries(spec.fields)) { names.add(name); visit(field); }
+  };
+  for (const variant of Object.values(definitions[kind].variants)) for (const [name, field] of Object.entries(variant.fields)) { names.add(name); visit(field); }
+  return names;
+}
+
 function describeSpec(spec: Spec): string {
   switch (spec.type) {
     case 'literal': return JSON.stringify(spec.value);
@@ -368,6 +379,54 @@ export function validateSubmission(rule: SubmissionRule, raw: unknown): Contract
     classification: outcome === 'planned' || outcome === 'completed' ? 'accepted' : 'semantic',
     repairable: false, digest: contractDigest(contract, canonical),
   };
+}
+
+/**
+ * An explicit negative outcome inside a payload that failed format validation. A blocked status or an evidence entry
+ * reported `passed: false` is a semantic result: it is recorded as such and never offered for format repair, however
+ * malformed the rest of the payload is. Only contract field names and gate IDs are carried, plus the agent's own reason.
+ */
+export interface NegativeSignal {
+  outcome: 'blocked' | 'unfinished';
+  /** Valid gate IDs of the entries explicitly reported unpassed. */
+  gateIds: string[];
+  /** The agent's own blocked reason, when it supplied a non-empty string. */
+  reason?: string;
+  /** Contract field names the payload still omitted or malformed. */
+  fields: string[];
+}
+
+const NEGATIVE_GATE_LIMIT = 50;
+const LEAF_FIELD = /\.([A-Za-z][A-Za-z0-9]*)(?:\[\d+\])*$/;
+const ownValue = (target: Record<string, unknown>, key: string): unknown => Object.getOwnPropertyDescriptor(target, key)?.value as unknown;
+
+/**
+ * Looks for an explicit negative outcome in a payload that `validateSubmission` rejected. `errors` are those rejections.
+ * Pure: never mutates `raw`, never turns missing proof into passed proof.
+ */
+export function negativeSignal(rule: SubmissionRule, raw: unknown, errors: readonly ContractError[]): NegativeSignal | undefined {
+  if (!isPlainObject(raw)) return undefined;
+  const known = nestedFieldNames(rule.kind);
+  const fields = [...new Set(errors
+    .filter(error => error.code !== 'unknown_field' && error.code !== 'identity_field' && error.code !== 'too_many_errors')
+    .map(error => LEAF_FIELD.exec(error.path)?.[1])
+    .filter((name): name is string => name !== undefined && known.has(name)))];
+  if (ownValue(raw, 'status') === 'blocked') {
+    const reason = ownValue(raw, 'reason');
+    return { outcome: 'blocked', gateIds: [], ...(typeof reason === 'string' && reason.trim() ? { reason } : {}), fields };
+  }
+  if (rule.kind !== 'executor-result') return undefined;
+  const evidence = ownValue(raw, 'evidence');
+  if (!Array.isArray(evidence)) return undefined;
+  const failed = evidence.filter(isPlainObject).filter(entry => ownValue(entry, 'passed') === false);
+  if (!failed.length) return undefined;
+  const numbers = failed.map(entry => {
+    const id = ownValue(entry, 'gateId');
+    const match = typeof id === 'string' ? GATE_ID_PATTERN.exec(id) : null;
+    return match ? Number(match[1]) : 0;
+  }).filter(number => number >= 1 && number <= rule.dodCount);
+  const gateIds = [...new Set(numbers)].sort((a, b) => a - b).slice(0, NEGATIVE_GATE_LIMIT).map(number => 'G' + number);
+  return { outcome: 'unfinished', gateIds, fields };
 }
 
 export const validatePlannerPlan = (raw: unknown, context: { limit: number }) => validateSubmission({ kind: 'planner-plan', ...context }, raw);

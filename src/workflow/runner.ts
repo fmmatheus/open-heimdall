@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { chooseExecutor, authExpired, executorCandidates } from '../policy/quota.js';
 
-import { classifyError, classifyResult, pauseReportRecovery, reportPauseReason, submissionPauseReason, submissionRepairPauseReason } from './report.js';
+import { classifyError, classifyResult, pauseReportRecovery, REPORT_FIELDS, reportPauseReason, submissionPauseReason, submissionRepairPauseReason } from './report.js';
 import { MAX_SUBMISSION_REPAIRS } from './submission-repair.js';
 import type { ConflictInfo, RepairDecision, RepairHandler, RepairRequest } from './submission-repair.js';
 import { isTaskId, SUBMISSION_PROTOCOL, SUBMISSION_TOOL_IDS } from './contracts.js';
@@ -599,6 +599,13 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
             state.attempt = { id: attemptID, phase: state.phase, index: state.index, child: state.child, status: 'launching', startedAt: Date.now(), model: chosen, ...(variant ? { variant } : {}) };
             // Structured runs persist the submission authority with the attempt, in the same save, before any prompt is sent.
             if (state.protocol) state.submissionBinding = openSubmissionBinding(state, (state.submissionBinding?.dispatch ?? 0) + 1);
+            // The previous attempt's sealed boundary and reported outcome belong to it alone. The repair counter and refusals persist.
+            if (state.submissionRepair?.sealed || state.submissionRepair?.negative) {
+              const carried = { ...state.submissionRepair };
+              delete carried.sealed;
+              delete carried.negative;
+              state.submissionRepair = carried;
+            }
             await save(state);
           }
           const attempt = state.attempt!;
@@ -657,8 +664,9 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
           };
           let unregisterRepair: (() => void) | undefined;
           let conflicting: ConflictInfo | undefined;
-          let conflictSave: Promise<void> | undefined;
           let repairTail: Promise<unknown> = Promise.resolve();
+          /** The dispatch cannot end before a boundary, conflict or outcome save that has started has settled. */
+          const heldUntilSaved = <T>(saved: Promise<T>): Promise<T> => { repairTail = repairTail.then(() => saved).catch(() => {}); return saved; };
           const repairCode: Record<SubmissionRepairRefusal, 'submission_repair_exhausted' | 'submission_unsupported' | 'auth_or_quota' | 'submission_refused'> = {
             exhausted: 'submission_repair_exhausted', unsupported: 'submission_unsupported', auth_or_quota: 'auth_or_quota', unavailable: 'submission_refused',
           };
@@ -724,7 +732,8 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
             state.submissionRepair = next;
             try { await save(state); }
             catch (error) {
-              state.submissionRepair = previous; // A stale owner never grants a repair.
+              // A stale owner never grants a repair. Only the counter rolls back: a boundary sealed meanwhile stays sealed.
+              state.submissionRepair = state.submissionRepair && state.submissionRepair !== next ? { ...state.submissionRepair, repairs: record.repairs, attempts: record.attempts } : previous;
               if (taken) await releaseCorrection().catch(() => {});
               return refuse('unavailable', errorMessage(error));
             }
@@ -736,10 +745,29 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
               repairTail = pending.catch(() => {});
               return pending;
             },
+            negative(report) {
+              // The reported outcome IS the result: record it, keep its field diagnostics, pause with the real reason. No repair is
+              // counted or offered, nothing is rerun, and the attempt accepts nothing further.
+              const blocked = report.outcome === 'blocked';
+              const fields = report.fields.filter(field => (REPORT_FIELDS as readonly string[]).includes(field));
+              state.submissionRepair = { ...repairRecord(), negative: { attemptId: attempt.id, outcome: report.outcome, gateIds: report.gateIds, fields, ...(report.reason === undefined ? {} : { reason: report.reason }) } };
+              const stop = new Error(blocked ? report.reason ?? 'Agent blocked without a reason' : 'Unfinished work: the submission reported unresolved gates');
+              if (!planning) rejection = blocked ? { code: 'agent_blocked', ...(fields.length ? { missingFields: fields } : {}) } : { code: 'unfinished_work', ...(report.gateIds.length ? { gateIds: report.gateIds } : {}), ...(fields.length ? { missingFields: fields } : {}) };
+              const saved = heldUntilSaved(save(state));
+              guardError ??= stop;
+              controller.abort(stop); // Stops the dispatch even when the save failed: it is never silently dropped.
+              return saved;
+            },
+            seal(info) {
+              // Saved before the receipt is acknowledged. Work still running is recorded in the same save.
+              state.submissionRepair = { ...repairRecord(), sealed: { attemptId: attempt.id }, ...(info ? { conflict: { attemptId: attempt.id, kind: info.kind, tool: info.tool } } : {}) };
+              if (info) conflicting ??= info;
+              return heldUntilSaved(save(state)).catch((error: unknown) => { guardError ??= error; controller.abort(error); throw error; }); // Fail closed.
+            },
             conflict(info) {
               conflicting ??= info;
               state.submissionRepair = { ...repairRecord(), conflict: { attemptId: attempt.id, kind: info.kind, tool: info.tool } };
-              conflictSave = save(state).catch(() => {});
+              return heldUntilSaved(save(state));
             },
           };
           const onStarted = async (id: string) => {
@@ -829,8 +857,6 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
           }
           if (structured) {
             // Implementation work next to or after the accepted submission means its evidence may have changed after the receipt.
-            if (state.child && supervisor) { const seen = supervisor.conflict(state.child); if (seen && !conflicting) repairHandler.conflict(seen); }
-            await conflictSave;
             if (conflicting) {
               attempt.status = 'rejected';
               const reason = submissionRepairPauseReason('conflicting_work', planning ? 'the plan' : task.id, conflicting.kind === 'parallel' ? 'a tool call ran in parallel with the submission' : 'a tool call started after the submission');

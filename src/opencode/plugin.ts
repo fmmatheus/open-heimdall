@@ -16,7 +16,7 @@ import {
   submissionToolDescription,
 } from '../workflow/contracts.js';
 import type { SubmissionKind } from '../workflow/contracts.js';
-import { SUBMISSION_DENIAL } from '../workflow/submission.js';
+import { SEALED_DENIAL, SUBMISSION_DENIAL } from '../workflow/submission.js';
 import { createDispatchPromptSync } from '../workflow/prompt-sync.js';
 import { createSubmissionSupervisor } from '../workflow/submission-repair.js';
 import type { SubmissionSupervisor } from '../workflow/submission-repair.js';
@@ -82,12 +82,18 @@ export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
             // Identity comes only from the native call context, never from the model-supplied value.
             const native = { sessionID: context.sessionID, agent: context.agent, messageID: context.messageID, id: context.id };
             if (!await permitted(kind, native.sessionID, native.agent)) throw new Error(SUBMISSION_DENIAL);
-            supervisor.submitting(native.sessionID, native.id);
-            let accepted = false;
+            // A blocked or unpassed outcome already closed this attempt: nothing further is accepted from it.
+            if (!supervisor.submitting(native.sessionID, native.id)) throw new Error(SUBMISSION_DENIAL);
             try {
-              const response = await submissions.submit(kind, value, native);
+              // The boundary seals durably before any receipt is acknowledged; a seal that cannot be saved throws, so nothing is acknowledged.
+              const response = await submissions.submit(kind, value, native, { seal: () => supervisor.seal(native.sessionID) });
               if (!response.accepted && response.code === 'unauthorized') throw new Error(response.message);
-              accepted = response.accepted;
+              if (!response.accepted && response.code === 'negative') {
+                // Explicit blocked or unpassed work is the outcome. It is recorded durably and pauses the run; it is never repaired.
+                await supervisor.negative(native.sessionID, { kind, outcome: response.outcome, gateIds: response.gateIds, fields: response.fields, ...(response.reason === undefined ? {} : { reason: response.reason }) });
+                const answer = { accepted: false as const, code: 'negative' as const, repairable: false as const, outcome: response.outcome, errors: response.errors, message: 'Your ' + response.outcome + ' outcome was recorded as reported. No repair is offered and nothing will be rerun automatically. Stop now; do not call any other tool.' };
+                return { output: answer, content: JSON.stringify(answer) };
+              }
               if (response.accepted || response.code !== 'format') return { output: response, content: JSON.stringify(response) };
               // A format rejection spends one bounded repair. The restriction and the saved counter come BEFORE this feedback.
               const decision = await supervisor.reject(native.sessionID, { kind, errors: response.errors });
@@ -95,7 +101,7 @@ export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
                 ? { ...response, repairsRemaining: decision.remaining, message: response.message + (kind === 'planner-plan' ? ' Only this tool is available now and file writes are disabled: resubmit the whole plan inline as {"status":"planned","planMarkdown":...,"factSheet":...,"tasks":[...]} or the blocked payload.' : ' Only this tool is available now: correct the payload and call it again.') + ' Repairs remaining: ' + decision.remaining + '.' }
                 : { accepted: false as const, code: 'format' as const, repairable: false as const, errors: response.errors, message: 'Submission rejected and no repair is available (' + decision.message + '). Stop now; do not call any other tool.' };
               return { output: answer, content: JSON.stringify(answer) };
-            } finally { supervisor.submitted(native.sessionID, native.id, accepted); }
+            } finally { supervisor.submitted(native.sessionID, native.id); }
           },
         });
         editor.add({
@@ -121,6 +127,7 @@ export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
         });
       }));
       const submissionIds = Object.values(SUBMISSION_TOOL_IDS);
+      const roleAgents = [configuration.settings.plannerAgent, configuration.settings.executorAgent];
       registrations.push(await ctx.tool.hook('execute.before', async input => {
         if (submissionKindOfTool(input.tool)) reached.add(input.id);
         // Report-only keeps at most the one exact submission tool id: anything else (lookalikes, MCP, delegation, nested) is denied here.
@@ -128,8 +135,13 @@ export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
         const kind = submissionKindOfTool(input.tool);
         if (kind) { if (!await permitted(kind, input.sessionID, input.agent)) throw new Error(SUBMISSION_DENIAL); }
         else if (isLookalikeSubmissionTool(input.tool)) throw new Error(SUBMISSION_DENIAL);
-        await guards.get(input.sessionID)?.(); // Usage and quota guards also run for submission calls.
-        if (!kind) supervisor.started(input.sessionID, input.id, input.tool);
+        // No process-local timeline (a plugin restart, say): the persisted sealed boundary still denies new implementation work.
+        if (!kind && !supervisor.tracked(input.sessionID) && roleAgents.includes(input.agent) && await submissions.sealed?.(input.sessionID, input.agent)) throw new Error(SEALED_DENIAL);
+        // Registered before anything awaits, so a boundary sealed while the guards run still sees this call. A sealed one is denied.
+        const admitted = kind ? true : await supervisor.begin(input.sessionID, input.id, input.tool);
+        if (!admitted) throw new Error(SEALED_DENIAL);
+        try { await guards.get(input.sessionID)?.(); } // Usage and quota guards also run for submission calls.
+        catch (error) { if (!kind) supervisor.finished(input.sessionID, input.id); throw error; }
       }));
       registrations.push(await ctx.tool.hook('execute.after', async event => {
         supervisor.finished(event.sessionID, event.id);

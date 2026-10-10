@@ -3,7 +3,7 @@ import type { ExecutorOutcome, ExecutorResult, PlannedTask, PlannerOutcome, Plan
 import { planDigest, loadPlanSnapshot } from './plan-snapshot.js';
 import { runtimeIdentity } from './runtime-identity.js';
 import { sameSubmission, submissionKindForPhase } from './submission-store.js';
-import { SUBMISSION_DENIAL } from './submission.js';
+import { rejectedSubmission, SUBMISSION_DENIAL } from './submission.js';
 import type { NativeCallContext, SubmissionGate, SubmissionResponse } from './submission.js';
 import type { RunnerPersistence, RunState, RuntimeIdentity, SubmissionBinding, SubmissionReceipt } from './types.js';
 
@@ -49,6 +49,8 @@ export function authenticateSubmissionCaller(state: RunState | null | undefined,
   if (attempt.status === 'interrupted' || attempt.status === 'rejected') return undefined;
   // A refused repair ends this attempt's right to submit, even if a call races the pause.
   if (state.submissionRepair?.refused?.attemptId === attempt.id) return undefined;
+  // So does a recorded blocked or unpassed outcome: it is the attempt's result and nothing may replace it.
+  if (state.submissionRepair?.negative?.attemptId === attempt.id) return undefined;
   if (!binding.prompt) return undefined; // No host-recorded dispatch prompt: nothing can be proven current.
   if (binding.kind !== submissionKindForPhase(binding.phase) || !binding.child || binding.child !== state.child || binding.child !== attempt.child || sessionID !== binding.child) return undefined;
   const role = binding.phase === 'planner' ? state.settings.plannerAgent : state.settings.executorAgent;
@@ -67,7 +69,15 @@ export function createDurableSubmissionGate(options: DurableSubmissionGateOption
         return authenticateSubmissionCaller(state, sessionID, agent)?.kind;
       } catch { return undefined; } // Fail closed: an unreadable checkpoint exposes nothing.
     },
-    async submit(kind, raw, native: NativeCallContext) {
+    async sealed(sessionID) {
+      let state: RunState | null | undefined;
+      try { state = await persistence.load(runId); } catch { return true; } // Fail closed: an unreadable checkpoint cannot prove the boundary is open.
+      const attempt = state?.attempt;
+      const sealed = state?.submissionRepair?.sealed;
+      if (!state || state.protocol !== SUBMISSION_PROTOCOL || state.status !== 'running' || !attempt || !sealed) return false;
+      return sealed.attemptId === attempt.id && state.child === sessionID;
+    },
+    async submit(kind, raw, native: NativeCallContext, boundary) {
       const state = await persistence.load(runId);
       const binding = authenticateSubmissionCaller(state, native.sessionID, native.agent);
       if (!state || !binding || binding.kind !== kind) return unauthorized();
@@ -85,7 +95,7 @@ export function createDurableSubmissionGate(options: DurableSubmissionGateOption
       const stored = await persistence.readSubmission(runId, binding.attemptId, kind);
       if (stored) return sameSubmission(stored, { ...stored, rawPayload }) ? acknowledge(stored) : conflict();
       const result = validateSubmission(rule, rawPayload);
-      if (!result.ok) return { accepted: false, code: 'format', repairable: true, errors: result.errors, message: 'Submission rejected: ' + result.errors.map(error => `${error.path} ${error.message}`).join('; ') };
+      if (!result.ok) return rejectedSubmission(rule, rawPayload, result.errors);
       let canonical: unknown;
       if (kind === 'planner-plan') {
         const plan = result.value as PlannerPlan;
@@ -114,6 +124,9 @@ export function createDurableSubmissionGate(options: DurableSubmissionGateOption
         child: binding.child!, origin: binding.prompt!, caller: { sessionID: native.sessionID, agent: native.agent, messageID: native.messageID, callId: native.id },
         runtime: runtime(), outcome: result.outcome, rawPayload, canonical, digest: contractDigest(result.contract, canonical), acceptedAt: now(),
       };
+      // Close the reporting boundary durably first. Work still running is recorded in the same save, so a crash after the
+      // receipt can never leave evidence that changed after it unmarked. A failed seal throws: nothing is acknowledged.
+      await boundary?.seal();
       // Durable first: a persistence failure throws here, so no acknowledgement can be returned for an unsaved receipt.
       return acknowledge(await persistence.writeSubmission(runId, receipt));
     },

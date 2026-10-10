@@ -5,7 +5,7 @@
  */
 
 /** Fixed names a diagnostic may carry. Anything else never reaches a checkpoint, event or UI. */
-export const REPORT_FIELDS = ['taskId', 'summary', 'handoff', 'evidence', 'gateId', 'detail', 'passed'] as const;
+export const REPORT_FIELDS = ['taskId', 'summary', 'handoff', 'evidence', 'gateId', 'detail', 'passed', 'reason'] as const;
 
 export const REPORT_CODES = [
   'report_format', 'unfinished_work', 'agent_blocked', 'identity_mismatch', 'ambiguous_output',
@@ -68,14 +68,18 @@ export function submissionRepairInfo(value: unknown): ReportInfo | null {
   const used = typeof value.repairs === 'number' && Number.isInteger(value.repairs) ? value.repairs : 0;
   const refused = isRecord(value.refused) && typeof value.refused.code === 'string' ? REPAIR_REFUSALS[value.refused.code] : undefined;
   const conflicting = isRecord(value.conflict);
+  // An explicit blocked or unpassed outcome is the real failure and wins: it carries its own allowlisted diagnostics.
+  const negative = isRecord(value.negative) && (value.negative.outcome === 'blocked' || value.negative.outcome === 'unfinished') ? value.negative : undefined;
+  const fields = negative && Array.isArray(negative.fields) ? negative.fields : [];
+  const gates = negative && Array.isArray(negative.gateIds) ? negative.gateIds : [];
   return {
     kind: 'submission',
-    mode: refused || conflicting ? 'paused' : used > 0 ? 'correcting' : 'idle',
+    mode: negative || refused || conflicting ? 'paused' : used > 0 ? 'correcting' : 'idle',
     corrections: Math.max(0, Math.min(SUBMISSION_REPAIR_LIMIT, used)),
     limit: SUBMISSION_REPAIR_LIMIT,
-    code: conflicting ? 'conflicting_work' : refused ?? null,
-    missingFields: [],
-    gateIds: [],
+    code: negative ? (negative.outcome === 'blocked' ? 'agent_blocked' : 'unfinished_work') : conflicting ? 'conflicting_work' : refused ?? null,
+    missingFields: REPORT_FIELDS.filter(field => fields.includes(field)),
+    gateIds: [...new Set(gates.filter((id): id is string => typeof id === 'string' && GATE_ID.test(id)))].slice(0, LIST_LIMIT),
   };
 }
 

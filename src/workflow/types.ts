@@ -215,6 +215,17 @@ export interface SubmissionRepairRecord {
   refused?: { attemptId: string; code: SubmissionRepairRefusal; reason: string };
   /** Set when an implementation call ran in parallel with, or after, the accepted submission of this attempt. */
   conflict?: { attemptId: string; kind: 'parallel' | 'later'; tool: string };
+  /**
+   * Set, and saved BEFORE any receipt of the attempt is acknowledged, once the attempt began reporting. From then on the
+   * attempt admits no new implementation work, even after a restart that lost every process-local timeline. A conflict
+   * found when sealing is saved in the same checkpoint.
+   */
+  sealed?: { attemptId: string };
+  /**
+   * An explicit blocked or unpassed outcome that arrived inside a malformed payload. It is recorded as the outcome, never
+   * offered for repair, and the attempt then accepts nothing further. Names and gate IDs only, besides the agent's own reason.
+   */
+  negative?: { attemptId: string; outcome: 'blocked' | 'unfinished'; gateIds: string[]; fields: string[]; reason?: string };
 }
 
 export interface ProgressUpdate {
