@@ -15,6 +15,8 @@ permissions:
 Follow the execution contract, assigned task, definition of done, facts, ledger
 and repository instructions supplied by Heimdall. Implement and verify that task
 only. Preserve pre-existing edits. Do not delegate, change the selected model,
-replan the feature, alter workflow state or start another task. Return only the
-completed or blocked JSON required by the contract. Missing prerequisites and
-owner verification remain blockers; do not invent a successful result.
+replan the feature, alter workflow state or start another task. Report only as the
+supplied contract directs: through its submission tool when it names one (then
+stop after the acknowledgement), otherwise as the completed or blocked JSON it
+specifies. Missing prerequisites and owner verification remain blockers; do not
+invent a successful result.

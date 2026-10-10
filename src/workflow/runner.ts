@@ -4,12 +4,12 @@ import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { chooseExecutor, authExpired, executorCandidates } from '../policy/quota.js';
 
-import { classifyError, classifyResult, pauseReportRecovery, reportPauseReason } from './report.js';
-import { isTaskId } from './contracts.js';
-import { closeSubmissionBinding, openSubmissionBinding } from './submission-store.js';
+import { classifyError, classifyResult, pauseReportRecovery, reportPauseReason, submissionPauseReason } from './report.js';
+import { isTaskId, SUBMISSION_PROTOCOL, SUBMISSION_TOOL_IDS } from './contracts.js';
+import { closeSubmissionBinding, createLocalSubmissionStore, openSubmissionBinding, recordDispatchPrompt, submissionKindForPhase } from './submission-store.js';
 import type {
   CompletionResult, PlanResult, ProgressUpdate, ReportDiagnostic, ReportOnlyCheck, RunArguments, RunState,
-  RunnerContext, RunnerOptions, RunnerSettings, WorkflowResult, WorkflowTask,
+  RunnerContext, RunnerOptions, RunnerSettings, SubmissionReceipt, WorkflowResult, WorkflowTask,
 } from './types.js';
 export type { RunnerBackend, RunnerContext, RunnerOptions, RunnerSettings } from './types.js';
 export { classifyError, classifyResult, reportPauseReason } from './report.js';
@@ -146,6 +146,40 @@ export function executorContract(task: WorkflowTask): string {
   ].join('\n');
 }
 
+/**
+ * Final contract of a structured executor prompt. The result goes through the owner-bound tool; the final chat text is
+ * human-readable only and is never parsed. The host supplies run, task, attempt and gate text, so none of them appears.
+ */
+export function structuredExecutorContract(task: WorkflowTask): string {
+  const tool = SUBMISSION_TOOL_IDS['executor-result'];
+  return [
+    '=== Executor submission contract for ' + task.id + ' (authoritative; overrides any earlier example) ===',
+    'Submit your result by calling the tool ' + tool + ' exactly once. Your final chat text is never parsed and cannot complete the task: a JSON reply without this tool call is a missing submission.',
+    'Completed payload: {"status":"completed","summary":"<what changed>","handoff":"<what the next task must know>","evidence":[{"gateId":"G1","passed":true,"detail":"<actual check, result and evidence path>"}]}',
+    'Include exactly one evidence entry for every gate below. Do not include taskId, gate text or any run, attempt, session or owner identity: the host supplies them.',
+    'Gates:',
+    ...task.dod.map((gate, i) => 'G' + (i + 1) + ' = ' + gate),
+    'Blocked payload: {"status":"blocked","reason":"<specific blocker and owner steps>"}',
+    'Rules: evidence must already exist before you submit; report results truthfully; set passed=true only for a gate you fully proved; if any gate is unresolved, submit the blocked payload. A call the tool rejects records nothing.',
+    'After the tool acknowledges the submission, stop: reply with one short sentence and call no other tool.',
+  ].join('\n');
+}
+
+/** Final contract of a structured planner prompt: artifacts stay in the planning directory and only a reference is submitted. */
+export function structuredPlannerContract(): string {
+  const tool = SUBMISSION_TOOL_IDS['planner-plan'];
+  return [
+    '=== Planner submission contract (authoritative; overrides any earlier example) ===',
+    'Write plan.md, facts.md and tasks.md in the planning artifact directory named above, then call the tool ' + tool + ' exactly once with {"status":"planned","artifacts":true}. The host reads and validates those files itself and snapshots them when it accepts the plan.',
+    'If the plan cannot be made responsibly, call the tool with {"status":"blocked","reason":"<specific decision or prerequisite>"}.',
+    'Your final chat text is never parsed and cannot admit a plan. Do not put the plan, fact sheet or tasks in the tool payload or the chat reply.',
+    'After the tool acknowledges the submission, stop: reply with one short sentence and call no other tool.',
+  ].join('\n');
+}
+
+/** Delay between host observations of the dispatch prompt. The binding is not authoritative until it is recorded. */
+const PROMPT_POLL_MS = 50;
+
 /** Automatic report-only corrections allowed per task. The counter lives in the checkpoint and only advancement resets it. */
 export const MAX_REPORT_CORRECTIONS = 2;
 
@@ -190,6 +224,9 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
     return state;
   };
   const writeReceipt = async (id: string, receipt: NonNullable<RunState['attempt']> & { response: unknown }) => persistence ? persistence.writeReceipt(id, receipt) : atomicJSON(path.join(root, 'runs', id, 'attempt-' + receipt.id + '.json'), receipt);
+  // Typed submissions and native outcomes of a structured run: the authoritative persistence, or the atomic local files.
+  const localSubmissions = createLocalSubmissionStore(root);
+  const submissionStore = persistence ?? localSubmissions;
   const ledger = (state: RunState) => fs.writeFile(path.join(root, 'runs', state.id, 'ledger.md'), '# Task handoffs\n\n' + state.results.map(r => '## ' + r.taskId + '\n' + r.summary + '\n\n' + r.handoff + '\n\n' + r.evidence.map(e => '- ' + e.gate + ': ' + e.detail).join('\n')).join('\n\n'));
   return async function run(args: RunArguments, context: RunnerContext): Promise<string> {
     if (args.action === 'status') {
@@ -258,6 +295,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
         if (persistence) await fs.mkdir(path.join(root, 'runs', state.id), { recursive: true });
         if (state.parent !== context.sessionID) throw new Error('Resume must run from the original parent session');
         if (state.status === 'completed') return JSON.stringify(state);
+        if (state.protocol !== undefined && state.protocol !== SUBMISSION_PROTOCOL) throw new Error('This run uses an unsupported protocol: ' + String(state.protocol));
         if (state.attempt?.status === 'launching' && !state.child) throw new Error('Child creation was interrupted before its ID was recorded. Reconcile linked sessions manually before resuming; a duplicate child will not be created');
         if (state.child) await backend.assertIdle(state.child, state.parent, contextSignal(context));
         if (git(['branch', '--show-current']).trim() !== state.branch) throw new Error('Branch changed since this run started');
@@ -358,6 +396,93 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
         rejection = undefined;
         return true;
       };
+      /** Commits advancement atomically in one checkpoint. A crash before this save replays the saved receipt only. */
+      const advance = async (planning: boolean, admittedPlan: PlanResult | undefined, admittedCompletion: CompletionResult | undefined): Promise<void> => {
+        const next = { ...state, child: null };
+        delete next.attempt;
+        delete next.resolution;
+        delete next.taskStartedAt;
+        delete next.taskElapsedMs;
+        delete next.reportRecovery; // Real advancement only: restarts, new attempts and resumes keep the record.
+        if (next.submissionBinding) next.submissionBinding = closeSubmissionBinding(next.submissionBinding);
+        if (planning) { next.tasks = admittedPlan!.tasks; next.phase = 'executor'; }
+        else {
+          next.results = [...state.results, { ...admittedCompletion!, sessionId: state.child, model: state.attempt!.model, quotaSelection: state.selection, ...(state.reportRecovery?.corrections ? { reportCorrections: state.reportRecovery.corrections } : {}) }];
+          next.index++;
+        }
+        await save(next);
+        state = next;
+        await ledger(state);
+      };
+      /** The native turn result of a structured attempt, kept apart from the typed submission. Idempotent per attempt. */
+      const captureOutcome = async (response: unknown): Promise<void> => {
+        const attempt = state.attempt!;
+        if (!state.child || await submissionStore.readNativeOutcome(state.id, attempt.id)) return;
+        await submissionStore.writeNativeOutcome(state.id, { outcomeVersion: 1, runId: state.id, phase: attempt.phase, index: attempt.index, attemptId: attempt.id, child: state.child, response, capturedAt: Date.now() });
+      };
+      /**
+       * Applies the durable typed submission of a structured attempt, or pauses. Nothing is parsed from chat text. A
+       * plan or result is admitted only when the receipt matches the attempt AND the child is freshly confirmed idle
+       * with a successful final stop and empty inbox, forms and permissions. Blocked and unfinished submissions are
+       * semantic pauses and never invite a repair.
+       */
+      const admitSubmission = async (planning: boolean, task: WorkflowTask | undefined, stored: SubmissionReceipt): Promise<void> => {
+        const attempt = state.attempt!;
+        if (stored.protocol !== SUBMISSION_PROTOCOL || stored.runId !== state.id || stored.parent !== state.parent || stored.attemptId !== attempt.id || stored.phase !== state.phase
+          || stored.index !== state.index || stored.kind !== submissionKindForPhase(state.phase) || stored.child !== state.child || (task ? stored.taskId !== task.id : stored.taskId !== undefined)) {
+          throw new Error('Saved submission does not match the current attempt');
+        }
+        const canonical: Record<string, unknown> = isRecord(stored.canonical) ? stored.canonical : {};
+        if (stored.outcome === 'blocked') {
+          attempt.status = 'rejected';
+          if (task) rejection = { code: 'agent_blocked' };
+          throw new Error(nonempty(canonical.reason) ? canonical.reason : 'Agent blocked without a reason');
+        }
+        if (stored.outcome === 'unfinished') {
+          attempt.status = 'rejected';
+          const gateIds = (Array.isArray(canonical.evidence) ? canonical.evidence : []).filter(isRecord).filter(entry => entry.passed !== true).map(entry => entry.gateId).filter((id): id is string => typeof id === 'string').slice(0, 50);
+          if (task) rejection = { code: 'unfinished_work', ...(gateIds.length ? { gateIds } : {}) };
+          throw new Error('Unfinished work: the submission reported unresolved gates');
+        }
+        if (stored.outcome !== (planning ? 'planned' : 'completed')) throw new Error('Saved submission has an unknown outcome');
+        // Receipt AND confirmed native stop. Anything short of that pauses with the receipt kept for the next resume.
+        try {
+          if (!state.child) throw new Error('The submission has no recorded child session');
+          await backend.assertIdle(state.child, state.parent, contextSignal(context));
+          const finalText = await backend.recoverResponse(state.child, state.parent, attempt);
+          if (finalText === undefined) throw new Error('Native child did not finish successfully');
+          await captureOutcome(finalText);
+        } catch (error) {
+          const diagnostic = classifyError(error);
+          if (diagnostic.code === 'auth_or_quota') { if (task) rejection = diagnostic; throw error; }
+          if (task) { rejection = { code: 'submission_unconfirmed' }; throw error; }
+          throw new Error(submissionPauseReason('submission_unconfirmed', 'the plan', errorMessage(error)));
+        }
+        await checkBudget();
+        let admittedPlan: PlanResult | undefined;
+        let admittedCompletion: CompletionResult | undefined;
+        try {
+          if (planning) {
+            // The tasks come from the immutable snapshot the host captured when it accepted the plan, never from the files now.
+            const plan = { status: 'planned', planMarkdown: canonical.planMarkdown, factSheet: canonical.factSheet, tasks: structuredClone(canonical.tasks) } as WorkflowResult;
+            validatePlan(plan, cfg.maxTasks);
+            await atomicJSON(path.join(runDir, 'reply-plan.json'), plan);
+            await fs.writeFile(path.join(runDir, 'plan.md'), plan.planMarkdown);
+            await fs.writeFile(path.join(runDir, 'facts.md'), plan.factSheet);
+            await atomicJSON(path.join(runDir, 'tasks.json'), plan.tasks);
+            admittedPlan = plan;
+          } else {
+            const completion = structuredClone(canonical) as WorkflowResult;
+            validateCompletion(completion, task!, { requireGateIds: true });
+            await atomicJSON(path.join(runDir, 'reply-' + task!.id + '.json'), completion);
+            admittedCompletion = completion;
+          }
+        } catch (error) {
+          attempt.status = 'rejected';
+          throw error;
+        }
+        await advance(planning, admittedPlan, admittedCompletion);
+      };
       await ledger(state);
       while (true) {
         if (contextSignal(context)?.aborted) throw new Error('Run cancelled');
@@ -373,11 +498,19 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
         // A receipt saved before a crash is applied without submitting the same task again.
         let result!: WorkflowResult;
         let receipt: (NonNullable<RunState['attempt']> & { response: unknown }) | undefined;
-        const recheckRejected = args.action === 'resume' && !args.recovery && state.attempt?.status === 'rejected';
+        const structured = state.protocol === SUBMISSION_PROTOCOL;
+        const recheckRejected = !structured && args.action === 'resume' && !args.recovery && state.attempt?.status === 'rejected';
         // A correction persisted by THIS invocation is dispatched below. Any other correction without a receipt may already have run.
         const dispatchingCorrection = pendingCorrection !== undefined && state.attempt?.id === pendingCorrection;
         pendingCorrection = undefined;
-        if (state.attempt && (state.attempt.status !== 'rejected' || recheckRejected)) {
+        if (structured && state.attempt && state.attempt.status !== 'rejected') {
+          if (state.attempt.phase !== state.phase || state.attempt.index !== state.index || state.attempt.child !== state.child) throw new Error('Attempt does not match the current task');
+          // A saved typed submission is applied without redispatching: admission needs the receipt AND a freshly confirmed native stop.
+          const stored = await submissionStore.readSubmission(state.id, state.attempt.id, submissionKindForPhase(state.phase));
+          if (stored) { await admitSubmission(planning, task, stored); continue; }
+          // No submission was recorded for the interrupted attempt: only an explicit resume reaches here, and it dispatches a fresh attempt.
+        }
+        if (!structured && state.attempt && (state.attempt.status !== 'rejected' || recheckRejected)) {
           if (state.attempt.phase !== state.phase || state.attempt.index !== state.index || state.attempt.child !== state.child) throw new Error('Attempt does not match the current task');
           const receiptPath = path.join(runDir, 'attempt-' + state.attempt.id + '.json');
           try { receipt = persistence ? await persistence.readReceipt(state.id, state.attempt.id) ?? undefined : await readJSON<NonNullable<typeof receipt>>(receiptPath); } catch (error) { if (!isRecord(error) || error.code !== 'ENOENT') throw error; }
@@ -424,6 +557,8 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
         }
         if (!receipt) {
           if (!tokenLimitsDisabled && Object.values(usage).reduce((a, b) => a + b, 0) >= maxRunTokens) throw new Error('ADR token budget reached');
+          // A structured submission is authenticated to the observed dispatch prompt. Without that observation nothing could ever be accepted.
+          if (structured && typeof backend.observeDispatchPrompt !== 'function') throw new Error('This backend cannot observe the dispatch prompt, so no submission could be authenticated. Nothing was dispatched; use a native backend that supports structured submissions.');
           // The persisted correction attempt keeps its model and variant: no new quota selection and no provider switch.
           const correcting = dispatchingCorrection ? state.attempt : undefined;
           if (!correcting && planning) {
@@ -437,7 +572,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
           const variant = correcting ? correcting.variant : planning ? cfg.plannerVariant : state.selection!.variant;
           const attemptID = correcting ? correcting.id : randomUUID();
           const instructions = correcting ? '' : await fs.readFile(promptPaths[planning ? 'planner' : 'executor'], 'utf8');
-          const prompt = correcting ? correctionInstruction(task, state.reportRecovery!.corrections, state.reportRecovery!.diagnostic ?? { code: 'report_format' }) : (tokenLimitsDisabled ? 'Token limits disabled by owner; usage tracking remains enabled.' : 'Budget: ' + (planning ? cfg.maxPlannerTokens : cfg.maxSessionTokens) + ' reported tokens for this session, ' + cfg.maxRunTokens + ' for the ADR;') + ' ' + (timeoutMinutes > 0 ? 'Time warning after ' + cfg.timeoutMinutes + ' active minutes: continue working toward the DoD; elapsed time alone is not a blocker.' : 'No elapsed-time warning or task deadline is configured.') + ' Keep context narrow. Token limits, when enabled, still apply.\n' + instructions + '\n\nADR: ' + state.adr + '\nProject: ' + directory + '\nBranch: ' + state.branch + ' (stay on this branch; return blocked if another branch is required)\nPre-existing changes, do not overwrite or commit:\n' + state.baseline + '\nRun directory: ' + runDir + '\nPlanning artifact directory: ' + path.join(planRoot, 'adr-' + state.id) + '\n' + (planning ? '' : 'Task: ' + JSON.stringify(task) + '\nRead facts.md and ledger.md in the run directory. Do not read prior session transcripts.') + '\n' + (state.resolution ? 'Owner resolution: ' + state.resolution : '') + '\nDo not invoke other agents, background jobs, or Session Goals. Return the specified JSON as your final answer. If interrupted, reconcile files and existing completed work before continuing. Do not repeat passed checks unless affected by new changes.';
+          const prompt = correcting ? correctionInstruction(task, state.reportRecovery!.corrections, state.reportRecovery!.diagnostic ?? { code: 'report_format' }) : (tokenLimitsDisabled ? 'Token limits disabled by owner; usage tracking remains enabled.' : 'Budget: ' + (planning ? cfg.maxPlannerTokens : cfg.maxSessionTokens) + ' reported tokens for this session, ' + cfg.maxRunTokens + ' for the ADR;') + ' ' + (timeoutMinutes > 0 ? 'Time warning after ' + cfg.timeoutMinutes + ' active minutes: continue working toward the DoD; elapsed time alone is not a blocker.' : 'No elapsed-time warning or task deadline is configured.') + ' Keep context narrow. Token limits, when enabled, still apply.\n' + instructions + '\n\nADR: ' + state.adr + '\nProject: ' + directory + '\nBranch: ' + state.branch + ' (stay on this branch; return blocked if another branch is required)\nPre-existing changes, do not overwrite or commit:\n' + state.baseline + '\nRun directory: ' + runDir + '\nPlanning artifact directory: ' + path.join(planRoot, 'adr-' + state.id) + '\n' + (planning ? '' : 'Task: ' + JSON.stringify(task) + '\nRead facts.md and ledger.md in the run directory. Do not read prior session transcripts.') + '\n' + (state.resolution ? 'Owner resolution: ' + state.resolution : '') + '\nDo not invoke other agents, background jobs, or Session Goals. ' + (structured ? 'Report only through the submission tool named in the contract below; your final chat text is human-readable and is never parsed.' : 'Return the specified JSON as your final answer.') + ' If interrupted, reconcile files and existing completed work before continuing. Do not repeat passed checks unless affected by new changes.';
           if (!correcting) {
             state.attempt = { id: attemptID, phase: state.phase, index: state.index, child: state.child, status: 'launching', startedAt: Date.now(), model: chosen, ...(variant ? { variant } : {}) };
             // Structured runs persist the submission authority with the attempt, in the same save, before any prompt is sent.
@@ -456,6 +591,34 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
           let polling = false;
           let guardError: unknown;
           let activeStartedAt: number | undefined;
+          let promptStop = false;
+          const promptAbort = new AbortController();
+          let promptWatch: Promise<void> | undefined;
+          /**
+           * Records the native prompt that started this dispatch once the host observes it in the child session. The
+           * binding authenticates no call until then, and a failure here stops the dispatch (fail closed).
+           */
+          const watchPrompt = () => {
+            if (!structured || promptWatch) return;
+            promptWatch = (async () => {
+              while (!promptStop) {
+                const child = attempt.child;
+                const found = child ? await backend.observeDispatchPrompt!({ child, parent: state.parent, attemptId: attempt.id, signal: AbortSignal.any([controller.signal, promptAbort.signal]) }) : undefined;
+                if (promptStop) return;
+                if (found) {
+                  if (state.submissionBinding?.attemptId !== attempt.id) throw new Error('The submission binding no longer belongs to this attempt');
+                  state.submissionBinding = recordDispatchPrompt(state.submissionBinding, found);
+                  await save(state);
+                  return;
+                }
+                await new Promise(resolve => setTimeout(resolve, PROMPT_POLL_MS));
+              }
+            })().catch(error => {
+              if (promptStop) return;
+              guardError ??= error;
+              controller.abort(error);
+            });
+          };
           const onStarted = async (id: string) => {
             if (state.child && state.child !== id) throw new Error('Native executor changed the child session');
             if (activeStartedAt) return;
@@ -466,6 +629,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
             state.taskStartedAt ||= Date.now();
             state.taskElapsedMs ||= 0;
             await save(state); // Native progress runs before prompt admission.
+            watchPrompt();
             guards.set(id, checkBudget);
             await checkBudget();
             activeStartedAt = Date.now();
@@ -483,20 +647,29 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
           };
           try {
             if (state.child) await checkBudget();
-            const response = await backend.runSubagent({ child: state.child, parent: state.parent, agent: planning ? cfg.plannerAgent : cfg.executorAgent, model: chosen, variant, title: 'ADR ' + path.basename(state.adr) + ': ' + (planning ? 'plan' : task.id + ' ' + task.title + (correcting ? ' (report correction ' + state.reportRecovery!.corrections + '/' + MAX_REPORT_CORRECTIONS + ')' : '')), prompt: prompt + '\nWorkflow attempt: ' + attemptID + (planning ? '' : '\n\n' + executorContract(task)), onStarted, currentChild: () => state.child }, { ...context, signal: controller.signal, progress: update => announce({ title: state.id + ': ' + (planning ? 'planning' : task.id + ' (' + (state.index + 1) + '/' + state.tasks.length + ')'), ...update }) });
+            const response = await backend.runSubagent({ child: state.child, parent: state.parent, agent: planning ? cfg.plannerAgent : cfg.executorAgent, model: chosen, variant, title: 'ADR ' + path.basename(state.adr) + ': ' + (planning ? 'plan' : task.id + ' ' + task.title + (correcting ? ' (report correction ' + state.reportRecovery!.corrections + '/' + MAX_REPORT_CORRECTIONS + ')' : '')), prompt: prompt + '\nWorkflow attempt: ' + attemptID + (structured ? '\n\n' + (planning ? structuredPlannerContract() : structuredExecutorContract(task)) : planning ? '' : '\n\n' + executorContract(task)), onStarted, currentChild: () => state.child }, { ...context, signal: controller.signal, progress: update => announce({ title: state.id + ': ' + (planning ? 'planning' : task.id + ' (' + (state.index + 1) + '/' + state.tasks.length + ')'), ...update }) });
             if (guardError) throw guardError;
             if (controller.signal.aborted) throw new Error('Run cancelled');
-            receipt = { ...attempt, response };
-            await writeReceipt(state.id, receipt);
-            await atomicJSON(path.join(runDir, 'last-response.json'), response);
-            try { result = parseResult(response); }
-            catch (error) { attempt.status = 'rejected'; if (!planning) rejection = classifyCompletionFailure(task, { response }); throw error; }
-            await checkBudget();
+            if (structured) {
+              // The final chat text is only a human-readable native outcome; it is never parsed and never a receipt shortcut.
+              await captureOutcome(response);
+              await checkBudget();
+            } else {
+              receipt = { ...attempt, response };
+              await writeReceipt(state.id, receipt);
+              await atomicJSON(path.join(runDir, 'last-response.json'), response);
+              try { result = parseResult(response); }
+              catch (error) { attempt.status = 'rejected'; if (!planning) rejection = classifyCompletionFailure(task, { response }); throw error; }
+              await checkBudget();
+            }
           } catch (error) {
             // Native cancellation may reject with a generic interruption. Preserve the guard that caused it.
             const cause = guardError ?? error;
             // A failure before any reply (and not a budget guard or cancellation) is a native/provider failure.
-            if (!planning && !receipt && !guardError && !controller.signal.aborted) rejection = classifyCompletionFailure(task, { error: cause });
+            if (structured) {
+              // Never a format diagnostic in a structured run: only auth/quota or a native failure, neither invites a restated report.
+              if (!planning && !guardError && !controller.signal.aborted) rejection = classifyError(cause).code === 'auth_or_quota' ? classifyError(cause) : { code: 'native_failure' };
+            } else if (!planning && !receipt && !guardError && !controller.signal.aborted) rejection = classifyCompletionFailure(task, { error: cause });
             controller.abort(cause);
             if (!receipt && state.child) attempt.status = 'interrupted';
             if (state.child) {
@@ -520,10 +693,24 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
             if (activeStartedAt) state.taskElapsedMs = (state.taskElapsedMs ?? 0) + Date.now() - activeStartedAt;
             clearTimeout(timer);
             clearInterval(budgetTimer);
+            promptStop = true;
+            promptAbort.abort();
+            await promptWatch; // No binding write may land after this dispatch ended.
             await warningWrite;
             if (state.child) guards.delete(state.child);
             parentSignal?.removeEventListener('abort', cancel);
             await releaseCorrection().catch(() => {}); // Fail closed: a release that cannot run leaves the restriction in force.
+          }
+          if (structured) {
+            // The child returned. Admit only a durable typed submission; a missing one (refusal, omission, a rejected call) pauses.
+            const stored = await submissionStore.readSubmission(state.id, attempt.id, submissionKindForPhase(state.phase));
+            if (!stored) {
+              attempt.status = 'rejected';
+              if (!planning) rejection = { code: 'submission_missing' };
+              throw new Error(submissionPauseReason('submission_missing', planning ? 'the plan' : task.id));
+            }
+            await admitSubmission(planning, task, stored);
+            continue;
           }
         }
         let admittedPlan: PlanResult | undefined;
@@ -558,21 +745,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
         }
         if (correctable) continue;
         // Commit advancement atomically. A crash before this commit replays the receipt only.
-        const next = { ...state, child: null };
-        delete next.attempt;
-        delete next.resolution;
-        delete next.taskStartedAt;
-        delete next.taskElapsedMs;
-        delete next.reportRecovery; // Real advancement only: restarts, new attempts and resumes keep the record.
-        if (next.submissionBinding) next.submissionBinding = closeSubmissionBinding(next.submissionBinding);
-        if (planning) { next.tasks = admittedPlan!.tasks; next.phase = 'executor'; }
-        else {
-          next.results = [...state.results, { ...admittedCompletion!, sessionId: state.child, model: state.attempt!.model, quotaSelection: state.selection, ...(state.reportRecovery?.corrections ? { reportCorrections: state.reportRecovery.corrections } : {}) }];
-          next.index++;
-        }
-        await save(next);
-        state = next;
-        await ledger(state);
+        await advance(planning, admittedPlan, admittedCompletion);
       }
     } catch (error) {
       if (!state || !started) throw error;

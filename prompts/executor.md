@@ -34,7 +34,10 @@ Do not add reviewers, delegates, a branch-finishing stage or unrequested work.
 Use available source and documentation tools when preferred tools are unavailable;
 report the limitation without installing tools merely to satisfy a skill.
 
-The completion contract at the end of this prompt is authoritative for the final
-reply: its task ID, required fields, gate list and blocked shape override anything
-earlier. Evidence must already exist, results must be truthful, and passed=true is
-allowed only when the entire gate is proved; otherwise return blocked.
+The contract at the end of this prompt is authoritative for reporting: its
+required fields, gate list and blocked shape override anything earlier. When it
+names a submission tool, report only by calling that tool once, then stop after
+the tool acknowledges the submission; your final chat text is never parsed. When
+it instead asks for a final reply, return only the specified JSON. Evidence must
+already exist, results must be truthful, and passed=true is allowed only when the
+entire gate is proved; otherwise report blocked.

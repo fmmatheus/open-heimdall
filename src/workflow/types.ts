@@ -166,7 +166,8 @@ export interface WorkflowAttempt {
 /** Bounded reasons an executor completion report was not accepted. Only report_format is repairable. */
 export type ReportDiagnosticCode =
   | 'report_format' | 'unfinished_work' | 'agent_blocked' | 'identity_mismatch' | 'ambiguous_output'
-  | 'native_failure' | 'auth_or_quota' | 'correction_exhausted' | 'correction_unsupported' | 'correction_ambiguous';
+  | 'native_failure' | 'auth_or_quota' | 'correction_exhausted' | 'correction_unsupported' | 'correction_ambiguous'
+  | 'submission_missing' | 'submission_unconfirmed';
 
 /** Field names and gate IDs only: never reply text. */
 export interface ReportDiagnostic {
@@ -248,6 +249,12 @@ export interface RunnerBackend {
   /** Absent means report-only enforcement is unsupported (safe-pause fallback). */
   reportOnly?: ReportOnlyCapability;
   assertIdle: (id: string, parent?: string, signal?: AbortSignal) => Promise<unknown>;
+  /**
+   * Structured runs only. Returns the native user message id of the prompt that carries this attempt's marker once it
+   * exists in the child session, or undefined while it does not. Host-observed native state only. A structured run
+   * whose backend lacks it pauses before dispatch, because no submission could ever be authenticated.
+   */
+  observeDispatchPrompt?: (input: { child: string; parent: string; attemptId: string; signal?: AbortSignal }) => Promise<string | undefined>;
   recoverResponse: (child: string, parent: string, attempt: WorkflowAttempt) => Promise<unknown>;
   usage: (child: string) => Promise<{ used: number; uncached: number }>;
   interrupt: (child: string, parent: string) => Promise<unknown>;

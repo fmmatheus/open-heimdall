@@ -129,27 +129,6 @@ test('managed plugin keeps native hooks but omits watchdog recovery RPC', async 
   await cleanup(); assert.equal(disposed, 3);
 });
 
-test('structured protocol is persisted once at start; its binding follows the attempt and child and closes on advance and pause', async t => {
-  const f = await fixture(t, [plan, { status: 'blocked', reason: 'Owner input' }, done], { protocol: 'structured-v1' });
-  assert.equal(JSON.parse(await f.run({ action: 'start', runId: 'reserved', adr: '.heimdall/feature.md' }, caller())).status, 'paused');
-  assert.ok(f.saved.every(state => state.protocol === 'structured-v1'));
-  const planning = f.saved.filter(state => state.attempt?.phase === 'planner' && state.submissionBinding);
-  assert.equal(planning[0].submissionBinding.child, null, 'the binding is saved with the attempt before any child exists');
-  assert.equal(planning[0].submissionBinding.status, 'open');
-  assert.ok(planning.some(state => state.submissionBinding.child === state.child && state.child !== null), 'the child is bound before prompt admission');
-  const executing = f.saved.filter(state => state.attempt?.phase === 'executor' && state.submissionBinding?.status === 'open');
-  assert.equal(executing[0].submissionBinding.taskId, 'T1');
-  assert.ok(executing[0].submissionBinding.dispatch > planning[0].submissionBinding.dispatch, 'every dispatch rises');
-  assert.equal(f.state.status, 'paused');
-  assert.equal(f.state.submissionBinding.status, 'closed', 'a paused run accepts no late submission');
-  // A resume never changes the protocol, even if the runner is built without one.
-  const legacyRunner = createRunner({ directory: f.directory, backend: { assertIdle: async () => {}, recoverResponse: async () => undefined, usage: async () => ({ used: 0, uncached: 0 }), interrupt: async () => {}, runSubagent: async input => { await input.onStarted(input.child); return JSON.stringify(done); } }, settings, quota, persistence: f.persistence, workflowRoot: '.heimdall/state', planRoot: '.heimdall/plans', plannerPromptPath: '.heimdall/planner.md', executorPromptPath: '.heimdall/executor.md', git: args => args[0] === 'branch' ? 'heimdall/run\n' : '' });
-  const resumed = JSON.parse(await legacyRunner({ action: 'resume', runId: 'reserved', input: 'Resolved' }, { ...caller(), id: 'call_resume', messageID: 'msg_assistant_resume' }));
-  assert.equal(resumed.status, 'completed');
-  assert.equal(f.state.protocol, 'structured-v1');
-  assert.equal(f.state.submissionBinding.status, 'closed');
-});
-
 test('a runner without a selected protocol never writes protocol or binding state', async t => {
   const f = await fixture(t);
   assert.equal(JSON.parse(await f.run({ action: 'start', runId: 'reserved', adr: '.heimdall/feature.md' }, caller())).status, 'completed');

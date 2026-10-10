@@ -55,6 +55,15 @@ export function createNativeBackend({ ctx, observe, pause = ms => new Promise(re
   return {
     ...(capability ? { reportOnly: capability } : {}),
     async assertIdle(id, parent, signal) { return requireIdle(await observe(id, signal), id, parent, true); },
+    // Host-observed native state only: the user message of the child session that carries this attempt's marker.
+    async observeDispatchPrompt({ child, parent, attemptId, signal }) {
+      const value = await observe(child, signal);
+      if (value.session.id !== child || value.session.parentID !== parent) throw new Error('Child session does not belong to this parent');
+      const marker = 'Workflow attempt: ' + attemptId;
+      const messages = await ctx.session.context({ sessionID: child });
+      const prompt = messages.filter(m => m.type === 'user' && typeof m.id === 'string' && m.id.length > 0 && m.text.includes(marker)).at(-1);
+      return prompt?.id;
+    },
     async recoverResponse(id: string, parent: string, attempt: WorkflowAttempt) {
       const value = requireIdle(await observe(id), id, parent, true);
       if (value.session.outcome !== 'succeeded') return undefined;

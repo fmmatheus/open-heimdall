@@ -72,6 +72,19 @@ export const bounded = (text: string, limit: number): string => {
 const gates = (ids: string[] | undefined) => ids?.length ? ids.slice(0, 10).join(', ') + (ids.length > 10 ? ' (+' + (ids.length - 10) + ' more)' : '') : '';
 
 /**
+ * Pause reason for a structured run whose typed submission is absent or cannot be applied. `subject` is a task id or
+ * "the plan". Neither text invites a format repair: the final chat text is never a result in a structured run.
+ */
+export function submissionPauseReason(code: 'submission_missing' | 'submission_unconfirmed', subject: string, detail = ''): string {
+  if (code === 'submission_missing') {
+    return 'No valid submission was recorded for ' + subject + ': the child ended without a successful call to its submission tool (refusal, omission, a limit, or a rejected call). '
+      + 'Its final chat text is not a result and was not parsed. Inspect the child session, then resume with guidance to submit the result through the tool; nothing was advanced.';
+  }
+  return 'A submission was recorded for ' + subject + ' but the child\'s successful stop could not be confirmed' + (detail ? ' (' + bounded(detail, 300) + ')' : '') + ', so it was not applied. '
+    + 'Reconcile the child session (it must be idle with an empty inbox and a final stop); the recorded submission is kept and a resume applies it without redoing the work.';
+}
+
+/**
  * Pause reason for a rejected executor report. Contains only the category, field names, gate IDs and the
  * agent's own blocked reason or the provider error text (`detail`), never any part of a reply.
  */
@@ -99,6 +112,9 @@ export function reportPauseReason(diagnostic: ReportDiagnostic, task: WorkflowTa
       return 'Invalid completion report for ' + task.id + ': report-only correction is unsupported here' + (detail ? ' (' + bounded(detail, 300) + ')' : '') + stillMissing + '.' + formatOnly;
     case 'correction_ambiguous':
       return 'Invalid completion report for ' + task.id + ': a previous correction may already have run, so none is repeated automatically.' + formatOnly;
+    case 'submission_missing':
+    case 'submission_unconfirmed':
+      return submissionPauseReason(diagnostic.code, task.id, detail);
     default:
       return 'Native/provider failure: ' + bounded(detail || 'the executor did not return a reply', 300);
   }
