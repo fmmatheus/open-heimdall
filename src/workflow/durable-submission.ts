@@ -7,12 +7,22 @@ import { SUBMISSION_DENIAL } from './submission.js';
 import type { NativeCallContext, SubmissionGate, SubmissionResponse } from './submission.js';
 import type { RunnerPersistence, RunState, RuntimeIdentity, SubmissionBinding, SubmissionReceipt } from './types.js';
 
+/**
+ * Proves, from native observation of the bound child session, which dispatch prompt a tool call descends from.
+ * Returns the native prompt message id, or undefined when that cannot be established. Implementations must use
+ * host-observed native state only (never a model-supplied attempt or generation), and the gate treats a missing,
+ * throwing or non-matching resolver as unauthorized.
+ */
+export type NativeOriginResolver = (native: NativeCallContext, binding: SubmissionBinding) => Promise<string | undefined> | string | undefined;
+
 export interface DurableSubmissionGateOptions {
   runId: string;
   directory: string;
   planRoot?: string;
   /** The authoritative store: coordinator-backed for managed runs, the local run directory otherwise. */
   persistence: Pick<RunnerPersistence, 'load' | 'readSubmission' | 'writeSubmission'>;
+  /** Maps a native call to its dispatch prompt. Absent means no call can be proven current, so every submit fails closed. */
+  origin?: NativeOriginResolver;
   runtime?: () => RuntimeIdentity;
   now?: () => number;
 }
@@ -37,6 +47,7 @@ export function authenticateSubmissionCaller(state: RunState | null | undefined,
   if (binding.status !== 'open' || binding.protocol !== SUBMISSION_PROTOCOL || binding.runId !== state.id || binding.parent !== state.parent) return undefined;
   if (attempt.id !== binding.attemptId || attempt.phase !== binding.phase || attempt.index !== binding.index || state.phase !== binding.phase || state.index !== binding.index) return undefined;
   if (attempt.status === 'interrupted' || attempt.status === 'rejected') return undefined;
+  if (!binding.prompt) return undefined; // No host-recorded dispatch prompt: nothing can be proven current.
   if (binding.kind !== submissionKindForPhase(binding.phase) || !binding.child || binding.child !== state.child || binding.child !== attempt.child || sessionID !== binding.child) return undefined;
   const role = binding.phase === 'planner' ? state.settings.plannerAgent : state.settings.executorAgent;
   if (!role || agent !== role) return undefined;
@@ -46,7 +57,7 @@ export function authenticateSubmissionCaller(state: RunState | null | undefined,
 
 /** The durable implementation of the submission port: binding from persisted state, receipt persisted before acknowledgement. */
 export function createDurableSubmissionGate(options: DurableSubmissionGateOptions): SubmissionGate {
-  const { runId, directory, planRoot, persistence, runtime = runtimeIdentity, now = Date.now } = options;
+  const { runId, directory, planRoot, persistence, origin, runtime = runtimeIdentity, now = Date.now } = options;
   return {
     async exposed(sessionID, agent) {
       try {
@@ -58,6 +69,11 @@ export function createDurableSubmissionGate(options: DurableSubmissionGateOption
       const state = await persistence.load(runId);
       const binding = authenticateSubmissionCaller(state, native.sessionID, native.agent);
       if (!state || !binding || binding.kind !== kind) return unauthorized();
+      // A delayed call from an earlier dispatch on the same reused child passes the session/agent checks above, so its
+      // native origin must also resolve to this binding's recorded dispatch prompt. Unverifiable origin fails closed.
+      let proven: string | undefined;
+      try { proven = origin ? await origin(native, binding) : undefined; } catch { proven = undefined; }
+      if (!proven || proven !== binding.prompt) return unauthorized();
       // Clone before validation: the receipt keeps exactly what was submitted.
       let rawPayload: unknown;
       try { rawPayload = structuredClone(raw); } catch { rawPayload = undefined; }
@@ -93,7 +109,7 @@ export function createDurableSubmissionGate(options: DurableSubmissionGateOption
       const receipt: SubmissionReceipt = {
         receiptVersion: 1, protocol: SUBMISSION_PROTOCOL, contract: result.contract, kind, runId: binding.runId, phase: binding.phase, index: binding.index,
         ...(binding.taskId === undefined ? {} : { taskId: binding.taskId }), attemptId: binding.attemptId, dispatch: binding.dispatch, parent: binding.parent,
-        child: binding.child!, caller: { sessionID: native.sessionID, agent: native.agent, messageID: native.messageID, callId: native.id },
+        child: binding.child!, origin: binding.prompt!, caller: { sessionID: native.sessionID, agent: native.agent, messageID: native.messageID, callId: native.id },
         runtime: runtime(), outcome: result.outcome, rawPayload, canonical, digest: contractDigest(result.contract, canonical), acceptedAt: now(),
       };
       // Durable first: a persistence failure throws here, so no acknowledgement can be returned for an unsaved receipt.

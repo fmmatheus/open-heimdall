@@ -26,6 +26,13 @@ export interface SubmissionBinding {
   dispatch: number;
   parent: string;
   child: string | null;
+  /**
+   * The native prompt message that started this dispatch, recorded by the host (never the model) when it sends or
+   * observes that prompt. A tool call is only accepted when native observation proves it descends from this prompt,
+   * so a delayed call from an earlier dispatch to the same child cannot be admitted under a newer one. Null until
+   * recorded, and a binding with no recorded prompt authenticates nobody.
+   */
+  prompt: string | null;
   status: 'open' | 'closed';
 }
 
@@ -55,6 +62,8 @@ export interface SubmissionReceipt {
   dispatch: number;
   parent: string;
   child: string;
+  /** The binding's dispatch prompt, proven by native observation of the call; always equal to the binding at acceptance. */
+  origin: string;
   caller: SubmissionCaller;
   runtime: RuntimeIdentity;
   outcome: string;

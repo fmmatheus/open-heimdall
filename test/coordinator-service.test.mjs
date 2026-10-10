@@ -11,7 +11,7 @@ import { createCoordinatorClient } from '../dist/coordinator/client.js';
 import { loadCoordinatorConfiguration } from '../dist/coordinator/config.js';
 import { startCoordinatorService, readCoordinatorToken } from '../dist/coordinator/service.js';
 import { createDurableSubmissionGate } from '../dist/workflow/durable-submission.js';
-import { openSubmissionBinding } from '../dist/workflow/submission-store.js';
+import { openSubmissionBinding, recordDispatchPrompt } from '../dist/workflow/submission-store.js';
 
 const git = (directory, args) => execFileSync('git', args, { cwd: directory, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 async function fixture(t) {
@@ -205,10 +205,11 @@ test('owner-fenced submission routes store, replay and refuse by identity; the a
   await f.client.request('POST', `/runs/${run.id}/binding`, caller, run.ownerToken);
   const state = { id: run.id, status: 'running', adr: '.heimdall/feature.md', parent: run.parentSessionId, caller, branch: run.branch, baseline: '', index: 0, tasks: [], results: [], phase: 'planner', child: null, settings: run.specification.settings };
   const structured = { ...state, protocol: 'structured-v1', phase: 'executor', child: 'ses_child', tasks: [{ id: 'T1', title: 'T', brief: 'B', dependsOn: [], dod: ['gate one'] }], attempt: { id: 'attempt_1', phase: 'executor', index: 0, child: 'ses_child', status: 'admitted', startedAt: 1, model: 'anthropic/x' }, settings: { ...state.settings, plannerAgent: 'planner', executorAgent: 'executor', maxTasks: 10 } };
-  structured.submissionBinding = openSubmissionBinding(structured, 1);
+  structured.submissionBinding = recordDispatchPrompt(openSubmissionBinding(structured, 1), 'prompt_1');
   await f.client.request('PUT', `/runs/${run.id}/checkpoint`, structured, run.ownerToken);
   const gate = createDurableSubmissionGate({
     runId: run.id, directory: f.temporary,
+    origin: native => ({ msg_1: 'prompt_1', msg_old: 'prompt_0' })[native.messageID], // Stands in for native observation of the child.
     persistence: {
       load: async () => structured,
       readSubmission: async (id, attempt, kind) => f.client.request('GET', `/runs/${id}/submissions/${attempt}/${kind}`, undefined, run.ownerToken),
@@ -218,6 +219,9 @@ test('owner-fenced submission routes store, replay and refuse by identity; the a
   const raw = { status: 'completed', summary: 'Done', handoff: 'Next', evidence: [{ gateId: 'G1', passed: true, detail: 'proved' }] };
   const native = { sessionID: 'ses_child', agent: 'executor', messageID: 'msg_1', id: 'call_1' };
   const route = `/runs/${run.id}/submissions/attempt_1/executor-result`;
+  assert.equal(await f.client.request('GET', route, undefined, run.ownerToken), null);
+  const staleCall = await gate.submit('executor-result', raw, { ...native, messageID: 'msg_old', id: 'call_stale' });
+  assert.equal(staleCall.code, 'unauthorized', 'a call from another dispatch prompt is not admitted');
   assert.equal(await f.client.request('GET', route, undefined, run.ownerToken), null);
   const ack = await gate.submit('executor-result', raw, native);
   assert.equal(ack.accepted, true);

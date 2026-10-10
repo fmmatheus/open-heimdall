@@ -23,7 +23,7 @@ export function isSubmissionReceipt(value: unknown): value is SubmissionReceipt 
     && isRecord(contract) && contract.protocol === SUBMISSION_PROTOCOL && contract.kind === value.kind && index(contract.version)
     && text(value.runId) && phases.includes(value.phase as string) && index(value.index)
     && (value.taskId === undefined || text(value.taskId)) && text(value.attemptId) && index(value.dispatch)
-    && text(value.parent) && text(value.child)
+    && text(value.parent) && text(value.child) && text(value.origin)
     && isRecord(caller) && text(caller.sessionID) && text(caller.agent) && text(caller.messageID) && text(caller.callId)
     && isRecord(runtime) && text(runtime.packageVersion) && runtime.protocol === SUBMISSION_PROTOCOL
     && text(value.outcome) && 'rawPayload' in value && 'canonical' in value && text(value.digest)
@@ -73,6 +73,7 @@ export function assertSubmissionMatchesCheckpoint(state: RunState | null | undef
   if (binding.status !== 'open') throw new Error('Submission binding is closed');
   if (!binding.child || binding.child !== receipt.child || state.child !== receipt.child || attempt.child !== receipt.child || receipt.caller.sessionID !== receipt.child) throw new Error('Submission does not match the bound child session');
   if (binding.dispatch !== receipt.dispatch) throw new Error('Submission dispatch generation is not current');
+  if (!binding.prompt || binding.prompt !== receipt.origin) throw new Error('Submission native origin does not match the binding dispatch prompt');
 }
 
 export function assertOutcomeMatchesCheckpoint(state: RunState | null | undefined, outcome: NativeOutcome): void {
@@ -90,8 +91,15 @@ export function openSubmissionBinding(state: RunState, dispatch = 1): Submission
   if (attempt.phase === 'executor' && !taskId) throw new Error('The bound executor attempt has no task');
   return {
     protocol: SUBMISSION_PROTOCOL, kind: submissionKindForPhase(attempt.phase), runId: state.id, phase: attempt.phase, index: attempt.index,
-    ...(taskId === undefined ? {} : { taskId }), attemptId: attempt.id, dispatch, parent: state.parent, child: state.child, status: 'open',
+    ...(taskId === undefined ? {} : { taskId }), attemptId: attempt.id, dispatch, parent: state.parent, child: state.child, prompt: null, status: 'open',
   };
+}
+/** Records the native prompt that started a dispatch. Write-once: a recorded prompt is never replaced. */
+export function recordDispatchPrompt(binding: SubmissionBinding, promptMessageId: string): SubmissionBinding {
+  if (!text(promptMessageId)) throw new Error('A dispatch prompt message id is required');
+  if (binding.status !== 'open') throw new Error('Submission binding is closed');
+  if (binding.prompt !== null && binding.prompt !== promptMessageId) throw new Error('The dispatch prompt is already recorded');
+  return { ...binding, prompt: promptMessageId };
 }
 export const closeSubmissionBinding = (binding: SubmissionBinding): SubmissionBinding => ({ ...binding, status: 'closed' });
 

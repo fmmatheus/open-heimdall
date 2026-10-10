@@ -162,7 +162,7 @@ test('managed persistence routes submissions and outcomes under the owner fence 
   await fs.writeFile(path.join(f.root, 'managed.json'), JSON.stringify(identity));
   const receipt = {
     receiptVersion: 1, protocol: 'structured-v1', contract: { protocol: 'structured-v1', kind: 'executor-result', version: 1 }, kind: 'executor-result', runId: 'reserved', phase: 'executor', index: 0,
-    taskId: 'T1', attemptId: 'attempt_1', dispatch: 1, parent: 'ses_parent', child: 'ses_child', caller: { sessionID: 'ses_child', agent: 'adr-executor', messageID: 'm', callId: 'c' },
+    taskId: 'T1', attemptId: 'attempt_1', dispatch: 1, parent: 'ses_parent', child: 'ses_child', origin: 'prompt_1', caller: { sessionID: 'ses_child', agent: 'adr-executor', messageID: 'm', callId: 'c' },
     runtime: { packageVersion: '1.0.0', protocol: 'structured-v1' }, outcome: 'completed', rawPayload: {}, canonical: {}, digest: 'd', acceptedAt: 1,
   };
   const outcome = { outcomeVersion: 1, runId: 'reserved', phase: 'executor', index: 0, attemptId: 'attempt_1', child: 'ses_child', response: 'text', capturedAt: 1 };

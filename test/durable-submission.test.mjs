@@ -6,7 +6,7 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { CoordinatorStore } from '../dist/coordinator/store.js';
 import { createDurableSubmissionGate, authenticateSubmissionCaller } from '../dist/workflow/durable-submission.js';
-import { createLocalSubmissionStore, openSubmissionBinding, closeSubmissionBinding, sameSubmission } from '../dist/workflow/submission-store.js';
+import { createLocalSubmissionStore, openSubmissionBinding, closeSubmissionBinding, recordDispatchPrompt, sameSubmission } from '../dist/workflow/submission-store.js';
 
 const settings = { plannerAgent: 'planner', executorAgent: 'executor', plannerModel: 'anthropic/planner', executorModel: 'anthropic/executor', executorFallbackModel: 'kimi/fallback', maxTasks: 10, minQuotaRemainingPercent: 10, tokenLimitsDisabled: true };
 const specification = { settings, plannerPrompt: 'p', executorPrompt: 'e', agents: {}, opencode: { baseUrl: 'http://127.0.0.1:9999', passwordEnvironmentVariable: 'SYNTHETIC_PASSWORD' } };
@@ -14,6 +14,12 @@ const tasks = [{ id: 'T1', title: 'Title', brief: 'Brief', dependsOn: [], dod: [
 const completed = (extra = {}) => ({ status: 'completed', summary: 'Done', handoff: 'Next', evidence: [{ gateId: 'G1', passed: true, detail: 'proved one' }, { gateId: 'G2', passed: true, detail: 'proved two' }], ...extra });
 const plan = { status: 'planned', planMarkdown: '# Plan', factSheet: '# Facts', tasks };
 const CHILD = 'ses_child_1';
+/**
+ * Deterministic stand-in for native observation of the child session: which dispatch prompt each assistant message
+ * descends from. Stands in for the resolver T4 wires from real OpenCode session observation.
+ */
+const NATIVE_ORIGINS = { msg_1: 'prompt_1', msg_retry: 'prompt_1', msg_old: 'prompt_old', msg_2: 'prompt_2', msg_2_retry: 'prompt_2' };
+const nativeOrigin = native => NATIVE_ORIGINS[native.messageID];
 const caller = (extra = {}) => ({ sessionID: CHILD, agent: 'executor', messageID: 'msg_1', id: 'call_1', ...extra });
 
 /** A structured checkpoint with an open binding for the current attempt. */
@@ -23,7 +29,7 @@ function structured(base, phase = 'executor') {
     tasks: phase === 'executor' ? structuredClone(tasks) : [], results: [], phase, child: CHILD, protocol: 'structured-v1', settings: { ...settings },
     attempt: { id: 'attempt_1', phase, index: 0, child: CHILD, status: 'admitted', startedAt: 1, model: 'anthropic/x' },
   };
-  state.submissionBinding = openSubmissionBinding(state, 1);
+  state.submissionBinding = recordDispatchPrompt(openSubmissionBinding(state, 1), 'prompt_1');
   return state;
 }
 
@@ -31,7 +37,7 @@ function structured(base, phase = 'executor') {
 async function receiptFor(state, raw = completed(), native = caller()) {
   let captured;
   const gate = createDurableSubmissionGate({
-    runId: state.id, directory: os.tmpdir(), now: () => 5000,
+    runId: state.id, directory: os.tmpdir(), now: () => 5000, origin: nativeOrigin,
     persistence: { load: async () => state, readSubmission: async () => null, writeSubmission: async (_id, receipt) => { captured = receipt; return receipt; } },
   });
   const response = await gate.submit(state.phase === 'planner' ? 'planner-plan' : 'executor-result', raw, native);
@@ -90,7 +96,7 @@ async function localBackend(t, phase = 'executor') {
   };
 }
 const backends = [['coordinator', coordinatorBackend], ['local', localBackend]];
-const gateOf = (backend, persistence = backend.persistence(), now = (() => { let n = 1000; return () => n++; })()) => createDurableSubmissionGate({ runId: backend.id, directory: backend.directory, persistence, now });
+const gateOf = (backend, persistence = backend.persistence(), now = (() => { let n = 1000; return () => n++; })()) => createDurableSubmissionGate({ runId: backend.id, directory: backend.directory, persistence, now, origin: nativeOrigin });
 
 // --- Coordinator store --------------------------------------------------------------------------------------
 
@@ -189,6 +195,7 @@ test('conflict matrix: nothing but the exact, current, owner-bound receipt is ev
     ['wrong child', () => write({ ...good, child: 'ses_other', caller: { ...good.caller, sessionID: 'ses_other' } }), /bound child/],
     ['caller is not the child', () => write({ ...good, caller: { ...good.caller, sessionID: 'ses_other' } }), /bound child/],
     ['late dispatch', () => write({ ...good, dispatch: 2 }), /dispatch/],
+    ['foreign native origin', () => write({ ...good, origin: 'prompt_old' }), /origin/],
     ['stale dispatch', () => write({ ...good, dispatch: 0 }), /dispatch/],
     ['malformed', () => write({ ...good, digest: '' }), /identity/],
   ];
@@ -290,6 +297,7 @@ test('local store enforces the same authority checks as the coordinator and reje
     ['wrong task', { ...receipt, taskId: 'T9' }, /checkpoint attempt|binding/],
     ['wrong child', { ...receipt, child: 'ses_other', caller: { ...receipt.caller, sessionID: 'ses_other' } }, /bound child/],
     ['late dispatch', { ...receipt, dispatch: 3 }, /dispatch/],
+    ['foreign native origin', { ...receipt, origin: 'prompt_old' }, /origin/],
     ['wrong parent', { ...receipt, parent: 'ses_other' }, /does not belong/],
   ];
   for (const [name, value, expected] of cases) {
@@ -335,6 +343,7 @@ for (const [name, make] of backends) {
       ['different attempt', state => { state.attempt.id = 'attempt_2'; }],
       ['different task', state => { state.submissionBinding.taskId = 'T9'; }],
       ['legacy run', state => { delete state.protocol; }],
+      ['no recorded dispatch prompt', state => { state.submissionBinding.prompt = null; }],
     ]) {
       const hostile = await make(t);
       try { await hostile.update(change); }
@@ -436,6 +445,45 @@ for (const [name, make] of backends) {
   });
 }
 
+for (const [name, make] of backends) {
+  test(`${name}: a delayed native call from an earlier dispatch on the reused child is rejected, a genuine later call and its replays are not`, async t => {
+    const backend = await make(t);
+    const persistence = backend.persistence();
+    // Dispatch 1 (prompt_1) runs on CHILD; the host then closes it and rebinds the same child and agent to dispatch 2.
+    await backend.update(state => { state.submissionBinding = closeSubmissionBinding(state.submissionBinding); });
+    await backend.update(state => {
+      state.attempt = { ...state.attempt, id: 'attempt_2', status: 'admitted' };
+      state.submissionBinding = recordDispatchPrompt(openSubmissionBinding(state, 2), 'prompt_2');
+    });
+    const gate = gateOf(backend);
+    // Same session, same agent, but its native message descends from the earlier dispatch's prompt.
+    const stale = await gate.submit('executor-result', completed(), caller({ messageID: 'msg_old', id: 'call_stale' }));
+    assert.equal(stale.accepted, false);
+    assert.equal(stale.code, 'unauthorized');
+    assert.equal(await persistence.readSubmission(backend.id, 'attempt_2', 'executor-result'), null, 'no receipt for the newer dispatch');
+    assert.equal(await persistence.readSubmission(backend.id, 'attempt_1', 'executor-result'), null);
+    // A message the host cannot place, a throwing resolver, and a missing resolver all fail closed.
+    assert.equal((await gate.submit('executor-result', completed(), caller({ messageID: 'msg_unknown' }))).code, 'unauthorized');
+    const throwing = createDurableSubmissionGate({ runId: backend.id, directory: backend.directory, persistence, origin: () => { throw new Error('native unavailable'); } });
+    assert.equal((await throwing.submit('executor-result', completed(), caller({ messageID: 'msg_2' }))).code, 'unauthorized');
+    const unwired = createDurableSubmissionGate({ runId: backend.id, directory: backend.directory, persistence });
+    assert.equal((await unwired.submit('executor-result', completed(), caller({ messageID: 'msg_2' }))).code, 'unauthorized', 'session and agent alone never authenticate');
+    assert.equal(await persistence.readSubmission(backend.id, 'attempt_2', 'executor-result'), null);
+    // The genuine call for dispatch 2 works and records the proven origin.
+    const genuine = await gate.submit('executor-result', completed(), caller({ messageID: 'msg_2', id: 'call_b' }));
+    assert.equal(genuine.accepted, true);
+    const stored = await persistence.readSubmission(backend.id, 'attempt_2', 'executor-result');
+    assert.deepEqual({ attemptId: stored.attemptId, dispatch: stored.dispatch, origin: stored.origin }, { attemptId: 'attempt_2', dispatch: 2, origin: 'prompt_2' });
+    // A late stale call after acceptance still cannot replace or replay it; identical genuine replays survive a restart.
+    assert.equal((await gate.submit('executor-result', completed(), caller({ messageID: 'msg_old', id: 'call_stale_2' }))).code, 'unauthorized');
+    await backend.restart();
+    const rebuilt = gateOf(backend);
+    assert.deepEqual(await rebuilt.submit('executor-result', completed(), caller({ messageID: 'msg_2_retry', id: 'call_b_retry' })), genuine);
+    assert.equal((await rebuilt.submit('executor-result', completed(), caller({ messageID: 'msg_old' }))).code, 'unauthorized');
+    assert.deepEqual(await backend.persistence().readSubmission(backend.id, 'attempt_2', 'executor-result'), stored, 'nothing was overwritten');
+  });
+}
+
 test('planner gate canonicalizes an inline plan with its content hash, and a blocked plan verbatim', async t => {
   const backend = await localBackend(t, 'planner');
   const planner = { ...caller({ agent: 'planner' }) };
@@ -465,7 +513,7 @@ test('planner gate snapshots artifacts from the host-owned plan directory', asyn
   await fs.writeFile(path.join(base, 'plan.md'), '# Artifact plan');
   await fs.writeFile(path.join(base, 'facts.md'), '# Artifact facts');
   await fs.writeFile(path.join(base, 'tasks.md'), JSON.stringify(tasks));
-  const gate = createDurableSubmissionGate({ runId: backend.id, directory: backend.directory, persistence: backend.persistence() });
+  const gate = createDurableSubmissionGate({ runId: backend.id, directory: backend.directory, persistence: backend.persistence(), origin: nativeOrigin });
   const response = await gate.submit('planner-plan', { status: 'planned', artifacts: true }, caller({ agent: 'planner' }));
   assert.equal(response.accepted, true, JSON.stringify(response));
   const stored = await backend.persistence().readSubmission(backend.id, 'attempt_1', 'planner-plan');
