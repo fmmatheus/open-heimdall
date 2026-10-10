@@ -193,6 +193,8 @@ export interface SavedCompletion extends CompletionResult {
   sessionId: string | null;
   model: string;
   quotaSelection?: ExecutorSelection;
+  /** Report-only corrections consumed before this report was accepted. Absent when none ran. */
+  reportCorrections?: number;
 }
 
 export interface RunState {

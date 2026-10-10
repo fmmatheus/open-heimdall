@@ -2,11 +2,11 @@ import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { chooseExecutor, authExpired } from '../policy/quota.js';
+import { chooseExecutor, authExpired, executorCandidates } from '../policy/quota.js';
 
 import { classifyError, classifyResult, pauseReportRecovery, reportPauseReason } from './report.js';
 import type {
-  CompletionResult, PlanResult, ProgressUpdate, ReportDiagnostic, RunArguments, RunState,
+  CompletionResult, PlanResult, ProgressUpdate, ReportDiagnostic, ReportOnlyCheck, RunArguments, RunState,
   RunnerContext, RunnerOptions, RunnerSettings, WorkflowResult, WorkflowTask,
 } from './types.js';
 export type { RunnerBackend, RunnerContext, RunnerOptions, RunnerSettings } from './types.js';
@@ -144,6 +144,20 @@ export function executorContract(task: WorkflowTask): string {
   ].join('\n');
 }
 
+/** Automatic report-only corrections allowed per task. The counter lives in the checkpoint and only advancement resets it. */
+export const MAX_REPORT_CORRECTIONS = 2;
+
+/**
+ * Report-only correction prompt: restate results that already exist, never do work. Names only fields and gate
+ * IDs from the diagnostic, never reply text. The caller appends the attempt marker and then the contract footer.
+ */
+export function correctionInstruction(task: WorkflowTask, number: number, diagnostic: ReportDiagnostic): string {
+  const missing = [diagnostic.missingFields?.length && 'missing fields: ' + diagnostic.missingFields.join(', '), diagnostic.gateIds?.length && 'missing gate entries: ' + diagnostic.gateIds.slice(0, 20).join(', ')].filter(Boolean).join('; ');
+  return 'Report-only correction ' + number + '/' + MAX_REPORT_CORRECTIONS + ' for ' + task.id + '. Your previous final reply was not an acceptable completion report' + (missing ? ' (' + missing + ')' : '') + '. '
+    + 'Restate ONLY results you already obtained in this session, in the final contract below. Do not call any tools, edit files, run commands or tests, commit, or delegate: all tools are disabled for this turn. '
+    + 'For any gate or field you did not actually prove, report passed:false for that gate or reply with the blocked shape. Never guess or invent evidence.';
+}
+
 const contextSignal = (context: RunnerContext) => context.signal || context.abort;
 const callerIdentity = (context: RunnerContext) => ({ sessionID: context.sessionID, id: context.id, messageID: context.messageID, agent: context.agent });
 
@@ -202,6 +216,15 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
     let state!: RunState;
     let started = false;
     let rejection: ReportDiagnostic | undefined; // Set only when an executor completion report is rejected.
+    let pendingCorrection: string | undefined; // A correction attempt persisted by this invocation and not yet dispatched.
+    let correctionRelease: (() => Promise<void>) | undefined; // Report-only restriction held for the pending or running correction.
+    let terminationUnconfirmed = false; // True while an interrupt is unconfirmed: the restriction then stays in force.
+    const releaseCorrection = async () => {
+      const release = correctionRelease;
+      if (!release || terminationUnconfirmed) return;
+      correctionRelease = undefined;
+      await release();
+    };
     try {
       await lock.writeFile(JSON.stringify({ pid: process.pid, parent: context.sessionID }));
       const settings = await configuredSettings();
@@ -265,6 +288,60 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
         if (context.progress) await context.progress({ runId: state.id, childSession: state.child, ...update });
         else context.metadata?.({ title: update.title, metadata: { runId: state.id, childSession: state.child, ...update } });
       };
+      /**
+       * Decides whether a format-only rejection may be corrected and, if so, persists the consumed counter and the
+       * new correction attempt in ONE save. Returns true when the loop should dispatch it. Every refusal throws with
+       * `rejection` set to its category, so the run pauses without any prompt. Nothing is sent from here.
+       */
+      const prepareCorrection = async (task: WorkflowTask, diagnostic: ReportDiagnostic): Promise<boolean> => {
+        const failed = state.attempt!;
+        const child = state.child;
+        if (!child) return false;
+        const record = pauseReportRecovery(state.reportRecovery, { index: state.index, taskId: task.id, child, attemptId: failed.id }, diagnostic);
+        state.reportRecovery = record; // Keeps the counter in the pause checkpoint even when the next checks refuse.
+        const stop = (code: 'correction_exhausted' | 'correction_unsupported', message: string): never => {
+          rejection = { ...diagnostic, code };
+          throw new Error(message);
+        };
+        if (contextSignal(context)?.aborted) { rejection = undefined; throw new Error('Run cancelled'); }
+        if (record.corrections >= MAX_REPORT_CORRECTIONS) stop('correction_exhausted', 'Report correction exhausted for ' + task.id + ' after ' + record.corrections + ' attempts');
+        const capability = backend.reportOnly;
+        let support: ReportOnlyCheck;
+        try { support = capability ? await capability.check(failed.model, child) : { supported: false, reason: 'Report-only enforcement is unavailable: this backend has no report-only capability' }; }
+        catch (error) { support = { supported: false, reason: errorMessage(error) }; }
+        if (!capability || !support.supported) return stop('correction_unsupported', support.supported ? 'Report-only enforcement is unavailable' : support.reason);
+        try {
+          await backend.assertIdle(child, state.parent, contextSignal(context));
+          await checkBudget();
+        } catch (error) { rejection = undefined; throw error; }
+        // Same model and variant only: never switch provider for a correction.
+        const same = executorCandidates(cfg).filter(candidate => candidate.model === failed.model && (candidate.variant || undefined) === (failed.variant || undefined));
+        try {
+          if (!same.length) throw new Error('the selected model is no longer configured');
+          chooseExecutor(await quota(cfg), { ...cfg, executorCandidates: same });
+        } catch (error) {
+          rejection = { code: 'auth_or_quota' };
+          throw new Error('Quota unavailable for the selected model ' + failed.model + '; no report correction was sent: ' + errorMessage(error));
+        }
+        // The restriction is taken before anything is persisted, so a refusal never consumes a correction.
+        try { correctionRelease = await capability.restrict(child); }
+        catch (error) { return stop('correction_unsupported', errorMessage(error)); }
+        const id = randomUUID();
+        const previous = { recovery: state.reportRecovery, attempt: state.attempt };
+        failed.status = 'rejected';
+        state.reportRecovery = { ...record, corrections: record.corrections + 1, mode: 'correcting', attempts: [...record.attempts, id], diagnostic };
+        state.attempt = { id, phase: 'executor', index: state.index, child, status: 'launching', startedAt: Date.now(), model: failed.model, ...(failed.variant ? { variant: failed.variant } : {}), purpose: 'report-correction' };
+        try { await save(state); }
+        catch (error) {
+          state.reportRecovery = previous.recovery; state.attempt = previous.attempt; // A stale owner never dispatches.
+          await releaseCorrection().catch(() => {});
+          rejection = undefined;
+          throw error;
+        }
+        pendingCorrection = id;
+        rejection = undefined;
+        return true;
+      };
       await ledger(state);
       while (true) {
         if (contextSignal(context)?.aborted) throw new Error('Run cancelled');
@@ -281,17 +358,31 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
         let result!: WorkflowResult;
         let receipt: (NonNullable<RunState['attempt']> & { response: unknown }) | undefined;
         const recheckRejected = args.action === 'resume' && !args.recovery && state.attempt?.status === 'rejected';
+        // A correction persisted by THIS invocation is dispatched below. Any other correction without a receipt may already have run.
+        const dispatchingCorrection = pendingCorrection !== undefined && state.attempt?.id === pendingCorrection;
+        pendingCorrection = undefined;
         if (state.attempt && (state.attempt.status !== 'rejected' || recheckRejected)) {
           if (state.attempt.phase !== state.phase || state.attempt.index !== state.index || state.attempt.child !== state.child) throw new Error('Attempt does not match the current task');
           const receiptPath = path.join(runDir, 'attempt-' + state.attempt.id + '.json');
           try { receipt = persistence ? await persistence.readReceipt(state.id, state.attempt.id) ?? undefined : await readJSON<NonNullable<typeof receipt>>(receiptPath); } catch (error) { if (!isRecord(error) || error.code !== 'ENOENT') throw error; }
-          if (!receipt && state.child && ['admitted', 'interrupted'].includes(state.attempt.status)) {
+          const correctionAttempt = state.attempt.purpose === 'report-correction';
+          // A correction is persisted before it is sent, so even a launching one with a recorded child may have been admitted.
+          if (!receipt && state.child && !dispatchingCorrection && (['admitted', 'interrupted'].includes(state.attempt.status) || (correctionAttempt && state.attempt.status === 'launching'))) {
             let response: unknown;
             try { response = await backend.recoverResponse(state.child, state.parent, state.attempt); }
-            catch (error) { state.attempt.status = 'rejected'; if (!planning) rejection = classifyCompletionFailure(task, { error }); throw error; }
+            catch (error) {
+              state.attempt.status = 'rejected';
+              if (correctionAttempt) rejection = { code: 'correction_ambiguous' };
+              else if (!planning) rejection = classifyCompletionFailure(task, { error });
+              throw error;
+            }
             if (response !== undefined) {
               receipt = { ...state.attempt, response };
               await writeReceipt(state.id, receipt);
+            } else if (correctionAttempt) {
+              state.attempt.status = 'rejected';
+              rejection = { code: 'correction_ambiguous' };
+              throw new Error('A previous report correction may already have run and no reply could be recovered; none is repeated automatically');
             }
           }
           if (receipt) {
@@ -317,21 +408,25 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
         }
         if (!receipt) {
           if (!tokenLimitsDisabled && Object.values(usage).reduce((a, b) => a + b, 0) >= maxRunTokens) throw new Error('ADR token budget reached');
-          if (planning) {
+          // The persisted correction attempt keeps its model and variant: no new quota selection and no provider switch.
+          const correcting = dispatchingCorrection ? state.attempt : undefined;
+          if (!correcting && planning) {
             const snapshot = await quota(cfg);
             const provider = cfg.plannerModel.startsWith('claude-code/') ? 'claude-code' : 'anthropic';
             if (!snapshot[provider]?.entries?.length || snapshot[provider]!.errors?.length) throw new Error('Claude quota unavailable before planning');
-          } else {
+          } else if (!correcting) {
             state.selection = chooseExecutor(await quota(cfg), cfg);
           }
-          const chosen = planning ? cfg.plannerModel : state.selection!.model;
-          const variant = planning ? cfg.plannerVariant : state.selection!.variant;
-          const attemptID = randomUUID();
-          const instructions = await fs.readFile(promptPaths[planning ? 'planner' : 'executor'], 'utf8');
-          const prompt = (tokenLimitsDisabled ? 'Token limits disabled by owner; usage tracking remains enabled.' : 'Budget: ' + (planning ? cfg.maxPlannerTokens : cfg.maxSessionTokens) + ' reported tokens for this session, ' + cfg.maxRunTokens + ' for the ADR;') + ' ' + (timeoutMinutes > 0 ? 'Time warning after ' + cfg.timeoutMinutes + ' active minutes: continue working toward the DoD; elapsed time alone is not a blocker.' : 'No elapsed-time warning or task deadline is configured.') + ' Keep context narrow. Token limits, when enabled, still apply.\n' + instructions + '\n\nADR: ' + state.adr + '\nProject: ' + directory + '\nBranch: ' + state.branch + ' (stay on this branch; return blocked if another branch is required)\nPre-existing changes, do not overwrite or commit:\n' + state.baseline + '\nRun directory: ' + runDir + '\nPlanning artifact directory: ' + path.join(planRoot, 'adr-' + state.id) + '\n' + (planning ? '' : 'Task: ' + JSON.stringify(task) + '\nRead facts.md and ledger.md in the run directory. Do not read prior session transcripts.') + '\n' + (state.resolution ? 'Owner resolution: ' + state.resolution : '') + '\nDo not invoke other agents, background jobs, or Session Goals. Return the specified JSON as your final answer. If interrupted, reconcile files and existing completed work before continuing. Do not repeat passed checks unless affected by new changes.';
-          state.attempt = { id: attemptID, phase: state.phase, index: state.index, child: state.child, status: 'launching', startedAt: Date.now(), model: chosen, ...(variant ? { variant } : {}) };
-          const attempt = state.attempt;
-          await save(state);
+          const chosen = correcting ? correcting.model : planning ? cfg.plannerModel : state.selection!.model;
+          const variant = correcting ? correcting.variant : planning ? cfg.plannerVariant : state.selection!.variant;
+          const attemptID = correcting ? correcting.id : randomUUID();
+          const instructions = correcting ? '' : await fs.readFile(promptPaths[planning ? 'planner' : 'executor'], 'utf8');
+          const prompt = correcting ? correctionInstruction(task, state.reportRecovery!.corrections, state.reportRecovery!.diagnostic ?? { code: 'report_format' }) : (tokenLimitsDisabled ? 'Token limits disabled by owner; usage tracking remains enabled.' : 'Budget: ' + (planning ? cfg.maxPlannerTokens : cfg.maxSessionTokens) + ' reported tokens for this session, ' + cfg.maxRunTokens + ' for the ADR;') + ' ' + (timeoutMinutes > 0 ? 'Time warning after ' + cfg.timeoutMinutes + ' active minutes: continue working toward the DoD; elapsed time alone is not a blocker.' : 'No elapsed-time warning or task deadline is configured.') + ' Keep context narrow. Token limits, when enabled, still apply.\n' + instructions + '\n\nADR: ' + state.adr + '\nProject: ' + directory + '\nBranch: ' + state.branch + ' (stay on this branch; return blocked if another branch is required)\nPre-existing changes, do not overwrite or commit:\n' + state.baseline + '\nRun directory: ' + runDir + '\nPlanning artifact directory: ' + path.join(planRoot, 'adr-' + state.id) + '\n' + (planning ? '' : 'Task: ' + JSON.stringify(task) + '\nRead facts.md and ledger.md in the run directory. Do not read prior session transcripts.') + '\n' + (state.resolution ? 'Owner resolution: ' + state.resolution : '') + '\nDo not invoke other agents, background jobs, or Session Goals. Return the specified JSON as your final answer. If interrupted, reconcile files and existing completed work before continuing. Do not repeat passed checks unless affected by new changes.';
+          if (!correcting) {
+            state.attempt = { id: attemptID, phase: state.phase, index: state.index, child: state.child, status: 'launching', startedAt: Date.now(), model: chosen, ...(variant ? { variant } : {}) };
+            await save(state);
+          }
+          const attempt = state.attempt!;
           const controller = new AbortController();
           const parentSignal = contextSignal(context);
           const cancel = () => controller.abort(parentSignal?.reason);
@@ -369,14 +464,14 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
           };
           try {
             if (state.child) await checkBudget();
-            const response = await backend.runSubagent({ child: state.child, parent: state.parent, agent: planning ? cfg.plannerAgent : cfg.executorAgent, model: chosen, variant, title: 'ADR ' + path.basename(state.adr) + ': ' + (planning ? 'plan' : task.id + ' ' + task.title), prompt: prompt + '\nWorkflow attempt: ' + attemptID + (planning ? '' : '\n\n' + executorContract(task)), onStarted, currentChild: () => state.child }, { ...context, signal: controller.signal, progress: update => announce({ title: state.id + ': ' + (planning ? 'planning' : task.id + ' (' + (state.index + 1) + '/' + state.tasks.length + ')'), ...update }) });
+            const response = await backend.runSubagent({ child: state.child, parent: state.parent, agent: planning ? cfg.plannerAgent : cfg.executorAgent, model: chosen, variant, title: 'ADR ' + path.basename(state.adr) + ': ' + (planning ? 'plan' : task.id + ' ' + task.title + (correcting ? ' (report correction ' + state.reportRecovery!.corrections + '/' + MAX_REPORT_CORRECTIONS + ')' : '')), prompt: prompt + '\nWorkflow attempt: ' + attemptID + (planning ? '' : '\n\n' + executorContract(task)), onStarted, currentChild: () => state.child }, { ...context, signal: controller.signal, progress: update => announce({ title: state.id + ': ' + (planning ? 'planning' : task.id + ' (' + (state.index + 1) + '/' + state.tasks.length + ')'), ...update }) });
             if (guardError) throw guardError;
             if (controller.signal.aborted) throw new Error('Run cancelled');
-            receipt = { ...state.attempt, response };
+            receipt = { ...attempt, response };
             await writeReceipt(state.id, receipt);
             await atomicJSON(path.join(runDir, 'last-response.json'), response);
             try { result = parseResult(response); }
-            catch (error) { state.attempt.status = 'rejected'; if (!planning) rejection = classifyCompletionFailure(task, { response }); throw error; }
+            catch (error) { attempt.status = 'rejected'; if (!planning) rejection = classifyCompletionFailure(task, { response }); throw error; }
             await checkBudget();
           } catch (error) {
             // Native cancellation may reject with a generic interruption. Preserve the guard that caused it.
@@ -384,9 +479,10 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
             // A failure before any reply (and not a budget guard or cancellation) is a native/provider failure.
             if (!planning && !receipt && !guardError && !controller.signal.aborted) rejection = classifyCompletionFailure(task, { error: cause });
             controller.abort(cause);
-            if (!receipt && state.child) state.attempt.status = 'interrupted';
+            if (!receipt && state.child) attempt.status = 'interrupted';
             if (state.child) {
-              try { await backend.interrupt(state.child, state.parent); }
+              terminationUnconfirmed = !!correctionRelease; // A held report-only restriction is kept until termination is confirmed.
+              try { await backend.interrupt(state.child, state.parent); terminationUnconfirmed = false; }
               catch (cancelError) {
                 if (guardError) throw new Error(errorMessage(guardError) + '. Cancellation check: ' + errorMessage(cancelError));
                 throw new Error(errorMessage(cancelError) + '. Original error: ' + errorMessage(cause));
@@ -408,10 +504,12 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
             await warningWrite;
             if (state.child) guards.delete(state.child);
             parentSignal?.removeEventListener('abort', cancel);
+            await releaseCorrection().catch(() => {}); // Fail closed: a release that cannot run leaves the restriction in force.
           }
         }
         let admittedPlan: PlanResult | undefined;
         let admittedCompletion: CompletionResult | undefined;
+        let correctable: ReportDiagnostic | undefined; // Set only for a format-only rejection that may be corrected.
         try {
           await atomicJSON(path.join(runDir, 'reply-' + (planning ? 'plan' : task.id) + '.json'), result);
           if (result.status === 'blocked') {
@@ -427,13 +525,19 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
             await atomicJSON(path.join(runDir, 'tasks.json'), result.tasks);
           } else {
             try { validateCompletion(result, task, { requireGateIds: true }); }
-            catch (error) { rejection = classifyCompletionFailure(task, { result }); throw error; }
+            catch (error) {
+              rejection = classifyCompletionFailure(task, { result });
+              if (rejection.code === 'report_format') correctable = rejection;
+              throw error;
+            }
             admittedCompletion = result;
           }
         } catch (error) {
           if (state.attempt) state.attempt.status = 'rejected'; // An explicit resolution may reprompt this idle child.
-          throw error;
+          // Only a format-only rejection is corrected, and only after the counter and attempt are durably saved. Every refusal throws.
+          if (!correctable || !(await prepareCorrection(task, correctable))) throw error;
         }
+        if (correctable) continue;
         // Commit advancement atomically. A crash before this commit replays the receipt only.
         const next = { ...state, child: null };
         delete next.attempt;
@@ -443,7 +547,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
         delete next.reportRecovery; // Real advancement only: restarts, new attempts and resumes keep the record.
         if (planning) { next.tasks = admittedPlan!.tasks; next.phase = 'executor'; }
         else {
-          next.results = [...state.results, { ...admittedCompletion!, sessionId: state.child, model: state.attempt!.model, quotaSelection: state.selection }];
+          next.results = [...state.results, { ...admittedCompletion!, sessionId: state.child, model: state.attempt!.model, quotaSelection: state.selection, ...(state.reportRecovery?.corrections ? { reportCorrections: state.reportRecovery.corrections } : {}) }];
           next.index++;
         }
         await save(next);
@@ -459,9 +563,12 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
         state.reportRecovery = pauseReportRecovery(state.reportRecovery, { index: state.index, taskId: failedTask.id, child: state.child, attemptId: state.attempt?.id ?? '' }, rejection);
         state.reason = reportPauseReason(rejection, failedTask, state.reason);
       }
+      // A pause is never "correcting": cancellation, budget and quota stops keep the counter and clear the mode.
+      if (state.reportRecovery?.mode === 'correcting') state.reportRecovery = { ...state.reportRecovery, mode: 'paused' };
       await save(state);
       return JSON.stringify({ runId: state.id, status: 'paused', childSession: state.child, reason: state.reason });
     } finally {
+      await releaseCorrection().catch(() => {}); // Pre-dispatch stops; an unconfirmed interrupt keeps the restriction.
       await lock.close();
       await fs.unlink(lockPath);
     }

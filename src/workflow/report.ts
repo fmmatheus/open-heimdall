@@ -78,6 +78,7 @@ const gates = (ids: string[] | undefined) => ids?.length ? ids.slice(0, 10).join
 export function reportPauseReason(diagnostic: ReportDiagnostic, task: WorkflowTask, detail = ''): string {
   const fields = diagnostic.missingFields?.join(', ');
   const ids = gates(diagnostic.gateIds);
+  const stillMissing = fields || ids ? ', still missing ' + [fields && 'fields ' + fields, ids && 'gate entries ' + ids].filter(Boolean).join(' and ') : '';
   const formatOnly = ' Resume with guidance to restate the results that already exist in the final completion contract: no new work, tests or file changes.';
   switch (diagnostic.code) {
     case 'report_format':
@@ -93,9 +94,9 @@ export function reportPauseReason(diagnostic: ReportDiagnostic, task: WorkflowTa
     case 'auth_or_quota':
       return bounded(detail || 'Native/provider failure: authentication or quota unavailable.', 500);
     case 'correction_exhausted':
-      return 'Invalid completion report for ' + task.id + ': automatic report correction is exhausted.' + formatOnly;
+      return 'Invalid completion report for ' + task.id + ': automatic report correction is exhausted' + stillMissing + '.' + formatOnly;
     case 'correction_unsupported':
-      return 'Invalid completion report for ' + task.id + ': report-only correction is unsupported here.' + formatOnly;
+      return 'Invalid completion report for ' + task.id + ': report-only correction is unsupported here' + (detail ? ' (' + bounded(detail, 300) + ')' : '') + stillMissing + '.' + formatOnly;
     case 'correction_ambiguous':
       return 'Invalid completion report for ' + task.id + ': a previous correction may already have run, so none is repeated automatically.' + formatOnly;
     default:

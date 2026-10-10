@@ -5,7 +5,15 @@ import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { cachedQuota, deduplicateUsageFetch } from './quota-cache.js';
 import { readClaudeCodeQuota } from './claude-code-quota.js';
-import type { CandidateQuotaScore, ExecutorSelection, QuotaEvent, QuotaResult, QuotaSettings, QuotaSnapshot, RawQuotaResult } from './types.js';
+import type { CandidateQuotaScore, ExecutorCandidate, ExecutorSelection, QuotaEvent, QuotaResult, QuotaSettings, QuotaSnapshot, RawQuotaResult } from './types.js';
+
+/** The configured executor candidates, or the legacy primary/fallback pair. */
+export function executorCandidates(settings: QuotaSettings): ExecutorCandidate[] {
+  return settings.executorCandidates || [
+    { key: 'sonnet', quotaProvider: settings.executorModel.startsWith('claude-code/') ? 'claude-code' : 'anthropic', model: settings.executorModel },
+    { key: 'kimi', quotaProvider: settings.executorFallbackModel.startsWith('claude-code/') ? 'claude-code' : 'kimi', model: settings.executorFallbackModel },
+  ];
+}
 
 export function chooseExecutor(snapshot: QuotaSnapshot, settings: QuotaSettings): ExecutorSelection {
   const weight = settings.fiveHourQuotaWeight ?? 0.6;
@@ -30,10 +38,7 @@ export function chooseExecutor(snapshot: QuotaSnapshot, settings: QuotaSettings)
       };
     } catch (error) { return { eligible: false, score: 0, reason: errorMessage(error) }; }
   };
-  const candidates = settings.executorCandidates || [
-    { key: 'sonnet', quotaProvider: settings.executorModel.startsWith('claude-code/') ? 'claude-code' : 'anthropic', model: settings.executorModel },
-    { key: 'kimi', quotaProvider: settings.executorFallbackModel.startsWith('claude-code/') ? 'claude-code' : 'kimi', model: settings.executorFallbackModel },
-  ];
+  const candidates = executorCandidates(settings);
   for (const candidate of candidates) {
     if (['model', 'variant', 'checkedAt'].includes(candidate.key)) throw new Error('Executor candidate key is a reserved selection field: ' + candidate.key);
   }

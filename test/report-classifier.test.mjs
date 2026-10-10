@@ -144,7 +144,7 @@ async function fixture(t, responses) {
 
 const SECRET = 'SECRET-RAW-REPLY-TEXT-4242';
 const pauseCases = [
-  ['missing handoff and G2', () => good({ handoff: '', summary: SECRET, evidence: [entry(1, { detail: SECRET }), entry(3)] }), 'report_format', /^Invalid completion report for T2/, { missingFields: ['handoff'], gateIds: ['G2'] }],
+  ['missing handoff and G2', () => good({ handoff: '', summary: SECRET, evidence: [entry(1, { detail: SECRET }), entry(3)] }), 'correction_unsupported', /^Invalid completion report for T2: report-only correction is unsupported here.*still missing fields handoff and gate entries G2/, { missingFields: ['handoff'], gateIds: ['G2'] }],
   ['prose only', () => SECRET + ' all done', 'ambiguous_output', /^Invalid completion report for T2/],
   ['truncated', () => nativeText(SECRET, { finish: 'length' }), 'ambiguous_output', /^Invalid completion report for T2/],
   ['unresolved gate', () => good({ summary: SECRET, evidence: [entry(1), entry(2, { passed: false, detail: SECRET }), entry(3)] }), 'unfinished_work', /^Unfinished work for T2.*G2/, { gateIds: ['G2'] }],
@@ -188,7 +188,7 @@ test('reportRecovery survives a repeated rejection, keeps its counter, and is re
   const f = await fixture(t, [plan, good({ handoff: '' }), good({ taskId: 'T1' }), good()]);
   const first = JSON.parse(await f.run({ action: 'start', adr: 'ADR.md' }, f.context));
   const before = await f.readState(first.runId);
-  assert.equal(before.reportRecovery.diagnostic.code, 'report_format');
+  assert.equal(before.reportRecovery.diagnostic.code, 'correction_unsupported', 'this backend has no report-only capability');
   before.reportRecovery.corrections = 1;
   before.reportRecovery.attempts = ['earlier-correction'];
   await fs.writeFile(f.statePath(first.runId), JSON.stringify(before));
