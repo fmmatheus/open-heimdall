@@ -195,11 +195,11 @@ forces a full re-run. Verification record:
 - Automatic report correction needs an owner-verified provider
   (`VERIFIED_REPORT_ONLY_PROVIDERS` is empty); until then format-only failures
   pause for a manual resume. **`claude-code` is unsupported.** Feature 0004
-  tried to verify it live and stopped at a blocker: its provider relies on the
-  real `claude` login, which cannot be used in an isolated OpenCode store
-  without touching credentials, so no denial was observed. Whether
-  `claude-code` tool calls (parked MCP calls, code-mode nested calls) pass
-  through the plugin hooks therefore stays unproven. See
+  did not perform an authenticated live check. Its fresh Claude login store
+  had no login. Earlier smoke tests reused the existing login with isolated
+  OpenCode stores, transcript persistence disabled and user hooks disabled;
+  that does not prove protection against credential refresh or every CLI write.
+  Those protections and every supported tool path still need verification. See
   [Provider verification](validation/completion-report-recovery.md#provider-verification-feature-0004).
 - A correction that was dispatched but never answered consumes one of the two
   attempts and is not re-sent; the next owner resume uses a normal task prompt.

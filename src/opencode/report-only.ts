@@ -13,8 +13,8 @@ export const REPORT_ONLY_DENIAL = 'Heimdall report-only correction: every tool c
  * Providers whose tool paths are proven to pass through the enforcement hooks.
  * Empty on purpose: no provider has been proven live (docs/validation/completion-report-recovery.md).
  * `claude-code` stays unsupported: its tool paths are unverified at the host (parked MCP
- * calls, code-mode nested calls) and a live check needs a Claude login that cannot be
- * isolated without touching credentials. Remaining steps are listed in the validation record.
+ * calls, code-mode nested calls). Earlier isolated smoke tests reused the existing login,
+ * but did not prove credential-write protections. Live verification remains pending.
  */
 export const VERIFIED_REPORT_ONLY_PROVIDERS: readonly string[] = [];
 

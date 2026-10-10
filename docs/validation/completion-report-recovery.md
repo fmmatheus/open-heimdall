@@ -239,21 +239,27 @@ and was not proven for a default environment. `serve` accepts `--hostname` and `
 `opencode run` and the TUI default to the shared background service unless `--standalone`
 or `--server` is given, so they were not used.
 
-### Blocker
+### Verification limitation
 
-Store isolation works, but a `claude-code` session cannot be authenticated inside it
-without touching credentials:
+No authenticated live check was attempted during feature 0004. The fresh login
+store was empty; this does not prove isolated authentication is impossible:
 
-- The provider runs the real `claude` CLI and relies on its own login store
-  (`buildClaudeCodeChildEnv` only removes `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and
-  `CLAUDE_CODE_OAUTH_TOKEN`).
-- With `HOME` and `CLAUDE_CONFIG_DIR` pointed at the temp dir, `claude auth status` printed
-  `"loggedIn": false, "authMethod": "none"` and only wrote inside `$T/claude`.
-- Running against the real `~/.claude` login would make the CLI write session transcripts
-  and config under `~/.claude`; copying the login into the temp dir would copy credentials.
-  Both were out of bounds for this task.
+- The provider uses the Claude CLI login store and removes credential overrides
+  from its child environment.
+- With `HOME` and `CLAUDE_CONFIG_DIR` pointed at the temp dir, `claude auth status`
+  reported `"loggedIn": false, "authMethod": "none"`. Setting `CLAUDE_CONFIG_DIR`
+  also selects a different macOS Keychain service.
+- The earlier [Claude Code coordinator smoke](claude-code-coordinator-smoke.md)
+  used the existing login with private OpenCode stores, transcript persistence
+  disabled and user hooks disabled. It did not prove protection against Claude
+  credential refresh or every CLI state write.
 
-Therefore no server was started and no tool path was attempted. Nothing was run against
+The next check should assess that earlier setup against the installed CLI and
+prove credential-write protections before starting a disposable server. Do not
+copy or refresh credentials or use existing sessions as fixtures. Provider
+support remains disabled until live enforcement is proven.
+
+No server was started and no tool path was attempted. Nothing was run against
 `http://127.0.0.1:57123`, no existing session database was opened, and `~/.config/opencode`,
 `~/.claude`, credentials and installed builds were not modified (the provider and user
 config were only read). No server or session process was started (no PID to stop); only
@@ -263,8 +269,8 @@ HEAD` comparison exist because nothing was run. The repository was not changed b
 
 ### Remaining verification (owner)
 
-Run this on a machine where a disposable Claude Code login is allowed (a throwaway account
-or an owner-approved `CLAUDE_CONFIG_DIR` login), never against the live server:
+Establish an isolated setup that preserves the existing login and prevents credential
+changes, or use an owner-authorized disposable login. Never use the live server:
 
 1. `npm run build`, create a temp git repo with a committed implementation file, and a
    fixture plugin there that loads this repo's `dist/opencode/plugin.js` with an injected
