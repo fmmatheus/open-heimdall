@@ -99,6 +99,27 @@ rate-limit cooldowns.
 See the [live Claude Code coordinator validation](validation/claude-code-coordinator-smoke.md)
 for execution, concurrency, token tracking and recovery observations.
 
+## Structured completion
+
+New native and managed runs use `structured-v1`: the planner and executor submit
+through `heimdall_submit_plan` / `heimdall_submit_result`, receipts are durable
+and immutable, and a task advances only after a matching receipt and a confirmed
+idle stop. Runs persisted without a protocol keep the prose completion path.
+Pause codes and the repair bound are described in
+[the coordinator guide](coordinator.md#structured-completion-protocol).
+
+The plugin computes its own runtime identity (digests of `dist`, `prompts`,
+`examples/opencode/agents`, package version and dependency resolution) and records
+it in run states and receipts. Coordinator-managed runs are pinned to a run-owned
+read-only copy (`.heimdall-runtime-snapshot.json`), verified before launch and
+resume. Rebuilding the package therefore needs no coordination with managed runs
+already started, but a native standalone run loads `dist` in place: do not
+rebuild or reload while one is running.
+
+The guarded live harness is `scripts/live/claude-report-only/`; the structured
+run is `e2e-structured.mjs` (one prompt, read-only sampling), described in
+[structured-completion-live.md](validation/structured-completion-live.md).
+
 ## Current limits
 
 - The standalone baseline keeps one active run per configured state directory

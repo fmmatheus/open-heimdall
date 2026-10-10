@@ -46,7 +46,10 @@ const observe = async (id, signal) => {
   faults.set(id, faults.get(id) + 1);
   return { ...snapshot, active: true };
 };
-const inner = createPlugin({ reportOnly: registry, observe });
+// Fixture-only quota (F2): a synthetic healthy claude-code snapshot through the documented createPlugin({ quota }) seam. The real
+// probe execs the absolute /usr/bin/security, which the guard denies on purpose; no source or dist file is patched for it.
+const quota = async () => ({ 'claude-code': { fetchedAt: Date.now(), errors: [], entries: [{ name: '5h', percentRemaining: 90 }, { name: 'Weekly', percentRemaining: 90 }] } });
+const inner = createPlugin({ reportOnly: registry, observe, quota });
 const releases = new Map(); // `${child}|${attemptId}` -> idempotent release returned by restrict()
 let server;
 const log = entry => fs.appendFileSync(logPath, JSON.stringify({ at: Date.now(), ...entry }) + '\n');

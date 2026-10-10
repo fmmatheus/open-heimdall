@@ -1,14 +1,15 @@
 // T2 fixture preparation: copies the built dist/ into the fixture root, applies the fixture-only settings, writes the
 // fixture plugins, agents, MCP server and OpenCode config, and creates the recovery repository.
 // Starts nothing and calls no model.
-//   node t2-prepare.mjs --root /private/tmp/heimdall-0006.XXXXXX --port 4731 [--variant low] [--dist <built dist/>]
+//   node t2-prepare.mjs --root /private/tmp/heimdall-0006.XXXXXX --port 4731 [--variant high] [--planner-model claude-code/opus] [--dist <built dist/>]
 //
 // Fixture-only settings (never applied to src/ or the repository's dist/):
 //   F1 dist/opencode/report-only.js: VERIFIED_REPORT_ONLY_PROVIDERS must be ['claude-code']; the historical empty list is rewritten,
 //      the final list is kept, any other value is rejected (provider-list.mjs)
-//   F2 dist/policy/quota.js: createQuota returns a synthetic healthy claude-code snapshot. The probe it replaces execs the
-//      absolute /usr/bin/security, which the guard denies on purpose; quota is not what this verification proves.
-//   F3 a wrapper plugin (createPlugin({ reportOnly: createReportOnlyRegistry() })) with an owner-only control socket,
+//   F2 the fixture wrapper plugin passes createPlugin({ quota }) (the documented harness seam), a synthetic healthy
+//      claude-code snapshot. The real probe execs the absolute /usr/bin/security, which the guard denies on purpose; quota
+//      is not what this verification proves. dist/ itself is NOT modified for it, so the built plugin runs byte-identical.
+//   F3 a wrapper plugin (createPlugin({ reportOnly: createReportOnlyRegistry(), quota })) with an owner-only control socket,
 //      and two observers around it that only record
 //   F4 a disposable stdio MCP server writing a marker file
 // Plus the provider isolation patches already recorded by T1 (copy-provider.mjs).
@@ -25,6 +26,8 @@ const root = assertFixtureRoot(options.root ?? '');
 const port = Number(options.port);
 if (!Number.isInteger(port) || port < 1024 || port > 65535 || port === 57123) throw new Error('Provide a free --port (not the live server port)');
 const variant = typeof options.variant === 'string' ? options.variant : undefined;
+const plannerModel = typeof options['planner-model'] === 'string' ? options['planner-model'] : 'claude-code/sonnet';
+if (!/^claude-code\/[a-z0-9.-]+$/.test(plannerModel)) throw new Error('--planner-model must be a claude-code model');
 const manifest = readManifest(root);
 if (manifest.guard?.outcome !== 'guard proven') throw new Error('T1 did not record guard proven; T2 must not prepare a live fixture');
 if (manifest.t2Prepared) throw new Error('T2 fixture was already prepared in this root');
@@ -39,15 +42,12 @@ fs.cpSync(sourceDist, dist, { recursive: true, errorOnExist: true, force: false 
 // The plugin reads prompts/planner.md and prompts/executor.md next to dist/ (the published package ships both).
 fs.cpSync(path.resolve(sourceDist, '..', 'prompts'), path.join(heimdall, 'prompts'), { recursive: true, errorOnExist: true, force: false });
 fs.symlinkSync(sourceNodeModules, path.join(heimdall, 'node_modules'), 'dir');
-fs.writeFileSync(path.join(heimdall, 'package.json'), JSON.stringify({ name: 'heimdall-fixture-host', private: true, type: 'module' }, null, 2) + '\n', { mode: 0o600 });
+// Mirror the published package layout so the plugin computes its real runtime identity (name, version, lockfile, dist,
+// prompts, agent files) from the fixture copy instead of reporting it unavailable. The sources are only read.
+const sourceRoot = path.resolve(sourceDist, '..');
+for (const name of ['package.json', 'package-lock.json']) fs.copyFileSync(path.join(sourceRoot, name), path.join(heimdall, name), fs.constants.COPYFILE_EXCL);
+fs.cpSync(path.join(sourceRoot, 'examples', 'opencode', 'agents'), path.join(heimdall, 'examples', 'opencode', 'agents'), { recursive: true, errorOnExist: true, force: false });
 
-const patch = (relative, anchor, replacement) => {
-  const file = path.join(dist, relative);
-  const original = fs.readFileSync(file, 'utf8');
-  if (original.split(anchor).length !== 2) throw new Error(`Fixture patch anchor did not match exactly once in ${relative}`);
-  fs.writeFileSync(file, original.replace(anchor, replacement));
-  return { file: `dist/${relative}`, before: sha256(original), after: sha256(fs.readFileSync(file)) };
-};
 // F1 accepts exactly the historical empty list or the final ['claude-code'] list in the fixture COPY of dist.
 const patchProviderList = relative => {
   const file = path.join(dist, relative);
@@ -56,10 +56,7 @@ const patchProviderList = relative => {
   if (prepared.patched) fs.writeFileSync(file, prepared.text);
   return { file: `dist/${relative}`, found: prepared.found, patched: prepared.patched, before: sha256(original), after: sha256(fs.readFileSync(file)) };
 };
-const patches = [
-  patchProviderList('opencode/report-only.js'),
-  patch('policy/quota.js', 'export function createQuota(options) {\n    return settings => fetchQuota(settings, options);\n}', "// FIXTURE-ONLY (t2-prepare.mjs F2): synthetic healthy snapshot; the real probe execs /usr/bin/security, denied by the guard.\nexport function createQuota(options) {\n    return async () => ({ 'claude-code': { fetchedAt: Date.now(), errors: [], entries: [{ name: '5h', percentRemaining: 90 }, { name: 'Weekly', percentRemaining: 90 }] } });\n}"),
-];
+const patches = [patchProviderList('opencode/report-only.js')];
 
 // Fixture sources live next to the copied dist so '@opencode/plugin' and '../dist/...' resolve from the fixture.
 const fixtureDirectory = path.join(heimdall, 'fixture');
@@ -99,7 +96,7 @@ fs.writeFileSync(path.join(agents, 'fixture-worker-ask.md'), '---\ndescription: 
 const toml = `[workflow]
 plannerAgent = "adr-planner"
 executorAgent = "adr-executor"
-plannerModel = "claude-code/sonnet"
+plannerModel = "${plannerModel}"
 ${variant ? `plannerVariant = "${variant}"\n` : ''}maxTasks = 3
 minQuotaRemainingPercent = 10
 fiveHourQuotaWeight = 0.6
@@ -145,6 +142,7 @@ updateManifest(root, current => {
     preparedAt: new Date().toISOString(),
     port,
     variant: variant ?? null,
+    plannerModel,
     fixtureOnly: patches,
     distCopyTreeSha256: sha256(JSON.stringify(hashTree(dist))),
     plugins: { order: ['fixture-observer-pre', 'fixture-heimdall', 'fixture-observer-post', 'opencode-claude'] },

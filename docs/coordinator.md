@@ -124,9 +124,63 @@ remain held for inspection after restart.
 Runs can also be watched and reviewed read-only from OpenChamber 2.1.0; see the
 [OpenChamber extension guide](openchamber-extension.md).
 
+## Structured completion protocol
+
+New runs persist `structured-v1` at start. The planner and the executor no longer
+report through final chat text: each is offered one typed, owner-bound tool,
+`heimdall_submit_plan` or `heimdall_submit_result`, and ends its turn after the
+acknowledgement. The final chat text is never parsed as a result in a structured
+run. Live record (planner and executor, one task advancement):
+[structured-completion-live.md](validation/structured-completion-live.md).
+
+- **Binding and receipts.** A binding with a rising dispatch generation is saved
+  before each dispatch and bound to the child before the prompt is admitted; it
+  is confirmed once the host observes the dispatch prompt. A submission is
+  authenticated against that binding and against the native caller (session,
+  agent, message and call ID, proved from the host message timeline, failing
+  closed when no native origin exists). The accepted payload is written once as
+  an immutable receipt (`submission-<attempt>-<phase>-<kind>.json`, schema v3
+  `submissions` table in the coordinator) before it is acknowledged.
+- **Advancement.** A plan or task advances only with a matching durable receipt
+  and a freshly confirmed successful native stop of the same idle child.
+  Blocked, unfinished, interrupted, truncated or failed outcomes pause without a
+  repair prompt; authentication and quota stay real failures.
+- **Format repair.** A malformed submission gets at most two format repairs (the
+  initial call plus two retries), counted per planner phase or executor task in
+  the checkpoint and saved, with the owner-bound, submission-only restriction,
+  before any feedback is returned. Framework-rejected calls count. An explicit
+  `blocked` status or `passed: false` evidence inside a malformed payload is
+  recorded as the real outcome and never consumes a repair. The reporting
+  boundary is sealed (running implementation work is recorded as a conflict)
+  before a receipt is acknowledged, and later implementation calls are denied.
+- **Pause codes.** `submission_missing` (the child ended without a successful
+  submission call), `submission_unconfirmed` (receipt recorded, successful stop
+  not confirmed; a resume applies it without redoing the work),
+  `submission_repair_exhausted`, `submission_unsupported` (repair cannot be
+  enforced for this model or host, so none was offered), `submission_refused`
+  (no repair could be offered) and `conflicting_work` (implementation work ran
+  beside or after the accepted submission, so the evidence is not admitted). All
+  carry bounded host-owned text, never submitted content, and none repeats a
+  repair automatically.
+- **Legacy compatibility.** A run persisted without a protocol keeps the prose
+  path, including the completion-report correction below. The two paths are
+  chosen once at start and never mixed in one run.
+- **Runtime identity and snapshot.** The loaded plugin hashes its own `dist`,
+  prompts, agent files and dependency resolution and records that build identity
+  in new run states and in every submission receipt. A coordinator-managed run is
+  admitted with that identity and launches from a run-owned, read-only copy
+  beside its checkout (`STATE/worktrees/PROJECT_ID/RUN_ID/runtime`, marker
+  `.heimdall-runtime-snapshot.json`, generated loader `.opencode/plugins/heimdall.ts`).
+  The copy, its dependency location and the loader are verified before launch and
+  before every resume; any mismatch refuses the run, so a rebuild of the shared
+  package cannot change a running workflow. A run admitted without a snapshot
+  (an earlier run) is not pinned and follows its existing path.
+- **Not proven live.** Repair, negative outcomes, the pause codes above and the
+  runtime snapshot were not exercised in the live run; they rest on unit tests.
+
 ## Completion-report correction
 
-An executor that finishes the work but sends a malformed report no longer
+This path applies to runs persisted without the structured protocol. An executor that finishes the work but sends a malformed report no longer
 forces a full re-run. Verification record:
 [completion-report-recovery.md](validation/completion-report-recovery.md).
 
@@ -201,6 +255,13 @@ forces a full re-run. Verification record:
 
 ## Remaining limits
 
+- The structured protocol was observed live once, on `claude-code`, with a valid
+  first submission from each role. Repair, every `submission_*` pause code and
+  the immutable runtime snapshot have no live evidence; the live run used a
+  native workflow start with the built `dist` loaded in place, not a
+  coordinator-managed run. Nothing runs against an installed build until the
+  owner installs this branch. See
+  [structured-completion-live.md](validation/structured-completion-live.md).
 - Automatic report correction needs an owner-verified provider
   (`VERIFIED_REPORT_ONLY_PROVIDERS`). On this branch only `claude-code` is
   listed, from the live record in
