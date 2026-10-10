@@ -1,6 +1,6 @@
 // Resolve every OpenCode and provider store with the fixture environment and prove each is
 // under the fixture root. Runs `opencode debug paths` only (read-only); starts no server.
-//   node stores.mjs --root /private/tmp/heimdall-0005.XXXXXX
+//   node stores.mjs --root /private/tmp/heimdall-0006.XXXXXX
 import fs from 'node:fs';
 import path from 'node:path';
 import { assertFixtureRoot, capture, emit, isUnder, parseArguments, storeEnvironment, storePaths, updateManifest } from './lib.mjs';

@@ -1,5 +1,5 @@
 // T2 late-release checks on the live registry and the paused `interrupt` run.
-//   node t2-release.mjs --root /private/tmp/heimdall-0005.XXXXXX
+//   node t2-release.mjs --root /private/tmp/heimdall-0006.XXXXXX
 //
 //   1. owner isolation: a restriction held by one owner is not removed by another owner's release, and an
 //      unowned/other-session restriction is untouched

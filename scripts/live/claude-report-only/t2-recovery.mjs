@@ -1,6 +1,6 @@
 // T2 recovery scenarios against the disposable server: the real workflow runs through the real plugin with fresh
 // claude-code/sonnet planner and executor children.
-//   node t2-recovery.mjs --root /private/tmp/heimdall-0005.XXXXXX --scenario correct|cap|interrupt
+//   node t2-recovery.mjs --root /private/tmp/heimdall-0006.XXXXXX --scenario correct|cap|interrupt
 //
 //   correct    executor omits `handoff` once; one automatic correction on the same idle child repairs it
 //   cap        executor omits `handoff` every time; corrections stop at the cap; a later resume does not add more

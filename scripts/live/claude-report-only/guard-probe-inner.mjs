@@ -4,13 +4,23 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { openLedger, recordCreated } from './ownership.mjs';
 
 const plan = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const results = [];
 
+// A guarded write that SUCCEEDS means the guard failed. Whatever it created is recorded in the ownership ledger
+// (intent first, then dev/ino of what exists) so the outer cleanup can remove exactly that and nothing else.
+const ledger = plan.ledger ? openLedger(plan.ledger) : null;
+const creates = new Set(['create', 'mkdir', 'symlink', 'hardlink', 'rename']);
+
 function attempt(entry) {
   const { target, op } = entry;
+  const destination = op === 'rename' ? `${target}.renamed` : target;
+  let identity = null;
   try {
+    if (ledger && creates.has(op)) ledger.intent(destination, op);
+    if (op === 'rename') { const stat = fs.lstatSync(target); identity = { dev: stat.dev, ino: stat.ino }; }
     if (op === 'create') fs.closeSync(fs.openSync(target, 'wx'));
     else if (op === 'overwrite') { const fd = fs.openSync(target, 'r+'); fs.writeSync(fd, 'GUARD-PROBE-OVERWRITE'); fs.closeSync(fd); }
     else if (op === 'truncate') fs.truncateSync(target, 0);
@@ -22,13 +32,20 @@ function attempt(entry) {
     else if (op === 'symlink') fs.symlinkSync('/nonexistent', target);
     else if (op === 'hardlink') fs.linkSync(entry.source, target);
     else throw new Error(`unknown op ${op}`);
-    return { denied: false };
+    return { denied: false, ...record(destination, op, identity) };
   } catch (error) {
     return { denied: error.code === 'EPERM' || error.code === 'EACCES' || error.code === 'EROFS', errno: error.code ?? String(error.message).slice(0, 60) };
   }
 }
 
-for (const entry of plan.writes) results.push({ kind: 'write', label: entry.label, class: entry.class, op: entry.op, expected: entry.expect ?? 'denied', ...attempt(entry) });
+// Ownership of what a successful guarded write created. A rename may overwrite a foreign destination, so it is
+// claimed only when the destination is the very inode that was renamed; the others fail on an existing path.
+function record(destination, op, identity) {
+  if (!ledger || !creates.has(op)) return {};
+  try { return { created: recordCreated(plan.ledger, destination, op, identity) }; } catch { return { created: false, ledgerError: true }; }
+}
+
+for (const entry of plan.writes) results.push({ kind: 'write', label: entry.label, class: entry.class, op: entry.op, target: entry.target, expected: entry.expect ?? 'denied', ...attempt(entry) });
 
 for (const entry of plan.execs) {
   const run = spawnSync(entry.command, entry.args, { encoding: 'utf8', timeout: 30_000, env: process.env });

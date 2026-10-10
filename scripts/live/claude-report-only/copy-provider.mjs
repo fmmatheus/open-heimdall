@@ -1,6 +1,6 @@
 // Copy the installed provider into the fixture with exclusive-create writes and apply only
 // the isolation patches. The installed provider is hashed before and after and never written.
-//   node copy-provider.mjs --root /private/tmp/heimdall-0005.XXXXXX
+//   node copy-provider.mjs --root /private/tmp/heimdall-0006.XXXXXX
 import fs from 'node:fs';
 import path from 'node:path';
 import {

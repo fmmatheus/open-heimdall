@@ -1,6 +1,6 @@
 // T2 follow-up fixtures: disposable repositories for the failed/unresolved-work scenarios and for the retained-restriction
 // scenario. Starts nothing and calls no model.
-//   node t2-negative-prepare.mjs --root /private/tmp/heimdall-0005.XXXXXX
+//   node t2-negative-prepare.mjs --root /private/tmp/heimdall-0006.XXXXXX
 //
 //   repo-blocked     farewell ADR; adr-executor-blocked (fixture-only rule) replies blocked, naming a missing owner prerequisite
 //   repo-unresolved  farewell ADR; adr-executor-unresolved (fixture-only rule) implements but replies `completed` with one gate

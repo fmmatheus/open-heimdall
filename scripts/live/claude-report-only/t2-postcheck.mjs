@@ -1,5 +1,5 @@
 // After the recovery scenarios: every executor child must be idle, unrestricted, and able to run an ordinary tool call.
-//   node t2-postcheck.mjs --root /private/tmp/heimdall-0005.XXXXXX
+//   node t2-postcheck.mjs --root /private/tmp/heimdall-0006.XXXXXX
 // The check prompts each executor child directly (its agent allows all tools) to write one file in its own disposable
 // repository, then verifies the file and that the call reached every hook (not stopped by Heimdall).
 import fs from 'node:fs';

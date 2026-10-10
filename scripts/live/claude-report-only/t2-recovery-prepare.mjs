@@ -1,6 +1,6 @@
 // T2 recovery fixture: one disposable repository per scenario plus two fixture-only executor agents that deliberately
 // leave `handoff` out of their final report. Starts nothing and calls no model.
-//   node t2-recovery-prepare.mjs --root /private/tmp/heimdall-0005.XXXXXX
+//   node t2-recovery-prepare.mjs --root /private/tmp/heimdall-0006.XXXXXX
 //
 // Fixture-only settings (the committed examples/ agents are untouched; these live in the fixture config directory):
 //   adr-executor-omit-once    first final reply omits `handoff`; a reply to a "Report-only correction" message is complete

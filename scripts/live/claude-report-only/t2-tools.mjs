@@ -1,5 +1,5 @@
 // T2 live tool-path matrix against the disposable server started by the T2 launcher.
-//   node t2-tools.mjs --root /private/tmp/heimdall-0005.XXXXXX [--only edit,write,...]
+//   node t2-tools.mjs --root /private/tmp/heimdall-0006.XXXXXX [--only edit,write,...]
 //
 // One fresh claude-code/sonnet session per path, four prompts each:
 //   A  unrestricted       the action must take effect (the path works at all)

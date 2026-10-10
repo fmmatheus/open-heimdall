@@ -13,6 +13,10 @@
 //   3. `security` on PATH is a shim that forwards only the credential read to broker.mjs, which
 //      runs outside the sandbox and strips every refresh token before the CLI sees the login, so
 //      the CLI cannot refresh (rotate) the stored login either.
+//
+// Cleanup is ownership based (ownership.mjs): every probe object has a unique per-run name and is removed
+// only when this run created it exclusively and recorded its identity. The probe never removes anything
+// recursively and is not 'guard proven' unless that cleanup is confirmed.
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -21,6 +25,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import {
   assertFixtureRoot, capture, emit, parseArguments, readManifest, sha256, storeEnvironment, updateManifest,
 } from './lib.mjs';
+import { cleanupOwned, createExclusiveFile, newNonce, openLedger, probeOutcome } from './ownership.mjs';
 
 const here = path.dirname(new URL(import.meta.url).pathname);
 export const PROBE_SERVICE = 'Claude Code-credentials-probe0005';
@@ -101,9 +106,8 @@ export function guardedCommand(root, command, args) {
   return { command: '/usr/bin/sandbox-exec', args: ['-f', guardPaths(root).profile, command, ...args], env: guardedEnvironment(root) };
 }
 
-export function install(root) {
+export function install(root, home = os.homedir()) {
   const paths = guardPaths(root);
-  const home = os.homedir();
   fs.mkdirSync(paths.bin, { recursive: true, mode: 0o700 });
   fs.rmSync(paths.profile, { force: true });
   fs.writeFileSync(paths.profile, buildProfile({ root, home }), { flag: 'wx', mode: 0o600 });
@@ -153,8 +157,9 @@ const listKeychains = async () => ({
 });
 const serviceNames = async keychain => [...(await security(['dump-keychain', keychain])).stdout.matchAll(/"svce"<blob>="([^"]*)"/g)].map(match => match[1]).sort();
 
-function seedFile(file) {
-  fs.writeFileSync(file, 'DISPOSABLE-GUARD-PROBE-0005\n', { flag: 'wx', mode: 0o600 });
+// Exclusive create of a disposable seed; ownership is recorded before the content is written.
+function seedFile(ledger, file) {
+  createExclusiveFile(ledger, file, 'DISPOSABLE-GUARD-PROBE-0006\n', { op: 'seed' });
   return { sha256: sha256(fs.readFileSync(file)), mode: fs.statSync(file).mode & 0o777 };
 }
 
@@ -165,9 +170,13 @@ export async function probe(root) {
   const hashes = install(root);
   const evidenceDirectory = path.join(root, 'evidence');
   const failures = [];
-  const created = [];
   const seeds = [];
-  const record = { home: 'unchanged', installedGuard: hashes, writes: [], execs: [], keychain: {}, controls: {}, authStatus: {}, cleanup: {} };
+  // Unique per-run names: nothing this run creates can collide with another run's or a user's objects.
+  const nonce = newNonce();
+  const tag = `heimdall-0006-probe-${nonce}`;
+  const ledgerFile = path.join(evidenceDirectory, `ownership-${nonce}.jsonl`);
+  const ledger = openLedger(ledgerFile);
+  const record = { home: 'unchanged', nonce, ownershipLedger: '<root>/evidence/' + path.basename(ledgerFile), installedGuard: hashes, writes: [], execs: [], keychain: {}, controls: {}, authStatus: {}, cleanup: {} };
 
   // Disposable keychain. create-keychain may add it to the user's search list; the list is restored and compared.
   const keychain = path.join(root, 'guard', 'disposable.keychain-db');
@@ -203,12 +212,12 @@ export async function probe(root) {
 
     // Seed disposable credential-like files in each existing guarded class (sibling probe names only).
     const seedClasses = [
-      ['claude-home', '.claude', 'heimdall-0005-probe.credentials.json'], ['claude-settings', '.claude', 'heimdall-0005-probe.settings.json'],
-      ['claude-projects', '.claude/projects', 'heimdall-0005-probe.jsonl'], ['claude-todos', '.claude/todos', 'heimdall-0005-probe.json'],
-      ['claude-shell-snapshots', '.claude/shell-snapshots', 'heimdall-0005-probe.sh'], ['claude-plugins', '.claude/plugins', 'heimdall-0005-probe.json'],
-      ['claude-session-env', '.claude/session-env', 'heimdall-0005-probe.env'], ['claude-statsig', '.claude/statsig', 'heimdall-0005-probe.json'],
-      ['claude-telemetry', '.claude/telemetry', 'heimdall-0005-probe.json'], ['claude-sessions', '.claude/sessions', 'heimdall-0005-probe.json'],
-      ['claude-json-sibling', '.', '.claude.json.heimdall-0005-probe'], ['keychains-dir', 'Library/Keychains', 'heimdall-0005-probe.txt'],
+      ['claude-home', '.claude', `${tag}.credentials.json`], ['claude-settings', '.claude', `${tag}.settings.json`],
+      ['claude-projects', '.claude/projects', `${tag}.jsonl`], ['claude-todos', '.claude/todos', `${tag}.json`],
+      ['claude-shell-snapshots', '.claude/shell-snapshots', `${tag}.sh`], ['claude-plugins', '.claude/plugins', `${tag}.json`],
+      ['claude-session-env', '.claude/session-env', `${tag}.env`], ['claude-statsig', '.claude/statsig', `${tag}.json`],
+      ['claude-telemetry', '.claude/telemetry', `${tag}.json`], ['claude-sessions', '.claude/sessions', `${tag}.json`],
+      ['claude-json-sibling', '.', `.claude.json.${tag}`], ['keychains-dir', 'Library/Keychains', `${tag}.txt`],
     ];
     const writes = [];
     const hardlinkDirectory = path.join(root, 'profile', 'tmp');
@@ -217,8 +226,7 @@ export async function probe(root) {
       // Class directory absent on this machine: creating the class directory itself must be denied.
       if (!fs.existsSync(directory)) { writes.push({ label: `${label}:mkdir-absent-class`, class: label, op: 'mkdir', target: directory }); continue; }
       const file = path.join(directory, name);
-      seeds.push({ label, file, ...seedFile(file) });
-      created.push(file);
+      seeds.push({ label, file, ...seedFile(ledger, file) });
       for (const op of ['overwrite', 'truncate', 'append', 'unlink', 'rename', 'chmod']) writes.push({ label: `${label}:${op}`, class: label, op, target: file });
       writes.push({ label: `${label}:hardlink`, class: label, op: 'hardlink', source: file, target: path.join(hardlinkDirectory, `link-${label}`) });
       writes.push({ label: `${label}:create-sibling`, class: label, op: 'create', target: `${file}.sibling` });
@@ -227,21 +235,21 @@ export async function probe(root) {
     for (const [label, relative] of [['xdg-claude-config', '.config/claude'], ['xdg-claude-share', '.local/share/claude'], ['xdg-claude-state', '.local/state/claude'], ['xdg-claude-cache', '.cache/claude']]) {
       const target = path.join(home, relative);
       writes.push(fs.existsSync(target)
-        ? { label: `${label}:create`, class: label, op: 'create', target: path.join(target, 'heimdall-0005-probe-create') }
+        ? { label: `${label}:create`, class: label, op: 'create', target: path.join(target, `${tag}-create`) }
         : { label: `${label}:mkdir-absent-class`, class: label, op: 'mkdir', target });
     }
     for (const [label, relative] of [['opencode-data', '.local/share/opencode'], ['opencode-config', '.config/opencode'], ['opencode-state', '.local/state/opencode'], ['openchamber-config', '.config/openchamber']]) {
-      if (fs.existsSync(path.join(home, relative))) writes.push({ label: `${label}:create`, class: label, op: 'create', target: path.join(home, relative, 'heimdall-0005-probe-create') });
+      if (fs.existsSync(path.join(home, relative))) writes.push({ label: `${label}:create`, class: label, op: 'create', target: path.join(home, relative, `${tag}-create`) });
     }
-    writes.push({ label: 'keychains-dir:create', class: 'keychains-dir', op: 'create', target: path.join(home, 'Library/Keychains', 'heimdall-0005-probe-create.keychain-db') });
-    writes.push({ label: 'claude-json:create-lock', class: 'claude-json-sibling', op: 'create', target: path.join(home, '.claude.json.heimdall-0005-probe.lock') });
+    writes.push({ label: 'keychains-dir:create', class: 'keychains-dir', op: 'create', target: path.join(home, 'Library/Keychains', `${tag}-create.keychain-db`) });
+    writes.push({ label: 'claude-json:create-lock', class: 'claude-json-sibling', op: 'create', target: path.join(home, `.claude.json.${tag}.lock`) });
     // Guard material and the disposable keychain file itself.
     for (const [label, target] of [['guard-profile', paths.profile], ['guard-shim', paths.shim], ['disposable-keychain-file', keychain]]) {
       writes.push({ label: `${label}:overwrite`, class: 'guard-material', op: 'overwrite', target });
       writes.push({ label: `${label}:unlink`, class: 'guard-material', op: 'unlink', target });
       writes.push({ label: `${label}:rename`, class: 'guard-material', op: 'rename', target });
     }
-    writes.push({ label: 'guard-dir:create', class: 'guard-material', op: 'create', target: path.join(root, 'guard', 'heimdall-0005-probe-create') });
+    writes.push({ label: 'guard-dir:create', class: 'guard-material', op: 'create', target: path.join(root, 'guard', `${tag}-create`) });
     writes.push({ label: 'fixture-profile-tmp:create (allowed control)', class: 'control', op: 'create', target: path.join(root, 'profile', 'tmp', 'allowed-control'), expect: 'allowed' });
 
     broker = await startBroker(root, ['--login', 'disposable', '--keychain', keychain]);
@@ -260,7 +268,7 @@ export async function probe(root) {
     ];
     const planFile = path.join(root, 'guard', 'probe-plan.json');
     fs.rmSync(planFile, { force: true });
-    fs.writeFileSync(planFile, JSON.stringify({ root, writes, execs }), { flag: 'wx', mode: 0o600 });
+    fs.writeFileSync(planFile, JSON.stringify({ root, writes, execs, ledger: ledgerFile }), { flag: 'wx', mode: 0o600 });
     const inner = runGuarded(root, process.execPath, [path.join(here, 'guard-probe-inner.mjs'), planFile], 180_000);
     let parsed = null;
     try { parsed = JSON.parse(inner.stdout.trim().split('\n').pop()); } catch { /* reported below */ }
@@ -288,13 +296,19 @@ export async function probe(root) {
     record.postconditions = { seeded: [], createdPathsAbsent: true };
     for (const seed of seeds) {
       const exists = fs.existsSync(seed.file);
-      const unchanged = exists && sha256(fs.readFileSync(seed.file)) === seed.sha256 && (fs.statSync(seed.file).mode & 0o777) === seed.mode && fs.statSync(seed.file).nlink === 1 && !fs.existsSync(`${seed.file}.renamed`);
+      const unchanged = exists && sha256(fs.readFileSync(seed.file)) === seed.sha256 && (fs.statSync(seed.file).mode & 0o777) === seed.mode && fs.statSync(seed.file).nlink === 1;
       record.postconditions.seeded.push({ class: seed.label, unchanged });
       if (!unchanged) failures.push(`seed ${seed.label} changed`);
     }
-    const strays = [...writes.filter(entry => entry.op === 'create' || entry.op === 'mkdir').map(entry => entry.target), ...writes.filter(entry => entry.op === 'hardlink').map(entry => entry.target)].filter(target => !target.includes('allowed-control') && fs.existsSync(target));
-    record.postconditions.createdPathsAbsent = strays.length === 0;
-    if (strays.length > 0) { failures.push('stray created paths'); for (const stray of strays) fs.rmSync(stray, { recursive: true, force: true }); }
+    // A guarded write that unexpectedly created something is reported by the inner probe, with the identity of
+    // what it created, and recorded as owned by the ledger. Objects that merely exist (for example an absent
+    // class directory another process created meanwhile) are not ours: they are reported and left alone.
+    const targets = [...writes.filter(entry => ['create', 'mkdir', 'hardlink'].includes(entry.op)).map(entry => entry.target)].filter(target => !target.includes('allowed-control'));
+    const createdByGuardedProbe = parsed.results.filter(result => result.kind === 'write' && result.created === true && result.expected === 'denied').map(result => result.label);
+    record.postconditions.createdPathsAbsent = createdByGuardedProbe.length === 0;
+    record.postconditions.foreignObjectsPreserved = targets.filter(target => { try { fs.lstatSync(target); return true; } catch { return false; } }).filter(target => !parsed.results.some(result => result.target === target && result.created === true)).length;
+    if (createdByGuardedProbe.length > 0) failures.push(`guarded writes created objects: ${createdByGuardedProbe.join(', ')}`);
+    if (parsed.results.some(result => result.ledgerError)) failures.push('inner probe could not record ownership');
     const servicesAfter = await serviceNames(keychain);
     const secretAfter = sha256((await security(['find-generic-password', '-a', user, '-s', PROBE_SERVICE, '-w', keychain])).stdout);
     record.keychain.servicesBefore = servicesBefore.length;
@@ -311,9 +325,10 @@ export async function probe(root) {
     record.brokerLog = fs.existsSync(path.join(evidenceDirectory, 'broker-disposable.log')) ? fs.readFileSync(path.join(evidenceDirectory, 'broker-disposable.log'), 'utf8').trim().split('\n').map(line => JSON.parse(line)).map(({ verb, decision, code }) => ({ verb, decision, code })) : [];
   } finally {
     if (broker) record.cleanup.disposableBrokerExited = await stopBroker(root, broker);
-    for (const seed of seeds) { fs.rmSync(seed.file, { force: true }); fs.rmSync(`${seed.file}.renamed`, { force: true }); fs.rmSync(`${seed.file}.sibling`, { force: true }); }
-    for (const extra of ['.claude.json.heimdall-0005-probe.lock']) fs.rmSync(path.join(home, extra), { force: true });
+    // Ownership-based: only objects this run created exclusively and still recognises by dev/ino/type are removed.
+    record.cleanup.owned = cleanupOwned({ ledgerFile });
     record.cleanup.seededFilesRemoved = seeds.every(seed => !fs.existsSync(seed.file));
+    fs.writeFileSync(path.join(evidenceDirectory, `cleanup-${nonce}.json`), JSON.stringify(record.cleanup.owned, null, 2) + '\n', { mode: 0o600 });
     await security(['delete-keychain', keychain]);
     const listAfter = await listKeychains();
     if (JSON.stringify(listAfter) !== JSON.stringify(listBefore)) await security(['list-keychains', '-d', 'user', '-s', ...listBefore.user]);
@@ -340,7 +355,7 @@ export async function probe(root) {
   record.authStatus.brokerRequests = tally;
   record.authStatus.credentialExpiryBucket = [...new Set(realLog.map(entry => entry.expiry).filter(Boolean))];
 
-  record.outcome = failures.length === 0 ? 'guard proven' : `failed gate: ${failures.join('; ')}`;
+  record.outcome = probeOutcome({ failures, cleanup: record.cleanup.owned });
   fs.writeFileSync(path.join(evidenceDirectory, 'guard-results.json'), JSON.stringify(record, null, 2) + '\n', { mode: 0o600 });
   updateManifest(root, manifest => { manifest.outcome = record.outcome; manifest.guard = { outcome: record.outcome, results: '<root>/evidence/guard-results.json', failures }; });
   return record;

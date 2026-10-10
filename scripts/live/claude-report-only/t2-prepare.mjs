@@ -1,10 +1,11 @@
 // T2 fixture preparation: copies the built dist/ into the fixture root, applies the fixture-only settings, writes the
 // fixture plugins, agents, MCP server and OpenCode config, and creates the recovery repository.
 // Starts nothing and calls no model.
-//   node t2-prepare.mjs --root /private/tmp/heimdall-0005.XXXXXX --port 4731 [--variant low] [--dist <built dist/>]
+//   node t2-prepare.mjs --root /private/tmp/heimdall-0006.XXXXXX --port 4731 [--variant low] [--dist <built dist/>]
 //
 // Fixture-only settings (never applied to src/ or the repository's dist/):
-//   F1 dist/opencode/report-only.js: VERIFIED_REPORT_ONLY_PROVIDERS = ['claude-code']   (no injection point in src/workflow.ts)
+//   F1 dist/opencode/report-only.js: VERIFIED_REPORT_ONLY_PROVIDERS must be ['claude-code']; the historical empty list is rewritten,
+//      the final list is kept, any other value is rejected (provider-list.mjs)
 //   F2 dist/policy/quota.js: createQuota returns a synthetic healthy claude-code snapshot. The probe it replaces execs the
 //      absolute /usr/bin/security, which the guard denies on purpose; quota is not what this verification proves.
 //   F3 a wrapper plugin (createPlugin({ reportOnly: createReportOnlyRegistry() })) with an owner-only control socket,
@@ -15,6 +16,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { assertFixtureRoot, emit, hashTree, parseArguments, readManifest, sha256, updateManifest } from './lib.mjs';
+import { prepareProviderList } from './provider-list.mjs';
 import { createRepository } from './repo.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -46,8 +48,16 @@ const patch = (relative, anchor, replacement) => {
   fs.writeFileSync(file, original.replace(anchor, replacement));
   return { file: `dist/${relative}`, before: sha256(original), after: sha256(fs.readFileSync(file)) };
 };
+// F1 accepts exactly the historical empty list or the final ['claude-code'] list in the fixture COPY of dist.
+const patchProviderList = relative => {
+  const file = path.join(dist, relative);
+  const original = fs.readFileSync(file, 'utf8');
+  const prepared = prepareProviderList(original);
+  if (prepared.patched) fs.writeFileSync(file, prepared.text);
+  return { file: `dist/${relative}`, found: prepared.found, patched: prepared.patched, before: sha256(original), after: sha256(fs.readFileSync(file)) };
+};
 const patches = [
-  patch('opencode/report-only.js', 'export const VERIFIED_REPORT_ONLY_PROVIDERS = [];', "export const VERIFIED_REPORT_ONLY_PROVIDERS = ['claude-code']; // FIXTURE-ONLY (t2-prepare.mjs F1)"),
+  patchProviderList('opencode/report-only.js'),
   patch('policy/quota.js', 'export function createQuota(options) {\n    return settings => fetchQuota(settings, options);\n}', "// FIXTURE-ONLY (t2-prepare.mjs F2): synthetic healthy snapshot; the real probe execs /usr/bin/security, denied by the guard.\nexport function createQuota(options) {\n    return async () => ({ 'claude-code': { fetchedAt: Date.now(), errors: [], entries: [{ name: '5h', percentRemaining: 90 }, { name: 'Weekly', percentRemaining: 90 }] } });\n}"),
 ];
 

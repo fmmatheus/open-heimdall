@@ -10,7 +10,7 @@ import { promisify } from 'node:util';
 const run = promisify(execFile);
 
 export const FIXTURE_PARENT = '/private/tmp';
-export const FIXTURE_PREFIX = 'heimdall-0005.';
+export const FIXTURE_PREFIX = 'heimdall-0006.';
 export const INSTALLED_PROVIDER = path.join(os.homedir(), '.config/opencode/v2-plugins/opencode-claude');
 export const PROVIDER_FILES = ['package.json', 'index.js', 'opencode-claude.js', 'LICENSE', 'README.md'];
 

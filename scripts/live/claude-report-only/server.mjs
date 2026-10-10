@@ -1,10 +1,14 @@
 // Disposable native OpenCode host for the live verification, adapted from the feature 0003 smoke host.
-// Run only inside the guarded launch wrapper (guard.mjs launch ...) and with Bun:
-//   bun server.mjs --root /private/tmp/heimdall-0005.XXXXXX [--port N]
+// Start it only through the guard launcher, which wraps it in the recorded sandbox-exec profile and Bun:
+//   node guard.mjs launch --root /private/tmp/heimdall-0006.XXXXXX -- bun server.mjs --root /private/tmp/heimdall-0006.XXXXXX [--port N]
 //   node server.mjs --root ... --resolve-only      # prints resolved stores, starts nothing
-// It refuses to start unless every resolved store is under the fixture root.
+// It refuses to start unless every resolved store is under the fixture root and the process proves, by OS
+// behaviour (confinement.mjs), that it runs confined by the recorded profile. That check runs before any
+// directory is created, any host module is imported or any server is opened.
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { proveConfinement } from './confinement.mjs';
 import { assertFixtureRoot, emit, isUnder, parseArguments, readManifest, storeEnvironment, storePaths } from './lib.mjs';
 
 const options = parseArguments(process.argv.slice(2));
@@ -26,6 +30,11 @@ if (outside.length > 0) { process.stderr.write(`Refusing to start: outside fixtu
 if (options['resolve-only']) {
   emit({ resolveOnly: true, home: process.env.HOME === environment.HOME ? 'unchanged' : 'CHANGED', stores: Object.fromEntries(Object.entries(resolved).map(([key, value]) => [key, value.replaceAll(root, '<root>')])) });
   process.exit(0);
+}
+const confinement = proveConfinement({ root, home: os.homedir(), manifest });
+if (!confinement.confined) {
+  process.stderr.write(`Refusing to start: not confined by the recorded guard (${confinement.problems.join('; ').replaceAll(root, '<root>')}). Start it with guard.mjs launch.\n`);
+  process.exit(3);
 }
 if (typeof Bun === 'undefined') { process.stderr.write('Refusing to start: this host needs Bun\n'); process.exit(2); }
 

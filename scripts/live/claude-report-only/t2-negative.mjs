@@ -1,6 +1,6 @@
 // T2 follow-up scenarios against the disposable server, through the real workflow runner with fresh claude-code/sonnet
 // planner and executor children.
-//   node t2-negative.mjs --root /private/tmp/heimdall-0005.XXXXXX --scenario blocked|unresolved|retained
+//   node t2-negative.mjs --root /private/tmp/heimdall-0006.XXXXXX --scenario blocked|unresolved|retained
 //
 //   blocked     a fixture-only executor replies blocked (missing owner prerequisite): the run must stay paused with
 //               no report-correction prompt, no restriction and no task advancement

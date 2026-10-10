@@ -1,6 +1,6 @@
 // Create the disposable git repository used by the live tool-path checks (T2).
 // Committed files only: src/impl.js, test/impl.test.js, package.json. No hooks, no signing.
-//   node repo.mjs --root /private/tmp/heimdall-0005.XXXXXX
+//   node repo.mjs --root /private/tmp/heimdall-0006.XXXXXX
 import fs from 'node:fs';
 import path from 'node:path';
 import { assertFixtureRoot, assertUnder, capture, emit, parseArguments, sha256, updateManifest } from './lib.mjs';
