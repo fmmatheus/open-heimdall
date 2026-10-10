@@ -77,16 +77,111 @@ passed in the full run.
 - A resumed legacy receipt without gate IDs is still rejected at admission (unchanged).
 - A checkpoint saved before this feature (no `reportRecovery`) loads and resumes.
 
-## Enforcement limitation
+## Provider verification (feature 0004)
 
-`claude-code` is **unsupported, not proven**. The provider plugin disables Claude Code's
-built-in tools and exposes only the tools in the OpenCode request as an MCP server,
-parking each call back to OpenCode. The local sources do not show that OpenCode core runs
-`execute.before` and `permission.evaluate` for those parked calls or for code-mode
-`execute` nested calls (`tools.x(...)`), and OpenCode core is not available locally. No
-live experiment was run. The production capability therefore reports unsupported for every
-provider and `report_format` failures pause as `correction_unsupported`. Tests inject a
-verified provider (`openai`) to exercise the supported path.
+Result: `claude-code` stays **unsupported**. `VERIFIED_REPORT_ONLY_PROVIDERS` is unchanged
+(empty). No disposable server was started, so no live denial was observed. Date of the
+check: 2026-10-10.
+
+### Versions
+
+| Component | Version | Source |
+| --- | --- | --- |
+| OpenCode | `v2.0.22` | `opencode --version` |
+| `@opencode/plugin` (this repo) | `2.0.22` | `node_modules/@opencode/plugin/package.json` |
+| `opencode-claude` provider | `1.3.4` (`@openchamber/opencode-claude`, Agent SDK `0.3.224`) | `~/.config/opencode/v2-plugins/opencode-claude/package.json` (read only) |
+| Claude Code CLI | `2.1.292` | `claude --version` |
+| Node | `v22.22.3` | `node --version` |
+
+### Dispatch paths for `claude-code`
+
+Read from the provider source (`dist/proxy.js`, `dist/query.js`, read only) and the plugin
+types. "Hook" is the Heimdall hook that would enforce the path. "Proven" means the source
+or a live run shows the hook is reached; nothing here was observed live.
+
+| Path | How the provider reaches it | Enforcing hook | Status |
+| --- | --- | --- | --- |
+| Claude Code built-in tools (Bash, Edit, Write, Task/Agent) | Provider passes `tools: []`, so built-ins are never enabled. | none needed | Proven by provider source only; not exercised live. |
+| edit / write | OpenCode request tools are exposed as the in-process MCP server `mcp__<host>__*`; the call parks and returns to OpenCode as an ordinary tool call. | `execute.before`, `permission.evaluate`; `context` removes the tool from the request | Unverified: the source does not show that core runs `execute.before` or `permission.evaluate` for a parked call. |
+| shell, tests, `git commit` | Same bridge (`bash`/`shell` aliased to `mcp__<host>__bash`). | same as above | Unverified (same reason). |
+| delegation / subagent | OpenCode `subagent` (V2) or `task` (V1) is listed on purpose in the bridged tools, so a restricted session would call it through the bridge. | `execute.before`; `context` | Unverified (same reason). |
+| namespaced MCP (`mcp__openchamber__*`, `mcp__opencode__*`) | This is the bridge itself: `allowedTools` lists every request tool as `mcp__<host>__<name>`; `permissionMode` is `bypassPermissions` whenever any tool is bridged, so Claude Code adds no permission check of its own. | `context` (an empty tool list gives the turn no MCP server and `dontAsk` mode), `execute.before` | Unverified: the empty-list behavior is in provider source, but it depends on core passing the post-`context` tool list to the provider, which is not shown. |
+| nested code-mode (`execute` tool, `tools.x(...)`) | `execute` is itself a bridged tool; nested calls run inside core's code-mode runtime. | `execute.before` on the outer `execute` call; nested calls are not shown to reach any hook | Unverified. The public plugin types (`ToolHooks`) do not state that nested calls fire `execute.before`, and OpenCode core source is not available locally. |
+| parked turn resumed after restriction | The provider keeps a live CLI child with its earlier MCP tools for a parked turn and resumes it when results arrive. | `execute.before` only | Not reachable for a correction (the child is idle before it is restricted), but not proven either. |
+
+No dispatch path is proven by a live run, and the nested code-mode and parked-call paths
+are unverified even by source, so the support rule (every path proven) is not met.
+
+### Isolation
+
+Supported isolation was found and proven read-only before anything else ran:
+`opencode debug paths` honours `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`,
+`XDG_STATE_HOME` and `HOME`. With a fresh temp dir `T` (`mktemp -d /tmp/t2-iso.XXXXXX`) and
+the live `OPENCODE_CONFIG`, `OPENCODE_SERVER_PASSWORD` and `OPENCODE_PASSWORD` unset for the
+command, it printed:
+
+```
+home   $T/home
+data   $T/data/opencode
+cache  $T/cache/opencode
+config $T/config/opencode
+state  $T/state/opencode
+bin    $T/cache/opencode/bin
+log    $T/data/opencode/log
+repos  $T/data/opencode/repos
+db     $T/data/opencode/opencode.db
+tmp    /private/var/folders/.../T/opencode   (follows TMPDIR, not set)
+```
+
+Without that override the same command printed the real `~/.local/share/opencode`,
+`~/.config/opencode` and `opencode.db`, so the isolation depends on setting every variable
+and was not proven for a default environment. `serve` accepts `--hostname` and `--port`;
+`opencode run` and the TUI default to the shared background service unless `--standalone`
+or `--server` is given, so they were not used.
+
+### Blocker
+
+Store isolation works, but a `claude-code` session cannot be authenticated inside it
+without touching credentials:
+
+- The provider runs the real `claude` CLI and relies on its own login store
+  (`buildClaudeCodeChildEnv` only removes `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and
+  `CLAUDE_CODE_OAUTH_TOKEN`).
+- With `HOME` and `CLAUDE_CONFIG_DIR` pointed at the temp dir, `claude auth status` printed
+  `"loggedIn": false, "authMethod": "none"` and only wrote inside `$T/claude`.
+- Running against the real `~/.claude` login would make the CLI write session transcripts
+  and config under `~/.claude`; copying the login into the temp dir would copy credentials.
+  Both were out of bounds for this task.
+
+Therefore no server was started and no tool path was attempted. Nothing was run against
+`http://127.0.0.1:57123`, no existing session database was opened, and `~/.config/opencode`,
+`~/.claude`, credentials and installed builds were not modified (the provider and user
+config were only read). No server or session process was started (no PID to stop); only
+short read-only CLI commands ran (`--version`, `debug paths`, `auth status` in the temp dir). The temp dir was removed and `pgrep` showed no
+`opencode serve` process of this check. No disposable repo, file hashes or `git rev-parse
+HEAD` comparison exist because nothing was run. The repository was not changed by the check.
+
+### Remaining verification (owner)
+
+Run this on a machine where a disposable Claude Code login is allowed (a throwaway account
+or an owner-approved `CLAUDE_CONFIG_DIR` login), never against the live server:
+
+1. `npm run build`, create a temp git repo with a committed implementation file, and a
+   fixture plugin there that loads this repo's `dist/opencode/plugin.js` with an injected
+   registry from `createReportOnlyRegistry()` so a session can be restricted and released.
+2. Set every XDG variable and `HOME`, run `opencode debug paths` and confirm each store is
+   under the temp dir, then `opencode serve --port <free port>`; record PID, port, command.
+3. In a fresh `claude-code/sonnet` session, restrict it and attempt edit/write, shell, tests,
+   `git commit`, `subagent`, an `mcp__*` tool and a nested `tools.x(...)` call through
+   `execute`. Each must be denied; hashes of the implementation file and `git rev-parse
+   HEAD` must be unchanged; a plain text report must still complete.
+4. Release through the owner-matched release, confirm an ordinary tool call works, stop only
+   the recorded PID and confirm it exited.
+5. Only then add `claude-code` to `VERIFIED_REPORT_ONLY_PROVIDERS` and update the
+   default-set assertion in `test/native-backend.test.mjs`.
+
+Until then a `report_format` pause on `claude-code` stays `correction_unsupported` and needs
+a manual resume. Tests inject a verified provider (`openai`) to exercise the supported path.
 
 ## Owner activation checklist
 
