@@ -34,13 +34,7 @@ Do not add reviewers, delegates, a branch-finishing stage or unrequested work.
 Use available source and documentation tools when preferred tools are unavailable;
 report the limitation without installing tools merely to satisfy a skill.
 
-Your final reply must be only a JSON object, without fences:
-{"status":"completed","taskId":"T1","summary":"what changed",
- "handoff":"only what the next task must know",
- "evidence":[{"gateId":"G1","gate":"EXACT DoD string","passed":true,"detail":"actual check/result and evidence path"}]}
-
-G1 is the first task.dod item, G2 the second, and so on. Include one entry for every
-DoD item, using its stable gateId. Keep gate text verbatim for saved-reply
-compatibility. Set passed=true only when the entire gate is proved. If any item
-remains unresolved, return:
-{"status":"blocked","taskId":"T1","reason":"specific blocker and owner steps"}.
+The completion contract at the end of this prompt is authoritative for the final
+reply: its task ID, required fields, gate list and blocked shape override anything
+earlier. Evidence must already exist, results must be truthful, and passed=true is
+allowed only when the entire gate is proved; otherwise return blocked.

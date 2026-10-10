@@ -106,6 +106,20 @@ export function validateCompletion(result: WorkflowResult, task: WorkflowTask, {
 }
 
 
+/** Compact, task-specific final-reply contract. Always the last text of an executor prompt so long context cannot dilute it. */
+export function executorContract(task: WorkflowTask): string {
+  return [
+    '=== Executor completion contract for ' + task.id + ' (authoritative; overrides any earlier example) ===',
+    'Reply with exactly one JSON object: no code fences, no prose before or after it.',
+    'Completed shape: {"status":"completed","taskId":' + JSON.stringify(task.id) + ',"summary":"<what changed>","handoff":"<what the next task must know>","evidence":[{"gateId":"G1","gate":"<exact DoD item>","passed":true,"detail":"<actual check, result and evidence path>"}]}',
+    'Required fields: status, taskId, summary, handoff, evidence[{gateId, gate, passed, detail}]. Include one evidence entry for every gate below.',
+    'Gates:',
+    ...task.dod.map((gate, i) => 'G' + (i + 1) + ' = ' + gate),
+    'Blocked shape: {"status":"blocked","taskId":' + JSON.stringify(task.id) + ',"reason":"<specific blocker and owner steps>"}',
+    'Rules: evidence must already exist before you reply; report results truthfully; set passed=true only for a gate you fully proved; if any gate is unresolved, reply blocked.',
+  ].join('\n');
+}
+
 const contextSignal = (context: RunnerContext) => context.signal || context.abort;
 const callerIdentity = (context: RunnerContext) => ({ sessionID: context.sessionID, id: context.id, messageID: context.messageID, agent: context.agent });
 
@@ -327,7 +341,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
           };
           try {
             if (state.child) await checkBudget();
-            const response = await backend.runSubagent({ child: state.child, parent: state.parent, agent: planning ? cfg.plannerAgent : cfg.executorAgent, model: chosen, variant, title: 'ADR ' + path.basename(state.adr) + ': ' + (planning ? 'plan' : task.id + ' ' + task.title), prompt: prompt + '\nWorkflow attempt: ' + attemptID, onStarted, currentChild: () => state.child }, { ...context, signal: controller.signal, progress: update => announce({ title: state.id + ': ' + (planning ? 'planning' : task.id + ' (' + (state.index + 1) + '/' + state.tasks.length + ')'), ...update }) });
+            const response = await backend.runSubagent({ child: state.child, parent: state.parent, agent: planning ? cfg.plannerAgent : cfg.executorAgent, model: chosen, variant, title: 'ADR ' + path.basename(state.adr) + ': ' + (planning ? 'plan' : task.id + ' ' + task.title), prompt: prompt + '\nWorkflow attempt: ' + attemptID + (planning ? '' : '\n\n' + executorContract(task)), onStarted, currentChild: () => state.child }, { ...context, signal: controller.signal, progress: update => announce({ title: state.id + ': ' + (planning ? 'planning' : task.id + ' (' + (state.index + 1) + '/' + state.tasks.length + ')'), ...update }) });
             if (guardError) throw guardError;
             if (controller.signal.aborted) throw new Error('Run cancelled');
             receipt = { ...state.attempt, response };
