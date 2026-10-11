@@ -86,7 +86,9 @@ node dist/cli.js --version
 ```
 
 `init` creates `.heimdall.toml` and refuses to overwrite it. Edit the model IDs
-and managed OpenCode URL using [the example](../examples/heimdall.toml). `check`
+and managed OpenCode URL using [the example](../examples/heimdall.toml), or use
+`heimdall setup` to create the project and coordinator configuration from flags
+or prompts; see [Installation and setup](installation.md). `check`
 only validates configuration; it does not verify model availability or connect
 to a server. `status` reads saved state without starting or interrupting agents.
 
@@ -112,20 +114,23 @@ identity and project directory. It does not harvest passwords from processes.
 Explicitly passwordless loopback servers can use `authentication = "none"` in
 `[opencode]`; password authentication remains the default.
 
-After building this checkout, use a local link in a **separate development Git
-project**. Run these commands from that separate project:
+To try the native plugin, build the tarball as described in
+[Packaging](#packaging) and install it into a **separate development Git
+project** with ordinary `npm install`; no consumer overrides, links or peer
+flags are needed. Run these commands from that separate project, with the
+installed package's `examples/opencode` directory (under the directory printed by
+`npm root --global` when installed globally, see
+[Installation and setup](installation.md)) in place of `EXAMPLES`:
 
 ```sh
 mkdir -p .opencode/plugins .opencode/agents .opencode/commands
-npm install --prefix .opencode --ignore-scripts --install-links=false /path/to/open-heimdall
-cp -n /path/to/open-heimdall/examples/opencode/plugins/heimdall.ts .opencode/plugins/
-cp -n /path/to/open-heimdall/examples/opencode/agents/*.md .opencode/agents/
-cp -n /path/to/open-heimdall/examples/opencode/commands/*.md .opencode/commands/
+npm install --prefix .opencode --ignore-scripts /path/to/open-heimdall-core-0.0.0.tgz
+cp -n EXAMPLES/plugins/heimdall.ts .opencode/plugins/
+cp -n EXAMPLES/agents/*.md .opencode/agents/
+cp -n EXAMPLES/commands/*.md .opencode/commands/
 ```
 
-The explicit link keeps dependencies resolved from the built checkout and its
-lockfile. A tarball built as described in [Packaging](#packaging) installs with
-ordinary `npm install` and needs no consumer overrides. The plugin entry point is `@open-heimdall/core/plugin`. Do not load it alongside
+The plugin entry point is `@open-heimdall/core/plugin`. Do not load it alongside
 another plugin that uses the same identity (`adr.workflow`), tool names or RPC
 names at the same project location.
 
