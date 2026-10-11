@@ -41,7 +41,10 @@ response contract take precedence over their default execution workflow. Do not
 delegate, implement tasks, install missing tools or create a branch-finishing step.
 Report unavailable tools as limitations and use available source-reading tools.
 
-Your final reply must be only one small JSON object:
-{"status":"planned","artifacts":true}
-or {"status":"blocked","reason":"specific decision or prerequisite"}.
-Never embed the plan, fact sheet or task briefs in the final response.
+The contract appended at the end of this prompt is authoritative for reporting. When
+it names a submission tool, report only by calling that tool once with
+{"status":"planned","artifacts":true} or
+{"status":"blocked","reason":"specific decision or prerequisite"}, then stop after
+the tool acknowledges the submission. Your final chat text is never parsed. When it
+instead asks for a final reply, return only that one small JSON object. Never embed
+the plan, fact sheet or task briefs in the tool payload or in any reply.

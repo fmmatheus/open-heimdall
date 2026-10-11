@@ -72,6 +72,39 @@ export const bounded = (text: string, limit: number): string => {
 const gates = (ids: string[] | undefined) => ids?.length ? ids.slice(0, 10).join(', ') + (ids.length > 10 ? ' (+' + (ids.length - 10) + ' more)' : '') : '';
 
 /**
+ * Pause reason for a structured run whose typed submission is absent or cannot be applied. `subject` is a task id or
+ * "the plan". Neither text invites a format repair: the final chat text is never a result in a structured run.
+ */
+export function submissionPauseReason(code: 'submission_missing' | 'submission_unconfirmed', subject: string, detail = ''): string {
+  if (code === 'submission_missing') {
+    return 'No valid submission was recorded for ' + subject + ': the child ended without a successful call to its submission tool (refusal, omission, a limit, or a rejected call). '
+      + 'Its final chat text is not a result and was not parsed. Inspect the child session, then resume with guidance to submit the result through the tool; nothing was advanced.';
+  }
+  return 'A submission was recorded for ' + subject + ' but the child\'s successful stop could not be confirmed' + (detail ? ' (' + bounded(detail, 300) + ')' : '') + ', so it was not applied. '
+    + 'Reconcile the child session (it must be idle with an empty inbox and a final stop); the recorded submission is kept and a resume applies it without redoing the work.';
+}
+
+const SUBJECT_ACTION = ' Inspect the child session, then resume with guidance; nothing was advanced and no repair is repeated automatically.';
+
+/**
+ * Pause reason for a typed submission whose bounded format repair ended, or whose evidence can no longer be trusted.
+ * `subject` is a task id or "the plan"; `detail` is a bounded host-owned reason, never submitted content.
+ */
+export function submissionRepairPauseReason(code: 'submission_repair_exhausted' | 'submission_refused' | 'submission_unsupported' | 'conflicting_work', subject: string, detail = ''): string {
+  const suffix = detail ? ' (' + bounded(detail, 300) + ')' : '';
+  switch (code) {
+    case 'submission_repair_exhausted':
+      return 'The submission for ' + subject + ' was rejected as malformed more often than the bounded repair allows (initial plus two repairs)' + suffix + '.' + SUBJECT_ACTION;
+    case 'submission_unsupported':
+      return 'The submission for ' + subject + ' was rejected as malformed, but report-only repair cannot be enforced for this model or host' + suffix + ', so no repair was offered.' + SUBJECT_ACTION;
+    case 'conflicting_work':
+      return 'Implementation work ran alongside or after the accepted submission for ' + subject + suffix + ', so the evidence may have changed after its receipt and was not admitted.' + SUBJECT_ACTION;
+    default:
+      return 'The submission for ' + subject + ' was rejected as malformed and no repair could be offered' + suffix + '.' + SUBJECT_ACTION;
+  }
+}
+
+/**
  * Pause reason for a rejected executor report. Contains only the category, field names, gate IDs and the
  * agent's own blocked reason or the provider error text (`detail`), never any part of a reply.
  */
@@ -99,6 +132,14 @@ export function reportPauseReason(diagnostic: ReportDiagnostic, task: WorkflowTa
       return 'Invalid completion report for ' + task.id + ': report-only correction is unsupported here' + (detail ? ' (' + bounded(detail, 300) + ')' : '') + stillMissing + '.' + formatOnly;
     case 'correction_ambiguous':
       return 'Invalid completion report for ' + task.id + ': a previous correction may already have run, so none is repeated automatically.' + formatOnly;
+    case 'submission_missing':
+    case 'submission_unconfirmed':
+      return submissionPauseReason(diagnostic.code, task.id, detail);
+    case 'submission_repair_exhausted':
+    case 'submission_refused':
+    case 'submission_unsupported':
+    case 'conflicting_work':
+      return detail || submissionRepairPauseReason(diagnostic.code, task.id);
     default:
       return 'Native/provider failure: ' + bounded(detail || 'the executor did not return a reply', 300);
   }

@@ -124,9 +124,63 @@ remain held for inspection after restart.
 Runs can also be watched and reviewed read-only from OpenChamber 2.1.0; see the
 [OpenChamber extension guide](openchamber-extension.md).
 
+## Structured completion protocol
+
+New runs persist `structured-v1` at start. The planner and the executor no longer
+report through final chat text: each is offered one typed, owner-bound tool,
+`heimdall_submit_plan` or `heimdall_submit_result`, and ends its turn after the
+acknowledgement. The final chat text is never parsed as a result in a structured
+run. Live record (planner and executor, one task advancement):
+[structured-completion-live.md](validation/structured-completion-live.md).
+
+- **Binding and receipts.** A binding with a rising dispatch generation is saved
+  before each dispatch and bound to the child before the prompt is admitted; it
+  is confirmed once the host observes the dispatch prompt. A submission is
+  authenticated against that binding and against the native caller (session,
+  agent, message and call ID, proved from the host message timeline, failing
+  closed when no native origin exists). The accepted payload is written once as
+  an immutable receipt (`submission-<attempt>-<phase>-<kind>.json`, schema v3
+  `submissions` table in the coordinator) before it is acknowledged.
+- **Advancement.** A plan or task advances only with a matching durable receipt
+  and a freshly confirmed successful native stop of the same idle child.
+  Blocked, unfinished, interrupted, truncated or failed outcomes pause without a
+  repair prompt; authentication and quota stay real failures.
+- **Format repair.** A malformed submission gets at most two format repairs (the
+  initial call plus two retries), counted per planner phase or executor task in
+  the checkpoint and saved, with the owner-bound, submission-only restriction,
+  before any feedback is returned. Framework-rejected calls count. An explicit
+  `blocked` status or `passed: false` evidence inside a malformed payload is
+  recorded as the real outcome and never consumes a repair. The reporting
+  boundary is sealed (running implementation work is recorded as a conflict)
+  before a receipt is acknowledged, and later implementation calls are denied.
+- **Pause codes.** `submission_missing` (the child ended without a successful
+  submission call), `submission_unconfirmed` (receipt recorded, successful stop
+  not confirmed; a resume applies it without redoing the work),
+  `submission_repair_exhausted`, `submission_unsupported` (repair cannot be
+  enforced for this model or host, so none was offered), `submission_refused`
+  (no repair could be offered) and `conflicting_work` (implementation work ran
+  beside or after the accepted submission, so the evidence is not admitted). All
+  carry bounded host-owned text, never submitted content, and none repeats a
+  repair automatically.
+- **Legacy compatibility.** A run persisted without a protocol keeps the prose
+  path, including the completion-report correction below. The two paths are
+  chosen once at start and never mixed in one run.
+- **Runtime identity and snapshot.** The loaded plugin hashes its own `dist`,
+  prompts, agent files and dependency resolution and records that build identity
+  in new run states and in every submission receipt. A coordinator-managed run is
+  admitted with that identity and launches from a run-owned, read-only copy
+  beside its checkout (`STATE/worktrees/PROJECT_ID/RUN_ID/runtime`, marker
+  `.heimdall-runtime-snapshot.json`, generated loader `.opencode/plugins/heimdall.ts`).
+  The copy, its dependency location and the loader are verified before launch and
+  before every resume; any mismatch refuses the run, so a rebuild of the shared
+  package cannot change a running workflow. A run admitted without a snapshot
+  (an earlier run) is not pinned and follows its existing path.
+- **Not proven live.** Repair, negative outcomes, the pause codes above and the
+  runtime snapshot were not exercised in the live run; they rest on unit tests.
+
 ## Completion-report correction
 
-An executor that finishes the work but sends a malformed report no longer
+This path applies to runs persisted without the structured protocol. An executor that finishes the work but sends a malformed report no longer
 forces a full re-run. Verification record:
 [completion-report-recovery.md](validation/completion-report-recovery.md).
 
@@ -154,13 +208,22 @@ forces a full re-run. Verification record:
   child (`execute.before` throws, the session tool list is emptied,
   `permission.evaluate` denies where available) and releases it only after the
   child is confirmed idle. Heimdall sends a correction only for a provider
-  listed in `VERIFIED_REPORT_ONLY_PROVIDERS` (`src/opencode/report-only.ts`),
-  which ships **empty**. `claude-code` is unsupported, not proven: its provider
-  plugin exposes only OpenCode's tool list and parks tool calls back to
-  OpenCode, but the local sources do not show that OpenCode core routes those
-  calls, or code-mode `execute` nested calls, through the hooks, and no live
-  experiment was run. Without a verified provider every `report_format` failure
-  pauses as `correction_unsupported` and nothing is re-sent automatically.
+  listed in `VERIFIED_REPORT_ONLY_PROVIDERS` (`src/opencode/report-only.ts`).
+  On this branch the list is exactly `['claude-code']`. Feature 0005 observed
+  live, in a guarded disposable OpenCode fixture (OpenCode 2.0.22, Claude Code
+  CLI 2.1.292, provider 1.3.4), that edit, write, shell, tests, `git commit`,
+  delegation, namespaced MCP calls and nested code-mode calls were denied under
+  restriction, left the files and Git `HEAD` unchanged, and worked again after
+  owner-matched release; recovery (one bounded correction, the cap, interrupt and
+  resume, failed work staying paused, late release) was also observed. Record:
+  [claude-code-report-only-live.md](validation/claude-code-report-only-live.md).
+  The live runs used a fixture-only copy of `dist` with the constant patched and
+  a fault injected into the idle observation for the retained-restriction case;
+  they were not run against an installed build of this branch. No other provider
+  has live evidence and none is listed. For any unlisted provider every
+  `report_format` failure still pauses as `correction_unsupported` and nothing is
+  re-sent automatically. Activation is an owner action: until you build and
+  install this branch, the installed runtime keeps the earlier empty list.
 - **Restriction lifetime.** Each restriction carries an owner identity (parent,
   child, correction attempt ID and run ID) in the plugin's in-memory registry,
   so a later runner invocation, or a backend recreated over the same registry,
@@ -192,14 +255,26 @@ forces a full re-run. Verification record:
 
 ## Remaining limits
 
+- The structured protocol was observed live once, on `claude-code`, with a valid
+  first submission from each role. Repair, every `submission_*` pause code and
+  the immutable runtime snapshot have no live evidence; the live run used a
+  native workflow start with the built `dist` loaded in place, not a
+  coordinator-managed run. Nothing runs against an installed build until the
+  owner installs this branch. See
+  [structured-completion-live.md](validation/structured-completion-live.md).
 - Automatic report correction needs an owner-verified provider
-  (`VERIFIED_REPORT_ONLY_PROVIDERS` is empty); until then format-only failures
-  pause for a manual resume. **`claude-code` is unsupported.** Feature 0004
-  did not perform an authenticated live check. Its fresh Claude login store
-  had no login. Earlier smoke tests reused the existing login with isolated
-  OpenCode stores, transcript persistence disabled and user hooks disabled;
-  that does not prove protection against credential refresh or every CLI write.
-  Those protections and every supported tool path still need verification. See
+  (`VERIFIED_REPORT_ONLY_PROVIDERS`). On this branch only `claude-code` is
+  listed, from the live record in
+  [claude-code-report-only-live.md](validation/claude-code-report-only-live.md)
+  (feature 0005); it becomes operational only after you build and install the
+  branch. Any other provider pauses format-only failures for a manual resume.
+  The live proof has stated limits: authentication used the existing login
+  through a read-only guard with refresh tokens withheld, so an access token
+  that expires mid-run fails authentication instead of rotating; the retained
+  restriction case used an injected observation fault, not a real OpenCode
+  interrupt that fails to terminate a child; the receipt hashes were computed
+  after the fact; and a restriction lost to a plugin restart is not recovered.
+  The earlier feature 0004 status (no authenticated live check) is kept in
   [Provider verification](validation/completion-report-recovery.md#provider-verification-feature-0004).
 - A correction that was dispatched but never answered consumes one of the two
   attempts and is not re-sent; the next owner resume uses a normal task prompt.

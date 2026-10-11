@@ -3,11 +3,13 @@
 Automated verification of feature 0003 (guide section:
 [Completion-report correction](../coordinator.md#completion-report-correction)).
 
-**Status: automated checks PASSED. Live provider verification and activation are PENDING (owner).**
-Mocked and synthetic tests do not prove live OpenCode or provider behavior. Automatic
-correction ships disabled in practice: `VERIFIED_REPORT_ONLY_PROVIDERS` is empty, and
-`claude-code` was **not** verified (see [Provider verification](#provider-verification-feature-0004)),
-so automatic recovery is **not operational** for it.
+**Status: automated checks PASSED. `claude-code` live-verified on this branch (feature 0005); activation is PENDING (owner).**
+Mocked and synthetic tests do not prove live OpenCode or provider behavior; the live proof is
+the [feature 0005 record](claude-code-report-only-live.md). On this branch
+`VERIFIED_REPORT_ONLY_PROVIDERS` is exactly `['claude-code']` (no other provider). Automatic
+correction is operational for `claude-code` only after the owner builds and installs this
+branch; the currently installed runtime is unchanged. The feature 0003 and 0004 sections below
+are the historical record and still describe their own states (empty list, no live check).
 
 Feature 0004 (restriction lifetime fix) adds its own environment and results in
 [Feature 0004 verification](#feature-0004-verification) below; the tables directly under
@@ -269,6 +271,10 @@ HEAD` comparison exist because nothing was run. The repository was not changed b
 
 ### Remaining verification (owner)
 
+> Historical (feature 0004). Steps 1 to 5 below were carried out in feature 0005 and are
+> recorded in [Provider verification (feature 0005)](#provider-verification-feature-0005).
+> The list is kept unchanged as the plan that was pending at the time.
+
 Establish an isolated setup that preserves the existing login and prevents credential
 changes, or use an owner-authorized disposable login. Never use the live server:
 
@@ -289,14 +295,42 @@ changes, or use an owner-authorized disposable login. Never use the live server:
 Until then a `report_format` pause on `claude-code` stays `correction_unsupported` and needs
 a manual resume. Tests inject a verified provider (`openai`) to exercise the supported path.
 
+## Provider verification (feature 0005)
+
+Result: `claude-code` is **verified live** and listed; `VERIFIED_REPORT_ONLY_PROVIDERS` is
+exactly `['claude-code']` on branch `heimdall/run/138b8157-4527-4842-8c8e-8d745af8eb48`.
+Date of the checks: 2026-10-10. Full record, versions, guard design, tool-path matrix,
+recovery scenarios, fixture-only settings and cleanup:
+[claude-code-report-only-live.md](claude-code-report-only-live.md).
+
+Completed (observed):
+
+- Private OpenCode stores resolved under the fixture root, and an OS-enforced read-only guard over
+  the Claude login and user state (96 of 96 probes as expected on disposable credential-like
+  targets) with guarded `claude auth status` still logged in.
+- Eight tool paths (edit, write, shell, tests, `git commit`, delegation, namespaced MCP, nested
+  code-mode) denied under restriction, with implementation files, `HEAD` and the MCP marker
+  unchanged, and working again after owner-matched release.
+- Recovery: bounded same-child correction with one advancement and separate receipts; the cap;
+  failed or unresolved work staying paused with no correction; interrupt and resume; late release
+  after confirmed idle.
+
+Still not proven (stated limits, not failures): a real OpenCode interrupt that fails to terminate
+a child (the retained-restriction case used an injected observation fault); behavior once the
+stored access token expires mid-run (refresh was deliberately withheld); receipt hashes were
+computed after the fact; any other provider; any installed build of this branch.
+
 ## Activation plan (owner)
 
 Nothing below has been done; each step is yours and none is urgent. The fix is merged and
-installed only by you.
+installed only by you. Updated for feature 0005: the steps now cover branch
+`heimdall/run/138b8157-4527-4842-8c8e-8d745af8eb48` (commits `60adf62`, `5591d83`, `a03b396` and
+the feature 0005 enablement commit on top of `dadeb3c`); the earlier wording is kept below.
 
 1. Review the branch `heimdall/run/f63305a9-1230-49e6-a662-b1a00f08f264`. Feature 0004 is
    `7e7eae3`, `d4c67dd` and the docs commit; a diff from `619d78b` also shows the five
-   feature 0003 commits (`f2a25ee`, `e4548fd`, `4277bb4`, `bea7797`, `cbff04c`).
+   feature 0003 commits (`f2a25ee`, `e4548fd`, `4277bb4`, `bea7797`, `cbff04c`). For feature 0005,
+   review `heimdall/run/138b8157-4527-4842-8c8e-8d745af8eb48` (diff from `dadeb3c`).
 2. Respect running workflows: let existing runs finish, or pause them, first. Do not
    rebuild, replace or restart the active runtime (the plugin imports the original
    repository's `dist`, and its in-memory restrictions are lost on restart) while any
@@ -305,12 +339,12 @@ installed only by you.
    branch (`npm ci --ignore-scripts`, `npm run build`, `npm run build:extension`) and
    restart your own OpenCode runtime and the Heimdall extension service at a quiet point.
    Until you rebuild there, nothing changes.
-4. Provider enablement only per recorded evidence. `claude-code` is **not verified**: do not
-   add it to `VERIFIED_REPORT_ONLY_PROVIDERS` or describe automatic report recovery as
-   operational for it until every step under
-   [Remaining verification (owner)](#remaining-verification-owner) has been completed and
-   recorded. Until then a `report_format` pause stays `correction_unsupported` and needs a
-   manual resume with the format-only guidance in the pause reason. Automatic correction is
-   operational only for a provider that has been proven live and listed.
+4. Provider enablement only per recorded evidence. In the feature 0004 state `claude-code` was
+   not verified and a `report_format` pause stayed `correction_unsupported`. On the feature 0005
+   branch `claude-code` is listed after the live record above, so after the build and install in
+   step 3 a format-only failure on `claude-code` is corrected automatically (at most twice). Any
+   other provider is not listed and still needs a manual resume with the format-only guidance in
+   the pause reason. Do not describe automatic report recovery as operational for a provider that
+   has not been proven live and listed, or for `claude-code` before the install.
 5. Optional live check in the extension: a paused report problem shows its category and
    next step in the run summary, and a running correction shows `Correcting report (1/2)`.

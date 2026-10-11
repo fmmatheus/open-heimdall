@@ -11,7 +11,8 @@ import { positiveInteger } from './config.js';
 import { privateFile, readCoordinatorToken } from './token.js';
 import type { CoordinatorConfiguration } from './config.js';
 import type { ManagedExecutor, Receipt, RunRecord, StartBinding } from './types.js';
-import type { RunState } from '../workflow/types.js';
+import { isSubmissionKind } from '../workflow/submission-store.js';
+import type { NativeOutcome, RunState, SubmissionReceipt } from '../workflow/types.js';
 
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
 const text = (value: unknown, name: string): string => {
@@ -113,6 +114,26 @@ export async function startCoordinatorService(options: ServiceOptions) {
             const receipt = await body(request) as unknown as Receipt;
             if (receipt.id !== attemptId) throw new Error('Receipt identity does not match its route');
             store.writeReceipt(run.id, token, receipt); send(200, { saved: true }); return;
+          }
+        }
+        if (segments[2] === 'submissions' && segments.length === 5) {
+          const attemptId = id(segments[3]!);
+          const kind = segments[4]!;
+          if (!isSubmissionKind(kind)) throw new Error('Unknown submission kind');
+          if (method === 'GET') { send(200, store.readSubmission(run.id, token, attemptId, kind) ?? null); return; }
+          if (method === 'PUT') {
+            const receipt = await body(request) as unknown as SubmissionReceipt;
+            if (receipt.attemptId !== attemptId || receipt.kind !== kind) throw new Error('Submission identity does not match its route');
+            send(200, store.writeSubmission(run.id, token, receipt)); return;
+          }
+        }
+        if (segments[2] === 'outcomes' && segments.length === 4) {
+          const attemptId = id(segments[3]!);
+          if (method === 'GET') { send(200, store.readNativeOutcome(run.id, token, attemptId) ?? null); return; }
+          if (method === 'PUT') {
+            const outcome = await body(request) as unknown as NativeOutcome;
+            if (outcome.attemptId !== attemptId) throw new Error('Native outcome identity does not match its route');
+            send(200, store.writeNativeOutcome(run.id, token, outcome)); return;
           }
         }
         send(403, { error: 'Run capability cannot administer the coordinator' }); return;

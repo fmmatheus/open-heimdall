@@ -1,4 +1,4 @@
-import type { RunnerSettings, RunState, WorkflowAttempt } from '../workflow/types.js';
+import type { RunnerSettings, RunState, RuntimeIdentity, WorkflowAttempt } from '../workflow/types.js';
 
 export interface ProjectRecord {
   id: string;
@@ -16,6 +16,14 @@ export interface RunSpecification {
   executorPrompt: string;
   agents: Record<string, string>;
   opencode: { baseUrl: string; passwordEnvironmentVariable: string; authentication?: 'basic' | 'none' | 'openchamber' };
+  /** Expected runtime of a new run, fixed at submission. Absent on runs submitted earlier: they keep the live package path and are not pinned. */
+  runtime?: RuntimeSnapshotSpecification;
+}
+export interface RuntimeSnapshotSpecification {
+  /** Identity the immutable snapshot must have, with its build computed from the source package at submission. */
+  identity: RuntimeIdentity;
+  /** Absolute dependency directory the snapshot resolves packages through. Its installed versions are part of the identity. */
+  modules: string;
 }
 
 export type RunStatus = 'queued' | 'preparing' | 'running' | 'paused' | 'succeeded' | 'failed' | 'reconciliation-required';
