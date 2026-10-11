@@ -4,3 +4,5 @@ dist/
 .heimdall.toml
 *.tgz
 coverage/
+
+/local-features/
