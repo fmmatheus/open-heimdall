@@ -1,4 +1,5 @@
 import type { ReportOnlyCapability, RunnerBackend, RunnerContext, SubagentInput, WorkflowAttempt } from '../workflow/types.js';
+import type { NativeOriginResolver } from '../workflow/durable-submission.js';
 import { VERIFIED_REPORT_ONLY_PROVIDERS } from './report-only.js';
 import type { ReportOnlyRegistry } from './report-only.js';
 import type { NativeContext, NativeTool, NativeToolContext, ObservedSession, SessionObserver, SessionSnapshot } from './types.js';
@@ -24,6 +25,23 @@ export function nativeModel(model: string, variant?: string): string {
   return model + (variant ? '#' + variant : '');
 }
 
+/**
+ * Proves, from the host's ordered message timeline of the calling session, which user prompt a tool call descends
+ * from: the assistant message that carries the call (identified by the native message id, never by anything the
+ * model supplied) belongs to the nearest user message before it. A delayed call from an earlier dispatch on a reused
+ * child therefore resolves to the earlier prompt, and an unknown message, a foreign agent or a missing prompt yields
+ * undefined (the gate then fails closed).
+ */
+export function createNativeOriginResolver(ctx: Pick<NativeContext, 'session'>): NativeOriginResolver {
+  return async native => {
+    const messages = await ctx.session.context({ sessionID: native.sessionID as never });
+    const index = messages.findIndex(m => m.type === 'assistant' && m.id === native.messageID);
+    if (index < 0 || (messages[index] as { agent?: unknown }).agent !== native.agent) return undefined;
+    const prompt = messages.slice(0, index).filter(m => m.type === 'user').at(-1);
+    return typeof prompt?.id === 'string' && prompt.id.length > 0 ? prompt.id : undefined;
+  };
+}
+
 export function createNativeBackend({ ctx, observe, pause = ms => new Promise(resolve => setTimeout(resolve, ms)), cancellationWaitMs = 30000, reportOnly, verifiedProviders = VERIFIED_REPORT_ONLY_PROVIDERS }: {
   ctx: NativeContext;
   observe: SessionObserver;
@@ -43,8 +61,8 @@ export function createNativeBackend({ ctx, observe, pause = ms => new Promise(re
       if (!verifiedProviders.includes(provider)) return { supported: false, reason: 'Report-only enforcement is not verified for provider "' + provider + '"' };
       return { supported: true };
     },
-    async restrict(child, owner) {
-      const release = reportOnly.restrict(child, owner && { ...owner, child });
+    async restrict(child, owner, options) {
+      const release = reportOnly.restrict(child, owner && { ...owner, child }, options);
       return async () => { release(); };
     },
     // The registry is shared by every adapter built for this plugin, so a recreated backend releases what an earlier one took.
@@ -55,6 +73,15 @@ export function createNativeBackend({ ctx, observe, pause = ms => new Promise(re
   return {
     ...(capability ? { reportOnly: capability } : {}),
     async assertIdle(id, parent, signal) { return requireIdle(await observe(id, signal), id, parent, true); },
+    // Host-observed native state only: the user message of the child session that carries this attempt's marker.
+    async observeDispatchPrompt({ child, parent, attemptId, signal }) {
+      const value = await observe(child, signal);
+      if (value.session.id !== child || value.session.parentID !== parent) throw new Error('Child session does not belong to this parent');
+      const marker = 'Workflow attempt: ' + attemptId;
+      const messages = await ctx.session.context({ sessionID: child });
+      const prompt = messages.filter(m => m.type === 'user' && typeof m.id === 'string' && m.id.length > 0 && m.text.includes(marker)).at(-1);
+      return prompt?.id;
+    },
     async recoverResponse(id: string, parent: string, attempt: WorkflowAttempt) {
       const value = requireIdle(await observe(id), id, parent, true);
       if (value.session.outcome !== 'succeeded') return undefined;

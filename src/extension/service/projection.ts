@@ -6,7 +6,7 @@ import type {
   Blocker, BlockerContentResponse, ContentLimitsUsed, EvidenceView, LimitsView, ListCaps, ModelChoice, ModelsView, ProjectSummary,
   ReportView, RunDetail, RunPhase, RunSummary, SessionUsage, TaskClips, TaskContentResponse, TaskRef, TaskView, UsageView, WireRunStatus,
 } from '../shared/protocol.js';
-import { reportInfo } from '../../workflow/report-info.js';
+import { checkpointReportInfo } from '../../workflow/report-info.js';
 import type { PublicRun } from './coordinator.js';
 
 /*
@@ -161,9 +161,9 @@ function blockerOf(run: PublicRun, budget: Budget, limit: number = LIMITS.reason
   };
 }
 
-/** Correction state from the checkpoint's `reportRecovery` only, through the shared allowlists. */
+/** Correction or repair state from the checkpoint's `submissionRepair` / `reportRecovery` only, through the shared allowlists. */
 function reportOf(run: PublicRun): ReportView | null {
-  return reportInfo(record(run.checkpoint)?.reportRecovery);
+  return checkpointReportInfo(run.checkpoint);
 }
 
 const choice = (model: unknown, variant: unknown, budget: Budget): ModelChoice => ({

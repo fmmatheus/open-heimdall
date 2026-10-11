@@ -91,9 +91,9 @@ test('SQLite schema is strict and versioned; authoritative global limits cannot 
   const store = f.open();
   const db = new DatabaseSync(f.databasePath);
   try {
-    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 2);
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 3);
     const tables = db.prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all();
-    assert.equal(tables.length, 6);
+    assert.equal(tables.length, 7);
     assert.ok(tables.every(row => /STRICT\s*$/i.test(row.sql)));
   } finally { db.close(); }
   assert.throws(() => new CoordinatorStore({ databasePath: f.databasePath, globalConcurrency: 3 }), /persisted/);
@@ -487,4 +487,60 @@ test('checkpoint.saved drops unknown codes and modes, clamps the counter and omi
   store.saveCheckpoint(run.id, run.ownerToken, { ...checkpoint(run), reportRecovery: recoveryOf({ diagnostic: { code: 'correction_exhausted', gateIds: gates } }) });
   assert.equal(events().at(-1).payload.report.gateIds.length, 50);
   assert.equal(store.getRun(run.id).status, 'running');
+});
+
+test('the recorded runtime identity is set once for new runs and an existing run is never given or stripped of one', async t => {
+  const recorded = { packageVersion: '1.2.3', protocol: 'structured-v1', build: { packageName: '@fake/core', digest: 'a'.repeat(64) } };
+  const fresh = await admitFixture(t);
+  fresh.store.bindStart(fresh.run.id, fresh.run.ownerToken, binding(fresh.run));
+  const first = { ...checkpoint(fresh.run), runtime: recorded };
+  fresh.store.saveCheckpoint(fresh.run.id, fresh.run.ownerToken, first);
+  fresh.store.saveCheckpoint(fresh.run.id, fresh.run.ownerToken, { ...first, status: 'paused', runtime: structuredClone(recorded) });
+  assert.throws(() => fresh.store.saveCheckpoint(fresh.run.id, fresh.run.ownerToken, { ...first, runtime: { ...recorded, packageVersion: '9.9.9' } }), /runtime identity is immutable/);
+  assert.throws(() => fresh.store.saveCheckpoint(fresh.run.id, fresh.run.ownerToken, { ...first, runtime: undefined }), /runtime identity is immutable/);
+  assert.deepEqual(fresh.store.getRun(fresh.run.id).checkpoint.runtime, recorded);
+  const legacy = await admitFixture(t);
+  legacy.store.bindStart(legacy.run.id, legacy.run.ownerToken, binding(legacy.run));
+  legacy.store.saveCheckpoint(legacy.run.id, legacy.run.ownerToken, checkpoint(legacy.run));
+  assert.throws(() => legacy.store.saveCheckpoint(legacy.run.id, legacy.run.ownerToken, { ...checkpoint(legacy.run), runtime: recorded }), /runtime identity is immutable/);
+  assert.equal(Object.hasOwn(legacy.store.getRun(legacy.run.id).checkpoint, 'runtime'), false, 'an existing run is not retroactively claimed');
+});
+
+test('a checkpoint from a stale view can never erase a seal, conflict, outcome or refusal of the active attempt, nor lower its repair counter', async t => {
+  const { store, run } = await admitFixture(t);
+  store.bindStart(run.id, run.ownerToken, binding(run));
+  const base = checkpoint(run);
+  const attemptId = base.attempt.id;
+  const record = (extra = {}) => ({ phase: 'planner', index: 0, child: base.child, repairs: 1, attempts: [attemptId], ...extra });
+  const held = { ...base, submissionRepair: record() };
+  store.saveCheckpoint(run.id, run.ownerToken, held);
+  const markers = {
+    sealed: { attemptId },
+    conflict: { attemptId, kind: 'parallel', tool: 'edit' },
+    negative: { attemptId, outcome: 'blocked', gateIds: [], fields: [] },
+    refused: { attemptId, code: 'unavailable', reason: 'synthetic' },
+  };
+  for (const [name, marker] of Object.entries(markers)) {
+    const durable = { ...base, submissionRepair: record({ [name]: marker }) };
+    store.saveCheckpoint(run.id, run.ownerToken, durable);
+    // The stale view still holds the pre-marker record and tries to persist it.
+    assert.throws(() => store.saveCheckpoint(run.id, run.ownerToken, held), new RegExp('drop the ' + name + ' marker'));
+    assert.throws(() => store.saveCheckpoint(run.id, run.ownerToken, { ...base, submissionRepair: undefined }), /drop the .* marker|drop the repair record/);
+    assert.deepEqual(store.getRun(run.id).checkpoint.submissionRepair, durable.submissionRepair, 'the refused checkpoint changed nothing');
+    // Not a regression: the same record rewritten, a higher counter, and a fresh attempt that supersedes the old one.
+    store.saveCheckpoint(run.id, run.ownerToken, { ...durable, status: 'paused' });
+    store.saveCheckpoint(run.id, run.ownerToken, { ...base, submissionRepair: record({ [name]: marker, repairs: 2 }) });
+    assert.throws(() => store.saveCheckpoint(run.id, run.ownerToken, durable), /lower the repair counter from 2 to 1/);
+    store.saveCheckpoint(run.id, run.ownerToken, { ...base, attempt: { ...base.attempt, id: 'fresh-' + name }, submissionRepair: record({ repairs: 2 }) });
+    store.saveCheckpoint(run.id, run.ownerToken, { ...base, attempt: { ...base.attempt, status: 'rejected' }, submissionRepair: record({ [name]: marker, repairs: 2 }) });
+    store.saveCheckpoint(run.id, run.ownerToken, { ...base, attempt: { ...base.attempt, status: 'rejected' }, submissionRepair: record({ repairs: 2 }) });
+    // Reset for the next marker: advancing to another task clears the record.
+    store.saveCheckpoint(run.id, run.ownerToken, { ...base, index: 1, attempt: { ...base.attempt, index: 1 } });
+    store.saveCheckpoint(run.id, run.ownerToken, { ...held, index: 0 });
+    store.saveCheckpoint(run.id, run.ownerToken, held);
+  }
+  // The same transition guard accepts real advancement: the record is dropped together with the task moving on.
+  store.saveCheckpoint(run.id, run.ownerToken, { ...base, submissionRepair: record({ sealed: markers.sealed }) });
+  store.saveCheckpoint(run.id, run.ownerToken, { ...base, phase: 'executor', attempt: undefined });
+  assert.equal(store.getRun(run.id).checkpoint.submissionRepair, undefined);
 });

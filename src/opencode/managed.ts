@@ -2,7 +2,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createCoordinatorClient } from '../coordinator/client.js';
 import type { RunRecord, StartBinding } from '../coordinator/types.js';
-import type { RunArguments, RunnerContext, RunnerPersistence, RunState, WorkflowReceipt } from '../workflow/types.js';
+import { isNativeOutcome, isSubmissionKind, isSubmissionReceipt } from '../workflow/submission-store.js';
+import type { NativeOutcome, RunArguments, RunnerContext, RunnerPersistence, RunState, SubmissionReceipt, WorkflowReceipt } from '../workflow/types.js';
 
 export interface ManagedMetadata {
   endpoint: string;
@@ -11,6 +12,7 @@ export interface ManagedMetadata {
   parentSessionId: string;
 }
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
+const SAFE = /^[A-Za-z0-9_-]+$/;
 const text = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
 
 export async function readManagedMetadata(directory: string): Promise<ManagedMetadata | undefined> {
@@ -52,6 +54,32 @@ export function createManagedPersistence(directory: string, metadata: ManagedMet
     async writeReceipt(runId, receipt) {
       if (runId !== identity.runId || !/^[A-Za-z0-9_-]+$/.test(receipt.id)) throw new Error('Managed receipt identity mismatch');
       await request('PUT', base + '/receipts/' + encodeURIComponent(receipt.id), receipt);
+    },
+    async readSubmission(runId, attemptId, kind) {
+      if (runId !== identity.runId || !SAFE.test(attemptId) || !isSubmissionKind(kind)) throw new Error('Managed submission identity mismatch');
+      const value = await request('GET', base + '/submissions/' + encodeURIComponent(attemptId) + '/' + kind);
+      if (value === null) return null;
+      if (!isSubmissionReceipt(value) || value.runId !== identity.runId || value.attemptId !== attemptId || value.kind !== kind) throw new Error('Coordinator returned a submission for a different identity');
+      return value;
+    },
+    async writeSubmission(runId, receipt) {
+      if (runId !== identity.runId || receipt.runId !== identity.runId || receipt.parent !== identity.parentSessionId || !SAFE.test(receipt.attemptId) || !isSubmissionReceipt(receipt)) throw new Error('Managed submission identity mismatch');
+      const value = await request('PUT', base + '/submissions/' + encodeURIComponent(receipt.attemptId) + '/' + receipt.kind, receipt);
+      if (!isSubmissionReceipt(value) || value.runId !== identity.runId || value.attemptId !== receipt.attemptId || value.kind !== receipt.kind) throw new Error('Coordinator did not confirm the submission');
+      return value as SubmissionReceipt;
+    },
+    async readNativeOutcome(runId, attemptId) {
+      if (runId !== identity.runId || !SAFE.test(attemptId)) throw new Error('Managed outcome identity mismatch');
+      const value = await request('GET', base + '/outcomes/' + encodeURIComponent(attemptId));
+      if (value === null) return null;
+      if (!isNativeOutcome(value) || value.runId !== identity.runId || value.attemptId !== attemptId) throw new Error('Coordinator returned an outcome for a different identity');
+      return value;
+    },
+    async writeNativeOutcome(runId, outcome) {
+      if (runId !== identity.runId || outcome.runId !== identity.runId || !SAFE.test(outcome.attemptId) || !isNativeOutcome(outcome)) throw new Error('Managed outcome identity mismatch');
+      const value = await request('PUT', base + '/outcomes/' + encodeURIComponent(outcome.attemptId), outcome);
+      if (!isNativeOutcome(value) || value.runId !== identity.runId || value.attemptId !== outcome.attemptId) throw new Error('Coordinator did not confirm the outcome');
+      return value as NativeOutcome;
     },
     async bindStart(binding) {
       if (binding.sessionID !== identity.parentSessionId) throw new Error('Managed native parent mismatch');

@@ -1,5 +1,6 @@
 import { createManagedWorktree, verifyManagedWorktree } from './worktrees.js';
 import { prepareRuntime } from './runtime.js';
+import { verifyRuntimeSnapshot } from './runtime-snapshot.js';
 import type { CoordinatorStore } from './store.js';
 import type { ManagedExecutor, ProjectRecord, RunRecord } from './types.js';
 
@@ -105,6 +106,7 @@ export class CoordinatorScheduler {
     if (!run || run.status !== 'paused' || run.capacityReserved) throw new Error('Only a confirmed idle paused run may be resumed');
     const project = this.options.store.getProject(run.projectId)!;
     await (this.options.verifyWorktree ?? verifyManagedWorktree)({ project, run });
+    await verifyRuntimeSnapshot(run); // Refuse an altered runtime at the request, not after the run is queued.
     const observation = await this.options.executor.inspect(run);
     if (!observation.idle || observation.status !== 'paused') throw new Error('Native parent and children must be confirmed idle before resume');
     return this.options.store.queueResume(id, input);
