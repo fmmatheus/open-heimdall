@@ -22,12 +22,67 @@ npm test
 Tests use temporary project directories, injected backends and synthetic
 credentials. They do not prompt live models or operate on current OpenCode runs.
 
+## Packaging
+
+`npm run pack:clean` (`scripts/pack.mjs`) builds the npm tarball from a disposable
+copy of the working tree: tracked and untracked-but-not-ignored files are copied,
+then `npm ci --ignore-scripts`, `npm run build` and `npm pack` run inside the copy.
+The checkout's `dist/` and `node_modules/` are never read and no extension build is
+needed. It prints the tarball path and the file inventory (`--out DIRECTORY`
+selects where the tarball is written).
+
+`npm run test:package` builds that tarball, installs it with plain `npm install`
+into a fresh consumer project and, separately, with
+`npm install --global --prefix TEMPORARY_DIRECTORY` into a temporary prefix, and
+checks the inventory, the installed `heimdall --help` and `--version` outside the
+checkout, the three package exports and the quota helper modules with `fetch`
+replaced by a stub that fails. It needs registry access, uses isolated HOME and npm
+cache/configuration, and is not part of `npm test`. `test/package/helpers.mjs`
+holds the reusable tarball and install helpers.
+
+The tarball contains `dist` (without source maps), `prompts`, `examples`, `README.md`
+and `docs`. It excludes `src`, `test`, `scripts`, `node_modules`, lockfiles,
+`.heimdall` and the extension outputs. `dist/extension/**` is compiled from the
+OpenChamber extension sources and imports the `@openchamber/sdk` development
+dependency; no export or CLI path imports it, so it is not part of the core package
+and `dist/openchamber-extension/**` (the bundled extension) stays a separate
+`npm run build:extension` artifact.
+
+### Quota provider packaging
+
+`@slkiser/opencode-quota` 5.0.1 declares an exact peer on `@opencode/plugin` 2.0.16,
+while Heimdall requires the supported 2.0.22. In the source checkout this is
+`ERESOLVE` (`peer @opencode/plugin@"2.0.16" from @slkiser/opencode-quota@5.0.1`
+against `@opencode/plugin@"2.0.22" from the root project`) and is worked around by a
+root `overrides` entry, which npm does not apply when the package is installed as a
+dependency. A plain `npm install` of the previous tarball then either hoisted a
+second, unsupported `@opencode/plugin` 2.0.16 next to the nested 2.0.22 or, when the
+consumer also depended on 2.0.22, produced an invalid peer tree (`npm ls`: `invalid:
+"2.0.16" from node_modules/@slkiser/opencode-quota`, `ELSPROBLEMS`).
+
+Alternatives checked with npm 10.9.8: a shipped `npm-shrinkwrap.json` was not
+applied when installing a local tarball (the resolved tree was unchanged), and
+`bundleDependencies` still yielded an invalid peer tree while adding roughly 48 MB
+of platform-specific files (including `@opentui` binaries).
+Heimdall only uses four provider modules, whose relative import closure is 28
+plain JavaScript files that import nothing but Node built-ins and `comment-json`.
+`scripts/vendor-quota.mjs`, run by `npm run build`, therefore copies exactly that
+closure and the upstream MIT license into `dist/vendor/opencode-quota` and writes a
+manifest with the pinned name and version. The upstream package moves to
+`devDependencies` (still 5.0.1, with the development-only override) and
+`comment-json` becomes a direct dependency. `resolveQuotaPackage` resolves the
+vendored copy by default, still requires name `@slkiser/opencode-quota` and version
+5.0.1 and still honors `settings.packagePath`. The script fails if the upstream
+version changes or the closure imports another package. Because the files live in
+`dist`, runtime identity covers them.
+
 ## Configuration and CLI
 
 ```sh
 node dist/cli.js init --project /path/to/separate-project
 node dist/cli.js check --project /path/to/separate-project
 node dist/cli.js status RUN_ID --project /path/to/separate-project
+node dist/cli.js --version
 ```
 
 `init` creates `.heimdall.toml` and refuses to overwrite it. Edit the model IDs
@@ -69,9 +124,8 @@ cp -n /path/to/open-heimdall/examples/opencode/commands/*.md .opencode/commands/
 ```
 
 The explicit link keeps dependencies resolved from the built checkout and its
-lockfile. Dependency overrides do not propagate to consumer roots; regular
-tarball/copy installation requires the same quota/plugin override in the consumer.
-The plugin entry point is `@open-heimdall/core/plugin`. Do not load it alongside
+lockfile. A tarball built as described in [Packaging](#packaging) installs with
+ordinary `npm install` and needs no consumer overrides. The plugin entry point is `@open-heimdall/core/plugin`. Do not load it alongside
 another plugin that uses the same identity (`adr.workflow`), tool names or RPC
 names at the same project location.
 
@@ -82,8 +136,9 @@ roles also requires corresponding agent filenames and matching orchestrator
 permission resources.
 
 The quota adapter pins `@slkiser/opencode-quota` **5.0.1** and isolates its internal
-provider-module paths. A scoped dependency override uses the tested native plugin
-version. Credentials resolve through the active OpenCode account and stay
+provider-module paths. The build vendors the pinned provider modules (see
+[Packaging](#packaging)); a development-only override keeps the source checkout on
+the tested native plugin version. Credentials resolve through the active OpenCode account and stay
 transient; caches retain normalized quota fields and hashed account scope.
 
 For the OpenChamber Claude Code provider, use `claude-code/opus` for planning
