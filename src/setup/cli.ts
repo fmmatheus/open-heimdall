@@ -1,4 +1,4 @@
-import { runSetup, UNVERIFIED_BY_SETUP, type SetupInput, type SetupOptions, type SetupResult } from './core.js';
+import { runSetup, UNVERIFIED_BY_SETUP, type SetupInput, type SetupOptions, type SetupResult, type SetupTrace } from './core.js';
 
 /*
  * `heimdall setup` command line front end over the shared setup core (core.ts).
@@ -93,6 +93,8 @@ export interface SetupPromptRequest {
   /** The working directory and home directory the setup core will resolve paths against, when overridden. */
   cwd?: string;
   homeDirectory?: string;
+  /** Masks credentials in text the prompt prints, such as target paths and validation messages. */
+  sanitize?: (text: string) => string;
 }
 export type SetupPrompt = (request: SetupPromptRequest) => Promise<SetupInput | null>;
 
@@ -169,31 +171,58 @@ export function parseSetupArguments(args: readonly string[]): ParsedSetupArgumen
 }
 
 const SECRET_NAME = /pass|token|secret|credential|api_?key/i;
+const VARIABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-/** Builds a redactor for diagnostics: environment credential values, URL user information and Authorization-style values. */
-export function createRedactor(environment: NodeJS.ProcessEnv, args: readonly string[]): (text: string) => string {
+/** The values given for `--password-env`, in both the separated and the `--password-env=NAME` spelling. */
+function passwordEnvironmentArguments(args: readonly string[]): string[] {
+  const values: string[] = [];
+  args.forEach((argument, index) => {
+    if (argument === '--password-env') { const next = args[index + 1]; if (next !== undefined) values.push(next); }
+    else if (argument.startsWith('--password-env=')) values.push(argument.slice('--password-env='.length));
+  });
+  return values;
+}
+
+/** A redactor that also accepts credential references learned after it was built (existing configuration, wizard decisions). */
+export interface Redactor {
+  (text: string): string;
+  /**
+   * Adds environment variable names that hold credentials; their current values are masked from then on. A reference
+   * that is not a variable name may be a pasted credential and is masked itself. Values are held only in this closure.
+   */
+  addReferences(references: Iterable<string | undefined>): void;
+}
+
+/**
+ * Builds a redactor for diagnostics: the values of credential-named environment variables, of the variables named as
+ * credential references (`--password-env` and any added later), URL user information and Authorization-style values.
+ * Other environment values are never masked.
+ */
+export function createRedactor(environment: NodeJS.ProcessEnv, args: readonly string[]): Redactor {
   const secrets = new Set<string>();
   for (const [name, value] of Object.entries(environment)) if (value && value.length >= 4 && SECRET_NAME.test(name)) secrets.add(value);
-  const indexOfPasswordName = args.indexOf('--password-env');
-  const passwordName = indexOfPasswordName === -1 ? undefined : args[indexOfPasswordName + 1];
-  if (passwordName !== undefined) {
-    const referenced = environment[passwordName];
-    if (referenced && referenced.length >= 4) secrets.add(referenced);
-    // A value that is not a variable name may be a pasted credential.
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(passwordName) && passwordName.length >= 3) secrets.add(passwordName);
-  }
+  const addReferences = (references: Iterable<string | undefined>): void => {
+    for (const reference of references) {
+      if (reference === undefined || reference === '') continue;
+      const referenced = environment[reference];
+      if (referenced && referenced.length >= 4) secrets.add(referenced);
+      // A value that is not a variable name may be a pasted credential.
+      if (!VARIABLE_NAME.test(reference) && reference.length >= 3) secrets.add(reference);
+    }
+  };
+  addReferences(passwordEnvironmentArguments(args));
   for (const argument of args) {
     const match = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)@/i.exec(argument.includes('=') && argument.startsWith('--') ? argument.slice(argument.indexOf('=') + 1) : argument);
     if (match?.[1]) { secrets.add(match[1]); for (const part of match[1].split(':')) if (part.length >= 3) secrets.add(part); }
   }
-  const ordered = [...secrets].sort((a, b) => b.length - a.length);
-  return text => {
+  const redact = (text: string): string => {
     let result = text;
-    for (const secret of ordered) result = result.split(secret).join('[redacted]');
+    for (const secret of [...secrets].sort((a, b) => b.length - a.length)) result = result.split(secret).join('[redacted]');
     return result
       .replace(/(:\/\/)[^/?#\s@]*@/g, '$1[redacted]@')
       .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{6,}/gi, '$1 [redacted]');
   };
+  return Object.assign(redact, { addReferences });
 }
 
 function redactResult(result: SetupResult, redact: (text: string) => string): SetupResult {
@@ -261,12 +290,13 @@ export async function setupMain(args: readonly string[], options: SetupCommandOp
   try { parsed = parseSetupArguments(args); }
   catch (error) { return emit(failureResult('invalid-input', error instanceof UsageError ? error.message : 'Invalid setup arguments')); }
 
+  const trace: SetupTrace = {};
   try {
     const interactive = !parsed.noInput && !parsed.json && Boolean((options.stdin ?? process.stdin).isTTY) && Boolean(stdout.isTTY) && options.prompt !== undefined;
     let input = parsed.input;
     if (interactive) {
       const completed = await options.prompt!({
-        input, environment,
+        input, environment, sanitize: redact,
         ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
         ...(options.homeDirectory === undefined ? {} : { homeDirectory: options.homeDirectory }),
       });
@@ -276,14 +306,18 @@ export async function setupMain(args: readonly string[], options: SetupCommandOp
       }
       input = completed;
     }
+    // Credential references chosen interactively are known only now.
+    redact.addReferences([input.passwordEnv]);
     const result = await runSetup(input, {
       environment,
       ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
       ...(options.homeDirectory === undefined ? {} : { homeDirectory: options.homeDirectory }),
       ...(options.operations === undefined ? {} : { operations: options.operations }),
-    });
+    }, trace);
+    redact.addReferences(trace.credentialReferences ?? []);
     return emit(result);
   } catch (error) {
+    redact.addReferences(trace.credentialReferences ?? []);
     const code = (error as NodeJS.ErrnoException | null)?.code;
     return emit(failureResult('unexpected', `Setup failed unexpectedly (${code ?? (error instanceof Error ? error.name : 'error')}); no configuration was written`));
   }
