@@ -206,8 +206,12 @@ export async function runLocalChecks(input: DoctorInput, options: DoctorOptions 
 
   try {
     const installed = installedDependencies(packageRoot);
-    if (installed.missing.length) add('runtime.dependencies', 'fail', true, `Required runtime dependencies are not installed: ${installed.missing.join(', ')}`);
-    else {
+    if (installed.missing.length || installed.unidentified.length) {
+      const problems: string[] = [];
+      if (installed.missing.length) problems.push(`Required runtime dependencies are not installed: ${installed.missing.join(', ')}`);
+      if (installed.unidentified.length) problems.push(`Installed runtime dependencies cannot be identified (unidentifiable: ${installed.unidentified.join(', ')}); each needs a readable package.json with a version`);
+      add('runtime.dependencies', 'fail', true, problems.join('. '));
+    } else {
       await admitRuntime(packageRoot);
       add('runtime.dependencies', 'pass', true, `The package's declared dependencies and ${installed.entries.length} installed runtime packages resolve`);
     }

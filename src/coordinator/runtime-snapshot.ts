@@ -29,6 +29,7 @@ export async function admitRuntime(root = sourcePackageRoot()): Promise<RuntimeS
   if (identity.build?.dependencies.lockfile !== null) return { identity, modules };
   const installed = installedDependencies(root);
   if (installed.missing.length) throw new Error('Runtime dependencies are not installed for this package (missing: ' + installed.missing.join(', ') + ')');
+  if (installed.unidentified.length) throw new Error('Runtime dependencies cannot be identified for this package (unidentifiable: ' + installed.unidentified.join(', ') + '); each installed dependency needs a readable package.json with a version');
   return { identity, modules, links: installed.links };
 }
 

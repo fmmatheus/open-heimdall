@@ -404,6 +404,64 @@ for (const layout of locklessLayouts) {
   });
 }
 
+const MANIFEST_SENTINEL = 'sentinel-manifest-content-7f3a91';
+
+/** Package manifests a dependency can have on disk without identifying the package: unparsable, not an object, or no usable version. */
+const unidentifiableManifests = [
+  ['invalid JSON', `{ "name": "bad", "note": "${MANIFEST_SENTINEL}", `],
+  ['an array', JSON.stringify([MANIFEST_SENTINEL])],
+  ['a string', JSON.stringify(MANIFEST_SENTINEL)],
+  ['null', 'null'],
+  ['no version', JSON.stringify({ name: 'bad', note: MANIFEST_SENTINEL })],
+  ['an empty version', JSON.stringify({ name: 'bad', version: '', note: MANIFEST_SENTINEL })],
+  ['a non-string version', JSON.stringify({ name: 'bad', version: 7, note: MANIFEST_SENTINEL })],
+];
+
+for (const layout of locklessLayouts) {
+  for (const [kind, manifest] of unidentifiableManifests) {
+    for (const [role, target, named] of [
+      ['direct dependency', f => path.join(f.hoisted, 'dep'), /unidentifiable: .*\(package\) > dep/],
+      ['direct nested dependency', f => f.nested, /unidentifiable: .*\(package\) > nested/],
+      ['hoisted transitive dependency', f => f.trans, /unidentifiable: .*dep > trans, nested > trans/],
+      ['nested transitive dependency', f => f.inner, /unidentifiable: .*nested > inner/],
+    ]) {
+      test(`${layout} layout: a ${role} whose package.json is ${kind} is refused, naming it and nothing of its content`, async t => {
+        const f = await installedPackage(t, layout);
+        await admitRuntime(f.source);
+        await fs.writeFile(path.join(target(f), 'package.json'), manifest);
+        let failure;
+        try { await admitRuntime(f.source); } catch (error) { failure = error; }
+        assert.ok(failure, 'the unidentifiable dependency was admitted');
+        assert.match(failure.message, named);
+        assert.match(failure.message, /cannot be identified/);
+        assert.ok(!failure.message.includes(MANIFEST_SENTINEL), 'manifest content leaked into the refusal');
+        assert.ok(!JSON.stringify(computeRuntimeIdentity(f.source)).includes(MANIFEST_SENTINEL));
+      });
+    }
+  }
+
+  test(`${layout} layout: absent optional and peer dependencies, and dependency cycles, are still admitted`, async t => {
+    const f = await installedPackage(t, layout);
+    // `absent` is an optional dependency of the package that is not installed. Add an absent peer and an absent optional deeper down.
+    await f.write('package.json', JSON.stringify({ name: 'dep', version: '1.0.0', dependencies: { trans: '^0.4.0' }, optionalDependencies: { ghost: '1.0.0' }, peerDependencies: { phantom: '1.0.0' } }), path.join(f.hoisted, 'dep'));
+    // dep <-> trans cycle.
+    await f.write('package.json', JSON.stringify({ name: 'trans', version: '0.4.0', dependencies: { dep: '1.0.0' } }), f.trans);
+    const admitted = await admitRuntime(f.source);
+    assert.deepEqual(Object.keys(admitted.links), ['@sc/scoped', 'dep', 'nested']);
+    const identity = computeRuntimeIdentity(f.source);
+    assert.deepEqual(computeRuntimeIdentity(f.source), identity, 'stable');
+  });
+
+  test(`${layout} layout: an installed optional dependency with an unidentifiable manifest is refused, an absent one is not`, async t => {
+    const f = await installedPackage(t, layout);
+    const optional = path.join(f.hoisted, 'maybe');
+    await f.write('package.json', JSON.stringify({ name: '@fake/core', version: '1.2.3', type: 'module', dependencies: { dep: '1.0.0', '@sc/scoped': '2.0.0', nested: '3.0.0' }, optionalDependencies: { absent: '1.0.0', maybe: '1.0.0' } }));
+    await admitRuntime(f.source);
+    await f.write('package.json', `{ "note": "${MANIFEST_SENTINEL}", `, optional);
+    await assert.rejects(admitRuntime(f.source), error => /unidentifiable: .*\(package\) > maybe/.test(error.message) && !error.message.includes(MANIFEST_SENTINEL));
+  });
+}
+
 test('a snapshot imports its plugin through the linked dependencies', async t => {
   const f = await installedPackage(t, 'consumer');
   await f.write('dist/opencode/plugin.js', "import { value } from 'nested'; import { inner } from 'nested/inner.js'; export const createPlugin = () => value + inner;\n");
