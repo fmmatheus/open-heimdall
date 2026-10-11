@@ -13,8 +13,11 @@ registry entries.
 
 ## Setup
 
-Build the package with Node.js 22.19 or newer. Use a separate development Git
-project with a valid [project configuration](../examples/heimdall.toml). Set its
+Install the package from a tarball and create the configuration with
+`heimdall setup` as described in [Installation and setup](installation.md), using
+Node.js 22.19 or newer; `heimdall doctor` checks the result. Use a separate
+development Git project with a valid [project configuration](../examples/heimdall.toml)
+(the file `heimdall setup` writes, or one you edit yourself). Set its
 existing local OpenCode **2.0.22** connection URL. For OpenChamber Desktop, use
 its local HTTP port and set `authentication = "openchamber"` in `[opencode]`.
 Heimdall uses Desktop's existing client token from
@@ -31,8 +34,9 @@ supports passwordless operation. Starting a second server on an existing native
 database can resume its unfinished sessions, so validation must keep execution
 state separate from running workflows.
 
-Copy [coordinator.toml](../examples/coordinator.toml) to a private configuration
-directory. Limits default to one global run and one run per project when omitted.
+`heimdall setup` creates the coordinator configuration in a private directory; the
+[coordinator.toml](../examples/coordinator.toml) example lists its settings.
+Limits default to one global run and one run per project when omitted.
 An explicit project `--limit` overrides the registration default. Limits count
 whole admitted runs, including uncertain execution, rather than individual tasks.
 

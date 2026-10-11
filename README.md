@@ -11,46 +11,56 @@ Heimdall is designed to run as a single global service across your local Git pro
 ## Quickstart
 
 Requires Git, Node.js **22.19+**, a Git project with at least one commit, and a
-running local **OpenCode 2.0.22** server. Install from source during pre-alpha:
+running local **OpenCode 2.0.22** server. There is no public release, so build an
+installable tarball from source and install it globally:
 
 ```sh
 git clone https://github.com/fmmatheus/open-heimdall.git
 cd open-heimdall
 npm ci --ignore-scripts
-npm run build
+npm run pack:clean -- --out /path/to/output
+npm install --global /path/to/output/open-heimdall-core-0.0.0.tgz
 ```
 
-Create the project and coordinator configuration:
+Create the project and coordinator configuration from your Git project, then
+check the installation:
 
 ```sh
-node dist/cli.js init --project /path/to/your/project
-mkdir -p ~/.config/heimdall
-cp -n examples/coordinator.toml ~/.config/heimdall/coordinator.toml
+cd /path/to/your/project
+heimdall setup
+heimdall doctor
+heimdall doctor --connect
 ```
 
-Edit your project's `.heimdall.toml` with your models and OpenCode server URL.
-For Claude Code models, set the executor's `quotaProvider = "claude-code"`.
-For OpenChamber Desktop, use its local HTTP port as the URL and set
-`authentication = "openchamber"`; Heimdall uses Desktop's existing client token.
-For password authentication, supply the existing server password as
-`OPENCODE_PASSWORD` in the terminal that starts the coordinator.
+`heimdall setup` asks for the planner and executor models, quota provider and
+OpenCode URL and authentication, then writes the coordinator configuration and
+your project's `.heimdall.toml` without overwriting existing files. Pass flags
+and `--no-input` (or `--json`) to run it without prompts. `heimdall doctor`
+runs offline checks; `--connect` also verifies the OpenCode endpoint, but no
+check proves model availability, provider login, quota or run readiness. For
+Claude Code models, use `claude-code` as the quota provider. For OpenChamber
+Desktop, use its local HTTP port as the URL and `openchamber` authentication;
+Heimdall uses Desktop's existing client token. For password authentication,
+supply the existing server password as `OPENCODE_PASSWORD` in the terminal that
+starts the coordinator. See the [installation and setup guide](docs/installation.md)
+for the global install without `sudo`, every flag, JSON output and exit codes.
 
 ```sh
-node dist/cli.js coordinator serve
+heimdall coordinator serve
 ```
 
-In another terminal, open the same Heimdall checkout. Write your feature request
-in a Markdown file, then register the project and submit it:
+In another terminal, write your feature request in a Markdown file, then register
+the project and submit it:
 
 ```sh
-node dist/cli.js coordinator project add /path/to/your/project
-node dist/cli.js coordinator run submit PROJECT_ID --feature /path/to/feature.md
-node dist/cli.js coordinator run show RUN_ID
+heimdall coordinator project add /path/to/your/project
+heimdall coordinator run submit PROJECT_ID --feature /path/to/feature.md
+heimdall coordinator run show RUN_ID
 ```
 
 Use the `id` returned by `project add` as `PROJECT_ID`, and the `id` returned by
 `run submit` as `RUN_ID`. Each run executes tasks sequentially in its own worktree.
-See [setup and recovery](docs/coordinator.md) and [model/authentication configuration](docs/development.md#opencode-adapter)
+See [installation and setup](docs/installation.md), [coordinator operation and recovery](docs/coordinator.md) and [model/authentication configuration](docs/development.md#opencode-adapter)
 for connection options, compatibility limits, and existing workflow separation.
 
 To watch and review runs inside OpenChamber 2.1.0, see the read-only
@@ -142,7 +152,8 @@ Heimdall has a TypeScript runner extracted from the working ADR workflow, an
 OpenCode adapter, quota-aware model selection, and an opt-in SQLite coordinator
 with project registration, isolated worktrees, concurrency limits and local IPC.
 
-There is no public release yet. See [baseline development](docs/development.md)
+There is no public release yet; see [installation and setup](docs/installation.md)
+for the tarball install. See [baseline development](docs/development.md)
 and [coordinator development](docs/coordinator.md) for setup, tested boundaries,
 current limits, and how to keep existing workflows separate.
 
