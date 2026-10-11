@@ -414,6 +414,99 @@ test('invalid values, conflicts and incomplete configuration return structured e
   await assertNoNetworkAttempts(s);
 });
 
+/**
+ * A HOME whose default state directory yields a coordinator socket path above the portable 100-byte limit, with
+ * a short, explicitly selected state directory. `existing` pre-creates the coordinator and project files.
+ */
+async function longHomeSandbox(t, { existing }) {
+  const s = await sandbox(t);
+  const home = path.join(s.root, 'h'.repeat(90));
+  const state = path.join(s.root, 'state');
+  await fs.mkdir(home);
+  const coordinatorFile = path.join(home, '.config', 'heimdall', 'coordinator.toml');
+  assert.ok(Buffer.byteLength(path.join(home, '.local', 'state', 'heimdall', 'coordinator.sock')) > 100, 'the default socket path must exceed the limit');
+  const env = { HOME: home };
+  if (existing) {
+    await fs.mkdir(path.dirname(coordinatorFile), { recursive: true });
+    await fs.writeFile(coordinatorFile, `[coordinator]\nstateDirectory = ${JSON.stringify(state)}\nglobalConcurrency = 2\n`, { mode: 0o600 });
+    await fs.writeFile(s.projectFile, ['[workflow]', 'plannerModel = "anthropic/planner-x"', '', '[[workflow.executorCandidates]]', 'key = "primary"', 'quotaProvider = "openai"', 'model = "openai/executor-x"', '', '[opencode]', 'baseUrl = "http://127.0.0.1:4096"', 'authentication = "basic"', ''].join('\n'), { mode: 0o600 });
+  }
+  return { ...s, home, state, env, coordinatorFile };
+}
+
+const fileState = async file => ({ bytes: await fs.readFile(file), mtimeMs: (await fs.stat(file)).mtimeMs });
+
+test('an existing coordinator file with a short state directory is reused under a HOME whose default socket path is too long', async t => {
+  const s = await longHomeSandbox(t, { existing: true });
+  const before = { tree: await tree(s.root), coordinator: await fileState(s.coordinatorFile), project: await fileState(s.projectFile) };
+  const unchanged = async () => {
+    assert.deepEqual(await tree(s.root), before.tree);
+    assert.deepEqual(await fileState(s.coordinatorFile), before.coordinator);
+    assert.deepEqual(await fileState(s.projectFile), before.project);
+  };
+
+  const reused = jsonDocument(setup(s, ['--no-input', '--json'], { env: s.env }));
+  assert.equal(reused.ok, true, JSON.stringify(reused.error));
+  assert.deepEqual(reused.targets, { coordinator: { path: s.coordinatorFile, outcome: 'reused' }, project: { path: s.projectFile, outcome: 'reused' } });
+  assert.deepEqual(reused.createdDirectories, []);
+  await unchanged();
+
+  // Equivalent spellings of the existing state directory (and of its concurrency) are not conflicts.
+  const configDirectory = path.dirname(s.coordinatorFile);
+  const spellings = [s.state, path.relative(configDirectory, s.state), `${s.state}/.`, `${s.state}/sub/..`];
+  for (const spelling of spellings) {
+    const same = jsonDocument(setup(s, ['--no-input', '--json', '--state-directory', spelling, '--global-concurrency', '2', '--project-concurrency', '1'], { env: s.env }));
+    assert.equal(same.ok, true, `${spelling}: ${JSON.stringify(same.error)}`);
+    assert.deepEqual([same.targets.coordinator.outcome, same.targets.project.outcome], ['reused', 'reused']);
+    await unchanged();
+  }
+
+  // Conflicting values still fail before any write.
+  for (const [flags, key] of [
+    [['--state-directory', path.join(s.root, 'other-state')], 'coordinator.stateDirectory'],
+    [['--global-concurrency', '3'], 'coordinator.globalConcurrency'],
+    [['--project-concurrency', '4'], 'coordinator.projectConcurrency'],
+  ]) {
+    const conflict = jsonDocument(setup(s, ['--no-input', '--json', ...flags], { env: s.env }));
+    assert.equal(conflict.error.code, 'conflict', JSON.stringify(conflict.error));
+    assert.ok(conflict.error.message.includes(key), conflict.error.message);
+    assert.deepEqual([conflict.targets.coordinator.outcome, conflict.targets.project.outcome], ['not-written', 'not-written']);
+    await unchanged();
+  }
+
+  // A supplied value must still pass the loader rules: a state directory that is too long is invalid even though reuse is possible.
+  const tooLong = jsonDocument(setup(s, ['--no-input', '--json', '--state-directory', path.join(s.root, 's'.repeat(100))], { env: s.env }));
+  assert.equal(tooLong.error.code, 'invalid-input', JSON.stringify(tooLong.error));
+  assert.match(tooLong.error.message, /too long/);
+  const invalidConcurrency = jsonDocument(setup(s, ['--no-input', '--json', '--global-concurrency', '0'], { env: s.env }));
+  assert.equal(invalidConcurrency.error.code, 'invalid-input', JSON.stringify(invalidConcurrency.error));
+  await unchanged();
+  await assertNoNetworkAttempts(s);
+});
+
+test('a new coordinator file needs a usable state directory when the default socket path is too long', async t => {
+  const s = await longHomeSandbox(t, { existing: false });
+  const before = await tree(s.root);
+  const args = ['--no-input', '--json', ...complete];
+
+  const rejected = jsonDocument(setup(s, args, { env: s.env }));
+  assert.equal(rejected.error.code, 'invalid-input', JSON.stringify(rejected.error));
+  assert.match(rejected.error.message, /too long/);
+  assert.match(rejected.error.message, /--state-directory/);
+  assert.deepEqual([rejected.targets.coordinator.outcome, rejected.targets.project.outcome], ['not-written', 'not-written']);
+  assert.deepEqual(await tree(s.root), before, 'nothing may be created');
+  assert.equal(await exists(s.coordinatorFile), false);
+  assert.equal(await exists(s.projectFile), false);
+
+  const created = jsonDocument(setup(s, [...args, '--state-directory', s.state], { env: s.env }));
+  assert.equal(created.ok, true, JSON.stringify(created.error));
+  assert.deepEqual([created.targets.coordinator.outcome, created.targets.project.outcome], ['created', 'created']);
+  assert.match(await read(s.coordinatorFile), /stateDirectory/);
+  const coordinator = await loadCoordinatorConfiguration(s.coordinatorFile);
+  assert.equal(coordinator.stateDirectory, s.state);
+  await assertNoNetworkAttempts(s);
+});
+
 test('a failure after the first file was published reports a partial outcome and a rerun finishes it', { skip: process.getuid?.() === 0 ? 'permissions do not restrict root' : false }, async t => {
   const s = await sandbox(t);
   await fs.chmod(s.project, 0o555);

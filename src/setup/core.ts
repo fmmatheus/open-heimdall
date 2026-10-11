@@ -129,8 +129,11 @@ interface Requested {
   coordinatorLines: string[];
 }
 
-/** Validates every supplied value with the configuration loaders' own rules by parsing a probe document. */
-async function validateInput(input: SetupInput, coordinatorFile: string, cwd: string): Promise<Requested> {
+/**
+ * Validates the supplied project values with the configuration loaders' own rules by parsing a probe document.
+ * Coordinator values are validated by `validateCoordinatorInput` once the existing coordinator file is known.
+ */
+function validateInput(input: SetupInput, cwd: string): Requested {
   const requested: Requested = { coordinatorLines: [] };
   const plannerModel = text(input.plannerModel, 'plannerModel');
   const executorModel = text(input.executorModel, 'executorModel');
@@ -162,21 +165,33 @@ async function validateInput(input: SetupInput, coordinatorFile: string, cwd: st
     if (opencodeAuth !== undefined) requested.opencodeAuth = opencodeAuth;
     if (passwordEnv !== undefined) requested.passwordEnv = passwordEnv;
   }
+  if (stateDirectory !== undefined) requested.stateDirectory = stateDirectory;
+  return requested;
+}
+
+/**
+ * Validates the supplied coordinator values with the loader's own rules by parsing a probe document. The probe
+ * describes the configuration that would take effect: when the coordinator file already exists, its effective
+ * state directory stands in for an omitted one, so the loader default is never evaluated for a file that is reused.
+ */
+async function validateCoordinatorInput(input: SetupInput, requested: Requested, coordinatorFile: string, existing: CoordinatorConfiguration | undefined): Promise<void> {
+  const supplied = requested.stateDirectory;
   const lines: string[] = [];
+  const concurrency: string[] = [];
   try {
-    if (stateDirectory !== undefined) lines.push(`stateDirectory = ${tomlString(stateDirectory)}`);
-    if (input.globalConcurrency !== undefined) lines.push(`globalConcurrency = ${positiveInteger(input.globalConcurrency, 'globalConcurrency')}`);
-    if (input.projectConcurrency !== undefined) lines.push(`projectConcurrency = ${positiveInteger(input.projectConcurrency, 'projectConcurrency')}`);
-    const parsed = await parseCoordinatorConfiguration(renderCoordinator(lines), coordinatorFile);
-    if (stateDirectory !== undefined) requested.stateDirectory = parsed.stateDirectory;
+    if (supplied !== undefined) lines.push(`stateDirectory = ${tomlString(supplied)}`);
+    if (input.globalConcurrency !== undefined) concurrency.push(`globalConcurrency = ${positiveInteger(input.globalConcurrency, 'globalConcurrency')}`);
+    if (input.projectConcurrency !== undefined) concurrency.push(`projectConcurrency = ${positiveInteger(input.projectConcurrency, 'projectConcurrency')}`);
+    const probeState = supplied === undefined && existing ? [`stateDirectory = ${tomlString(existing.stateDirectory)}`] : [];
+    const parsed = await parseCoordinatorConfiguration(renderCoordinator([...probeState, ...lines, ...concurrency]), coordinatorFile);
+    if (supplied !== undefined) requested.stateDirectory = parsed.stateDirectory;
     if (input.globalConcurrency !== undefined) requested.globalConcurrency = parsed.globalConcurrency;
     if (input.projectConcurrency !== undefined) requested.projectConcurrency = parsed.projectConcurrency;
   } catch (error) {
-    const hint = stateDirectory === undefined && describe(error).startsWith('stateDirectory') ? ' (the default state directory is used; choose one with --state-directory)' : '';
+    const hint = supplied === undefined && !existing && describe(error).startsWith('stateDirectory') ? ' (the default state directory is used; choose one with --state-directory)' : '';
     throw new SetupError('invalid-input', `Invalid setup input: ${describe(error)}${hint}`);
   }
-  requested.coordinatorLines = lines;
-  return requested;
+  requested.coordinatorLines = [...lines, ...concurrency];
 }
 
 async function readExisting(file: string, label: string): Promise<string | null> {
@@ -292,7 +307,7 @@ export async function planSetup(input: SetupInput, options: SetupOptions = {}, t
   const home = options.homeDirectory ?? os.homedir();
   const coordinatorFile = path.resolve(cwd, input.coordinatorConfigPath ?? environment.HEIMDALL_COORDINATOR_CONFIG ?? path.join(home, '.config', 'heimdall', 'coordinator.toml'));
   trace.coordinatorPath = coordinatorFile;
-  const requested = await validateInput(input, coordinatorFile, cwd);
+  const requested = validateInput(input, cwd);
 
   const selected = path.resolve(cwd, input.projectDirectory ?? '.');
   let projectDirectory: string;
@@ -312,6 +327,7 @@ export async function planSetup(input: SetupInput, options: SetupOptions = {}, t
     try { coordinatorEffective = await parseCoordinatorConfiguration(coordinatorContent, coordinatorFile); }
     catch (error) { throw new SetupError('invalid-configuration', `The coordinator configuration ${coordinatorFile} is not valid: ${describe(error)}. Setup does not modify existing files; fix it or choose another destination with --coordinator-config.`); }
   }
+  await validateCoordinatorInput(input, requested, coordinatorFile, coordinatorEffective);
   let projectEffective: Configuration | undefined;
   if (projectContent !== null) {
     try { projectEffective = parseConfiguration(projectContent, { projectDirectory, file: projectFile }); }
