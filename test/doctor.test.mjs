@@ -687,6 +687,67 @@ test('incomplete or broken installed runtimes are fatal', async t => {
   assert.equal(by(checks, 'runtime.dependencies').status, 'fail');
 });
 
+test('required dependencies without a readable package identity make the report not ok, without echoing their content', async t => {
+  const s = await sandbox(t);
+  createSetup(s, ['--state-directory', path.join(s.root, 'state')]);
+  const MANIFEST_SENTINEL = 'sentinel-manifest-content-7f3a91';
+  const manifests = [
+    ['invalid JSON', `{ "name": "bad", "note": "${MANIFEST_SENTINEL}", `],
+    ['an array', JSON.stringify([MANIFEST_SENTINEL])],
+    ['a string', JSON.stringify(MANIFEST_SENTINEL)],
+    ['null', 'null'],
+    ['no version', JSON.stringify({ name: 'bad', note: MANIFEST_SENTINEL })],
+    ['an empty version', JSON.stringify({ name: 'bad', version: '', note: MANIFEST_SENTINEL })],
+    ['a non-string version', JSON.stringify({ name: 'bad', version: 7, note: MANIFEST_SENTINEL })],
+  ];
+  // An installed package without a lockfile, in the consumer layout (dependencies beside it) or the global one (inside it).
+  const install = async (name, layout) => {
+    const modules = layout === 'consumer' ? path.join(s.root, name, 'node_modules') : path.join(s.root, name, 'lib', 'node_modules');
+    const root = path.join(modules, 'fake-package');
+    const hoisted = layout === 'consumer' ? modules : path.join(root, 'node_modules');
+    const write = async (file, text) => { await fs.mkdir(path.dirname(file), { recursive: true }); await fs.writeFile(file, text); };
+    await write(path.join(root, 'package.json'), JSON.stringify({ name: 'fake-package', version: '1.2.3', dependencies: { dep: '1.0.0' } }));
+    for (const [file, text] of [['dist/index.js', 'export {};\n'], ['prompts/planner.md', '# planner\n'], ['examples/opencode/agents/adr-planner.md', '# agent\n'], ['examples/heimdall.toml', '\n'], ['examples/coordinator.toml', '\n']]) await write(path.join(root, file), text);
+    await write(path.join(hoisted, 'dep', 'package.json'), JSON.stringify({ name: 'dep', version: '1.0.0', dependencies: { trans: '1.0.0' } }));
+    await write(path.join(hoisted, 'trans', 'package.json'), JSON.stringify({ name: 'trans', version: '1.0.0' }));
+    return { root, dep: path.join(hoisted, 'dep', 'package.json'), trans: path.join(hoisted, 'trans', 'package.json') };
+  };
+  const doctor = async (args, packageRoot) => {
+    const out = [], err = [];
+    const code = await doctorMain(args, { environment: { ...s.env }, cwd: s.project, homeDirectory: s.home, packageRoot, stdout: { write: text => out.push(text) }, stderr: { write: text => err.push(text) } });
+    return { code, stdout: out.join(''), stderr: err.join('') };
+  };
+
+  for (const layout of ['consumer', 'global']) {
+    const good = await install(`good-${layout}`, layout);
+    const ok = JSON.parse((await doctor(['--json'], good.root)).stdout);
+    assert.equal(checkOf(ok, 'runtime.dependencies').status, 'pass', layout);
+
+    let index = 0;
+    for (const [kind, manifest] of manifests) {
+      for (const [role, pick, named] of [['direct', installed => installed.dep, /\(package\) > dep/], ['transitive', installed => installed.trans, /dep > trans/]]) {
+        const label = `${layout} ${role} dependency with ${kind}`;
+        const installed = await install(`bad-${layout}-${index += 1}`, layout);
+        await fs.writeFile(pick(installed), manifest);
+        const json = await doctor(['--json'], installed.root);
+        const human = await doctor([], installed.root);
+        const document = JSON.parse(json.stdout);
+        const check = checkOf(document, 'runtime.dependencies');
+        assert.equal(check.status, 'fail', label);
+        assert.equal(check.fatal, true, label);
+        assert.match(check.message, named, label);
+        assert.match(check.message, /cannot be identified/, label);
+        assert.equal(document.ok, false, label);
+        assert.equal(json.code, 1, label);
+        assert.equal(human.code, 1, label);
+        assert.match(human.stdout, /\[fail\] runtime\.dependencies/, label);
+        assert.match(human.stdout, named, label);
+        for (const output of [json.stdout, json.stderr, human.stdout, human.stderr]) assert.ok(!output.includes(MANIFEST_SENTINEL), label + ': manifest content leaked');
+      }
+    }
+  }
+});
+
 test('local checks reach no network and make no filesystem writes in-process', async t => {
   const s = await sandbox(t);
   createSetup(s, ['--state-directory', path.join(s.root, 'state')]);

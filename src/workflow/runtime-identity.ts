@@ -57,11 +57,17 @@ export function dependencyDirectory(root: string): string {
   return own;
 }
 
-function installedVersion(directory: string): string {
+/** The version a package.json identifies the package at `directory` with, or why it identifies none. */
+function packageVersion(directory: string): { version: string } | { placeholder: 'missing' | 'unreadable' } {
   try {
     const manifest: unknown = JSON.parse(readFileSync(path.join(directory, 'package.json'), 'utf8'));
-    return record(manifest) && typeof manifest.version === 'string' && manifest.version ? manifest.version : 'unreadable';
-  } catch { return 'missing'; }
+    return record(manifest) && typeof manifest.version === 'string' && manifest.version ? { version: manifest.version } : { placeholder: 'unreadable' };
+  } catch { return { placeholder: 'missing' }; }
+}
+
+function installedVersion(directory: string): string {
+  const found = packageVersion(directory);
+  return 'version' in found ? found.version : found.placeholder;
 }
 
 /** The installed package a dependency named `name` of the package at `from` resolves to, by Node's node_modules lookup. */
@@ -98,6 +104,11 @@ export interface InstalledDependencies {
   entries: string[];
   /** Required dependencies (of the package or any reachable one) that are not installed. */
   missing: string[];
+  /**
+   * Installed dependencies (of the package or any reachable one) whose package.json does not identify them: unparsable, not an
+   * object, or without a non-empty string version. Only the dependency path is reported, never what the file contains.
+   */
+  unidentified: string[];
 }
 
 /**
@@ -110,6 +121,7 @@ export function installedDependencies(root: string): InstalledDependencies {
   const links: Record<string, string> = {};
   const entries: string[] = [];
   const missing: string[] = [];
+  const unidentified: string[] = [];
   const visited = new Set<string>();
   const describe = (directory: string, label: string, isRoot: boolean): void => {
     const edges: string[] = [];
@@ -122,17 +134,22 @@ export function installedDependencies(root: string): InstalledDependencies {
         continue;
       }
       if (isRoot) links[name] = found;
-      edges.push(name + '@' + installedVersion(found));
+      // Only a dependency that is absent is excused when it is optional or a peer. One that is installed is on Node's resolution
+      // path and can be loaded whatever it was declared as, so it must identify itself or the tree cannot be pinned.
+      const identity = packageVersion(found);
+      if (!('version' in identity)) unidentified.push(label + ' > ' + name);
+      edges.push(name + '@' + ('version' in identity ? identity.version : identity.placeholder));
       if (!visited.has(found)) {
         visited.add(found);
         const manifest = readManifest(found);
-        describe(found, record(manifest) && typeof manifest.name === 'string' ? manifest.name : name, false);
+        // The name a manifest claims is only trusted for a package that identifies itself; diagnostics never echo anything else.
+        describe(found, 'version' in identity && record(manifest) && typeof manifest.name === 'string' ? manifest.name : name, false);
       }
     }
     entries.push((isRoot ? '(package)' : label + '@' + installedVersion(directory)) + '[' + edges.join(',') + ']');
   };
   describe(root, '(package)', true);
-  return { links, entries: entries.sort(), missing: missing.sort() };
+  return { links, entries: entries.sort(), missing: missing.sort(), unidentified: unidentified.sort() };
 }
 
 /**
