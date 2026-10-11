@@ -6,6 +6,7 @@ import path from 'node:path';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { setupMain } from '../dist/setup/index.js';
+import { createRedactor } from '../dist/setup/cli.js';
 import { loadConfiguration } from '../dist/config.js';
 import { loadCoordinatorConfiguration } from '../dist/coordinator/config.js';
 
@@ -809,4 +810,14 @@ test('the prompt hook runs only in an interactive terminal without --no-input or
   assert.equal(calls, 2);
   assert.match(answered.out.join(''), /setup complete/);
   await loadConfiguration({ projectDirectory: s.project, configPath: s.projectFile });
+});
+
+test('the redactor resolves credential references only from own string properties of the supplied environment', () => {
+  const environment = { HEIMDALL_SYNTHETIC_REF: 'zq-synthetic-own-3e6a', NOT_A_STRING: 12345 };
+  const redact = createRedactor(environment, []);
+  assert.doesNotThrow(() => redact.addReferences(['__proto__', 'constructor', 'toString', 'hasOwnProperty', 'MISSING', 'NOT_A_STRING']));
+  const text = 'Object [object Object] function Object() { [native code] } MISSING 12345 toString constructor __proto__';
+  assert.equal(redact(text), text, 'inherited and missing references mask nothing');
+  redact.addReferences(['HEIMDALL_SYNTHETIC_REF']);
+  assert.equal(redact('value zq-synthetic-own-3e6a here'), 'value [redacted] here');
 });

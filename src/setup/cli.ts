@@ -204,8 +204,9 @@ export function createRedactor(environment: NodeJS.ProcessEnv, args: readonly st
   const addReferences = (references: Iterable<string | undefined>): void => {
     for (const reference of references) {
       if (reference === undefined || reference === '') continue;
-      const referenced = environment[reference];
-      if (referenced && referenced.length >= 4) secrets.add(referenced);
+      // Only the supplied environment's own entries are credentials; inherited properties are never looked up.
+      const referenced = Object.hasOwn(environment, reference) ? environment[reference] : undefined;
+      if (typeof referenced === 'string' && referenced.length >= 4) secrets.add(referenced);
       // A value that is not a variable name may be a pasted credential.
       if (!VARIABLE_NAME.test(reference) && reference.length >= 3) secrets.add(reference);
     }
