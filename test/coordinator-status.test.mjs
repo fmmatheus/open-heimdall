@@ -5,9 +5,12 @@ import path from 'node:path';
 import os from 'node:os';
 import http from 'node:http';
 import { createHash, randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { createCoordinatorClient } from '../dist/coordinator/client.js';
 import { startCoordinatorService, readCoordinatorToken } from '../dist/coordinator/service.js';
 import { parseCoordinatorStatus } from '../dist/coordinator/status.js';
+import { coordinatorStatus } from '../dist/coordinator/cli.js';
 
 const TOKEN = 'k'.repeat(64);
 
@@ -243,4 +246,278 @@ test('repeated status reads do not change runs, events, launches or database fil
     assert.equal(body.reservedRuns, 1);
   }
   assert.deepEqual(await snapshot(fixture), before);
+});
+
+// ---- heimdall coordinator status (spawned CLI) ----
+//
+// Every spawned CLI runs from a temporary working directory with an isolated HOME, no
+// HEIMDALL_COORDINATOR_CONFIG and an explicit temporary --coordinator-config, so the default
+// configuration can never resolve to a live coordinator.
+
+const cli = fileURLToPath(new URL('../dist/cli.js', import.meta.url));
+const repository = fileURLToPath(new URL('..', import.meta.url));
+const posix = { skip: process.platform === 'win32' ? 'Unix socket endpoints only' : false };
+const COORDINATOR_TOML = '[coordinator]\nstateDirectory="state"\nglobalConcurrency=2\nprojectConcurrency=1\n';
+const HEX64 = /[a-f0-9]{64}/;
+
+/** Prepare an isolated HOME, working directory and coordinator.toml inside `root` (the state directory is created on request). */
+async function prepareCli(root, { state = true } = {}) {
+  const home = path.join(root, 'home');
+  const cwd = path.join(root, 'cwd');
+  await fs.mkdir(home, { recursive: true });
+  await fs.mkdir(cwd, { recursive: true });
+  if (state) await fs.mkdir(path.join(root, 'state'), { recursive: true });
+  const config = path.join(root, 'coordinator.toml');
+  await fs.writeFile(config, COORDINATOR_TOML);
+  assert.ok(path.relative(repository, cwd).startsWith('..'), 'spawned CLI must run outside the repository');
+  return { root, home, cwd, config, state: path.join(root, 'state'), endpoint: path.join(root, 'state', 'coordinator.sock') };
+}
+
+async function scenario(t, options) {
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'hdc-')));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  return prepareCli(root, options);
+}
+
+function runCli(env, args) {
+  const childEnvironment = { ...process.env, HOME: env.home, USERPROFILE: env.home };
+  delete childEnvironment.HEIMDALL_COORDINATOR_CONFIG;
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [cli, ...args], { cwd: env.cwd, env: childEnvironment, stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000 });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8').on('data', chunk => { stdout += chunk; });
+    child.stderr.setEncoding('utf8').on('data', chunk => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('close', (status, signal) => resolve({ status, signal, stdout, stderr }));
+  });
+}
+
+const statusArguments = (env, json) => ['coordinator', 'status', ...(json ? ['--json'] : []), '--coordinator-config', env.config];
+const tree = async root => (await fs.readdir(root, { recursive: true })).sort();
+
+async function writeKey(env, key = 'a'.repeat(64)) {
+  const file = path.join(env.state, 'coordinator.key');
+  await fs.writeFile(file, key, { mode: 0o600 });
+  await fs.chmod(file, 0o600);
+  return key;
+}
+
+async function serveAt(t, endpoint, handler) {
+  const server = http.createServer(handler);
+  await new Promise(resolve => server.listen(endpoint, resolve));
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  });
+}
+
+const respond = (statusCode, text) => (_request, response) => {
+  response.writeHead(statusCode, { 'Content-Type': 'application/json' });
+  response.end(text);
+};
+
+/** Both modes must fail with a nonzero exit, empty stdout, a stderr diagnostic, no key and no new files. */
+async function expectFailure(env, pattern, secrets = []) {
+  for (const json of [false, true]) {
+    const before = await tree(env.root);
+    const result = await runCli(env, statusArguments(env, json));
+    const mode = json ? 'json' : 'human';
+    assert.equal(result.signal, null, mode);
+    assert.equal(result.status, 1, `${mode}: ${result.stderr}`);
+    assert.equal(result.stdout, '', `${mode}: stdout must stay empty`);
+    assert.match(result.stderr, /^Heimdall: /, mode);
+    assert.match(result.stderr, pattern, mode);
+    for (const output of [result.stdout, result.stderr]) {
+      assert.doesNotMatch(output, HEX64, `${mode}: output must not contain a key`);
+      for (const secret of secrets) assert.ok(!output.includes(secret), mode);
+    }
+    assert.deepEqual(await tree(env.root), before, `${mode}: failure must not create files`);
+  }
+}
+
+const expectedStatus = { schemaVersion: 1, service: 'heimdall-coordinator', status: 'running', acceptingNewRuns: true, queuedRuns: 1, reservedRuns: 1 };
+
+test('status command reports a running coordinator in human and JSON mode', posix, async t => {
+  const fixture = await statusFixture(t);
+  const env = await prepareCli(fixture.temporary);
+  const human = await runCli(env, statusArguments(env, false));
+  assert.equal(human.status, 0, human.stderr);
+  assert.equal(human.stderr, '');
+  assert.equal(human.stdout, 'Coordinator running; accepting new runs.\nQueued runs: 1\nReserved runs: 1 (retained capacity, including uncertain execution)\n');
+
+  const json = await runCli(env, statusArguments(env, true));
+  assert.equal(json.status, 0, json.stderr);
+  assert.equal(json.stderr, '');
+  const validated = parseCoordinatorStatus(await fixture.admin.request('GET', '/status'));
+  assert.deepEqual(validated, expectedStatus);
+  assert.equal(json.stdout, JSON.stringify(validated, null, 2) + '\n');
+  assert.deepEqual(Object.keys(JSON.parse(json.stdout)).sort(), Object.keys(validated).sort());
+  for (const output of [human.stdout, json.stdout]) assert.ok(!output.includes(fixture.key));
+});
+
+test('status command reports a draining coordinator in human and JSON mode', { ...posix, timeout: 30000 }, async t => {
+  const fixture = await statusFixture(t, { pollIntervalMs: 5 });
+  const env = await prepareCli(fixture.temporary);
+  const drain = fixture.startDrain();
+  await turn();
+  const human = await runCli(env, statusArguments(env, false));
+  assert.equal(human.status, 0, human.stderr);
+  assert.equal(human.stdout, 'Coordinator draining; not accepting new runs.\nQueued runs: 1\nReserved runs: 1 (retained capacity, including uncertain execution)\n');
+  const json = await runCli(env, statusArguments(env, true));
+  assert.equal(json.status, 0, json.stderr);
+  assert.deepEqual(JSON.parse(json.stdout), { ...expectedStatus, status: 'draining', acceptingNewRuns: false });
+  fixture.release();
+  await drain;
+});
+
+test('status fails clearly when the coordinator configuration file is missing', posix, async t => {
+  const env = await scenario(t, { state: false });
+  await fs.rm(env.config);
+  const missing = path.join(env.root, 'missing.toml');
+  for (const json of [false, true]) {
+    const before = await tree(env.root);
+    const result = await runCli(env, ['coordinator', 'status', ...(json ? ['--json'] : []), '--coordinator-config', missing]);
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, '');
+    assert.match(result.stderr, /^Heimdall: .*(ENOENT|no such file)/);
+    assert.deepEqual(await tree(env.root), before);
+  }
+  assert.ok(!(await fs.readdir(env.root)).includes('state'));
+});
+
+test('status fails clearly when the coordinator key is missing', posix, async t => {
+  const env = await scenario(t);
+  await expectFailure(env, /Cannot read the coordinator key/);
+  assert.deepEqual(await fs.readdir(env.state), []);
+});
+
+test('status fails clearly when no coordinator is listening', posix, async t => {
+  const env = await scenario(t);
+  const key = await writeKey(env);
+  await expectFailure(env, new RegExp(`Coordinator status request to ${env.endpoint.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} failed: Coordinator unavailable`), [key]);
+  assert.deepEqual(await fs.readdir(env.state), ['coordinator.key']);
+});
+
+test('status fails clearly when the coordinator rejects the key', posix, async t => {
+  const fixture = await statusFixture(t);
+  const env = await prepareCli(fixture.temporary);
+  const wrong = 'b'.repeat(64);
+  assert.notEqual(wrong, fixture.key);
+  await fs.writeFile(path.join(env.state, 'coordinator.key'), wrong, { mode: 0o600 });
+  await fs.chmod(path.join(env.state, 'coordinator.key'), 0o600);
+  await expectFailure(env, /refused authorization/, [fixture.key, wrong]);
+});
+
+test('status reports an older coordinator without the status route as incompatible', posix, async t => {
+  const env = await scenario(t);
+  const key = await writeKey(env);
+  await serveAt(t, env.endpoint, respond(404, JSON.stringify({ error: 'Unknown coordinator route' })));
+  await expectFailure(env, /does not support status.*incompatible.*does not restart/s, [key]);
+});
+
+test('status reports a coordinator that is starting or stopping', posix, async t => {
+  const env = await scenario(t);
+  const key = await writeKey(env);
+  await serveAt(t, env.endpoint, respond(503, JSON.stringify({ error: 'Coordinator is starting or stopping' })));
+  await expectFailure(env, /starting or stopping/, [key]);
+});
+
+test('status rejects an invalid JSON body', posix, async t => {
+  const env = await scenario(t);
+  const key = await writeKey(env);
+  await serveAt(t, env.endpoint, respond(200, 'this is not json'));
+  await expectFailure(env, new RegExp('Invalid coordinator JSON response'), [key]);
+});
+
+test('status rejects schema-invalid and contradictory bodies', posix, async t => {
+  const bodies = {
+    'running while not accepting': { ...expectedStatus, acceptingNewRuns: false },
+    'unknown status': { ...expectedStatus, status: 'stopped' },
+    'schema version 2': { ...expectedStatus, schemaVersion: 2 },
+  };
+  for (const [name, body] of Object.entries(bodies)) {
+    await t.test(name, async subtest => {
+      const env = await scenario(subtest);
+      const key = await writeKey(env);
+      await serveAt(subtest, env.endpoint, respond(200, JSON.stringify(body)));
+      await expectFailure(env, /returned an invalid status response: Invalid coordinator status/, [key]);
+    });
+  }
+});
+
+test('status gives up at its deadline and writes nothing, in both modes', posix, async t => {
+  const env = await scenario(t);
+  const key = await writeKey(env);
+  const timers = new Set();
+  t.after(() => { for (const timer of timers) clearInterval(timer); });
+  await serveAt(t, env.endpoint, (_request, response) => {
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    const timer = setInterval(() => response.write(' '), 20);
+    timers.add(timer);
+    response.on('close', () => { clearInterval(timer); timers.delete(timer); });
+  });
+  const configuration = { stateDirectory: env.state, endpoint: env.endpoint, globalConcurrency: 2, projectConcurrency: 1 };
+  for (const json of [false, true]) {
+    const written = [];
+    const started = Date.now();
+    await assert.rejects(coordinatorStatus({ configuration, json, deadlineMs: 200, stdout: { write: text => written.push(text) } }), error => {
+      assert.match(error.message, /deadline/);
+      assert.ok(!error.message.includes(key));
+      return true;
+    });
+    assert.ok(Date.now() - started < 3000);
+    assert.deepEqual(written, [], 'nothing may be written before validation succeeds');
+  }
+});
+
+test('coordinator help documents status and needs no coordinator state', posix, async t => {
+  const env = await scenario(t, { state: false });
+  const homeBefore = await tree(env.root);
+  for (const args of [['coordinator', '--help'], ['coordinator', 'status', '--help'], ['coordinator', 'help']]) {
+    const result = await runCli(env, args);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stderr, '');
+    for (const text of ['heimdall coordinator status [--json] [--coordinator-config FILE]', '--json', '--coordinator-config FILE', '10 second deadline', 'heimdall coordinator status\n', 'heimdall coordinator status --json --coordinator-config ./coordinator.toml', 'exits 0', 'nothing on stdout']) {
+      assert.ok(result.stdout.includes(text), `${args.join(' ')} should mention ${text}`);
+    }
+    assert.match(result.stdout, /heimdall coordinator serve/);
+    assert.match(result.stdout, /heimdall coordinator events \[--after SEQUENCE\]/);
+  }
+  assert.deepEqual(await tree(env.root), homeBefore);
+});
+
+test('--json applies only to coordinator status and other commands are unchanged', posix, async t => {
+  const fixture = await statusFixture(t);
+  const env = await prepareCli(fixture.temporary);
+  const rejected = [
+    ['coordinator', 'run', 'list', '--json', '--coordinator-config', env.config],
+    ['coordinator', 'project', 'list', '--json', '--coordinator-config', env.config],
+    ['coordinator', 'events', '--json', '--coordinator-config', env.config],
+    ['coordinator', 'serve', '--json', '--coordinator-config', env.config],
+  ];
+  for (const args of rejected) {
+    const result = await runCli(env, args);
+    assert.equal(result.status, 1, args.join(' '));
+    assert.equal(result.stdout, '');
+    assert.match(result.stderr, /--json does not apply to this command/);
+  }
+  const repeated = await runCli(env, ['coordinator', 'status', '--json', '--json', '--coordinator-config', env.config]);
+  assert.equal(repeated.status, 1);
+  assert.equal(repeated.stdout, '');
+  assert.match(repeated.stderr, /repeated option: --json/);
+  const foreign = await runCli(env, ['coordinator', 'status', '--limit', '3', '--coordinator-config', env.config]);
+  assert.equal(foreign.status, 1);
+  assert.equal(foreign.stdout, '');
+  assert.match(foreign.stderr, /--limit does not apply/);
+  const topLevel = await runCli(env, ['check', '--json']);
+  assert.equal(topLevel.status, 1);
+  assert.match(topLevel.stderr, /Unknown argument: --json/);
+
+  const list = await runCli(env, ['coordinator', 'project', 'list', '--coordinator-config', env.config]);
+  assert.equal(list.status, 0, list.stderr);
+  assert.equal(list.stdout, JSON.stringify(await fixture.admin.request('GET', '/projects'), null, 2) + '\n');
+  const runs = await runCli(env, ['coordinator', 'run', 'list', '--coordinator-config', env.config]);
+  assert.equal(runs.status, 0, runs.stderr);
+  assert.equal(runs.stdout, JSON.stringify(await fixture.admin.request('GET', '/runs'), null, 2) + '\n');
 });
