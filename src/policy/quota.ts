@@ -1,8 +1,7 @@
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { appendFile, mkdir, readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
-import { createRequire } from 'node:module';
 import { cachedQuota, deduplicateUsageFetch } from './quota-cache.js';
 import { readClaudeCodeQuota } from './claude-code-quota.js';
 import type { CandidateQuotaScore, ExecutorCandidate, ExecutorSelection, QuotaEvent, QuotaResult, QuotaSettings, QuotaSnapshot, RawQuotaResult } from './types.js';
@@ -116,7 +115,10 @@ export function sanitizeQuotaResult(key: string, result: RawQuotaResult): QuotaR
 
 export type QuotaModuleLoader = (file: string) => Promise<unknown>;
 export type QuotaModuleResolver = (specifier: string) => string;
-const require = createRequire(import.meta.url);
+// The package is not installed as a dependency: the build copies the provider modules it
+// needs next to this file because its exact peer on an older @opencode/plugin cannot be
+// satisfied beside the tested one. See scripts/vendor-quota.mjs.
+const vendoredEntry = fileURLToPath(new URL('../vendor/opencode-quota/dist/lib/opencode-auth.js', import.meta.url));
 const packageName = '@slkiser/opencode-quota';
 const packageVersion = '5.0.1';
 const moduleFiles = {
@@ -127,7 +129,7 @@ const moduleFiles = {
 } as const;
 
 // The pinned v5 adapter is the only place that knows dependency-internal paths.
-export async function resolveQuotaPackage(packagePath?: string, resolveModule: QuotaModuleResolver = specifier => require.resolve(specifier)): Promise<string> {
+export async function resolveQuotaPackage(packagePath?: string, resolveModule: QuotaModuleResolver = () => vendoredEntry): Promise<string> {
   let base = packagePath;
   if (!base) {
     const entry = resolveModule(packageName);

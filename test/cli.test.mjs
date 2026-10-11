@@ -44,3 +44,10 @@ test('status reads saved progress without changing the state or lock', async t =
   assert.equal(await fs.readFile(path.join(root, 'active.lock'), 'utf8'), 'synthetic-lock');
   assert.equal(call(['status', '../another-run', ...args]).status, 1);
 });
+test('--version prints the package version without configuration', async () => {
+  const manifest = JSON.parse(await fs.readFile(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'));
+  const result = call(['--version']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, `${manifest.version}\n`);
+  assert.match(call(['--help']).stdout, /heimdall --version/);
+});

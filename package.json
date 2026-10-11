@@ -17,21 +17,26 @@
   },
   "files": [
     "dist",
+    "!dist/**/*.map",
+    "!dist/extension",
+    "!dist/openchamber-extension",
     "prompts",
     "examples",
     "README.md",
     "docs"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/vendor-quota.mjs",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test test/*.test.mjs",
+    "test:package": "npm run build && node --test --test-concurrency=1 test/package/*.test.mjs",
+    "pack:clean": "node scripts/pack.mjs",
     "prepack": "npm run build",
     "build:extension": "npm run build && node scripts/build-extension.mjs"
   },
   "dependencies": {
     "@opencode/plugin": "2.0.22",
-    "@slkiser/opencode-quota": "5.0.1",
+    "comment-json": "5.0.0",
     "smol-toml": "1.9.0"
   },
   "overrides": {
@@ -41,6 +46,7 @@
   },
   "devDependencies": {
     "@openchamber/sdk": "2.1.0",
+    "@slkiser/opencode-quota": "5.0.1",
     "@types/node": "22.20.5",
     "esbuild": "0.28.2",
     "typescript": "7.0.2"

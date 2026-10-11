@@ -11,6 +11,7 @@ Usage:
   heimdall check [--project DIRECTORY] [--config FILE]
   heimdall status RUN_ID [--project DIRECTORY] [--config FILE]
   heimdall coordinator --help
+  heimdall --version
 
 init writes a new configuration without overwriting existing files.
 check validates configuration without contacting OpenCode or starting agents.
@@ -21,6 +22,12 @@ async function main(args: string[]): Promise<void> {
   if (args[0] === 'coordinator') {
     const { coordinatorMain } = await import('./coordinator/cli.js');
     await coordinatorMain(args.slice(1));
+    return;
+  }
+  if (args.length === 1 && args[0] === '--version') {
+    const manifest = JSON.parse(await fs.readFile(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8')) as { version?: unknown };
+    if (typeof manifest.version !== 'string') throw new Error('Package version is unavailable');
+    process.stdout.write(`${manifest.version}\n`);
     return;
   }
   if (!args.length || args.includes('--help') || args[0] === 'help') { process.stdout.write(help); return; }
