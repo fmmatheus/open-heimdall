@@ -283,3 +283,144 @@ test('the plugin refuses to activate a build other than the one admitted', async
   await assert.rejects(createPlugin({ expectedRuntime: '0'.repeat(64) }).setup(context), /does not match the build admitted for this run/);
   await assert.rejects(createPlugin({ expectedRuntime: '' }).setup(context), /does not match the build admitted for this run/);
 });
+
+/**
+ * An installed package: no package-lock.json, dependencies where npm puts them. `consumer` hoists most of them beside the package
+ * in the consumer's node_modules and nests the rest in the package's own node_modules; `global` keeps all of them inside the
+ * package, as a global install does. `trans` is only a transitive dependency; `inner` is nested under `nested`.
+ */
+async function installedPackage(t, layout) {
+  const base = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'heimdall-installed-')));
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+  const modules = layout === 'consumer' ? path.join(base, 'consumer', 'node_modules') : path.join(base, 'prefix', 'lib', 'node_modules');
+  const source = path.join(modules, '@fake', 'core');
+  const own = path.join(source, 'node_modules');
+  const hoisted = layout === 'consumer' ? modules : own;
+  const write = async (file, content, root = source) => { await fs.mkdir(path.dirname(path.join(root, file)), { recursive: true }); await fs.writeFile(path.join(root, file), content); };
+  const manifest = (directory, name, version, dependencies = {}, extra = {}) => write('package.json', JSON.stringify({ name, version, dependencies, ...extra }), directory);
+  await write('package.json', JSON.stringify({ name: '@fake/core', version: '1.2.3', type: 'module', dependencies: { dep: '1.0.0', '@sc/scoped': '2.0.0', nested: '3.0.0' }, optionalDependencies: { absent: '1.0.0' } }));
+  await write('dist/index.js', "export const marker = 'build-one';\n");
+  await write('dist/opencode/plugin.js', 'export const createPlugin = () => null;\n');
+  await write('prompts/planner.md', 'planner prompt\n');
+  await write('examples/opencode/agents/adr-planner.md', 'planner agent\n');
+  await manifest(path.join(hoisted, 'dep'), 'dep', '1.0.0', { trans: '^0.4.0' });
+  await manifest(path.join(hoisted, '@sc', 'scoped'), '@sc/scoped', '2.0.0');
+  await manifest(path.join(hoisted, 'trans'), 'trans', '0.4.0');
+  // Always nested in the package, with a transitive dependency nested one level further.
+  await manifest(path.join(own, 'nested'), 'nested', '3.0.0', { inner: '1.0.0', trans: '^0.4.0' });
+  await manifest(path.join(own, 'nested', 'node_modules', 'inner'), 'inner', '1.0.0');
+  return { base, source, write, hoisted, own, layout, nested: path.join(own, 'nested'), inner: path.join(own, 'nested', 'node_modules', 'inner'), trans: path.join(hoisted, 'trans') };
+}
+
+const locklessLayouts = ['consumer', 'global'];
+
+for (const layout of locklessLayouts) {
+  test(`${layout} layout: lockless identity covers every resolved transitive dependency`, async t => {
+    const f = await installedPackage(t, layout);
+    const first = computeRuntimeIdentity(f.source);
+    assert.equal(first.build.dependencies.lockfile, null);
+    assert.deepEqual(first.build.dependencies.direct, { '@sc/scoped': '2.0.0', dep: '1.0.0', nested: '3.0.0' });
+    assert.deepEqual(computeRuntimeIdentity(f.source), first, 'stable');
+    const changes = [
+      ['hoisted transitive version', () => f.write('package.json', JSON.stringify({ name: 'trans', version: '0.4.1' }), f.trans)],
+      ['nested transitive version', () => f.write('package.json', JSON.stringify({ name: 'inner', version: '1.0.1' }), f.inner)],
+      ['removed hoisted transitive', () => fs.rm(f.trans, { recursive: true })],
+      ['removed nested transitive', () => fs.rm(f.inner, { recursive: true })],
+    ];
+    for (const [name, change] of changes) {
+      const baseline = computeRuntimeIdentity(f.source);
+      const files = await Promise.all([f.trans, f.inner].map(directory => fs.readFile(path.join(directory, 'package.json'), 'utf8').catch(() => undefined)));
+      await change();
+      const changed = computeRuntimeIdentity(f.source);
+      assert.deepEqual(changed.build.dependencies.direct, baseline.build.dependencies.direct, name + ': direct dependencies alone would not notice');
+      assert.notEqual(changed.build.digest, baseline.build.digest, name);
+      assert.match(runtimeMismatch(baseline, changed), /dependency identity changed/, name);
+      for (const [index, directory] of [f.trans, f.inner].entries()) if (files[index]) await f.write('package.json', files[index], directory);
+      assert.deepEqual(computeRuntimeIdentity(f.source), baseline, name + ' restored');
+    }
+  });
+
+  test(`${layout} layout: admission records where each dependency really is and refuses an incomplete tree`, async t => {
+    const f = await installedPackage(t, layout);
+    const admitted = await admitRuntime(f.source);
+    assert.deepEqual(admitted.links, {
+      '@sc/scoped': path.join(f.hoisted, '@sc', 'scoped'),
+      dep: path.join(f.hoisted, 'dep'),
+      nested: f.nested,
+    });
+    assert.equal(admitted.modules, f.own, 'informational: the package\'s own node_modules, which every layout here has');
+    await fs.rm(f.trans, { recursive: true });
+    await assert.rejects(admitRuntime(f.source), /not installed for this package \(missing: dep > trans, nested > trans\)/);
+  });
+
+  test(`${layout} layout: a snapshot links each dependency to its real location and refuses a changed or removed transitive dependency`, async t => {
+    const f = await installedPackage(t, layout);
+    const s = { f, ...await snapshotOf(f) };
+    const admitted = s.run.specification.runtime;
+    assert.deepEqual(Object.keys(admitted.links), ['@sc/scoped', 'dep', 'nested']);
+    const marker = JSON.parse(await fs.readFile(path.join(s.root, '.heimdall-runtime-snapshot.json'), 'utf8'));
+    assert.equal(marker.version, 2);
+    assert.deepEqual(marker.links, admitted.links);
+    assert.ok((await fs.lstat(path.join(s.root, 'node_modules'))).isDirectory(), 'a plain directory of links, not one symlink');
+    assert.equal(await fs.readlink(path.join(s.root, 'node_modules/@sc/scoped')), admitted.links['@sc/scoped']);
+    const snapshot = computeRuntimeIdentity(s.root);
+    assert.equal(snapshot.build.snapshot, true);
+    assert.equal(snapshot.build.digest, admitted.identity.build.digest, 'the snapshot resolves exactly the installed tree');
+    await verifyRuntimeSnapshot(s.run);
+
+    for (const [name, change] of [
+      ['changed hoisted transitive', () => f.write('package.json', JSON.stringify({ name: 'trans', version: '0.4.9' }), f.trans)],
+      ['changed nested transitive', () => f.write('package.json', JSON.stringify({ name: 'inner', version: '1.9.0' }), f.inner)],
+      ['removed hoisted transitive', () => fs.rm(f.trans, { recursive: true })],
+      ['removed nested transitive', () => fs.rm(f.inner, { recursive: true })],
+      ['removed direct dependency', () => fs.rm(path.join(f.hoisted, 'dep'), { recursive: true })],
+    ]) {
+      const keep = await fakeBackup(f);
+      await change();
+      await assert.rejects(verifyRuntimeSnapshot(s.run), /dependency identity changed/, name);
+      const calls = [];
+      await assert.rejects(executorFor({ ...s.run, launchAction: 'resume', resolution: 'Resolved' }, calls).launch({ ...s.run, launchAction: 'resume', resolution: 'Resolved' }), /Runtime snapshot refused for run run-one: /, name);
+      assert.deepEqual(calls, [], name + ': refused before any native request');
+      await keep();
+      await verifyRuntimeSnapshot(s.run);
+    }
+  });
+
+  test(`${layout} layout: a snapshot is refused when its dependency links are altered`, async t => {
+    for (const [name, alter] of [
+      ['extra link', async s => fs.symlink(s.f.trans, path.join(s.root, 'node_modules/trans'), 'dir')],
+      ['re-pointed link', async s => { await fs.rm(path.join(s.root, 'node_modules/dep')); await fs.symlink(s.f.trans, path.join(s.root, 'node_modules/dep'), 'dir'); }],
+      ['removed link', async s => fs.rm(path.join(s.root, 'node_modules/nested'))],
+      ['real directory in place of a link', async s => { await fs.rm(path.join(s.root, 'node_modules/dep')); await fs.mkdir(path.join(s.root, 'node_modules/dep')); }],
+      ['whole directory replaced by one symlink', async s => { await fs.rm(path.join(s.root, 'node_modules'), { recursive: true }); await fs.symlink(s.f.hoisted, path.join(s.root, 'node_modules'), 'dir'); }],
+      ['marker downgraded to version 1', async s => fs.writeFile(await writable(path.join(s.root, '.heimdall-runtime-snapshot.json')), JSON.stringify({ version: 1, runId: s.run.id, identity: s.run.specification.runtime.identity, modules: s.run.specification.runtime.modules }))],
+    ]) {
+      const f = await installedPackage(t, layout);
+      const s = { f, ...await snapshotOf(f) };
+      await verifyRuntimeSnapshot(s.run);
+      await alter(s);
+      await assert.rejects(verifyRuntimeSnapshot(s.run), /dependency location is not the recorded|different admitted runtime/, name);
+    }
+  });
+}
+
+test('a snapshot imports its plugin through the linked dependencies', async t => {
+  const f = await installedPackage(t, 'consumer');
+  await f.write('dist/opencode/plugin.js', "import { value } from 'nested'; import { inner } from 'nested/inner.js'; export const createPlugin = () => value + inner;\n");
+  await f.write('package.json', JSON.stringify({ name: 'nested', version: '3.0.0', type: 'module', main: 'index.js', dependencies: { inner: '1.0.0', trans: '^0.4.0' } }), f.nested);
+  await f.write('index.js', "export { inner as value } from 'inner'; \n", f.nested);
+  await f.write('inner.js', "export { inner } from 'inner';\n", f.nested);
+  await f.write('package.json', JSON.stringify({ name: 'inner', version: '1.0.0', type: 'module', main: 'main.js' }), f.inner);
+  await f.write('main.js', "export const inner = 'x';\n", f.inner);
+  const { run, root } = await snapshotOf(f);
+  await verifyRuntimeSnapshot(run);
+  const loaded = execFileSync(process.execPath, ['--input-type=module', '-e', `import(${JSON.stringify(pathToFileURL(path.join(root, 'dist/opencode/plugin.js')).href)}).then(module => console.log(module.createPlugin()))`], { encoding: 'utf8' }).trim();
+  assert.equal(loaded, 'xx');
+});
+
+/** Copies the package.json files of the transitive dependencies a test mutates, and returns a function restoring them. */
+async function fakeBackup(f) {
+  const targets = [f.trans, f.inner, path.join(f.hoisted, 'dep')];
+  const saved = await Promise.all(targets.map(async directory => [directory, await fs.readFile(path.join(directory, 'package.json'), 'utf8')]));
+  return async () => { for (const [directory, content] of saved) { await fs.mkdir(directory, { recursive: true }); await fs.writeFile(path.join(directory, 'package.json'), content); } };
+}
