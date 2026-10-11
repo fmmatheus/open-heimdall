@@ -135,14 +135,23 @@ export function installedDependencies(root: string): InstalledDependencies {
   return { links, entries: entries.sort(), missing: missing.sort() };
 }
 
-function dependencyIdentity(root: string, manifest: Record<string, unknown>): RuntimeBuildIdentity['dependencies'] {
+/**
+ * How a package without a lockfile is identified. `graph` describes the whole installed dependency tree and is what every new
+ * run is admitted with. `direct-versions` is the earlier format, which recorded only the installed versions of the direct
+ * dependencies under the package's dependency directory; version-1 snapshots admitted before installed-package support are
+ * verified in it. A package with a lockfile is identified from the lockfile whatever the format.
+ */
+export type DependencyFormat = 'graph' | 'direct-versions';
+
+function dependencyIdentity(root: string, manifest: Record<string, unknown>, format: DependencyFormat): RuntimeBuildIdentity['dependencies'] {
   const modules = dependencyDirectory(root);
   const lockFile = path.join(root, 'package-lock.json');
   const lockfile = existsSync(lockFile) ? sha256(readFileSync(lockFile)) : null;
   const names = record(manifest.dependencies) ? Object.keys(manifest.dependencies).sort() : [];
+  const installedDirectly = lockfile !== null || format === 'direct-versions';
   let lockless: InstalledDependencies | undefined;
   const direct = Object.fromEntries(names.map(name => {
-    if (lockfile) return [name, installedVersion(path.join(modules, name))];
+    if (installedDirectly) return [name, installedVersion(path.join(modules, name))];
     // Without a lockfile (an installed package: npm never packs one) the installed tree itself is the lock data.
     lockless ??= installedDependencies(root);
     const found = lockless.links[name];
@@ -150,7 +159,7 @@ function dependencyIdentity(root: string, manifest: Record<string, unknown>): Ru
   }));
   let entries: string[];
   const lock: unknown = lockfile ? JSON.parse(readFileSync(lockFile, 'utf8')) : undefined;
-  if (!lockfile) entries = (lockless ?? installedDependencies(root)).entries;
+  if (!lockfile && format === 'graph') entries = (lockless ?? installedDependencies(root)).entries;
   else if (record(lock) && record(lock.packages)) {
     // Every locked runtime package, resolved against the dependency directory actually in use.
     entries = Object.entries(lock.packages)
@@ -166,15 +175,16 @@ function dependencyIdentity(root: string, manifest: Record<string, unknown>): Ru
 
 /**
  * Identity of the package rooted at `root`: what is actually executing, computed from file content and never from Git.
- * `snapshot` records whether the root is an immutable run-owned copy; it is not part of `digest`.
+ * `snapshot` records whether the root is an immutable run-owned copy; it is not part of `digest`. `dependencyFormat` is chosen
+ * from the format a run was recorded in, never by retrying after a mismatch.
  */
-export function computeRuntimeIdentity(root: string): RuntimeIdentity {
+export function computeRuntimeIdentity(root: string, dependencyFormat: DependencyFormat = 'graph'): RuntimeIdentity {
   const manifest: unknown = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'));
   if (!record(manifest) || typeof manifest.name !== 'string' || typeof manifest.version !== 'string') throw new Error('Runtime package manifest has no name and version');
   if (!existsSync(path.join(root, 'dist'))) throw new Error('Runtime package has no built dist');
   const hashes = Object.fromEntries(RUNTIME_ASSETS.map(asset => [asset.name, treeHash(root, asset)])) as Record<RuntimeAssetName, string>;
   const contracts = Object.fromEntries(SUBMISSION_KINDS.map(kind => [kind, contractRef(kind).version]));
-  const dependencies = dependencyIdentity(root, manifest);
+  const dependencies = dependencyIdentity(root, manifest, dependencyFormat);
   const basis = { packageName: manifest.name, packageVersion: manifest.version, protocol: SUBMISSION_PROTOCOL, contracts, ...hashes, dependencies };
   let snapshot = false;
   try { snapshot = lstatSync(path.join(root, SNAPSHOT_MARKER)).isFile(); } catch {}

@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
-import { computeRuntimeIdentity, dependencyDirectory, installedDependencies, listRuntimeFiles, RUNTIME_ASSETS, runtimeMismatch, SNAPSHOT_MARKER } from '../workflow/runtime-identity.js';
+import { computeRuntimeIdentity, type DependencyFormat, dependencyDirectory, installedDependencies, listRuntimeFiles, RUNTIME_ASSETS, runtimeMismatch, SNAPSHOT_MARKER } from '../workflow/runtime-identity.js';
 import type { RunRecord, RuntimeSnapshotSpecification } from './types.js';
 
 /** The package this coordinator executes from: the only source a snapshot is ever copied from. */
@@ -31,6 +31,14 @@ export async function admitRuntime(root = sourcePackageRoot()): Promise<RuntimeS
   if (installed.missing.length) throw new Error('Runtime dependencies are not installed for this package (missing: ' + installed.missing.join(', ') + ')');
   return { identity, modules, links: installed.links };
 }
+
+/**
+ * The dependency format a run record was admitted in. Only a lockless record without dependency links is the earlier format
+ * (identified by the installed versions of its direct dependencies): every run admitted since keeps its links, and a lockfile
+ * record is identified from the lockfile. The record decides; a mismatch is never retried in another format.
+ */
+const recordedDependencyFormat = (expected: RuntimeSnapshotSpecification): DependencyFormat =>
+  !expected.links && expected.identity.build?.dependencies.lockfile === null ? 'direct-versions' : 'graph';
 
 /** Real directories a snapshot's node_modules must link to: exactly the recorded links, scoped names under a scope directory. */
 async function linkNodeModules(root: string, links: Record<string, string>): Promise<void> {
@@ -86,7 +94,7 @@ export async function createRuntimeSnapshot(run: RunRecord, source = sourcePacka
     await fs.symlink(expected.modules, path.join(root, 'node_modules'), 'dir');
     await writeReadOnly(path.join(root, SNAPSHOT_MARKER), JSON.stringify({ version: 1, runId: run.id, identity: expected.identity, modules: expected.modules }));
   }
-  const copied = computeRuntimeIdentity(root);
+  const copied = computeRuntimeIdentity(root, recordedDependencyFormat(expected));
   const mismatch = runtimeMismatch(expected.identity, copied);
   if (mismatch) throw new Error('Runtime snapshot refused: the package changed after this run was admitted (' + mismatch + ')');
   return root;
@@ -115,8 +123,10 @@ export async function verifyRuntimeSnapshot(run: RunRecord): Promise<void> {
     const present = link.isDirectory() && !link.isSymbolicLink() ? await readNodeModules(path.join(root, 'node_modules')) : undefined;
     if ((recorded as { version?: unknown }).version !== 2 || !isDeepStrictEqual((recorded as { links?: unknown }).links, expected.links) || !present || !isDeepStrictEqual(present, expected.links)) refuse('the dependency location is not the recorded dependency links');
   } else if (!link.isSymbolicLink() || await fs.readlink(path.join(root, 'node_modules')) !== expected.modules) refuse('the dependency location is not the recorded ' + expected.modules);
+  // Version-1 markers are what the earlier format wrote; a marker claiming any other version never selects it.
+  const format = (recorded as { version?: unknown }).version === 1 ? recordedDependencyFormat(expected) : 'graph';
   let actual;
-  try { actual = computeRuntimeIdentity(root); } catch (error) { return refuse('the snapshot cannot be identified (' + (error instanceof Error ? error.message : String(error)) + ')'); }
+  try { actual = computeRuntimeIdentity(root, format); } catch (error) { return refuse('the snapshot cannot be identified (' + (error instanceof Error ? error.message : String(error)) + ')'); }
   const mismatch = runtimeMismatch(expected.identity, actual);
   if (mismatch) refuse(mismatch);
   if (!actual.build?.snapshot) refuse('the loaded copy is not a run-owned snapshot');
