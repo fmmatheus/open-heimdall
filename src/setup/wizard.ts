@@ -46,6 +46,8 @@ class WizardCancelled extends Error {}
 /** Runs the wizard. Returns the completed input, or null when the user cancelled (Ctrl-C or end of input). */
 export async function runWizard(request: SetupPromptRequest, streams: WizardStreams): Promise<SetupInput | null> {
   const { stdout } = streams;
+  // Text that quotes paths or validation messages passes through the sanitizer; fixed prompt text does not.
+  const sanitize = request.sanitize ?? ((text: string): string => text);
   const options: SetupOptions = {
     environment: request.environment,
     ...(request.cwd === undefined ? {} : { cwd: request.cwd }),
@@ -104,7 +106,7 @@ export async function runWizard(request: SetupPromptRequest, streams: WizardStre
       }
       if (answer === '') { say('A value is required; setup does not guess it.'); continue; }
       const reason = await accept(input, { [key]: answer });
-      if (reason !== null) { say(reason); continue; }
+      if (reason !== null) { say(sanitize(reason)); continue; }
       return answer;
     }
   };
@@ -123,9 +125,9 @@ export async function runWizard(request: SetupPromptRequest, streams: WizardStre
   const showTargets = async (trace: SetupTrace): Promise<void> => {
     const existing = trace.coordinatorPath === undefined ? false : await fs.lstat(trace.coordinatorPath).then(() => true, () => false);
     say('Heimdall setup');
-    if (trace.projectDirectory !== undefined) say(`  Project:                   ${trace.projectDirectory}`);
-    if (trace.coordinatorPath !== undefined) say(`  Coordinator configuration: ${trace.coordinatorPath} (${existing ? 'exists; reused unchanged' : 'will be created'})`);
-    if (trace.projectPath !== undefined) say(`  Project configuration:     ${trace.projectPath} (will be created)`);
+    if (trace.projectDirectory !== undefined) say(sanitize(`  Project:                   ${trace.projectDirectory}`));
+    if (trace.coordinatorPath !== undefined) say(sanitize(`  Coordinator configuration: ${trace.coordinatorPath} (${existing ? 'exists; reused unchanged' : 'will be created'})`));
+    if (trace.projectPath !== undefined) say(sanitize(`  Project configuration:     ${trace.projectPath} (will be created)`));
     say('Only decisions that are still missing are asked. Nothing is written until every answer is valid; Ctrl-C cancels.');
     say();
   };
@@ -140,7 +142,7 @@ export async function runWizard(request: SetupPromptRequest, streams: WizardStre
       } catch (error) {
         if (!(error instanceof SetupError)) return input;
         if (error.code === 'no-git-project' && request.input.projectDirectory === undefined) {
-          say(round === 0 ? 'The current directory is not inside a Git project.' : `${input.projectDirectory} is not inside a Git project.`);
+          say(round === 0 ? 'The current directory is not inside a Git project.' : sanitize(`${input.projectDirectory} is not inside a Git project.`));
           say('Project directory: an existing Git project that has at least one commit.');
           const answer = await ask('Project directory: ');
           if (answer === '') { say('A value is required; setup does not guess it.'); continue; }

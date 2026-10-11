@@ -300,7 +300,8 @@ export function incompleteSettings(existing: Configuration): string[] {
   return missing;
 }
 
-export interface SetupTrace { projectDirectory?: string; coordinatorPath?: string; projectPath?: string }
+/** What planning learned before it finished or failed. `credentialReferences` are the names of environment variables that hold credentials. */
+export interface SetupTrace { projectDirectory?: string; coordinatorPath?: string; projectPath?: string; credentialReferences?: string[] }
 
 /** Resolves targets, validates everything and decides what would be created or reused. Writes nothing. */
 export async function planSetup(input: SetupInput, options: SetupOptions = {}, trace: SetupTrace = {}): Promise<SetupPlan> {
@@ -310,6 +311,7 @@ export async function planSetup(input: SetupInput, options: SetupOptions = {}, t
   const coordinatorFile = path.resolve(cwd, input.coordinatorConfigPath ?? environment.HEIMDALL_COORDINATOR_CONFIG ?? path.join(home, '.config', 'heimdall', 'coordinator.toml'));
   trace.coordinatorPath = coordinatorFile;
   const requested = validateInput(input, cwd);
+  if (requested.passwordEnv !== undefined) (trace.credentialReferences ??= []).push(requested.passwordEnv);
 
   const selected = path.resolve(cwd, input.projectDirectory ?? '.');
   let projectDirectory: string;
@@ -334,6 +336,7 @@ export async function planSetup(input: SetupInput, options: SetupOptions = {}, t
   if (projectContent !== null) {
     try { projectEffective = parseConfiguration(projectContent, { projectDirectory, file: projectFile }); }
     catch (error) { throw new SetupError('invalid-configuration', `The project configuration ${projectFile} is not valid: ${describe(error)}. Setup does not modify existing files; fix it or choose another destination with --config.`); }
+    if (projectEffective.opencode.passwordEnvironmentVariable !== undefined) (trace.credentialReferences ??= []).push(projectEffective.opencode.passwordEnvironmentVariable);
     const missing = incompleteSettings(projectEffective);
     if (missing.length) throw new SetupError('incomplete-configuration', `The existing project configuration ${projectFile} is incomplete for setup; missing decisions: ${missing.join(', ')}. Setup never modifies existing files; choose a new destination with --config (and --coordinator-config if needed) or edit the file yourself.`, missing);
   }
@@ -431,8 +434,7 @@ function failure(error: unknown, trace: SetupTrace): SetupResult {
 }
 
 /** Plans and applies setup. Failures before the first write are reported with nothing created. */
-export async function runSetup(input: SetupInput, options: SetupOptions = {}): Promise<SetupResult> {
-  const trace: SetupTrace = {};
+export async function runSetup(input: SetupInput, options: SetupOptions = {}, trace: SetupTrace = {}): Promise<SetupResult> {
   let plan: SetupPlan;
   try { plan = await planSetup(input, options, trace); }
   catch (error) { return failure(error, trace); }

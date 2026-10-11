@@ -205,6 +205,8 @@ export async function doctorMain(args: readonly string[], options: DoctorCommand
       ...(options.packageRoot === undefined ? {} : { packageRoot: options.packageRoot }),
       ...(options.nodeVersion === undefined ? {} : { nodeVersion: options.nodeVersion }),
     });
+    // The selected project configuration names the variable that holds the OpenCode password, whatever its name.
+    redact.addReferences([configuration?.opencode.passwordEnvironmentVariable]);
     const connect = parsed.input.connect === true;
     const connection = connect
       ? await verifyConnection({ configuration, projectDirectory, environment, ...(options.connection === undefined ? {} : { connection: options.connection }) })

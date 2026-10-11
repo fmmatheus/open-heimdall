@@ -659,6 +659,24 @@ test('the human report and the JSON report never contain credentials', async t =
   assert.equal(human.status, 1);
 });
 
+test('the password variable selected by the project configuration is redacted whatever its name', async t => {
+  const s = await sandbox(t);
+  // A credential held by a variable that no name heuristic recognises; it also names the configuration file.
+  const opaque = 'zq-opaque-3e6a90d4f1b7';
+  const configuration = path.join(s.project, `${opaque}.toml`);
+  const env = { OPAQUE: opaque };
+  createSetup(s, ['--config', configuration, '--password-env', 'OPAQUE']);
+  await fs.chmod(configuration, 0o600);
+  assert.match(await read(configuration), /passwordEnvironmentVariable = "OPAQUE"/);
+  const { human, json, document } = await both(s, ['--config', configuration], { env });
+  for (const output of [human.stdout, human.stderr, json.stdout, json.stderr]) assert.ok(!output.includes(opaque), `the referenced credential appeared in output:\n${output}`);
+  assert.equal(document.ok, true);
+  assert.ok(document.targets.projectConfig.includes('[redacted]'));
+  assert.equal(document.targets.projectDirectory, s.project, 'a path without the credential stays readable');
+  assert.equal(document.targets.coordinatorConfig, s.coordinatorFile);
+  assert.match(human.stdout, /Project configuration: .*\[redacted\]/);
+});
+
 test('node version minimum is enforced in-process', async t => {
   const s = await sandbox(t);
   createSetup(s, ['--state-directory', path.join(s.root, 'state')]);

@@ -86,9 +86,9 @@ const read = file => fs.readFile(file, 'utf8');
 const exists = file => fs.access(file).then(() => true, () => false);
 
 /** Runs `heimdall setup` on a pseudo-terminal, answering the scripted prompts, within a finite deadline. */
-function wizard(s, args, steps, { cwd = s.project } = {}) {
+function wizard(s, args, steps, { cwd = s.project, env = s.env } = {}) {
   const specification = {
-    argv: [process.execPath, '--import', s.preload, cli, 'setup', ...args], cwd, env: s.env, steps, deadline: RUN_DEADLINE_SECONDS,
+    argv: [process.execPath, '--import', s.preload, cli, 'setup', ...args], cwd, env, steps, deadline: RUN_DEADLINE_SECONDS,
   };
   const started = Date.now();
   const run = spawnSync('python3', ['-I', driver, JSON.stringify(specification)], { encoding: 'utf8', timeout: (RUN_DEADLINE_SECONDS + 20) * 1000, killSignal: 'SIGKILL' });
@@ -261,3 +261,24 @@ test('a complete existing configuration is reused without any prompt', { skip },
   assert.equal(await read(s.projectFile), project);
   assert.equal(await read(s.coordinatorFile), coordinator);
 });
+
+// A synthetic credential held by a variable whose name no heuristic recognises. It also names a directory, so the
+// target summary the wizard prints would reveal it. The scripted answers never contain the value, so the terminal
+// output measured here is produced by the program alone.
+const OPAQUE_VALUE = 'zq-opaque-3e6a90d4f1b7';
+
+for (const [label, flags] of [['--password-env NAME', ['--password-env', 'OPAQUE']], ['--password-env=NAME', ['--password-env=OPAQUE']]]) {
+  test(`the wizard's target summary and result redact the variable named by ${label}`, { skip }, async t => {
+    const s = await sandbox(t);
+    const target = path.join(s.project, OPAQUE_VALUE, 'project.toml');
+    const result = wizard(s, [...FLAGS, '--config', target, ...flags], [answer(AUTH, 'basic')], { env: { ...s.env, OPAQUE: OPAQUE_VALUE } });
+    assert.equal(result.status, 0, result.output);
+    assert.ok(!result.output.includes(OPAQUE_VALUE), `the referenced credential appeared in the terminal output:\n${result.output}`);
+    assert.ok(result.output.includes('[redacted]'));
+    assert.match(result.output, /Heimdall setup complete/);
+    // A path that carries no credential stays readable.
+    assert.ok(result.output.includes(`Coordinator configuration: ${s.coordinatorFile} (will be created)`), result.output);
+    assert.equal((await loadConfiguration({ projectDirectory: s.project, configPath: target })).opencode.passwordEnvironmentVariable, 'OPAQUE');
+    await assertNoNetworkAttempts(s);
+  });
+}

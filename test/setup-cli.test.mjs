@@ -641,6 +641,114 @@ test('credentials in the environment, OpenChamber settings, URLs and paths never
   await assertNoNetworkAttempts(s);
 });
 
+// A synthetic credential held by a variable whose name no heuristic recognises; it also names a directory, so any
+// message that quotes the path would reveal it.
+const OPAQUE_VALUE = 'zq-opaque-3e6a90d4f1b7';
+const withOpaque = s => ({ ...s.env, OPAQUE: OPAQUE_VALUE });
+function assertNoOpaque(outputs, context) {
+  for (const output of outputs) assert.ok(!output.includes(OPAQUE_VALUE), `the referenced credential appeared in output (${context}):\n${output}`);
+}
+
+test('a password variable of any name is redacted when named with --password-env NAME or --password-env=NAME', async t => {
+  for (const flags of [['--password-env', 'OPAQUE'], ['--password-env=OPAQUE']]) {
+    for (const json of [false, true]) {
+      const mode = json ? ['--json'] : [];
+      const context = `${flags.join(' ')} ${mode.join('')}`;
+      // Success: the created file path and directory names carry the value.
+      const created = await sandbox(t);
+      const target = path.join(created.project, OPAQUE_VALUE, 'project.toml');
+      const ok = setup(created, [...complete, '--config', target, ...flags, ...mode], { env: { OPAQUE: OPAQUE_VALUE } });
+      assert.equal(ok.status, 0, ok.stderr);
+      assertNoOpaque([ok.stdout, ok.stderr], `${context} success`);
+      assert.ok((ok.stdout + ok.stderr).includes('[redacted]'), context);
+      assert.ok((ok.stdout + ok.stderr).includes(created.coordinatorFile), 'a path without the credential stays readable');
+      assert.equal(await exists(target), true);
+      if (json) assert.equal(JSON.parse(ok.stdout).projectDirectory, created.project);
+      // Failure: the error quotes the selected project path.
+      const refused = await sandbox(t);
+      const bad = setup(refused, [...complete, '--project', path.join(refused.root, OPAQUE_VALUE), ...flags, ...mode], { env: { OPAQUE: OPAQUE_VALUE } });
+      assert.equal(bad.status, 1);
+      assertNoOpaque([bad.stdout, bad.stderr], `${context} failure`);
+      assert.match(bad.stdout + bad.stderr, /no-git-project/);
+    }
+  }
+});
+
+test('the password variable of an existing project file is redacted without any flag', async t => {
+  const s = await sandbox(t);
+  const directory = path.join(s.project, OPAQUE_VALUE);
+  const file = path.join(directory, 'project.toml');
+  await fs.mkdir(directory);
+  await fs.writeFile(file, ['[workflow]', 'plannerModel = "anthropic/planner-x"', '', '[[workflow.executorCandidates]]', 'key = "primary"', 'quotaProvider = "openai"', 'model = "openai/executor-x"', '', '[opencode]', 'baseUrl = "http://127.0.0.1:4096"', 'authentication = "basic"', 'passwordEnvironmentVariable = "OPAQUE"', ''].join('\n'), { mode: 0o600 });
+  for (const json of [false, true]) {
+    const mode = json ? ['--json'] : [];
+    const reused = setup(s, ['--config', file, '--no-input', ...mode], { env: { OPAQUE: OPAQUE_VALUE } });
+    assert.equal(reused.status, 0, reused.stderr);
+    assertNoOpaque([reused.stdout, reused.stderr], `reuse ${mode}`);
+    assert.ok(reused.stdout.includes('[redacted]'));
+    assert.ok(reused.stdout.includes(s.coordinatorFile), 'a path without the credential stays readable');
+    const conflict = setup(s, ['--config', file, '--planner-model', 'anthropic/other-x', '--no-input', ...mode], { env: { OPAQUE: OPAQUE_VALUE } });
+    assert.equal(conflict.status, 1);
+    assert.match(conflict.stdout + conflict.stderr, /conflict/);
+    assertNoOpaque([conflict.stdout, conflict.stderr], `conflict ${mode}`);
+  }
+});
+
+/** A prompt hook that behaves like the wizard answering the missing decisions, including a custom password variable. */
+const wizardAnswers = { plannerModel: 'anthropic/planner-x', executorModel: 'openai/executor-x', quotaProvider: 'openai', opencodeUrl: 'http://127.0.0.1:4096', opencodeAuth: 'basic', passwordEnv: 'OPAQUE' };
+
+test('a password variable chosen interactively is redacted in the result and in errors', async t => {
+  for (const failing of [false, true]) {
+    const s = await sandbox(t);
+    const projectDirectory = path.join(s.project, OPAQUE_VALUE);
+    const target = path.join(projectDirectory, 'project.toml');
+    const operations = failing ? { mkdir: async (directory, mode) => {
+      if (directory === projectDirectory) throw Object.assign(new Error(`simulated mkdir failure in ${directory}`), { code: 'EIO' });
+      await fs.mkdir(directory, { mode });
+    } } : undefined;
+    const captured = streams({ stdinTTY: true, stdoutTTY: true });
+    const status = await setupMain(['--config', target], {
+      ...captured, environment: withOpaque(s), cwd: s.project, homeDirectory: s.home, ...(operations ? { operations } : {}),
+      prompt: async ({ input }) => ({ ...input, ...wizardAnswers }),
+    });
+    assert.equal(status, failing ? 1 : 0, captured.err.join(''));
+    const output = captured.out.join('') + captured.err.join('');
+    assertNoOpaque([output], failing ? 'forced write failure' : 'success');
+    assert.ok(output.includes('[redacted]'));
+    assert.ok(output.includes(s.coordinatorFile), 'a path without the credential stays readable');
+    if (failing) assert.match(output, /simulated mkdir failure/);
+  }
+});
+
+test('partial outcomes and warnings never reveal the referenced credential', async t => {
+  for (const json of [false, true]) {
+    const s = await sandbox(t);
+    const target = path.join(s.project, OPAQUE_VALUE, 'project.toml');
+    const run = async operations => {
+      const captured = streams({ stdinTTY: false, stdoutTTY: false });
+      const status = await setupMain([...complete, '--config', target, '--password-env=OPAQUE', ...(json ? ['--json'] : [])], { ...captured, environment: withOpaque(s), cwd: s.project, homeDirectory: s.home, operations });
+      return { status, out: captured.out.join(''), err: captured.err.join('') };
+    };
+    // The coordinator file is published, then writing the project file fails; the message and the partial outcome quote the path.
+    const partial = await run({ createTemporary: async (file, mode) => {
+      if (file.includes(OPAQUE_VALUE)) throw Object.assign(new Error(`simulated failure for ${file}`), { code: 'EIO' });
+      return fs.open(file, 'wx', mode);
+    } });
+    assert.equal(partial.status, 1);
+    assert.match(partial.out + partial.err, /Partial outcome|"partial"/);
+    assert.match(partial.out + partial.err, /simulated failure/);
+    assertNoOpaque([partial.out, partial.err], `partial ${json}`);
+    await fs.rm(path.join(s.home, '.config'), { recursive: true });
+    await fs.rm(path.join(s.project, OPAQUE_VALUE), { recursive: true, force: true });
+    // A temporary file that cannot be removed produces a warning that names it.
+    const warned = await run({ unlink: async () => { throw Object.assign(new Error('simulated unlink failure'), { code: 'EIO' }); } });
+    assert.equal(warned.status, 0, warned.err);
+    assert.match(warned.out + warned.err, /Could not remove temporary file/);
+    assertNoOpaque([warned.out, warned.err], `warnings ${json}`);
+    assert.ok((warned.out + warned.err).includes('simulated unlink failure'), 'the reason stays readable');
+  }
+});
+
 test('the network guard records attempts, and setup leaves no service artifacts', async t => {
   const s = await sandbox(t);
   const probe = spawnSync(process.execPath, ['--import', s.preload, '-e', "fetch('http://127.0.0.1:1').catch(() => {})"], { env: s.env, encoding: 'utf8', timeout: DEADLINE_MS });
