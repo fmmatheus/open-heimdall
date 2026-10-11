@@ -8,6 +8,7 @@ import { createPlugin } from '../dist/opencode/plugin.js';
 import { createWorkflow } from '../dist/workflow.js';
 import { createRunner } from '../dist/workflow/runner.js';
 import { loadConfiguration } from '../dist/config.js';
+import { createMessageHistory } from '../dist/opencode/observer.js';
 import { SUBMISSION_TOOL_IDS } from '../dist/workflow/contracts.js';
 import { SUBMISSION_DENIAL } from '../dist/workflow/submission.js';
 
@@ -37,7 +38,7 @@ async function project(t, prefix) {
  * fires when the host BUILDS the model context. The dispatch prompt becomes visible in the child timeline only when
  * that generation begins, so the runner's 50ms watcher cannot have recorded it before the first context is built.
  */
-function nativeHost(directory, script) {
+function nativeHost(directory, script, { pageSize = 2 } = {}) {
   const sessions = new Map();
   const hooks = new Map();
   const registered = new Map();
@@ -46,7 +47,44 @@ function nativeHost(directory, script) {
   const ctrl = { outcome: 'succeeded', finish: 'stop' };
   let children = 0, messages = 0, calls = 0;
   const registration = () => ({ dispose: async () => {} });
-  const addSession = (id, parentID) => sessions.set(id, { id, parentID, messages: [], outcome: undefined, idle: undefined, active: false });
+  // `messages` is the compacted active context; `archive` is the complete native history in chronological order.
+  const addSession = (id, parentID) => sessions.set(id, { id, parentID, messages: [], archive: [], outcome: undefined, idle: undefined, active: false });
+  const admit = (s, message) => { s.messages.push(message); s.archive.push(message); };
+  const requests = [];
+  let compactions = 0;
+  // Host-side compaction: the archive keeps everything; the active context restarts at the summary, and the model
+  // continues in a NEW assistant message that now carries the submission calls.
+  const compact = dispatch => {
+    const s = sessions.get(dispatch.child);
+    const n = ++compactions;
+    const summary = { type: 'compaction', id: 'msg_compaction_' + n, status: 'completed', reason: 'auto', summary: 'Earlier work', recent: '', time: { created: Date.now() } };
+    const assistant = { type: 'assistant', id: 'msg_asst_after_' + n, agent: dispatch.agent, content: [], time: { created: Date.now() } };
+    s.archive.push(summary, assistant);
+    s.messages = [summary, assistant];
+    dispatch.assistant = assistant;
+    return assistant;
+  };
+  /** Unrelated older traffic (earlier turns) that the archive keeps and the final context no longer has. */
+  const chat = (child, count) => {
+    const s = sessions.get(child);
+    for (let i = 0; i < count; i++) s.archive.push({ type: 'user', id: 'msg_old_user_' + child + '_' + ++messages, text: 'Older question', time: { created: Date.now() } }, { type: 'assistant', id: 'msg_old_asst_' + messages, agent: 'build', content: [], time: { created: Date.now() } });
+  };
+  // The supported v2 message-list route: native order, an opaque cursor, `order` only on the first page.
+  const fetchImpl = async url => {
+    const route = url.pathname + '?' + [...url.searchParams].filter(([key]) => key !== 'location[directory]').map(([key, value]) => key + '=' + value).join('&');
+    requests.push(route);
+    if (url.pathname === '/api/info') return Response.json({ version: '2.0.22', pid: 77 });
+    const match = /^\/api\/session\/([^/]+)(\/message)?$/.exec(url.pathname);
+    const s = match && sessions.get(match[1]);
+    if (!s) return new Response('missing', { status: 404 });
+    if (!match[2]) return Response.json({ data: { id: s.id, location: { directory }, time: {} } });
+    const cursor = url.searchParams.get('cursor');
+    if (cursor === null ? url.searchParams.get('order') !== 'desc' : url.searchParams.has('order')) return new Response('bad paging', { status: 400 });
+    const newest = s.archive.slice().reverse();
+    const start = cursor === null ? 0 : Number(Buffer.from(cursor, 'base64url').toString().replace(/^cursor:/, ''));
+    const end = start + Math.min(Number(url.searchParams.get('limit')), pageSize);
+    return Response.json({ data: newest.slice(start, end), cursor: end < newest.length ? { next: Buffer.from('cursor:' + end).toString('base64url') } : {} });
+  };
   const observe = async id => {
     const s = sessions.get(id);
     if (!s) throw new Error('Unknown session ' + id);
@@ -66,20 +104,22 @@ function nativeHost(directory, script) {
       const dispatch = { n, child, agent: input.agent, user, assistant };
       dispatches.push(dispatch);
       // Host admits the prompt and builds the FIRST model context. No waiting for the runner: the hook must cope.
-      s.messages.push(user);
+      admit(s, user);
       const event = { sessionID: child, agent: input.agent, tools: Object.fromEntries(['read', 'subagent', PLANNER_TOOL, EXECUTOR_TOOL].map(name => [name, {}])) };
       await hooks.get('session.context')?.(event);
       contexts.push({ n, child, agent: input.agent, tools: Object.keys(event.tools) });
-      s.messages.push(assistant);
-      const submit = async (name, payload, messageID = assistant.id) => {
+      admit(s, assistant);
+      const submit = async (name, payload, messageID = dispatch.assistant.id) => {
         const info = { tool: name, sessionID: child, agent: input.agent, messageID, id: 'call_' + ++calls, input: payload };
+        // The host lists the call on the assistant message that carries it.
+        s.archive.find(m => m.id === messageID)?.content?.push({ type: 'tool', id: info.id, name, state: { status: 'running' }, time: { created: Date.now() } });
         await hooks.get('tool.execute.before')(info);
         return registered.get(name).execute(payload, { sessionID: child, agent: input.agent, messageID, id: info.id, signal: native.signal, progress: async () => {} });
       };
       await script.shift()?.({ dispatch, submit, tools: contexts.at(-1).tools, sessions });
-      assistant.content = [{ type: 'text', text: 'Done.' }];
-      assistant.finish = ctrl.finish;
-      assistant.time.completed = Date.now();
+      dispatch.assistant.content.push({ type: 'text', text: 'Done.' });
+      dispatch.assistant.finish = ctrl.finish;
+      dispatch.assistant.time.completed = Date.now();
       s.active = false;
       if (ctrl.outcome === 'succeeded') s.idle = Date.now();
       s.outcome = ctrl.outcome;
@@ -101,8 +141,16 @@ function nativeHost(directory, script) {
     },
     rpc: { register: async () => registration() },
   };
-  return { ctx, observe, registered, contexts, dispatches, ctrl, sessions, addSession };
+  /** Intermediate assistant turns between the prompt and the call: they push the call and its prompt onto different pages. */
+  const steps = (dispatch, count) => {
+    const s = sessions.get(dispatch.child);
+    for (let i = 0; i < count; i++) admit(s, { type: 'assistant', id: 'msg_step_' + ++messages, agent: dispatch.agent, content: [], time: { created: Date.now() } });
+  };
+  return { ctx, observe, registered, contexts, dispatches, ctrl, sessions, addSession, compact, chat, steps, fetchImpl, requests };
 }
+
+/** The real full-archive reader over the fixture's v2 message-list route. */
+const history = (host, directory, bounds = {}) => createMessageHistory({ directory, baseUrl: 'http://127.0.0.1:4096', authentication: 'none', fetchImpl: host.fetchImpl, ...bounds });
 
 const readState = async (directory, runId) => JSON.parse(await fs.readFile(path.join(directory, '.heimdall/runs', runId, 'state.json'), 'utf8'));
 const planStep = (...ids) => async ({ submit }) => { const response = (await submit(PLANNER_TOOL, plan(...ids))).output; assert.equal(response.accepted, true); };
@@ -111,7 +159,7 @@ const doneStep = () => async ({ submit }) => { const response = (await submit(EX
 test('a normal standalone start through createPlugin selects structured-v1, exposes the first context its tool and advances once after the native stop', async t => {
   const { directory, configuration } = await project(t, 'heimdall-native-standalone-');
   const host = nativeHost(directory, [planStep('T1'), doneStep()]);
-  const setup = await createPlugin({ configuration, observe: host.observe, quota, git }).setup(host.ctx);
+  const setup = await createPlugin({ configuration, observe: host.observe, history: history(host, directory), quota, git }).setup(host.ctx);
   t.after(setup);
   const result = JSON.parse((await host.registered.get('adr_workflow').execute({ action: 'start', adr: '.heimdall/feature.md' }, caller())).content);
   assert.equal(result.status, 'completed');
@@ -142,7 +190,7 @@ test('an unknown call origin and a late call from an earlier dispatch on a reuse
       assert.equal((await submit(EXECUTOR_TOOL, completed(), dispatch.assistant.id)).output.accepted, true);
     },
   ]);
-  const setup = await createPlugin({ configuration, observe: host.observe, quota, git }).setup(host.ctx);
+  const setup = await createPlugin({ configuration, observe: host.observe, history: history(host, directory), quota, git }).setup(host.ctx);
   t.after(setup);
   const paused = JSON.parse((await host.registered.get('adr_workflow').execute({ action: 'start', adr: '.heimdall/feature.md' }, caller())).content);
   assert.equal(paused.status, 'paused');
@@ -157,10 +205,118 @@ test('an unknown call origin and a late call from an earlier dispatch on a reuse
   assert.equal(receipts.length, 3, receipts.join(', '));
 });
 
+const receiptFiles = async (directory, runId) => (await fs.readdir(path.join(directory, '.heimdall/runs', runId), { recursive: true })).filter(file => /submission/i.test(file) && file.endsWith('.json'));
+const hasUser = (host, child) => host.sessions.get(child).messages.some(m => m.type === 'user');
+
+test('a compacted active context without the dispatch prompt still authenticates the genuine submission from the full archive', async t => {
+  const { directory, configuration } = await project(t, 'heimdall-native-compacted-');
+  const compacted = async ({ submit, dispatch }) => {
+    host.steps(dispatch, 3);
+    host.compact(dispatch);
+    assert.equal(hasUser(host, dispatch.child), false, 'the active context no longer holds the dispatch prompt');
+    const response = (await submit(dispatch.agent === 'adr-planner' ? PLANNER_TOOL : EXECUTOR_TOOL, dispatch.agent === 'adr-planner' ? plan('T1') : completed())).output;
+    assert.equal(response.accepted, true);
+  };
+  const host = nativeHost(directory, [compacted, compacted]);
+  const setup = await createPlugin({ configuration, observe: host.observe, history: history(host, directory), quota, git }).setup(host.ctx);
+  t.after(setup);
+  const result = JSON.parse((await host.registered.get('adr_workflow').execute({ action: 'start', adr: '.heimdall/feature.md' }, caller())).content);
+  assert.equal(result.status, 'completed', JSON.stringify(result));
+  const state = await readState(directory, result.runId);
+  assert.equal(state.results.length, 1);
+  assert.equal(state.submissionBinding.status, 'closed');
+  // Fully paginated: the first page asks for descending order, every later page carries only the opaque cursor.
+  const pages = host.requests.filter(route => route.includes('/message?'));
+  assert.ok(pages.length > 2, pages.join(', '));
+  assert.ok(pages.every(route => route.includes('cursor=') ? !route.includes('order=') : route.includes('order=desc')), pages.join(', '));
+});
+
+test('multiple compactions with the call and its prompt on different pages still authenticate', async t => {
+  const { directory, configuration } = await project(t, 'heimdall-native-multi-compaction-');
+  const host = nativeHost(directory, [
+    async ({ submit, dispatch }) => { host.compact(dispatch); host.steps(dispatch, 5); host.compact(dispatch); host.compact(dispatch); assert.equal((await submit(PLANNER_TOOL, plan('T1'))).output.accepted, true); },
+    async ({ submit, dispatch }) => { host.steps(dispatch, 7); host.compact(dispatch); host.compact(dispatch); assert.equal((await submit(EXECUTOR_TOOL, completed())).output.accepted, true); },
+  ], { pageSize: 3 });
+  const setup = await createPlugin({ configuration, observe: host.observe, history: history(host, directory), quota, git }).setup(host.ctx);
+  t.after(setup);
+  const result = JSON.parse((await host.registered.get('adr_workflow').execute({ action: 'start', adr: '.heimdall/feature.md' }, caller())).content);
+  assert.equal(result.status, 'completed');
+  assert.equal((await readState(directory, result.runId)).results.length, 1);
+  assert.ok(host.requests.filter(route => route.includes('cursor=')).length >= 3, 'later pages were reached through the returned cursor');
+});
+
+test('after compaction and a plugin restart, a reused child accepts its own call and rejects a delayed call from the earlier dispatch', async t => {
+  const { directory, configuration } = await project(t, 'heimdall-native-reused-compacted-');
+  let stale;
+  const host = nativeHost(directory, [
+    planStep('T1'),
+    async ({ submit, dispatch }) => { host.compact(dispatch); stale = dispatch.assistant.id; assert.equal((await submit(EXECUTOR_TOOL, { status: 'blocked', reason: 'Need the owner' })).output.accepted, true); host.chat(dispatch.child, 2); },
+    async ({ submit, dispatch }) => {
+      host.steps(dispatch, 4);
+      host.compact(dispatch);
+      host.compact(dispatch);
+      assert.equal(hasUser(host, dispatch.child), false);
+      // The earlier call still resolves, but to the earlier prompt: it is not this dispatch's.
+      await assert.rejects(submit(EXECUTOR_TOOL, completed(), stale), new Error(SUBMISSION_DENIAL));
+      await assert.rejects(submit(EXECUTOR_TOOL, completed(), 'msg_unknown'), new Error(SUBMISSION_DENIAL));
+      assert.equal((await submit(EXECUTOR_TOOL, completed())).output.accepted, true);
+    },
+  ]);
+  const first = await createPlugin({ configuration, observe: host.observe, history: history(host, directory), quota, git }).setup(host.ctx);
+  const paused = JSON.parse((await host.registered.get('adr_workflow').execute({ action: 'start', adr: '.heimdall/feature.md' }, caller())).content);
+  assert.equal(paused.status, 'paused');
+  // A fresh plugin and a fresh history reader hold no process-local authority from the first one.
+  await first();
+  const second = await createPlugin({ configuration, observe: host.observe, history: history(host, directory), quota, git }).setup(host.ctx);
+  t.after(second);
+  const resumed = JSON.parse((await host.registered.get('adr_workflow').execute({ action: 'resume', runId: paused.runId, input: 'Owner resolved it' }, caller())).content);
+  assert.equal(resumed.status, 'completed');
+  assert.equal((await readState(directory, paused.runId)).results.length, 1);
+  assert.equal(host.dispatches[1].child, host.dispatches[2].child, 'the child was reused');
+  assert.equal((await receiptFiles(directory, paused.runId)).length, 3, 'the delayed and unknown calls recorded nothing');
+});
+
+test('unverifiable provenance denies without a receipt, is not a format repair and does not block the genuine retry', async t => {
+  const { directory, configuration } = await project(t, 'heimdall-native-unavailable-');
+  let mode = 'up';
+  const attempts = [];
+  const host = nativeHost(directory, [planStep('T1'), async ({ submit, dispatch }) => {
+    host.compact(dispatch);
+    for (const failure of ['http', 'malformed', 'cycle', 'duplicate']) {
+      mode = failure;
+      attempts.push(await submit(EXECUTOR_TOOL, completed()).then(() => 'accepted', error => error.message));
+    }
+    mode = 'exhausted';
+    attempts.push(await submit(EXECUTOR_TOOL, completed()).then(() => 'accepted', error => error.message));
+    mode = 'up';
+    assert.equal((await submit(EXECUTOR_TOOL, completed())).output.accepted, true);
+  }]);
+  const served = async url => {
+    if (mode === 'up' || !url.pathname.endsWith('/message')) return host.fetchImpl(url);
+    if (mode === 'http') return new Response('boom', { status: 500 });
+    if (mode === 'malformed') return Response.json({ data: 'not a list', cursor: {} });
+    if (mode === 'cycle') return Response.json({ data: [{ type: 'compaction', id: 'msg_cycle' }], cursor: { next: url.searchParams.get('cursor') ?? 'again' } });
+    if (mode === 'duplicate') return Response.json({ data: [{ type: 'compaction', id: 'msg_dup' }, { type: 'compaction', id: 'msg_dup' }], cursor: {} });
+    // Exhausted: a well-formed endless history that never reaches the prompt within the bound.
+    const start = Number(url.searchParams.get('cursor') ?? 0);
+    return Response.json({ data: [{ type: 'compaction', id: 'msg_endless_' + start }], cursor: { next: String(start + 1) } });
+  };
+  const bounded = createMessageHistory({ directory, baseUrl: 'http://127.0.0.1:4096', authentication: 'none', fetchImpl: served, maxPages: 5 });
+  const setup = await createPlugin({ configuration, observe: host.observe, history: bounded, quota, git }).setup(host.ctx);
+  t.after(setup);
+  const result = JSON.parse((await host.registered.get('adr_workflow').execute({ action: 'start', adr: '.heimdall/feature.md' }, caller())).content);
+  assert.deepEqual(attempts, Array(5).fill(SUBMISSION_DENIAL));
+  assert.equal(result.status, 'completed');
+  const state = await readState(directory, result.runId);
+  assert.equal(state.results.length, 1);
+  // The planner receipt and the single genuine executor receipt only.
+  assert.equal((await receiptFiles(directory, result.runId)).length, 2);
+});
+
 test('a submission followed by a failed native outcome never advances', async t => {
   const { directory, configuration } = await project(t, 'heimdall-native-failed-');
   const host = nativeHost(directory, [planStep('T1'), async ({ submit }) => { await submit(EXECUTOR_TOOL, completed()); host.ctrl.outcome = 'failed'; }]);
-  const setup = await createPlugin({ configuration, observe: host.observe, quota, git }).setup(host.ctx);
+  const setup = await createPlugin({ configuration, observe: host.observe, history: history(host, directory), quota, git }).setup(host.ctx);
   t.after(setup);
   const result = JSON.parse((await host.registered.get('adr_workflow').execute({ action: 'start', adr: '.heimdall/feature.md' }, caller())).content);
   assert.equal(result.status, 'paused');
@@ -211,7 +367,7 @@ test('an unversioned legacy run resumes through the plugin on its legacy path wi
     const out = await execute(input, native);
     return { output: { ...out.output, output: JSON.stringify({ status: 'completed', taskId: 'T1', summary: 'Done', handoff: 'Handoff', evidence: [{ gateId: 'G1', passed: true, gate: 'test passed', detail: 'targeted test exit 0' }] }) } };
   };
-  const setup = await createPlugin({ configuration, observe: host.observe, quota, git }).setup(host.ctx);
+  const setup = await createPlugin({ configuration, observe: host.observe, history: history(host, directory), quota, git }).setup(host.ctx);
   t.after(setup);
   const resumed = JSON.parse((await host.registered.get('adr_workflow').execute({ action: 'resume', runId: paused.runId, input: 'Phone attached' }, caller())).content);
   assert.equal(resumed.status, 'completed');
@@ -257,7 +413,7 @@ test('a managed start through createPlugin gates submissions on the active owner
   const metadata = { endpoint: coordinator.endpoint, runId, ownerToken, parentSessionId };
   await fs.writeFile(path.join(directory, '.heimdall/managed.json'), JSON.stringify(metadata));
   const host = nativeHost(directory, [planStep('T1'), doneStep()]);
-  const setup = await createPlugin({ configuration, observe: host.observe, quota, git }).setup(host.ctx);
+  const setup = await createPlugin({ configuration, observe: host.observe, history: history(host, directory), quota, git }).setup(host.ctx);
   t.after(setup);
   const result = JSON.parse((await host.registered.get('adr_workflow').execute({ action: 'start', adr: '.heimdall/feature.md' }, caller())).content);
   assert.equal(result.status, 'completed');
@@ -279,7 +435,7 @@ test('a managed identity change makes the gate expose nothing and deny submissio
     await fs.writeFile(path.join(directory, '.heimdall/managed.json'), JSON.stringify({ endpoint: coordinator.endpoint, runId: 'run_other', ownerToken: 'tok', parentSessionId: 'ses_parent' }));
     denial = await submit(PLANNER_TOOL, plan('T1')).then(() => 'accepted', error => error.message);
   }]);
-  const setup = await createPlugin({ configuration, observe: host.observe, quota, git }).setup(host.ctx);
+  const setup = await createPlugin({ configuration, observe: host.observe, history: history(host, directory), quota, git }).setup(host.ctx);
   t.after(setup);
   await assert.rejects(host.registered.get('adr_workflow').execute({ action: 'start', adr: '.heimdall/feature.md' }, caller()), /./);
   assert.equal(denial, SUBMISSION_DENIAL);

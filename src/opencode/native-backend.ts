@@ -2,7 +2,9 @@ import type { ReportOnlyCapability, RunnerBackend, RunnerContext, SubagentInput,
 import type { NativeOriginResolver } from '../workflow/durable-submission.js';
 import { VERIFIED_REPORT_ONLY_PROVIDERS } from './report-only.js';
 import type { ReportOnlyRegistry } from './report-only.js';
-import type { NativeContext, NativeTool, NativeToolContext, ObservedSession, SessionObserver, SessionSnapshot } from './types.js';
+import { SUBMISSION_TOOL_IDS } from '../workflow/contracts.js';
+import { OriginProofError } from './types.js';
+import type { HistoryMessage, MessageHistory, NativeContext, NativeTool, NativeToolContext, ObservedSession, SessionObserver, SessionSnapshot } from './types.js';
 
 const terminal = (session: ObservedSession) => ['succeeded', 'failed', 'interrupted'].includes(session.outcome ?? '') && Number.isFinite(session.time?.idle);
 const unprompted = (value: SessionSnapshot) => value.session.outcome === undefined && Array.isArray(value.messages) && value.messages.length === 0 && [value.session.tokens?.input, value.session.tokens?.output, value.session.tokens?.reasoning, value.session.tokens?.cache?.read, value.session.tokens?.cache?.write].every(v => v === 0);
@@ -26,25 +28,45 @@ export function nativeModel(model: string, variant?: string): string {
 }
 
 /**
- * Proves, from the host's ordered message timeline of the calling session, which user prompt a tool call descends
+ * Proves, from the complete native message archive of the calling session, which user prompt a tool call descends
  * from: the assistant message that carries the call (identified by the native message id, never by anything the
- * model supplied) belongs to the nearest user message before it. A delayed call from an earlier dispatch on a reused
- * child therefore resolves to the earlier prompt, and an unknown message, a foreign agent or a missing prompt yields
- * undefined (the gate then fails closed).
+ * model supplied) belongs to the nearest user message before it. The archive is read newest first, so the scan
+ * finds that assistant message and then the first real `user` message after it. Compaction, synthetic, system,
+ * skill, shell, switch and idle records are never prompts, and the archive keeps the original dispatch prompt even
+ * after the host compacted the active context past it. A delayed call from an earlier dispatch on a reused child
+ * therefore resolves to the earlier prompt.
+ *
+ * When the carrying assistant message lists tool calls, one of them must be this call and the submission tool of the
+ * binding's kind. Anything that cannot be proven throws an OriginProofError with a bounded reason (never transcript text); the
+ * gate treats a throw exactly like an unknown origin and fails closed.
  */
-export function createNativeOriginResolver(ctx: Pick<NativeContext, 'session'>): NativeOriginResolver {
-  return async native => {
-    const messages = await ctx.session.context({ sessionID: native.sessionID as never });
-    const index = messages.findIndex(m => m.type === 'assistant' && m.id === native.messageID);
-    if (index < 0 || (messages[index] as { agent?: unknown }).agent !== native.agent) return undefined;
-    const prompt = messages.slice(0, index).filter(m => m.type === 'user').at(-1);
-    return typeof prompt?.id === 'string' && prompt.id.length > 0 ? prompt.id : undefined;
+export function createNativeOriginResolver(history: MessageHistory): NativeOriginResolver {
+  return async (native, binding) => {
+    let carrier: HistoryMessage | undefined;
+    for await (const message of history(native.sessionID)) {
+      if (!carrier) {
+        if (message.type !== 'assistant' || message.id !== native.messageID) continue;
+        if (message.agent !== native.agent) throw new OriginProofError('agent_mismatch');
+        const calls = Array.isArray(message.content) ? message.content.filter((part): part is Record<string, unknown> => part !== null && typeof part === 'object' && (part as { type?: unknown }).type === 'tool') : [];
+        if (calls.length > 0) {
+          const call = calls.find(part => part.id === native.id);
+          if (!call) throw new OriginProofError('call_mismatch');
+          if (call.name !== SUBMISSION_TOOL_IDS[binding.kind]) throw new OriginProofError('call_mismatch');
+        }
+        carrier = message;
+      } else if (message.type === 'user') {
+        return message.id;
+      }
+    }
+    throw new OriginProofError(carrier ? 'prompt_not_found' : 'call_not_found');
   };
 }
 
-export function createNativeBackend({ ctx, observe, pause = ms => new Promise(resolve => setTimeout(resolve, ms)), cancellationWaitMs = 30000, reportOnly, verifiedProviders = VERIFIED_REPORT_ONLY_PROVIDERS }: {
+export function createNativeBackend({ ctx, observe, history, pause = ms => new Promise(resolve => setTimeout(resolve, ms)), cancellationWaitMs = 30000, reportOnly, verifiedProviders = VERIFIED_REPORT_ONLY_PROVIDERS }: {
   ctx: NativeContext;
   observe: SessionObserver;
+  /** Complete message archive. Binding a completed child to its attempt must not depend on the compacted active context. */
+  history?: MessageHistory;
   pause?: (ms: number) => Promise<unknown>;
   cancellationWaitMs?: number;
   /** Shared with the plugin hooks. Omitted means no report-only capability. */
@@ -85,10 +107,25 @@ export function createNativeBackend({ ctx, observe, pause = ms => new Promise(re
     async recoverResponse(id: string, parent: string, attempt: WorkflowAttempt) {
       const value = requireIdle(await observe(id), id, parent, true);
       if (value.session.outcome !== 'succeeded') return undefined;
-      const messages = await ctx.session.context({ sessionID: id });
-      const user = messages.filter(m => m.type === 'user').at(-1);
-      const answer = messages.filter(m => m.type === 'assistant').at(-1);
-      if (!user?.text.includes('Workflow attempt: ' + attempt.id) || !answer || typeof answer.time.completed !== 'number' || !Number.isFinite(answer.time.completed) || answer.time.completed < attempt.startedAt || answer.error) throw new Error('Cannot bind completed child output to this attempt. Reconcile the saved child before resuming');
+      let user: { text: string } | undefined;
+      let answer: Awaited<ReturnType<NativeContext['session']['context']>>[number] & { type: 'assistant' } | undefined;
+      if (history) {
+        // The archive is newest first; the compacted context may no longer hold the dispatch prompt.
+        let latestUser: HistoryMessage | undefined;
+        let latestAnswer: HistoryMessage | undefined;
+        for await (const message of history(id)) {
+          if (message.type === 'user') latestUser ??= message;
+          else if (message.type === 'assistant') latestAnswer ??= message;
+          if (latestUser && latestAnswer) break;
+        }
+        user = latestUser as typeof user;
+        answer = latestAnswer as typeof answer;
+      } else {
+        const messages = await ctx.session.context({ sessionID: id });
+        user = messages.filter(m => m.type === 'user').at(-1) as typeof user;
+        answer = messages.filter(m => m.type === 'assistant').at(-1) as typeof answer;
+      }
+      if (typeof user?.text !== 'string' || !user.text.includes('Workflow attempt: ' + attempt.id) || !answer || typeof answer.time.completed !== 'number' || !Number.isFinite(answer.time.completed) || answer.time.completed < attempt.startedAt || answer.error) throw new Error('Cannot bind completed child output to this attempt. Reconcile the saved child before resuming');
       if (answer.finish === 'length') throw new Error('Planner/executor output truncated at model output limit. Recover artifacts before resuming');
       if (answer.finish !== 'stop') throw new Error('Completed child has no final stop response; reconcile it before resuming');
       return answer.content.filter(p => p.type === 'text').map(p => p.text).join('\n');

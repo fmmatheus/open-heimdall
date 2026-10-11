@@ -6,8 +6,8 @@ import type { WorkflowOptions } from '../workflow.js';
 import { loadConfiguration } from '../config.js';
 import type { Configuration } from '../config.js';
 import type { RunArguments, RunnerContext } from '../workflow/types.js';
-import type { SessionObserver } from './types.js';
-import { createObserver } from './observer.js';
+import type { MessageHistory, SessionObserver } from './types.js';
+import { createMessageHistory, createObserver } from './observer.js';
 import { createReportOnlyRegistry, REPAIR_ONLY_DENIAL, REPORT_ONLY_DENIAL } from './report-only.js';
 import type { ReportOnlyRegistry } from './report-only.js';
 import { createManagedPersistence, readManagedMetadata } from './managed.js';
@@ -42,6 +42,8 @@ export interface PluginOptions {
   reportOnly?: ReportOnlyRegistry;
   /** Owns binding and persistence of typed submissions. Defaults to the durable gate over the run's authoritative checkpoint and the host-observed call origin. */
   submissionGate?: SubmissionGate;
+  /** Complete message archive used by the default gate to prove call origin. Injectable so tests can serve a paginated archive. */
+  history?: MessageHistory;
   /** Format-repair decisions and the tool-call timeline shared with the runner. Injectable so tests can observe it. */
   supervisor?: SubmissionSupervisor;
   /** Managed runs: the runtime digest the coordinator admitted. A plugin loaded from any other build refuses to activate. */
@@ -64,14 +66,15 @@ export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
       const guards = new Map<string, () => Promise<void>>();
       const reportOnly = options.reportOnly ?? createReportOnlyRegistry();
       const observe = options.observe ?? createObserver({ directory: configuration.projectDirectory, ...configuration.opencode });
+      const history = options.history ?? createMessageHistory({ directory: configuration.projectDirectory, ...configuration.opencode });
       const promptSync = createDispatchPromptSync();
       const supervisor = options.supervisor ?? createSubmissionSupervisor();
       // Calls that reached execute.before. A submission call the framework rejected earlier (input validation) never does.
       const reached = new Set<string>();
-      const run = metadata ? undefined : createWorkflow({ configuration, ctx, observe, guards, reportOnly, promptSync, supervisor, quota: options.quota, git: options.git });
+      const run = metadata ? undefined : createWorkflow({ configuration, ctx, observe, history, guards, reportOnly, promptSync, supervisor, quota: options.quota, git: options.git });
       const registrations: Array<{ dispose(): Promise<void> }> = [];
       const recoveries = new Map<string, { operation: Promise<string>; controller: AbortController }>();
-      const submissions = options.submissionGate ?? createNativeSubmissionGate({ configuration, ctx, metadata });
+      const submissions = options.submissionGate ?? createNativeSubmissionGate({ configuration, history, metadata });
       // Exact registered ids only. A caller is allowed only when the gate binds its session to this kind.
       const permitted = async (kind: SubmissionKind, sessionID: string, agent: string) => (await submissions.exposed(sessionID, agent)) === kind;
       registrations.push(await ctx.tool.transform(editor => {
@@ -123,7 +126,7 @@ export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
               if (!current || current.runId !== metadata.runId || current.parentSessionId !== metadata.parentSessionId || current.endpoint !== metadata.endpoint) throw new Error('Managed workflow identity changed');
               const managed = createManagedPersistence(ctx.location.directory, current);
               const authorized = await managed.authorize(args, context);
-              const execute = createWorkflow({ configuration, ctx, observe, guards, reportOnly, promptSync, supervisor, quota: options.quota, git: options.git, persistence: managed.persistence });
+              const execute = createWorkflow({ configuration, ctx, observe, history, guards, reportOnly, promptSync, supervisor, quota: options.quota, git: options.git, persistence: managed.persistence });
               text = await execute(authorized, context);
             } else text = await run!(args, context);
             return { output: JSON.parse(text) as unknown, content: text };

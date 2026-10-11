@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { createAPI, connect, snapshot, createObserver } from '../dist/opencode/observer.js';
+import { createAPI, connect, snapshot, createObserver, createMessageHistory } from '../dist/opencode/observer.js';
+import { OriginProofError } from '../dist/opencode/types.js';
 
 const baseUrl = 'http://127.0.0.1:4096';
 const directory = '/workspace';
@@ -217,4 +218,63 @@ test('Basic and no-auth do not access Desktop settings or add its directory enco
       return Response.json(info());
     } });
   }
+});
+
+/** A fake supported server whose message route is served by `messages(url)`. */
+function archiveServer(messages, { project = directory } = {}) {
+  const routes = [];
+  const fetchImpl = async url => {
+    routes.push(url.pathname + url.search.replace(/[?&]location%5Bdirectory%5D=[^&]*/, ''));
+    if (url.pathname === '/api/info') return Response.json(info());
+    if (url.pathname === '/api/session/ses_child') return Response.json({ data: { ...session(), location: { directory: project } } });
+    if (url.pathname === '/api/session/ses_child/message') return messages(url);
+    return new Response('missing', { status: 404 });
+  };
+  return { routes, history: bounds => createMessageHistory({ directory, ...connection, fetchImpl, ...bounds }) };
+}
+const collect = async iterable => { const out = []; for await (const item of iterable) out.push(item); return out; };
+const failure = promise => promise.then(() => 'resolved', error => error instanceof OriginProofError ? error.reason : 'other:' + error.message);
+const message = id => ({ id, type: 'user' });
+
+test('message history follows the opaque cursor in native order and sends order only on the first page', async () => {
+  const pages = { first: { data: [message('m4'), message('m3')], cursor: { previous: 'p0', next: 'c1' } }, c1: { data: [message('m2'), message('m1')], cursor: { next: 'c2' } }, c2: { data: [message('m0')], cursor: {} } };
+  const server = archiveServer(url => Response.json(pages[url.searchParams.get('cursor') ?? 'first']));
+  // Native ordering is preserved verbatim: nothing is sorted or filtered.
+  assert.deepEqual((await collect(server.history({ pageSize: 2 })('ses_child'))).map(m => m.id), ['m4', 'm3', 'm2', 'm1', 'm0']);
+  assert.deepEqual(server.routes.filter(route => route.includes('/message')), [
+    '/api/session/ses_child/message?order=desc&limit=2', '/api/session/ses_child/message?cursor=c1&limit=2', '/api/session/ses_child/message?cursor=c2&limit=2',
+  ]);
+  // The version and project checks of the shared connection run first.
+  assert.deepEqual(server.routes.slice(0, 2), ['/api/info', '/api/session/ses_child']);
+});
+
+test('message history is lazy: it stops fetching when the consumer stops', async () => {
+  const server = archiveServer(url => Response.json({ data: [message('a' + (url.searchParams.get('cursor') ?? '0'))], cursor: { next: String(Number(url.searchParams.get('cursor') ?? 0) + 1) } }));
+  for await (const item of server.history()('ses_child')) { assert.equal(item.id, 'a0'); break; }
+  assert.equal(server.routes.filter(route => route.includes('/message')).length, 1);
+});
+
+test('message history fails closed with a bounded reason for unreachable, wrong-project, malformed, cyclic, duplicate and endless history', async () => {
+  const bad = (messages, bounds) => failure(collect(archiveServer(messages).history(bounds)('ses_child')));
+  assert.equal(await bad(() => new Response('secret transcript text', { status: 500 })), 'history_unavailable');
+  assert.equal(await failure(collect(archiveServer(() => Response.json({ data: [], cursor: {} }), { project: '/different' }).history()('ses_child'))), 'history_unavailable');
+  assert.equal(await failure(collect(createMessageHistory({ directory, ...connection, fetchImpl: async () => { throw new Error('down'); } })('ses_child'))), 'history_unavailable');
+  for (const malformed of [
+    { data: 'nope', cursor: {} }, { cursor: {} }, { data: [] }, { data: [], cursor: [] }, { data: [message('m')], cursor: { next: 7 } }, { data: [message('m')], cursor: { next: '' } }, { data: [message('m')], cursor: { previous: 7 } },
+    { data: [{ type: 'user' }], cursor: {} }, { data: [{ id: '', type: 'user' }], cursor: {} }, { data: [{ id: 'm' }], cursor: {} }, { data: ['text'], cursor: {} },
+  ]) assert.equal(await bad(() => Response.json(malformed)), 'page_malformed', JSON.stringify(malformed));
+  assert.equal(await bad(url => Response.json({ data: [message('m' + (url.searchParams.get('cursor') ?? 0))], cursor: { next: 'same' } })), 'cursor_repeated');
+  assert.equal(await bad(url => Response.json(url.searchParams.get('cursor') ? { data: [message('b' + url.searchParams.get('cursor'))], cursor: { next: url.searchParams.get('cursor') === 'again' ? 'other' : 'again' } } : { data: [message('a')], cursor: { next: 'again' } })), 'cursor_repeated');
+  assert.equal(await bad(() => Response.json({ data: [message('m'), message('m')], cursor: {} })), 'duplicate_message');
+  assert.equal(await bad(url => Response.json(url.searchParams.get('cursor') ? { data: [message('m')], cursor: {} } : { data: [message('m')], cursor: { next: 'n' } })), 'duplicate_message');
+  assert.equal(await bad(url => { const n = Number(url.searchParams.get('cursor') ?? 0); return Response.json({ data: [message('m' + n)], cursor: { next: String(n + 1) } }); }, { maxPages: 3 }), 'scan_exhausted');
+  // A page that was already valid is never lost to a later failure: earlier messages are delivered first.
+  const delivered = [];
+  const server = archiveServer(url => url.searchParams.get('cursor') ? new Response('boom', { status: 500 }) : Response.json({ data: [message('m1')], cursor: { next: 'n' } }));
+  assert.equal(await failure((async () => { for await (const item of server.history()('ses_child')) delivered.push(item.id); })()), 'history_unavailable');
+  assert.deepEqual(delivered, ['m1']);
+});
+
+test('message history rejects invalid bounds at construction', () => {
+  for (const bounds of [{ pageSize: 0 }, { pageSize: 201 }, { pageSize: 1.5 }, { maxPages: 0 }]) assert.throws(() => createMessageHistory({ directory, ...connection, ...bounds }), /Invalid message history bounds/);
 });

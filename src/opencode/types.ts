@@ -30,6 +30,33 @@ export interface SessionSnapshot {
 
 export type SessionObserver = (id: string, signal?: AbortSignal) => Promise<SessionSnapshot>;
 
+/** A projected message of the full session archive. Only the identity fields are validated by the reader. */
+export interface HistoryMessage {
+  id: string;
+  type: string;
+  [key: string]: unknown;
+}
+
+/**
+ * The complete projected message archive of a session in native order (newest first), independent of compaction.
+ * Implementations throw an OriginProofError instead of ever truncating or reordering the history.
+ */
+export type MessageHistory = (sessionID: string, signal?: AbortSignal) => AsyncIterable<HistoryMessage>;
+
+/** Bounded reasons a submission origin cannot be proven. They never carry transcript text. */
+export type OriginFailure =
+  | 'history_unavailable' | 'page_malformed' | 'cursor_repeated' | 'duplicate_message' | 'scan_exhausted'
+  | 'call_not_found' | 'agent_mismatch' | 'call_mismatch' | 'prompt_not_found';
+
+export class OriginProofError extends Error {
+  readonly reason: OriginFailure;
+  constructor(reason: OriginFailure) {
+    super('Submission origin could not be verified (' + reason + ')');
+    this.name = 'OriginProofError';
+    this.reason = reason;
+  }
+}
+
 export interface RequestOptions {
   method?: string;
   body?: unknown;
