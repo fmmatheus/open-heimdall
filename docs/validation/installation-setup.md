@@ -15,8 +15,8 @@ does not show that the coordinator was started or that a run can execute.
 | Item | Value |
 | --- | --- |
 | Date | 2026-10-11 |
-| Verified code | `d597d8e` (`fix(cli): redact selected credential references consistently`), the last commit that changed code or tests. Later commits change only `docs/installation.md`, `.github/workflows/test.yml` and this record. |
-| Branch | `heimdall/run/2327e50f-8828-4a67-be86-e39b44cef151`, based on `6aff533` |
+| Verified code | `d6b9d39` (`fix(doctor): redact project credential reference when validation fails`), the last commit that changed code or tests. Later commits change only documentation. |
+| Branch | `heimdall/run/7f37259e-4815-4d6d-a5ce-eaef832131b0`, based on `0265c72` |
 | OS | macOS 27.0.1 (Darwin 27.0.0, arm64) |
 | Node.js | v22.22.3 |
 | npm | 10.9.8 |
@@ -26,18 +26,18 @@ Not run locally: Linux, Node.js 22.19.0 exactly, Node.js 24, Windows.
 
 ## Command results
 
-All commands ran from the repository root with a clean tree, after the code,
-documentation and workflow commits. `node_modules` was installed from the lockfile
-with `npm ci --ignore-scripts` earlier in the same checkout; no dependency changed
-since, so the install was not repeated.
+All commands ran from the repository root with a clean tree on the verified code
+`d6b9d39`. `node_modules` was installed from the lockfile with
+`npm ci --ignore-scripts` in the same checkout; no dependency changed since, so
+the install was not repeated.
 
 | Command | Exit | Result |
 | --- | --- | --- |
 | `npm run check` | 0 | TypeScript check passed |
-| `npm test` | 0 | 917 tests, 917 pass, 0 fail, 0 cancelled, 0 skipped (includes the PTY wizard tests) |
+| `npm test` | 0 | 923 tests, 923 pass, 0 fail, 0 cancelled, 0 skipped (includes the PTY wizard tests) |
 | `npm run build:extension` | 0 | Build and extension bundle completed |
 | `npm run test:package` | 0 | 19 tests, 19 pass, 0 fail, 0 skipped |
-| `git diff --check 6aff533..HEAD` | 0 | No whitespace errors |
+| `git diff --check 0265c72..HEAD` | 0 | No whitespace errors |
 
 `npm run pack:clean` was not rerun for this change. The package artifact section
 below was recorded earlier; `npm run test:package` rebuilds the tarball from a
@@ -53,7 +53,8 @@ copied in): across `test/runtime-identity-compat.test.mjs`,
 and `test/doctor-connect.test.mjs` that run gave 248 tests, 142 pass, 106 fail,
 and every test named below failed there, except the ones noted as guarding
 behavior that already worked. On the final code commit the same files pass as
-part of the full 917/917 run above.
+part of the full 923/923 run above (the count includes the later failure-path
+regressions recorded below).
 
 | # | Fix | Regression tests (file: title) |
 | --- | --- | --- |
@@ -71,6 +72,57 @@ a reference. If a target path contains the credential and the variable is chosen
 only by answering the wizard prompt, the earlier target-summary lines have
 already been printed; the result and error output after the prompt are redacted.
 Matching is literal, so only the variable's value itself is masked.
+
+## Credential redaction on validation-failure paths
+
+Fix 7 covered reports produced after a configuration validated. Two failure paths
+still printed the selected project's credential value, for example when the value
+appeared in a file name, because the project's variable name was only registered
+after full validation succeeded. Both are fixed and covered by regression tests.
+
+| Defect | Path | Regression test (file: title) |
+| --- | --- | --- |
+| 1 | `heimdall setup` with a malformed existing coordinator file: the error message and targets named the coordinator path without masking the project's credential value | `test/setup-cli.test.mjs`: "a project credential reference is redacted when the coordinator file is malformed" (human and JSON modes) |
+| 2 | `heimdall doctor` with an invalid project configuration: the `project.config` message and the targets named the project path without masking the credential value | `test/doctor.test.mjs`: "a project credential reference is redacted when project validation fails" (human and JSON modes) |
+
+Each test runs the built CLI in a fresh sandbox with a synthetic opaque value in
+the environment variable named by the project file and in the path of the failing
+file. It asserts the unchanged exit status and error code, a useful message, the
+`[redacted]` marker where the value was, readable non-secret paths, a single
+schema-valid JSON document, the value absent from stdout, stderr and every JSON string,
+unchanged fixture bytes, modes, modification times and directory listing, no
+service or state artifacts, and no network attempts. Controls: "an invalid project
+credential reference still fails full validation without leaking" (setup) and "an
+invalid project credential reference still fails project validation" (doctor)
+show that an invalid variable name is still rejected by full validation.
+Supporting unit tests: `test/config.test.mjs` ("credentialReference extracts only
+a valid variable name from parseable TOML and never throws") and
+`test/setup-cli.test.mjs` ("the redactor resolves credential references only from
+own string properties of the supplied environment").
+
+Baseline versus fixed, using the two regression tests above:
+
+```sh
+node --test --test-name-pattern 'a project credential reference is redacted when the coordinator file is malformed|a project credential reference is redacted when project validation fails' test/setup-cli.test.mjs test/doctor.test.mjs
+```
+
+| Build | How it was built | Result |
+| --- | --- | --- |
+| Baseline `0265c72` | `git archive 0265c72` extracted into a temporary directory outside the checkout, its own `npm ci --ignore-scripts` and `npm run build`, then this branch's test files copied in unchanged and `npm run build` again | Exit 1: 2 tests, 0 pass, 2 fail. Both failed on the assertion that the credential value did not appear in output (setup: in the coordinator path of the human-mode error; doctor: in the `project.config` path). Setup is asserted in human mode first, so its JSON half is not reached on the baseline |
+| Fixed `d6b9d39` | `npm run build` in the checkout | Exit 0: 2 tests, 2 pass, 0 fail |
+
+On the baseline, `test/config.test.mjs` fails only because the new
+`credentialReference` export does not exist there; that is not evidence for the
+defects. The temporary baseline directory was removed afterwards.
+
+How it works: `credentialReference` in `src/config.ts` parses a project file with
+the normal TOML parser and returns only a syntactically valid variable name from
+`opencode.passwordEnvironmentVariable`, never throwing and never returning other
+content. `heimdall setup` and `heimdall doctor` register that name with the output
+redactor as soon as the project file is read, before any validation can fail. The
+redactor now resolves a reference only from own string properties of the supplied
+environment. Validation results, messages, exit statuses and what the connection
+check receives are unchanged.
 
 ## Package artifact
 
@@ -194,7 +246,17 @@ metadata, not results from a run. Nothing was pushed to obtain CI evidence.
 
 ## Scope review
 
-`git diff --stat 6aff533..HEAD` (before this record) shows 17 files:
+Failure-path redaction work: `git diff --stat 0265c72..HEAD` (before this record
+update) shows 8 files: `src/config.ts`, `src/setup/core.ts`, `src/setup/cli.ts`,
+`src/doctor/checks.ts`, `src/doctor/cli.ts`, `test/config.test.mjs`,
+`test/doctor.test.mjs` and `test/setup-cli.test.mjs`, with 229 insertions and 11
+deletions. `AGENTS.md`, `prompts/`, roles, `examples/`, `package.json`, the
+lockfile and `.github/workflows/` are unchanged. The new tests are matched by the
+existing workflow patterns (`test/*.test.mjs` in the `baseline` job and
+`test/setup-*.test.mjs test/doctor*.test.mjs` in `installed-package`), so the
+workflow needed no change.
+
+Earlier installation work: `git diff --stat 6aff533..HEAD` (before that record) showed 17 files:
 `src/workflow/runtime-identity.ts`, `src/coordinator/runtime-snapshot.ts`,
 `src/setup/` (`cli.ts`, `core.ts`, `publish.ts`, `wizard.ts`), `src/doctor/`
 (`checks.ts`, `cli.ts`), seven test files, `docs/installation.md` and
@@ -215,13 +277,20 @@ use synthetic paths and sentinel values.
 - The coordinator was not started, no run was submitted and no execution was
   verified by this work.
 - Windows is unsupported and untested.
-- Everything above was run on a single macOS host with Node.js v22.22.3. Linux,
+- Everything above, including the failure-path regressions, was run on a single
+  macOS host with Node.js v22.22.3 and npm 10.9.8. Linux,
   Node.js 22.19.0 exactly and Node.js 24 were not run; they depend on the
   pending, not executed `installed-package` CI job, and nothing was pushed to
   obtain CI evidence. No platform parity is claimed.
 - Fix 7 redacts literal credential values only, and cannot unprint output the
   wizard wrote before it learned a reference (see the note under the regression
   table).
+- The failure-path redaction also masks literal values only. It needs a project
+  file that parses as TOML and names a valid variable; for an unparseable project
+  file nothing can be collected. `heimdall setup` reads the coordinator file
+  before the project file, so when the coordinator file cannot be read (a
+  symbolic link, not a regular file or unreadable), setup fails before it has the
+  project's reference and does not mask that value. Read order was not changed.
 - The PTY wizard tests need `python3` with the `pty` module; they skip with an
   explicit reason where it is missing (they ran, not skipped, in the local
   results above).
