@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { parseConfiguration, type Configuration } from '../config.js';
+import { credentialReference, parseConfiguration, type Configuration } from '../config.js';
 import { parseCoordinatorConfiguration, type CoordinatorConfiguration } from '../coordinator/config.js';
 import { admitRuntime, sourcePackageRoot } from '../coordinator/runtime-snapshot.js';
 import type { ConnectionOptions } from '../opencode/observer.js';
@@ -71,6 +71,13 @@ export interface DoctorReport {
   verification: DoctorVerification;
   error: { code: 'invalid-input' | 'unexpected'; message: string } | null;
 }
+
+/**
+ * What the local checks learned about the selected project before any validation finished. `credentialReferences` are
+ * names of environment variables that hold credentials; they are used only to sanitize output and never make a
+ * configuration valid.
+ */
+export interface DoctorTrace { credentialReferences?: string[] }
 
 const execute = promisify(execFile);
 const errorCode = (error: unknown): string | undefined => (error as NodeJS.ErrnoException | null)?.code;
@@ -152,7 +159,7 @@ export function resolveDoctorTargets(input: DoctorInput, options: DoctorOptions 
  * Runs every offline, read-only local check. Nothing here writes, creates, changes permissions, starts a process other than
  * `git` read commands, or opens a network connection. Never throws for a problem the report can describe.
  */
-export async function runLocalChecks(input: DoctorInput, options: DoctorOptions = {}): Promise<{ checks: DoctorCheck[]; targets: DoctorTargets; projectDirectory?: string; configuration?: Configuration }> {
+export async function runLocalChecks(input: DoctorInput, options: DoctorOptions = {}, trace: DoctorTrace = {}): Promise<{ checks: DoctorCheck[]; targets: DoctorTargets; projectDirectory?: string; configuration?: Configuration }> {
   const checks: DoctorCheck[] = [];
   const targets: DoctorTargets = { projectDirectory: null, projectConfig: null, coordinatorConfig: null, stateDirectory: null };
   const add = (id: string, status: CheckStatus, fatal: boolean, message: string): void => { checks.push({ id, status, fatal, message }); };
@@ -252,6 +259,9 @@ export async function runLocalChecks(input: DoctorInput, options: DoctorOptions 
     targets.projectConfig = projectFile;
     const source = await readRegularFile(projectFile);
     if ('content' in source) {
+      // Sanitization context only: collected before full validation so a validation failure cannot lose it.
+      const reference = credentialReference(source.content);
+      if (reference !== undefined) (trace.credentialReferences ??= []).push(reference);
       try {
         configuration = parseConfiguration(source.content, { projectDirectory, file: projectFile });
         add('project.config', 'pass', true, `Project configuration ${projectFile} is valid`);
