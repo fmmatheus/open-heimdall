@@ -297,7 +297,13 @@ export async function runLocalChecks(input: DoctorInput, options: DoctorOptions 
     for (const [label, file] of files) {
       if (!file) continue;
       const stats = await fs.stat(file).catch(() => undefined);
-      if (stats?.isFile() && (stats.mode & 0o044) !== 0) findings.push(`${label} ${file} is readable by group or others (mode ${(stats.mode & 0o777).toString(8).padStart(3, '0')}); consider chmod 600`);
+      if (!stats?.isFile()) continue;
+      const readable = (stats.mode & 0o044) !== 0;
+      const writable = (stats.mode & 0o022) !== 0;
+      if (readable || writable) {
+        const access = readable && writable ? 'readable and writable' : writable ? 'writable' : 'readable';
+        findings.push(`${label} ${file} is ${access} by group or others (mode ${(stats.mode & 0o777).toString(8).padStart(3, '0')}); consider chmod 600`);
+      }
     }
     const seen = new Set<string>();
     for (const directory of directories) {
@@ -307,7 +313,7 @@ export async function runLocalChecks(input: DoctorInput, options: DoctorOptions 
     }
   }
   if (findings.length) add('permissions', 'warn', false, `${findings.join('; ')}. Advisory only; doctor never changes permissions.`);
-  else add('permissions', 'pass', false, 'No group- or world-accessible configuration files or writable directories were found');
+  else add('permissions', 'pass', false, 'No configuration files readable or writable by group or others, and no group- or world-writable directories, were found');
 
   return { checks, targets, ...(projectDirectory === undefined ? {} : { projectDirectory }), ...(configuration === undefined ? {} : { configuration }) };
 }

@@ -20,7 +20,7 @@ import { runLocalChecks, type DoctorCheck, type DoctorInput, type DoctorOptions,
  *   checks         [{ id, status, fatal, message }]
  *                  status: "pass" | "fail" | "warn" | "not-verified" | "skipped"
  *                  fatal: true for a required check (only a "fail" status on it makes ok false), false for advisory checks
- *   verification   { local: "passed" | "failed",
+ *   verification   { local: "passed" | "failed" (from the local checks only; a failed connection check does not change it),
  *                    connection: "not-requested" | "verified" | "failed",
  *                    protectedApiAuthorization, modelAvailability, providerLogin, quota: always "unverified" }
  *   error          null, or { code: "invalid-input" | "unexpected", message } when no checks could run
@@ -120,20 +120,23 @@ export interface DoctorCommandOptions extends DoctorOptions {
 
 const NO_TARGETS: DoctorTargets = { projectDirectory: null, projectConfig: null, coordinatorConfig: null, stateDirectory: null };
 
-function verificationFor(ok: boolean, connect: boolean): DoctorVerification {
-  return { local: ok ? 'passed' : 'failed', connection: connect ? 'failed' : 'not-requested', protectedApiAuthorization: 'unverified', modelAvailability: 'unverified', providerLogin: 'unverified', quota: 'unverified' };
+const requiredFailed = (check: DoctorCheck): boolean => check.fatal && check.status === 'fail';
+
+function verificationFor(local: boolean, connection: DoctorVerification['connection']): DoctorVerification {
+  return { local: local ? 'passed' : 'failed', connection, protectedApiAuthorization: 'unverified', modelAvailability: 'unverified', providerLogin: 'unverified', quota: 'unverified' };
 }
 
+/** The local verdict comes from the local checks only; `ok` also requires a requested connection check to pass. */
 function buildReport(checks: DoctorCheck[], targets: DoctorTargets, connection: ConnectionResult, connect: boolean): DoctorReport {
+  const local = !checks.some(requiredFailed);
   const all = [...checks, connection.check];
-  const ok = !all.some(check => check.fatal && check.status === 'fail');
-  const verification = verificationFor(ok, connect);
-  if (connect) verification.connection = connection.verified ? 'verified' : 'failed';
+  const ok = !all.some(requiredFailed);
+  const verification = verificationFor(local, connect ? (connection.verified ? 'verified' : 'failed') : 'not-requested');
   return { schemaVersion: 1, ok, targets, checks: all, verification, error: null };
 }
 
 function failureReport(code: 'invalid-input' | 'unexpected', message: string, connect: boolean): DoctorReport {
-  return { schemaVersion: 1, ok: false, targets: { ...NO_TARGETS }, checks: [], verification: verificationFor(false, connect), error: { code, message } };
+  return { schemaVersion: 1, ok: false, targets: { ...NO_TARGETS }, checks: [], verification: verificationFor(false, connect ? 'failed' : 'not-requested'), error: { code, message } };
 }
 
 function redactReport(report: DoctorReport, redact: (text: string) => string): DoctorReport {
@@ -155,9 +158,11 @@ function humanReport(report: DoctorReport): string {
   if (targets.stateDirectory) lines.push(`Coordinator state directory: ${targets.stateDirectory}`);
   lines.push('');
   for (const check of report.checks) lines.push(`[${check.status}] ${check.id}${check.fatal ? '' : ' (advisory)'}: ${check.message}`);
-  const counts = (status: string): number => report.checks.filter(check => check.status === status).length;
-  const failed = counts('fail');
-  lines.push('', report.ok
+  // The connection check has its own line below; the local summary counts the local checks only.
+  const localChecks = report.checks.filter(check => check.id !== 'connection');
+  const counts = (status: string): number => localChecks.filter(check => check.status === status).length;
+  const failed = localChecks.filter(requiredFailed).length;
+  lines.push('', report.verification.local === 'passed'
     ? `Local checks passed (${counts('pass')} passed, ${counts('warn')} warnings, ${counts('skipped')} skipped).`
     : `Local checks failed: ${failed} required check${failed === 1 ? '' : 's'} failed.`);
   lines.push({
@@ -183,7 +188,7 @@ export async function doctorMain(args: readonly string[], options: DoctorCommand
     else if (safe.error) stderr.write(`Heimdall doctor: ${safe.error.message}\n`);
     else {
       stdout.write(humanReport(safe));
-      const failed = safe.checks.filter(check => check.fatal && check.status === 'fail').map(check => check.id);
+      const failed = safe.checks.filter(requiredFailed).map(check => check.id);
       if (failed.length) stderr.write(`Heimdall doctor: required check${failed.length === 1 ? '' : 's'} failed: ${failed.join(', ')}\n`);
     }
     return safe.ok ? 0 : 1;
