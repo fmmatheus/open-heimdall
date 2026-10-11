@@ -158,7 +158,21 @@ Setup never overwrites. If you pass an explicit value that disagrees with an
 existing file (for example a different `--opencode-url`), setup fails with a
 `conflict` error naming the key, the existing value and the requested value. Omit
 the option to reuse the existing value, or choose a new destination with
-`--config` or `--coordinator-config`. An existing project file that still holds
+`--config` or `--coordinator-config`.
+
+Values are compared with what the existing file actually uses. An existing
+coordinator file is judged by its own effective state directory and limits, so
+rerunning setup without `--state-directory` reuses it even where the default
+state directory would not fit in a socket path (for example under a very long
+home directory); the default is evaluated only when setup would create the
+coordinator file. A project file without an `executorCandidates` pool is
+compared by its effective primary executor: `--executor-model` against
+`workflow.executorModel` and `--quota-provider` against the provider that model
+prefix implies (`claude-code/` models use `claude-code`, other models
+`anthropic`), so passing those matching values reuses the file. With a pool, only
+the first candidate is compared.
+
+An existing project file that still holds
 template placeholders or has no endpoint fails as `incomplete-configuration`;
 edit it yourself or choose another destination.
 
@@ -166,8 +180,10 @@ The coordinator file is published first, then the project file. If writing the
 second file fails after the first was published, the result is **partial**:
 nothing is rolled back, the error names the file that was created and the one
 that is incomplete, and rerunning the same command finishes the missing file and
-reuses the first. Rerunning a successful setup is safe: it reuses both files and
-reports that nothing changed.
+reuses the first. Directories are never removed either: if a directory cannot be
+created, `createdDirectories` still lists every directory created before the
+failure, and a rerun lists only the directories it newly creates. Rerunning a
+successful setup is safe: it reuses both files and reports that nothing changed.
 
 ### Exit codes and JSON output
 
@@ -185,14 +201,18 @@ errors, and stderr stays empty. Schema version 1:
 | `ok` | `true` when both configuration files are complete (created or reused). |
 | `projectDirectory` | Canonical Git project directory, or `null` if it was not determined. |
 | `targets` | `{ "coordinator": { "path", "outcome" }, "project": { "path", "outcome" } }`. `outcome` is `created`, `reused`, `not-written` or `failed`; `path` may be `null`. |
-| `createdDirectories` | Configuration parent directories this invocation created. |
+| `createdDirectories` | Configuration parent directories this invocation created, including those created before a failure. |
 | `verification` | `{ "level", "unverified" }`. `level` is `configuration-validated` (the files passed the configuration validators) or `none`. `unverified` always lists `opencode-connection`, `model-availability`, `provider-login` and `quota`. |
 | `error` | `null`, or `{ "code", "message", "missing" }`. `code` is one of `invalid-input`, `missing-input`, `no-git-project`, `no-commit`, `invalid-destination`, `invalid-configuration`, `incomplete-configuration`, `conflict`, `identical-destinations`, `destination-exists`, `write-failed` or `unexpected`. `missing` lists flag names for `missing-input` and setting keys for `incomplete-configuration`. |
 | `partial` | `null`, or `{ "created": [...], "incomplete": [...] }` when one file was published and the other was not. |
 | `warnings` | Array of strings. |
 
 All strings are redacted: credential values taken from the environment, URL user
-information and Authorization-style values never appear in output.
+information and Authorization-style values never appear in output. This includes
+the value of the environment variable named by `--password-env` (in either the
+`--password-env NAME` or `--password-env=NAME` form), chosen in the wizard or
+named by the existing project file that setup reuses, whatever the variable is
+called.
 
 Example of a successful result (abbreviated paths):
 
@@ -300,13 +320,17 @@ The local checks cover:
 - the project is in a Git project that has a commit;
 - the installed runtime: built code, prompts, agent files and configuration
   templates are present, the package identity can be computed, the declared
-  dependencies resolve, and the pinned quota package is installed;
+  dependencies resolve, and the pinned quota package is installed. An installed
+  dependency whose `package.json` cannot be read, is not a JSON object or has no
+  version cannot be identified and fails this check; the report names the
+  dependency but never quotes the file;
 - the coordinator configuration and the project configuration are valid, and the
   project configuration is complete (real models and an OpenCode endpoint);
 - the configured state, workflow and plan directories, and the prompt files, are
   usable. A state directory that does not exist yet is not a failure;
-- an advisory permissions check for group- or world-accessible configuration
-  files and writable directories. It only reports; it never changes anything.
+- an advisory permissions check for configuration files that group or others can
+  read or write, and for group- or world-writable directories. It only reports;
+  it never changes anything.
 
 ### Connection check
 
@@ -332,7 +356,10 @@ run.
 
 Exit status is **0** when no required check failed and **1** otherwise. A
 requested connection check that fails is required. Warnings, advisory checks and
-unverified items never change the exit status. In human mode the report goes to
+unverified items never change the exit status. The "Local checks" line of the
+human report and `verification.local` describe the local checks only, so a failed
+connection check makes `ok` false and the exit status 1 while the local verdict
+stays `passed`. In human mode the report goes to
 stdout and diagnostics to stderr.
 
 With `--json`, stdout carries exactly one JSON document and stderr stays empty.
@@ -344,7 +371,7 @@ Schema version 1:
 | `ok` | `true` unless a required check failed or the arguments were invalid. |
 | `targets` | `{ "projectDirectory", "projectConfig", "coordinatorConfig", "stateDirectory" }`, each a string or `null`. |
 | `checks` | Array of `{ "id", "status", "fatal", "message" }`. `status` is `pass`, `fail`, `warn`, `not-verified` or `skipped`. `fatal` is `true` for a required check, whose `fail` makes `ok` false, and `false` for advisory checks. |
-| `verification` | `{ "local": "passed" \| "failed", "connection": "not-requested" \| "verified" \| "failed", "protectedApiAuthorization", "modelAvailability", "providerLogin", "quota" }`. The last four are always `"unverified"`. |
+| `verification` | `{ "local": "passed" \| "failed" (local checks only), "connection": "not-requested" \| "verified" \| "failed", "protectedApiAuthorization", "modelAvailability", "providerLogin", "quota" }`. The last four are always `"unverified"`. |
 | `error` | `null`, or `{ "code": "invalid-input" \| "unexpected", "message" }` when no checks could run. |
 
 Strings are redacted in the same way as setup output.
