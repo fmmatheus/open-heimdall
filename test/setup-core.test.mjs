@@ -203,6 +203,66 @@ test('rich existing files are reused byte for byte and explicit matching inputs 
   assert.match(second.error.message, /executorCandidates\[0\]\.model is "claude-code\/sonnet", but "kimi-code-plan-global\/k2" was requested/);
 });
 
+const legacyProject = model => `[workflow]
+plannerModel = "anthropic/p"
+executorModel = "${model}"
+executorFallbackModel = "${model}"
+[opencode]
+baseUrl = "http://127.0.0.1:4096"
+`;
+
+test('legacy files without a candidate pool are compared by the effective primary candidate', async t => {
+  for (const [model, provider, other] of [['anthropic/sonnet-x', 'anthropic', 'openai'], ['claude-code/sonnet', 'claude-code', 'anthropic']]) {
+    const s = await sandbox(t);
+    assert.equal((await s.run({ plannerModel: 'anthropic/p', executorModel: model, quotaProvider: provider, opencodeUrl: 'http://127.0.0.1:4096', opencodeAuth: 'basic', stateDirectory: path.join(s.root, 'st') })).ok, true);
+    const content = legacyProject(model);
+    await fs.writeFile(s.projectFile, content);
+    const before = await tree(s.root);
+    const bytes = [await fs.readFile(s.coordinatorFile), await fs.readFile(s.projectFile)];
+    const mtimes = [(await fs.stat(s.coordinatorFile)).mtimeMs, (await fs.stat(s.projectFile)).mtimeMs];
+    for (const input of [{ quotaProvider: provider }, { executorModel: model, quotaProvider: provider }, { executorModel: model }]) {
+      const result = await s.run(input);
+      assert.equal(result.ok, true, JSON.stringify(result.error));
+      assert.deepEqual([result.targets.coordinator.outcome, result.targets.project.outcome], ['reused', 'reused']);
+    }
+    assert.deepEqual(await tree(s.root), before);
+    assert.deepEqual([await fs.readFile(s.coordinatorFile), await fs.readFile(s.projectFile)], bytes);
+    assert.deepEqual([(await fs.stat(s.coordinatorFile)).mtimeMs, (await fs.stat(s.projectFile)).mtimeMs], mtimes);
+    assert.equal(await read(s.projectFile), content);
+    for (const wrong of [other, 'kimi']) {
+      const result = await assertRejected(s, { quotaProvider: wrong }, 'conflict');
+      assert.ok(result.error.message.includes(`${s.projectFile}: effective quota provider of workflow.executorModel is ${JSON.stringify(provider)}, but ${JSON.stringify(wrong)} was requested`), result.error.message);
+    }
+    const otherModel = model.startsWith('claude-code/') ? 'claude-code/other' : 'anthropic/other';
+    const differentModel = await assertRejected(s, { executorModel: otherModel, quotaProvider: provider }, 'conflict');
+    assert.ok(differentModel.error.message.includes(`${s.projectFile}: workflow.executorModel is ${JSON.stringify(model)}, but ${JSON.stringify(otherModel)} was requested`), differentModel.error.message);
+    assert.deepEqual(await tree(s.root), before);
+    assert.equal(await read(s.projectFile), content);
+  }
+});
+
+test('a rich candidate pool compares only the first candidate model and provider', async t => {
+  const s = await sandbox(t);
+  const coordinatorFile = path.join(s.root, 'conf', 'coordinator.toml');
+  await fs.mkdir(path.dirname(coordinatorFile));
+  await fs.writeFile(coordinatorFile, richCoordinator);
+  await fs.writeFile(s.projectFile, richProject);
+  const before = await tree(s.root);
+  const base = { coordinatorConfigPath: coordinatorFile };
+  for (const input of [{ quotaProvider: 'claude-code' }, { executorModel: 'claude-code/sonnet', quotaProvider: 'claude-code' }]) {
+    assert.equal((await s.run({ ...base, ...input })).ok, true);
+  }
+  assert.equal(await read(s.projectFile), richProject);
+  assert.deepEqual(await tree(s.root), before);
+  // The second candidate's provider and model are not the primary ones.
+  const secondProvider = await assertRejected(s, { ...base, quotaProvider: 'kimi' }, 'conflict');
+  assert.ok(secondProvider.error.message.includes(`${s.projectFile}: workflow.executorCandidates[0].quotaProvider is "claude-code", but "kimi" was requested`), secondProvider.error.message);
+  const derived = await assertRejected(s, { ...base, quotaProvider: 'anthropic' }, 'conflict');
+  assert.match(derived.error.message, /executorCandidates\[0\]\.quotaProvider is "claude-code", but "anthropic" was requested/);
+  assert.equal(await read(s.projectFile), richProject);
+  assert.deepEqual(await tree(s.root), before);
+});
+
 test('explicit values equal to loader defaults and equivalent paths are accepted', async t => {
   const s = await sandbox(t);
   const content = '[workflow]\nplannerModel = "anthropic/p"\nexecutorModel = "anthropic/e"\nexecutorFallbackModel = "anthropic/e"\n[opencode]\nbaseUrl = "http://[::1]:4096"\n';
@@ -219,10 +279,12 @@ test('explicit values equal to loader defaults and equivalent paths are accepted
     assert.equal(result.ok, true, JSON.stringify(result.error));
   }
   assert.equal(await read(s.projectFile), content);
-  // Without a candidate pool there is no quota provider to compare, so an explicit one conflicts.
-  const result = await s.run({ quotaProvider: 'anthropic' });
+  // Without a candidate pool the primary candidate is derived from executorModel: an anthropic/ model uses the anthropic provider.
+  assert.equal((await s.run({ executorModel: 'anthropic/e', quotaProvider: 'anthropic' })).ok, true);
+  assert.equal(await read(s.projectFile), content);
+  const result = await s.run({ quotaProvider: 'openai' });
   assert.equal(result.error.code, 'conflict');
-  assert.match(result.error.message, /executorCandidates\[0\]\.quotaProvider is none/);
+  assert.match(result.error.message, /effective quota provider of workflow\.executorModel is "anthropic", but "openai" was requested/);
 
   const relative = path.join(s.root, 'rel', 'coordinator.toml');
   await fs.mkdir(path.dirname(relative));
@@ -555,7 +617,10 @@ test('setup performs no network access and imports no network module', async t =
     if (seen.has(file)) continue;
     seen.add(file);
     const source = await read(file);
-    assert.doesNotMatch(source, /\bfetch\s*\(|XMLHttpRequest|WebSocket|EventSource/, file);
+    // The quota policy modules are imported only for executorCandidates; they hold the provider usage fetchers, which setup never calls.
+    // Their member calls such as provider.fetch(...) are allowed, a direct fetch(...) call is not.
+    const pattern = file.startsWith(path.join(distribution, 'policy') + path.sep) ? /(?<![.\w])fetch\s*\(|XMLHttpRequest|WebSocket|EventSource/ : /\bfetch\s*\(|XMLHttpRequest|WebSocket|EventSource/;
+    assert.doesNotMatch(source, pattern, file);
     for (const [, specifier] of source.matchAll(/(?:from|import)\s*\(?\s*['"]([^'"]+)['"]/g)) {
       if (specifier.startsWith('.')) pending.push(path.resolve(path.dirname(file), specifier));
       else external.add(specifier.replace(/^node:/, ''));

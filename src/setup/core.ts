@@ -5,6 +5,7 @@ import { TomlError } from 'smol-toml';
 import { parseConfiguration, type Configuration } from '../config.js';
 import { canonicalPlannedDirectory, parseCoordinatorConfiguration, positiveInteger, type CoordinatorConfiguration } from '../coordinator/config.js';
 import { inspectProject, resolveBaseCommit } from '../coordinator/worktrees.js';
+import { executorCandidates } from '../policy/quota.js';
 import { createDirectories, nodeFileOperations, publishNoClobber, PublishError, type SetupFileOperations } from './publish.js';
 
 /** Explicit setup decisions. Omitted values are taken from existing files or loader defaults. */
@@ -262,20 +263,21 @@ function compareCoordinator(file: string, existing: CoordinatorConfiguration, re
 }
 
 /**
- * The primary executor is the first `workflow.executorCandidates` entry (or `workflow.executorModel` when the file
- * defines no candidate pool). `--executor-model` and `--quota-provider` are compared with that entry only; further
+ * The primary executor is the first effective executor candidate: the first `workflow.executorCandidates` entry, or the
+ * entry derived from `workflow.executorModel` when the file defines no pool (its quota provider follows the model
+ * prefix, as at run time). `--executor-model` and `--quota-provider` are compared with that candidate only; further
  * pool entries, variants and limits are preserved and never compared.
  */
 function compareProject(file: string, existing: Configuration, requested: Requested): Conflict[] {
   const conflicts: Conflict[] = [];
   const add = (key: string, current: string, wanted: string): void => { conflicts.push({ file, key, existing: current, requested: wanted }); };
-  const primary = existing.settings.executorCandidates?.[0];
+  const pooled = existing.settings.executorCandidates !== undefined;
+  const primary = executorCandidates(existing.settings)[0]!;
   if (requested.plannerModel !== undefined && requested.plannerModel !== existing.settings.plannerModel) add('workflow.plannerModel', quote(existing.settings.plannerModel), quote(requested.plannerModel));
   if (requested.executorModel !== undefined) {
-    const current = primary?.model ?? existing.settings.executorModel;
-    if (requested.executorModel !== current) add(primary ? 'workflow.executorCandidates[0].model' : 'workflow.executorModel', quote(current), quote(requested.executorModel));
+    if (requested.executorModel !== primary.model) add(pooled ? 'workflow.executorCandidates[0].model' : 'workflow.executorModel', quote(primary.model), quote(requested.executorModel));
   }
-  if (requested.quotaProvider !== undefined && requested.quotaProvider !== primary?.quotaProvider) add('workflow.executorCandidates[0].quotaProvider', primary ? quote(primary.quotaProvider) : 'none (the file defines no executorCandidates)', quote(requested.quotaProvider));
+  if (requested.quotaProvider !== undefined && requested.quotaProvider !== primary.quotaProvider) add(pooled ? 'workflow.executorCandidates[0].quotaProvider' : 'effective quota provider of workflow.executorModel', quote(primary.quotaProvider), quote(requested.quotaProvider));
   if (requested.opencodeUrl !== undefined && (existing.opencode.baseUrl === undefined || new URL(requested.opencodeUrl).href !== new URL(existing.opencode.baseUrl).href)) add('opencode.baseUrl', existing.opencode.baseUrl === undefined ? 'unset' : quote(existing.opencode.baseUrl), quote(requested.opencodeUrl));
   const authentication = existing.opencode.authentication ?? 'basic';
   if (requested.opencodeAuth !== undefined && requested.opencodeAuth !== authentication) add('opencode.authentication', quote(authentication), quote(requested.opencodeAuth));
