@@ -18,13 +18,17 @@ function localURL(value: string): URL {
   return url;
 }
 
-export function createAPI({ baseUrl, password, authentication = 'basic', desktop, directory, fetchImpl = fetch }: {
+/** Per-request deadline; callers may shorten it (tests) but the default is the supported behavior. */
+export const defaultRequestTimeoutMilliseconds = 10000;
+
+export function createAPI({ baseUrl, password, authentication = 'basic', desktop, directory, fetchImpl = fetch, timeoutMilliseconds = defaultRequestTimeoutMilliseconds }: {
   baseUrl: string;
   password?: string;
   authentication?: OpenCodeAuthentication;
   desktop?: DesktopClientConnection;
   directory: string;
   fetchImpl?: typeof fetch;
+  timeoutMilliseconds?: number;
 }): SessionAPI {
   const base = localURL(baseUrl);
   if (!['basic', 'none', 'openchamber'].includes(authentication) || !directory || (authentication === 'basic' && (typeof password !== 'string' || !password))) throw new Error('Invalid configured OpenCode connection');
@@ -41,7 +45,7 @@ export function createAPI({ baseUrl, password, authentication = 'basic', desktop
       const url = new URL(route, base);
       if (url.origin !== base.origin || !url.pathname.startsWith('/api/')) throw new Error('V2 API route required');
       url.searchParams.set('location[directory]', directory);
-      const timeout = signal ? AbortSignal.any([signal, AbortSignal.timeout(10000)]) : AbortSignal.timeout(10000);
+      const timeout = signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMilliseconds)]) : AbortSignal.timeout(timeoutMilliseconds);
       let response: Response;
       try {
         response = await fetchImpl(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: timeout, redirect: 'error' });
@@ -63,6 +67,8 @@ export interface ConnectionOptions {
   fetchImpl?: typeof fetch;
   readFS?: Pick<typeof fs, 'realpath'>;
   openchamber?: DesktopConnectionOptions;
+  /** Per-request deadline; defaults to 10000 ms. */
+  timeoutMilliseconds?: number;
 }
 
 /** Uses the explicit loopback endpoint and only its selected authentication source. */
@@ -74,13 +80,14 @@ export async function connect(directory: string, sessionID?: string, {
   fetchImpl = fetch,
   readFS = fs,
   openchamber,
+  timeoutMilliseconds,
 }: ConnectionOptions = {}): Promise<SessionAPI> {
   if (!baseUrl) throw new Error('Configure opencode.baseUrl before executing a workflow');
   if (!['basic', 'none', 'openchamber'].includes(authentication)) throw new Error('Invalid OpenCode authentication mode');
   const password = authentication === 'basic' ? environment[passwordEnvironmentVariable] : undefined;
   if (authentication === 'basic' && (typeof password !== 'string' || !password)) throw new Error('Set the configured OpenCode password environment variable');
   const desktop = authentication === 'openchamber' ? await readDesktopConnection(localURL(baseUrl), environment, openchamber) : undefined;
-  const api = createAPI({ baseUrl, password, authentication, desktop, directory, fetchImpl });
+  const api = createAPI({ baseUrl, password, authentication, desktop, directory, fetchImpl, ...(timeoutMilliseconds === undefined ? {} : { timeoutMilliseconds }) });
   const info = await api.request('/api/info');
   if (!record(info) || info.version !== supportedOpenCodeVersion || !Number.isInteger(info.pid) || (info.pid as number) < 1) {
     throw new Error('Configured server does not match supported OpenCode ' + supportedOpenCodeVersion);
