@@ -27,23 +27,29 @@ export const nodeFileOperations: SetupFileOperations = {
 };
 
 export class PublishError extends Error {
-  constructor(readonly kind: 'exists' | 'failed', message: string, options?: ErrorOptions) {
+  /** Directories this call created before it failed; they are never removed. */
+  readonly createdDirectories: string[];
+  constructor(readonly kind: 'exists' | 'failed', message: string, options?: ErrorOptions & { createdDirectories?: string[] }) {
     super(message, options);
     this.name = 'PublishError';
+    this.createdDirectories = options?.createdDirectories ?? [];
   }
 }
 
 const errorCode = (error: unknown): string | undefined => (error as NodeJS.ErrnoException | null)?.code;
 const reason = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
-/** Creates the missing directories in order with mode 0700 and returns those this call created; existing ones are never touched. */
+/**
+ * Creates the missing directories in order with mode 0700 and returns those this call created; existing ones are never touched.
+ * When a later directory fails, the thrown error lists the directories created before it.
+ */
 export async function createDirectories(directories: string[], operations: SetupFileOperations = nodeFileOperations): Promise<string[]> {
   const created: string[] = [];
   for (const directory of directories) {
     try { await operations.mkdir(directory, 0o700); created.push(directory); }
     catch (error) {
       if (errorCode(error) === 'EEXIST') continue;
-      throw new PublishError('failed', `Cannot create directory ${directory}: ${reason(error)}`, { cause: error });
+      throw new PublishError('failed', `Cannot create directory ${directory}: ${reason(error)}`, { cause: error, createdDirectories: created });
     }
   }
   return created;

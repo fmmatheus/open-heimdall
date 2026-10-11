@@ -538,6 +538,72 @@ test('a failure after the first file was published reports a partial outcome and
   await assertNoNetworkAttempts(s);
 });
 
+test('a directory failure after the first file was published reports the directories created, in JSON and human output', async t => {
+  for (const json of [true, false]) {
+    const s = await sandbox(t);
+    const projectParent = path.join(s.project, 'conf');
+    const projectDirectory = path.join(projectParent, 'nested');
+    const projectFile = path.join(projectDirectory, '.heimdall.toml');
+    const coordinatorParents = [path.join(s.home, '.config'), path.join(s.home, '.config', 'heimdall')];
+    const failing = { mkdir: async (directory, directoryMode) => {
+      if (directory === projectDirectory) throw Object.assign(new Error('simulated mkdir failure'), { code: 'EIO' });
+      await fs.mkdir(directory, { mode: directoryMode });
+    } };
+    const run = async (extra, operations) => {
+      const captured = streams({ stdinTTY: false, stdoutTTY: false });
+      const status = await setupMain([...complete, '--config', projectFile, ...extra], { ...captured, environment: s.env, cwd: s.project, homeDirectory: s.home, ...(operations ? { operations } : {}) });
+      return { status, out: captured.out.join(''), err: captured.err.join('') };
+    };
+    const afterFailure = ['home/', 'home/.config/', 'home/.config/heimdall/', 'home/.config/heimdall/coordinator.toml', 'project/', 'project/conf/'];
+
+    const failed = await run(json ? ['--json'] : [], failing);
+    assert.equal(failed.status, 1);
+    assert.deepEqual(await tree(s.root), afterFailure);
+    if (json) {
+      assert.equal(failed.err, '');
+      const document = JSON.parse(failed.out);
+      assertSchema(document);
+      assert.equal(document.error.code, 'write-failed');
+      assert.deepEqual([document.targets.coordinator.outcome, document.targets.project.outcome], ['created', 'failed']);
+      assert.deepEqual(document.createdDirectories, [...coordinatorParents, projectParent]);
+      assert.deepEqual(document.partial, { created: [s.coordinatorFile], incomplete: [projectFile] });
+    } else {
+      assert.equal(failed.out, '');
+      assert.match(failed.err, /simulated mkdir failure/);
+      assert.match(failed.err, /Partial outcome: created .*coordinator\.toml; incomplete .*\.heimdall\.toml/);
+    }
+
+    const coordinatorBytes = await fs.readFile(s.coordinatorFile);
+    const rerun = await run(['--json']);
+    assert.equal(rerun.status, 0, rerun.out + rerun.err);
+    const finished = JSON.parse(rerun.out);
+    assert.deepEqual([finished.targets.coordinator.outcome, finished.targets.project.outcome], ['reused', 'created']);
+    assert.deepEqual(finished.createdDirectories, [projectDirectory]);
+    assert.deepEqual(await fs.readFile(s.coordinatorFile), coordinatorBytes);
+    await loadConfiguration({ projectDirectory: s.project, configPath: projectFile });
+  }
+});
+
+test('a first directory creation failure with some directories created is not a partial outcome', async t => {
+  const s = await sandbox(t);
+  const coordinatorDirectory = path.join(s.home, '.config', 'heimdall');
+  const failing = { mkdir: async (directory, directoryMode) => {
+    if (directory === coordinatorDirectory) throw Object.assign(new Error('simulated mkdir failure'), { code: 'EIO' });
+    await fs.mkdir(directory, { mode: directoryMode });
+  } };
+  const captured = streams({ stdinTTY: false, stdoutTTY: false });
+  const status = await setupMain([...complete, '--json'], { ...captured, environment: s.env, cwd: s.project, homeDirectory: s.home, operations: failing });
+  assert.equal(status, 1);
+  const document = JSON.parse(captured.out.join(''));
+  assertSchema(document);
+  assert.deepEqual(document.createdDirectories, [path.join(s.home, '.config')]);
+  assert.equal(document.partial, null);
+  assert.deepEqual([document.targets.coordinator.outcome, document.targets.project.outcome], ['failed', 'not-written']);
+  assert.deepEqual(await tree(s.root), ['home/', 'home/.config/', 'project/']);
+  assert.equal(await exists(s.coordinatorFile), false);
+  assert.equal(await exists(s.projectFile), false);
+});
+
 test('credentials in the environment, OpenChamber settings, URLs and paths never reach stdout or stderr', async t => {
   const s = await sandbox(t);
   const before = await tree(s.root);
