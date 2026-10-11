@@ -41,18 +41,22 @@ async function until(condition, signal, what = 'condition') {
  * host simulation that mirrors OpenCode's order: framework input check, then execute.before hooks, then the tool, then
  * execute.after. Report-only state is the real registry and the capability restricts through it.
  */
-async function fixture(t, script, { capability = 'verified', quota = goodQuota, usage, noProtocol = false, interruptFails = false } = {}) {
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'heimdall-repair-'));
-  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+async function fixture(t, script, { capability = 'verified', quota = goodQuota, usage, noProtocol = false, interruptFails = false, rebuild } = {}) {
+  // `rebuild` is a previous fixture: the same project directory and durable files, with a brand new plugin, supervisor, registry, gate and runner (a restarted host).
+  const directory = rebuild ? rebuild.directory : await fs.mkdtemp(path.join(os.tmpdir(), 'heimdall-repair-'));
+  if (!rebuild) t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const root = path.join(directory, '.heimdall');
-  await fs.mkdir(root);
-  await fs.writeFile(path.join(root, 'feature.md'), 'Synthetic feature');
-  await fs.writeFile(path.join(root, 'planner.md'), 'Planner contract');
-  await fs.writeFile(path.join(root, 'executor.md'), 'Executor contract');
-  await fs.writeFile(path.join(directory, '.heimdall.toml'), '[workflow]\nplannerModel = "anthropic/test-planner"\nexecutorModel = "anthropic/test-executor"\nexecutorFallbackModel = "openai/test-fallback"\n');
+  if (!rebuild) {
+    await fs.mkdir(root);
+    await fs.writeFile(path.join(root, 'feature.md'), 'Synthetic feature');
+    await fs.writeFile(path.join(root, 'planner.md'), 'Planner contract');
+    await fs.writeFile(path.join(root, 'executor.md'), 'Executor contract');
+    await fs.writeFile(path.join(directory, '.heimdall.toml'), '[workflow]\nplannerModel = "anthropic/test-planner"\nexecutorModel = "anthropic/test-executor"\nexecutorFallbackModel = "openai/test-fallback"\n');
+  }
   const stateRoot = path.join(root, 'state');
   const local = createLocalSubmissionStore(stateRoot);
-  const control = { crashed: false, saveFails: false, interruptFails };
+  // `crashed` models a dead process: every later save is silently lost. `onSave` can hold or fail a save before it lands.
+  const control = { crashed: false, saveFails: false, interruptFails, onSave: undefined };
   const saves = [], dispatches = [], interrupts = [];
   const prompts = new Map(), origins = new Map();
   let children = 0;
@@ -60,6 +64,8 @@ async function fixture(t, script, { capability = 'verified', quota = goodQuota, 
   const persistence = {
     load: async () => local.load(RUN),
     save: async state => {
+      if (control.crashed) return;
+      await control.onSave?.(state);
       if (control.saveFails) throw new Error('fenced: stale owner');
       saves.push(structuredClone(state));
       await fs.writeFile(stateFile + '.tmp', JSON.stringify(state));
@@ -761,4 +767,346 @@ test('a restriction without an allowance still denies every call with the legacy
   const event = { sessionID: 'legacy-child', agent: 'adr-executor', tools: { [RESULT_TOOL]: {}, edit: {} } };
   await f.hooks.get('session.context')(event);
   assert.deepEqual(event.tools, {});
+});
+
+// --- Concurrent submissions: the durable reporting state stays coherent and monotonic -----------------------------
+//
+// Pinned OpenCode executes the tool calls of one streamed assistant message concurrently, so a malformed call that is
+// still awaiting its quota check can overlap a valid submission that seals the boundary. These tests run that race
+// through the real plugin hooks, gate, supervisor and runner.
+
+const settled = promise => promise.then(value => ({ value }), error => ({ error }));
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const MARKERS = ['sealed', 'conflict', 'negative', 'refused'];
+
+/** One quota callback whose next call blocks until released (optionally then failing), to hold a repair's quota check. */
+function heldQuota({ failOnRelease = false } = {}) {
+  let armed = false, enter, free;
+  const entered = new Promise(resolve => { enter = resolve; });
+  const released = new Promise(resolve => { free = resolve; });
+  return {
+    arm: () => { armed = true; },
+    entered,
+    release: () => free(),
+    quota: async (...args) => {
+      if (armed) { armed = false; enter(); await released; if (failOnRelease) return { anthropic: { fetchedAt: Date.now(), errors: ['quota unavailable'], entries: [] } }; }
+      return goodQuota(...args);
+    },
+  };
+}
+
+/** Every checkpoint written for a task keeps what the previous one held for its active attempt: markers stay, the counter never drops. */
+function assertMonotonic(saves) {
+  let previous;
+  for (const [i, save] of saves.entries()) {
+    const before = previous?.submissionRepair;
+    if (before && previous.phase === save.phase && previous.index === save.index) {
+      const after = save.submissionRepair;
+      assert.ok(after, `save ${i} dropped the repair record`);
+      assert.ok(after.repairs >= before.repairs, `save ${i} lowered the repair counter ${before.repairs} -> ${after.repairs}`);
+      const active = save.attempt && save.attempt.status !== 'rejected' ? save.attempt.id : undefined;
+      for (const marker of MARKERS) if (active && before[marker]?.attemptId === active) assert.ok(after[marker], `save ${i} dropped the ${marker} marker`);
+    }
+    previous = save;
+  }
+}
+
+/**
+ * A malformed call holds at its quota check. Meanwhile one synthetic implementation call is still running when a valid
+ * submission is accepted: the boundary seals with a parallel conflict. The quota check is then released. `crash` makes
+ * every later save vanish (the host died), so only what was durable at the race point survives.
+ */
+async function conflictedSealRace(t, { crash = false } = {}) {
+  const q = heldQuota();
+  const seen = {};
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool, child }) => {
+    q.arm();
+    const repairing = settled(call(submitTool, malformed()));
+    await q.entered;
+    assert.equal(await f.supervisor.begin(child, 'synthetic_parallel_edit', 'edit'), true);
+    seen.accepted = await call(submitTool, completed({ summary: 'Conflicted work' }));
+    seen.sealed = await f.state();
+    q.release();
+    seen.repair = await repairing;
+    seen.race = await f.state();
+    seen.raceFile = await fs.readFile(path.join(f.directory, '.heimdall/state/runs', RUN, 'state.json'), 'utf8');
+    if (crash) f.control.crashed = true;
+    return SPOKEN;
+  }], { quota: q.quota });
+  seen.result = await f.start();
+  return { f, seen };
+}
+
+test('a malformed call whose quota check is held cannot erase the seal and conflict of a valid submission accepted meanwhile', async t => {
+  const { f, seen } = await conflictedSealRace(t);
+  const attemptId = f.dispatches[1].attemptId;
+  assert.equal(seen.accepted.accepted, true);
+  assert.equal(seen.sealed.submissionRepair.sealed.attemptId, attemptId, 'the seal was durable before the receipt was acknowledged');
+  assert.equal(seen.sealed.submissionRepair.conflict.kind, 'parallel');
+  assert.notEqual(seen.repair.value?.repairable, true, 'no repair feedback after the boundary sealed');
+  assert.equal(seen.race.submissionRepair.sealed?.attemptId, attemptId, 'the released repair check kept the durable seal');
+  assert.equal(seen.race.submissionRepair.conflict?.attemptId, attemptId, 'and the durable conflict');
+  assert.equal(seen.race.submissionRepair.repairs, 0, 'a repair that was never granted is not counted');
+  assert.equal(seen.result.status, 'paused');
+  assert.match(seen.result.reason, /ran alongside or after the accepted submission/);
+  const state = await f.state();
+  assert.equal(state.results.length, 0, 'the conflicted receipt was not advanced');
+  assert.equal(state.submissionRepair.conflict.kind, 'parallel');
+  assert.equal(state.reportRecovery.diagnostic.code, 'conflicting_work');
+  assert.equal(f.dispatches.length, 2);
+  assert.equal(f.reportOnly.has('ses_child_2'), false, 'no restriction stayed behind');
+  assertMonotonic(f.saves);
+});
+
+test('crash at the race point (managed-style persistence): the rebuilt host reads the conflict, does not admit the receipt and dispatches fresh work', async t => {
+  const { f, seen } = await conflictedSealRace(t, { crash: true });
+  const attemptId = f.dispatches[1].attemptId;
+  // The durable checkpoint is exactly what existed at the race point: no catch/finally save of the dying process landed.
+  assert.equal(await fs.readFile(path.join(f.directory, '.heimdall/state/runs', RUN, 'state.json'), 'utf8'), seen.raceFile);
+  const durable = JSON.parse(seen.raceFile);
+  assert.equal(durable.submissionRepair.sealed?.attemptId, attemptId, 'the durable seal survived the delayed repair');
+  assert.equal(durable.submissionRepair.conflict?.attemptId, attemptId, 'the durable conflict survived the delayed repair');
+  assert.ok(await f.local.readSubmission(RUN, attemptId, 'executor-result'), 'the conflicted receipt is durable');
+  assert.equal(durable.results.length, 0);
+  // A brand new plugin/runner built from durable files only. The fresh dispatch submits nothing.
+  const g = await fixture(t, [async () => SPOKEN], { rebuild: f });
+  const resumed = await g.resume('Inspect after host restart');
+  assert.equal(resumed.status, 'paused', 'the conflicted receipt is not admitted');
+  assert.equal(g.dispatches.length, 1, 'a fresh attempt was dispatched instead of replaying the receipt');
+  assert.notEqual(g.dispatches[0].attemptId, attemptId);
+  const state = await g.state();
+  assert.equal(state.results.length, 0, 'zero admitted results');
+  assert.equal(state.reportRecovery.diagnostic.code, 'submission_missing');
+});
+
+test('crash at the race point, then the ordinary valid receipt of the fresh attempt advances exactly once', async t => {
+  const { f, seen } = await conflictedSealRace(t, { crash: true });
+  const conflicted = f.dispatches[1].attemptId;
+  const g = await fixture(t, [submitOk(completed({ summary: 'Fresh work' }))], { rebuild: f });
+  const resumed = await g.resume('Redo it');
+  assert.equal(resumed.status, 'completed');
+  assert.equal(g.dispatches.length, 1);
+  const state = await g.state();
+  assert.equal(state.results.length, 1, 'advanced exactly once');
+  assert.equal(state.results[0].summary, 'Fresh work', 'from the fresh attempt, never from the conflicted receipt');
+  assert.notEqual(state.attempt?.id, conflicted);
+  assert.equal(state.submissionRepair, undefined);
+  assert.equal(g.saves.filter(save => save.results.length === 1).length >= 1, true);
+  assert.equal(JSON.parse(seen.raceFile).results.length, 0);
+});
+
+test('a crash after an unconflicted valid acknowledgement replays the receipt once, without a dispatch, and does not advance twice', async t => {
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool }) => {
+    assert.equal((await call(submitTool, completed({ summary: 'Sealed work' }))).accepted, true);
+    f.control.crashed = true;
+    return SPOKEN;
+  }]);
+  await f.start();
+  const g = await fixture(t, [], { rebuild: f });
+  const resumed = await g.resume('Reconcile');
+  assert.equal(resumed.status, 'completed');
+  assert.equal(g.dispatches.length, 0);
+  const state = await g.state();
+  assert.equal(state.results.length, 1);
+  assert.equal(state.results[0].summary, 'Sealed work');
+});
+
+for (const [name, payload, pattern] of [
+  ['an unpassed gate with the handoff omitted', { status: 'completed', summary: 'Done', evidence: [unfinishedEvidence()] }, /Unfinished work for T1: gates G1/],
+  ['a blocked report without its reason', { status: 'blocked' }, /Agent blocked without a reason/],
+]) {
+  test(`${name} racing a held repair is retained: no repair feedback after it and the pause reason is the real outcome`, async t => {
+    const q = heldQuota();
+    const seen = {};
+    const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool, child }) => {
+      q.arm();
+      const repairing = settled(call(submitTool, malformed()));
+      await q.entered;
+      seen.negative = await call(submitTool, payload);
+      seen.recorded = await f.state();
+      q.release();
+      seen.repair = await repairing;
+      seen.race = await f.state();
+      seen.restricted = f.reportOnly.has(child);
+      return SPOKEN;
+    }, submitOk(completed())], { quota: q.quota });
+    const result = await f.start();
+    const attemptId = f.dispatches[1].attemptId;
+    assert.equal(seen.negative.code, 'negative');
+    assert.equal(seen.recorded.submissionRepair.negative.attemptId, attemptId);
+    assert.notEqual(seen.repair.value?.repairable, true, 'no repair feedback after the negative outcome');
+    assert.equal(seen.race.submissionRepair.negative?.attemptId, attemptId, 'the negative outcome stayed durable');
+    assert.equal(seen.race.submissionRepair.repairs, 0, 'no repair was granted or counted');
+    assert.equal(seen.restricted, false, 'the implementation tools were not restricted for a repair that was never offered');
+    assert.equal(result.status, 'paused');
+    assert.match(result.reason, pattern);
+    const state = await f.state();
+    assert.equal(state.results.length, 0);
+    assert.equal(state.submissionRepair.negative.attemptId, attemptId);
+    assert.equal(f.dispatches.length, 2, 'no automatic rerun');
+    assertMonotonic(f.saves);
+  });
+}
+
+test('a refusal and a valid seal racing each other keep both markers, acknowledge only a durable seal and never advance', async t => {
+  const q = heldQuota({ failOnRelease: true });
+  const seen = {};
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool }) => {
+    q.arm();
+    const repairing = settled(call(submitTool, malformed()));
+    await q.entered;
+    seen.accepted = await call(submitTool, completed({ summary: 'Sealed work' }));
+    seen.sealed = await f.state();
+    seen.receipt = await f.local.readSubmission(RUN, f.dispatches[1].attemptId, 'executor-result');
+    q.release();
+    seen.repair = await repairing;
+    seen.race = await f.state();
+    return SPOKEN;
+  }], { quota: q.quota });
+  const result = await f.start();
+  const attemptId = f.dispatches[1].attemptId;
+  assert.equal(seen.accepted.accepted, true);
+  assert.equal(seen.sealed.submissionRepair.sealed.attemptId, attemptId, 'acknowledged only after the seal was durable');
+  assert.ok(seen.receipt);
+  assert.notEqual(seen.repair.value?.repairable, true);
+  assert.equal(seen.race.submissionRepair.sealed?.attemptId, attemptId);
+  assert.equal(seen.race.submissionRepair.refused?.attemptId, attemptId);
+  assert.equal(seen.race.submissionRepair.repairs, 0);
+  assert.equal(result.status, 'paused');
+  assert.match(result.reason, /Quota|quota/);
+  assert.equal((await f.state()).results.length, 0, 'the refused dispatch did not advance');
+  assert.equal(f.dispatches.length, 2);
+  assertMonotonic(f.saves);
+});
+
+test('a repair save that fails while a seal lands keeps the seal and never lowers the durable counter, and nothing is acknowledged without a durable seal', async t => {
+  const seen = {};
+  let entered, failSave;
+  const reached = new Promise(resolve => { entered = resolve; });
+  const latch = new Promise(resolve => { failSave = resolve; });
+  let failed = false;
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool }) => {
+    // The save of the first granted repair is held and then fenced, while a valid submission is being accepted.
+    f.control.onSave = async state => {
+      if (failed || state.submissionRepair?.repairs !== 1 || state.submissionRepair.sealed) return;
+      failed = true; entered(); await latch;
+      throw new Error('fenced: stale owner');
+    };
+    const repairing = settled(call(submitTool, malformed()));
+    await reached;
+    const accepting = settled(call(submitTool, completed({ summary: 'Sealed work' })));
+    await sleep(25);
+    failSave();
+    seen.repair = await repairing;
+    seen.accepted = await accepting;
+    seen.race = await f.state();
+    seen.receipt = await f.local.readSubmission(RUN, f.dispatches[1].attemptId, 'executor-result');
+    return SPOKEN;
+  }]);
+  const result = await f.start();
+  const attemptId = f.dispatches[1].attemptId;
+  assert.notEqual(seen.repair.value?.repairable, true, 'a repair whose save failed is never granted');
+  if (seen.accepted.value?.accepted) {
+    assert.equal(seen.race.submissionRepair.sealed?.attemptId, attemptId, 'an acknowledged receipt has a durable seal');
+    assert.ok(seen.receipt);
+  } else assert.equal(seen.receipt ?? null, null, 'a receipt that was not sealed durably was not written');
+  assert.equal(seen.race.submissionRepair.sealed?.attemptId, attemptId, 'the seal landed while the repair save failed');
+  assert.equal(result.status, 'paused');
+  assert.equal((await f.state()).results.length, 0);
+  assert.equal(f.dispatches.length, 2);
+  assertMonotonic(f.saves);
+});
+
+test('several concurrent malformed calls never exceed the initial submission plus two repairs, with the first held at its quota check', async t => {
+  const q = heldQuota();
+  const seen = {};
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool }) => {
+    q.arm();
+    const first = settled(call(submitTool, malformed()));
+    await q.entered;
+    const rest = Array.from({ length: 4 }, () => settled(call(submitTool, malformed())));
+    await sleep(25);
+    q.release();
+    seen.answers = [await first, ...(await Promise.all(rest))];
+    seen.state = await f.state();
+    return SPOKEN;
+  }], { quota: q.quota });
+  const result = await f.start();
+  const granted = seen.answers.filter(answer => answer.value?.repairable === true);
+  assert.equal(granted.length, MAX_SUBMISSION_REPAIRS, 'exactly the allowed repairs were granted');
+  assert.equal(seen.state.submissionRepair.repairs, MAX_SUBMISSION_REPAIRS);
+  assert.ok(f.saves.every(save => (save.submissionRepair?.repairs ?? 0) <= MAX_SUBMISSION_REPAIRS));
+  assert.equal(seen.state.submissionRepair.refused.code, 'exhausted');
+  assert.equal(result.status, 'paused');
+  assert.equal(f.dispatches.length, 2);
+  assertMonotonic(f.saves);
+});
+
+test('concurrent malformed calls queued behind a held check are granted nothing once a valid submission sealed the boundary', async t => {
+  const q = heldQuota();
+  const seen = {};
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool }) => {
+    q.arm();
+    const first = settled(call(submitTool, malformed()));
+    await q.entered;
+    const rest = Array.from({ length: 3 }, () => settled(call(submitTool, malformed())));
+    seen.accepted = await call(submitTool, completed({ summary: 'Sealed work' }));
+    q.release();
+    seen.answers = [await first, ...(await Promise.all(rest))];
+    seen.state = await f.state();
+    return SPOKEN;
+  }], { quota: q.quota });
+  const result = await f.start();
+  assert.equal(seen.accepted.accepted, true);
+  assert.equal(seen.answers.filter(answer => answer.value?.repairable === true).length, 0, 'no repair after the seal');
+  assert.equal(seen.state.submissionRepair.sealed.attemptId, f.dispatches[1].attemptId);
+  assert.equal(seen.state.submissionRepair.repairs, 0);
+  assert.equal(f.reportOnly.has('ses_child_2'), false);
+  assert.equal(result.status, 'completed', 'the valid receipt of an undisturbed boundary advances');
+  assert.equal((await f.state()).results.length, 1, 'exactly once');
+  assertMonotonic(f.saves);
+});
+
+test('the seal completes while a repair quota check stays held: acknowledgement never waits behind it', async t => {
+  const q = heldQuota();
+  let acknowledged = false;
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool }) => {
+    q.arm();
+    const repairing = settled(call(submitTool, malformed()));
+    await q.entered;
+    const accepted = await call(submitTool, completed());
+    acknowledged = accepted.accepted === true;
+    // Only now is the quota check released: the acknowledgement above completed while it was still held.
+    q.release();
+    await repairing;
+    return SPOKEN;
+  }], { quota: q.quota });
+  assert.equal((await f.start()).status, 'completed');
+  assert.equal(acknowledged, true);
+});
+
+// --- The persistence layer refuses a stale checkpoint on its own ---------------------------------------------------
+
+test('the standalone checkpoint file refuses a stale view that drops a marker or lowers the counter, and accepts every legitimate transition', async t => {
+  const { writeCheckpointFile, repairRegression } = await import('../dist/workflow/repair-state.js');
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'heimdall-checkpoint-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const file = path.join(directory, 'state.json');
+  const base = { id: 'r', phase: 'executor', index: 0, results: [], attempt: { id: 'a1', status: 'admitted' } };
+  const record = extra => ({ phase: 'executor', index: 0, taskId: 'T1', child: 'c', repairs: 1, attempts: ['a1'], ...extra });
+  const sealed = { ...base, submissionRepair: record({ sealed: { attemptId: 'a1' }, conflict: { attemptId: 'a1', kind: 'parallel', tool: 'edit' } }) };
+  await writeCheckpointFile(file, { ...base, submissionRepair: record() });
+  await writeCheckpointFile(file, sealed);
+  const stale = { ...base, submissionRepair: record() };
+  await assert.rejects(writeCheckpointFile(file, stale), /drop the (sealed|conflict) marker/);
+  await assert.rejects(writeCheckpointFile(file, { ...base, submissionRepair: record({ sealed: sealed.submissionRepair.sealed, repairs: 0 }) }), /drop the conflict marker/);
+  await assert.rejects(writeCheckpointFile(file, { ...base }), /drop the sealed marker/);
+  assert.deepEqual(JSON.parse(await fs.readFile(file, 'utf8')), sealed, 'the refused writes left the file untouched');
+  assert.equal(repairRegression(sealed, { ...sealed, submissionRepair: record({ ...sealed.submissionRepair, repairs: 0 }) }), 'it would lower the repair counter from 1 to 0');
+  // Legitimate transitions: a rejected attempt, a fresh attempt, and real advancement.
+  assert.equal(repairRegression(sealed, { ...base, attempt: { id: 'a1', status: 'rejected' }, submissionRepair: record() }), undefined);
+  assert.equal(repairRegression(sealed, { ...base, attempt: { id: 'a2', status: 'launching' }, submissionRepair: record() }), undefined);
+  assert.equal(repairRegression(sealed, { ...base, index: 1, attempt: undefined }), undefined);
+  assert.equal(repairRegression(sealed, { ...base, results: [{}], index: 1, attempt: undefined }), undefined);
+  assert.equal(repairRegression(sealed, { ...sealed, submissionRepair: record({ ...sealed.submissionRepair, repairs: 2 }) }), undefined);
 });

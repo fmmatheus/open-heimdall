@@ -6,6 +6,7 @@ import { chooseExecutor, authExpired, executorCandidates } from '../policy/quota
 
 import { classifyError, classifyResult, pauseReportRecovery, REPORT_FIELDS, reportPauseReason, submissionPauseReason, submissionRepairPauseReason } from './report.js';
 import { MAX_SUBMISSION_REPAIRS } from './submission-repair.js';
+import { writeCheckpointFile } from './repair-state.js';
 import { runtimeIdentity } from './runtime-identity.js';
 import type { ConflictInfo, RepairDecision, RepairHandler, RepairRequest } from './submission-repair.js';
 import { isTaskId, SUBMISSION_PROTOCOL, SUBMISSION_TOOL_IDS } from './contracts.js';
@@ -17,6 +18,7 @@ import type {
 export type { RunnerBackend, RunnerContext, RunnerOptions, RunnerSettings } from './types.js';
 export { classifyError, classifyResult, reportPauseReason } from './report.js';
 
+const sameRepairTask = (a: SubmissionRepairRecord, b: SubmissionRepairRecord) => a.phase === b.phase && a.index === b.index && a.taskId === b.taskId && a.child === b.child;
 const readJSON = async <T>(p: string): Promise<T> => JSON.parse(await fs.readFile(p, 'utf8')) as T;
 const errorMessage = (error: unknown): string => error instanceof Error ? error.message : String(error);
 const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object';
@@ -217,10 +219,22 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
     await fs.rename(dest + '.tmp', dest);
   };
   let saveTail = Promise.resolve();
+  /** Repair counters that landed, or are still queued in a checkpoint that may land: a failed repair save never rolls the counter below them. */
+  let landedRepair: SubmissionRepairRecord | undefined;
+  const queuedRepairs = new Set<SubmissionRepairRecord>();
+  const repairFloor = (task: SubmissionRepairRecord): number => Math.max(0, ...[landedRepair, ...queuedRepairs].filter((entry): entry is SubmissionRepairRecord => !!entry && sameRepairTask(entry, task)).map(entry => entry.repairs));
   const save = (state: RunState) => {
     const value = structuredClone(state);
-    const pending = saveTail.then(() => persistence ? persistence.save(value) : atomicJSON(path.join(root, 'runs', value.id, 'state.json'), value));
-    saveTail = pending.catch(() => {});
+    const carried = value.submissionRepair;
+    if (carried) queuedRepairs.add(carried);
+    const pending = saveTail.then(async () => {
+      if (persistence) await persistence.save(value);
+      else await writeCheckpointFile(path.join(root, 'runs', value.id, 'state.json'), value); // The standalone store enforces the same durable invariant as the coordinator.
+      if (carried && (!landedRepair || !sameRepairTask(landedRepair, carried) || carried.repairs >= landedRepair.repairs)) landedRepair = carried;
+    });
+    saveTail = pending.then(() => {}, () => {});
+    // A save that failed (or settled) is no longer pending: only the failure removes its counter from the floor.
+    pending.then(() => carried && queuedRepairs.delete(carried), () => carried && queuedRepairs.delete(carried));
     return pending;
   };
   const load = async (id: string): Promise<RunState> => {
@@ -694,12 +708,18 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
             controller.abort(stop);
             return { feedback: false, code, message: detail };
           };
+          /** Whether this attempt's boundary is already closed (aborted, refused, sealed, conflicted or a negative outcome), judged on the live state. */
+          const closed = (): boolean => {
+            const live = state.submissionRepair;
+            return controller.signal.aborted || [live?.refused, live?.sealed, live?.conflict, live?.negative].some(marker => marker?.attemptId === attempt.id);
+          };
           const decide = async (request: RepairRequest): Promise<RepairDecision> => {
             const child = state.child;
             if (!child || request.kind !== submissionKindForPhase(state.phase)) return { feedback: false, code: 'unavailable', message: 'this session is not the bound child' };
-            if (controller.signal.aborted || state.submissionRepair?.refused?.attemptId === attempt.id) return { feedback: false, code: 'unavailable', message: 'this dispatch has ended' };
-            const record = repairRecord();
-            if (record.repairs >= MAX_SUBMISSION_REPAIRS) return refuse('exhausted', 'the submission was malformed ' + (record.repairs + 1) + ' times');
+            // Nothing read before an await is trusted after it: the record is re-read from the live state at every decision and at the commit.
+            const ended: RepairDecision = { feedback: false, code: 'unavailable', message: 'this dispatch has ended' };
+            if (closed()) return ended;
+            if (repairRecord().repairs >= MAX_SUBMISSION_REPAIRS) return refuse('exhausted', 'the submission was malformed ' + (repairRecord().repairs + 1) + ' times');
             // Repair needs enforced report-only mode; an unverifiable host or model pauses here, before any feedback is sent.
             const capability = backend.reportOnly;
             if (!correctionRelease) {
@@ -711,6 +731,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
             // The same usage and quota guards as any dispatch. A repair never resets accounting.
             try { await checkBudget(); }
             catch (error) { return refuse('unavailable', errorMessage(error), error); }
+            if (closed()) return ended;
             try {
               if (planning) {
                 const snapshot = await quota(cfg);
@@ -722,19 +743,27 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
                 chooseExecutor(await quota(cfg), { ...cfg, executorCandidates: same });
               }
             } catch (error) { return refuse('auth_or_quota', errorMessage(error)); }
+            if (closed()) return ended;
             // Restriction first (a refusal never consumes a repair), then the durable counter, then the feedback.
             let taken = false;
             if (!correctionRelease) {
               try { correctionRelease = await capability!.restrict(child, { parent: state.parent, attemptId: attempt.id, runId: state.id }, { allow: SUBMISSION_TOOL_IDS[request.kind] }); taken = true; }
               catch (error) { return refuse('unsupported', errorMessage(error)); }
             }
+            // Commit: no await between reading the live record and publishing the new counter, so nothing can interleave.
+            if (closed()) { if (taken) await releaseCorrection().catch(() => {}); return ended; }
+            const fresh = repairRecord();
+            if (fresh.repairs >= MAX_SUBMISSION_REPAIRS) return refuse('exhausted', 'the submission was malformed ' + (fresh.repairs + 1) + ' times');
             const previous = state.submissionRepair;
-            const next: SubmissionRepairRecord = { ...record, repairs: record.repairs + 1, attempts: record.attempts.includes(attempt.id) ? record.attempts : [...record.attempts, attempt.id] };
+            const next: SubmissionRepairRecord = { ...fresh, repairs: fresh.repairs + 1, attempts: fresh.attempts.includes(attempt.id) ? fresh.attempts : [...fresh.attempts, attempt.id] };
             state.submissionRepair = next;
             try { await save(state); }
             catch (error) {
-              // A stale owner never grants a repair. Only the counter rolls back: a boundary sealed meanwhile stays sealed.
-              state.submissionRepair = state.submissionRepair && state.submissionRepair !== next ? { ...state.submissionRepair, repairs: record.repairs, attempts: record.attempts } : previous;
+              // A stale owner never grants a repair. Only the counter rolls back, never below what any queued checkpoint carried (it may have landed),
+              // and a boundary, conflict or outcome recorded meanwhile stays recorded.
+              const landed = repairFloor(fresh);
+              const live = state.submissionRepair;
+              if (Math.max(fresh.repairs, landed) === fresh.repairs) state.submissionRepair = live && live !== next ? { ...live, repairs: fresh.repairs, attempts: fresh.attempts } : previous;
               if (taken) await releaseCorrection().catch(() => {});
               return refuse('unavailable', errorMessage(error));
             }

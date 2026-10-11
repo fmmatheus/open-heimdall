@@ -5,6 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 import type { SQLOutputValue } from 'node:sqlite';
 import { isDeepStrictEqual } from 'node:util';
 import { checkpointReportInfo } from '../workflow/report-info.js';
+import { assertRepairMonotonic } from '../workflow/repair-state.js';
 import type { SubmissionKind } from '../workflow/contracts.js';
 import {
   assertOutcomeMatchesCheckpoint, assertSubmissionMatchesCheckpoint, isNativeOutcome, isSubmissionKind, isSubmissionReceipt, sameOutcome, sameSubmission,
@@ -416,6 +417,8 @@ export class CoordinatorStore {
       if (run.checkpoint && run.checkpoint.protocol !== state.protocol) throw new Error('Run protocol is immutable once selected');
       // The loaded runtime is recorded once, at start, for new runs only; an existing run is never given or stripped of one.
       if (run.checkpoint && !isDeepStrictEqual(run.checkpoint.runtime, state.runtime)) throw new Error('Run runtime identity is immutable once recorded');
+      // A late writer holding an older view can never erase a seal, conflict, outcome or refusal, nor lower the repair counter.
+      assertRepairMonotonic(run.checkpoint, state);
       this.db.prepare('UPDATE runs SET checkpoint_json = ?, updated_at = ? WHERE id = ?').run(encoded, Date.now(), id);
       this.event('checkpoint.saved', run, null, {
         status: state.status, phase: state.phase, index: state.index, child: state.child,
