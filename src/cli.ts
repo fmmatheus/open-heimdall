@@ -28,8 +28,8 @@ unchanged. It never contacts OpenCode or providers. See heimdall setup --help. F
 
 async function main(args: string[]): Promise<void> {
   if (args[0] === 'setup') {
-    const { setupMain } = await import('./setup/cli.js');
-    process.exitCode = await setupMain(args.slice(1));
+    const [{ setupMain }, { runWizard }] = await Promise.all([import('./setup/cli.js'), import('./setup/wizard.js')]);
+    process.exitCode = await setupMain(args.slice(1), { prompt: request => runWizard(request, { stdin: process.stdin, stdout: process.stdout }) });
     return;
   }
   if (args[0] === 'coordinator') {

@@ -87,7 +87,14 @@ Example:
 `;
 
 /** Prompt hook for the interactive wizard: returns the completed input, or null when the user cancelled. */
-export type SetupPrompt = (request: { input: SetupInput; environment: NodeJS.ProcessEnv }) => Promise<SetupInput | null>;
+export interface SetupPromptRequest {
+  input: SetupInput;
+  environment: NodeJS.ProcessEnv;
+  /** The working directory and home directory the setup core will resolve paths against, when overridden. */
+  cwd?: string;
+  homeDirectory?: string;
+}
+export type SetupPrompt = (request: SetupPromptRequest) => Promise<SetupInput | null>;
 
 interface Writable { write(text: string): unknown; isTTY?: boolean }
 
@@ -258,7 +265,11 @@ export async function setupMain(args: readonly string[], options: SetupCommandOp
     const interactive = !parsed.noInput && !parsed.json && Boolean((options.stdin ?? process.stdin).isTTY) && Boolean(stdout.isTTY) && options.prompt !== undefined;
     let input = parsed.input;
     if (interactive) {
-      const completed = await options.prompt!({ input, environment });
+      const completed = await options.prompt!({
+        input, environment,
+        ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+        ...(options.homeDirectory === undefined ? {} : { homeDirectory: options.homeDirectory }),
+      });
       if (completed === null) {
         stderr.write('Heimdall setup cancelled; no configuration was written.\n');
         return 1;
