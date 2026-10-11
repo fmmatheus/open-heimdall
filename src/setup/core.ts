@@ -398,6 +398,7 @@ export async function applySetup(plan: SetupPlan, options: SetupOptions = {}): P
       targets[name].outcome = 'created';
       created.push(file.path);
     } catch (cause) {
+      if (cause instanceof PublishError) createdDirectories.push(...cause.createdDirectories);
       targets[name].outcome = 'failed';
       const exists = cause instanceof PublishError && cause.kind === 'exists';
       error = exists

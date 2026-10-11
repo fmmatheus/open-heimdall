@@ -586,6 +586,66 @@ test('a failure after the first file is published reports the exact partial outc
   assert.equal((await loadConfiguration({ projectDirectory: s.project })).settings.plannerModel, 'anthropic/planner-x');
 });
 
+/** mkdir that really creates directories except those named in `failing`, which fail without creating anything. */
+const mkdirFailing = failing => async (directory, directoryMode) => {
+  if (failing.includes(directory)) throw Object.assign(new Error('simulated mkdir failure'), { code: 'EIO' });
+  await fs.mkdir(directory, { mode: directoryMode });
+};
+const isDirectory = directory => fs.stat(directory).then(stats => stats.isDirectory(), () => false);
+
+test('directories created before a later directory creation fails are reported and no file is published', async t => {
+  const s = await sandbox(t);
+  const configDirectory = path.join(s.home, '.config');
+  const coordinatorDirectory = path.join(configDirectory, 'heimdall');
+  const result = await s.run(complete, { operations: { mkdir: mkdirFailing([coordinatorDirectory]) } });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, 'write-failed');
+  assert.match(result.error.message, /simulated mkdir failure/);
+  assert.deepEqual([result.targets.coordinator.outcome, result.targets.project.outcome], ['failed', 'not-written']);
+  assert.deepEqual(result.createdDirectories, [configDirectory]);
+  assert.equal(await isDirectory(configDirectory), true, 'the reported directory exists');
+  assert.equal(await mode(configDirectory), 0o700);
+  assert.equal(await isDirectory(coordinatorDirectory), false, 'the failed directory was not created');
+  assert.equal(result.partial, null, 'no file was published, and directories are not files');
+  assert.deepEqual(await tree(s.root), ['home/', 'home/.config/', 'project/']);
+  assert.equal(await fs.stat(s.projectFile).then(() => true, () => false), false);
+
+  // The directory is left in place: the rerun reports only what it creates now.
+  const rerun = await s.run(complete);
+  assert.equal(rerun.ok, true, JSON.stringify(rerun.error));
+  assert.deepEqual(rerun.createdDirectories, [coordinatorDirectory]);
+  assert.deepEqual([rerun.targets.coordinator.outcome, rerun.targets.project.outcome], ['created', 'created']);
+});
+
+test('a directory failure for the second file reports every directory created and the exact partial outcome, and a rerun finishes', async t => {
+  const s = await sandbox(t);
+  const projectParent = path.join(s.project, 'conf');
+  const projectDirectory = path.join(projectParent, 'nested');
+  const projectFile = path.join(projectDirectory, '.heimdall.toml');
+  const coordinatorParents = [path.join(s.home, '.config'), path.join(s.home, '.config', 'heimdall')];
+  const input = { ...complete, configPath: projectFile };
+  const result = await s.run(input, { operations: { mkdir: mkdirFailing([projectDirectory]) } });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, 'write-failed');
+  assert.deepEqual([result.targets.coordinator.outcome, result.targets.project.outcome], ['created', 'failed']);
+  assert.deepEqual(result.createdDirectories, [...coordinatorParents, projectParent]);
+  assert.deepEqual(result.partial, { created: [s.coordinatorFile], incomplete: [projectFile] });
+  assert.ok(result.partial.created.every(file => !result.createdDirectories.includes(file)), 'directories are not listed as published files');
+  assert.ok(result.error.message.includes(`Created: ${s.coordinatorFile}`));
+  assert.ok(result.error.message.includes(`Incomplete: ${projectFile}`));
+  assert.deepEqual(await tree(s.root), ['home/', 'home/.config/', 'home/.config/heimdall/', 'home/.config/heimdall/coordinator.toml', 'project/', 'project/conf/']);
+  for (const directory of result.createdDirectories) assert.equal(await mode(directory), 0o700);
+  const coordinatorBytes = await fs.readFile(s.coordinatorFile);
+
+  const rerun = await s.run(input);
+  assert.equal(rerun.ok, true, JSON.stringify(rerun.error));
+  assert.deepEqual([rerun.targets.coordinator.outcome, rerun.targets.project.outcome], ['reused', 'created']);
+  assert.deepEqual(rerun.createdDirectories, [projectDirectory], 'pre-existing directories are not reported');
+  assert.equal(rerun.partial, null);
+  assert.deepEqual(await fs.readFile(s.coordinatorFile), coordinatorBytes);
+  assert.equal((await loadConfiguration({ projectDirectory: s.project, configPath: projectFile })).settings.plannerModel, 'anthropic/planner-x');
+});
+
 test('a failed temporary-file unlink after publishing is a warning, not a failure', async t => {
   const s = await sandbox(t);
   const result = await s.run(complete, { operations: { unlink: async () => { throw Object.assign(new Error('cannot unlink'), { code: 'EPERM' }); } } });
