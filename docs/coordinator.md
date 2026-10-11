@@ -6,9 +6,10 @@ worktree and branch at its submitted base commit. The established runner plans
 and executes tasks sequentially; OpenCode owns all agent and tool execution.
 
 This is a development interface, tested with temporary repositories and mocked
-OpenCode APIs. It has not been activated against the running original workflows.
-Keep those workflows separate. Registration only reads the selected project;
-submission creates managed worktrees and adds their Git registry entries.
+OpenCode APIs. Live evidence is limited to the records under `docs/validation/`
+and the [Remaining limits](#remaining-limits). Registration only reads the
+selected project; submission creates managed worktrees and adds their Git
+registry entries.
 
 ## Setup
 
@@ -88,8 +89,9 @@ fences and durable attempt receipts prevent replay from starting duplicate work.
 
 Managed checkpoints and receipts are authoritative in SQLite. Planning files,
 facts, task ledgers and diagnostic replies remain in the managed checkout.
-OpenCode retains session/message storage. The original standalone plugin retains
-its file-backed checkpoints and recovery interface.
+OpenCode retains session/message storage. Standalone (non-managed) runs keep
+their file-backed checkpoints and explicit recovery interface; the coordinator
+does not migrate them.
 
 ## Lifecycle and recovery
 

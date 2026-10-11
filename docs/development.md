@@ -1,12 +1,12 @@
-# Baseline extraction
+# Development overview
 
-This package extracts the working ADR runner into TypeScript. It preserves
-planning, sequential fresh task sessions, completion gates, saved receipts,
-explicit resume, quota-aware model choice and usage tracking. It has no global
-scheduler or SQLite migration yet.
+The standalone workflow provides planning, sequential fresh task sessions,
+completion gates, saved receipts, explicit resume, quota-aware model choice and
+usage tracking. It keeps file-backed checkpoints and allows one active run per
+configured state directory. The [opt-in coordinator](coordinator.md) adds
+scheduling, managed worktrees and SQLite persistence on top of that runner.
 
-Existing workflows and running agents remain separate. The package does not
-install itself into OpenCode, migrate existing state, restart a server, or change
+The package does not install itself into OpenCode, restart a server, or change
 credentials. Develop and try it in a separate Git checkout with fresh state.
 
 ## Build and tests
@@ -71,9 +71,9 @@ cp -n /path/to/open-heimdall/examples/opencode/commands/*.md .opencode/commands/
 The explicit link keeps dependencies resolved from the built checkout and its
 lockfile. Dependency overrides do not propagate to consumer roots; regular
 tarball/copy installation requires the same quota/plugin override in the consumer.
-The plugin entry point is `@open-heimdall/core/plugin`. Do not load it alongside the original `adr.workflow`
-plugin in the same location: this extraction preserves its tool and RPC names.
-Loading or restarting the running original workflow is outside this setup.
+The plugin entry point is `@open-heimdall/core/plugin`. Do not load it alongside
+another plugin that uses the same identity (`adr.workflow`), tool names or RPC
+names at the same project location.
 
 From the configured OpenChamber parent session, use `/adr-run ADR_PATH`,
 `/adr-status RUN_ID`, or `/adr-resume RUN_ID RESOLUTION`. Planner and executor names
@@ -122,10 +122,10 @@ run is `e2e-structured.mjs` (one prompt, read-only sampling), described in
 
 ## Current limits
 
-- The standalone baseline keeps one active run per configured state directory
+- The standalone workflow keeps one active run per configured state directory
   and file-backed checkpoints. The [opt-in coordinator](coordinator.md) adds
   project registration, isolated worktrees, concurrent scheduling and SQLite
-  checkpoints/receipts without migrating existing runs.
+  checkpoints/receipts without migrating standalone runs.
 - Usage caps are disabled by default. Enabled caps cover cumulative session/run
   token counts, checked before child prompting, before tool execution and during
   periodic polling. Active requests can exceed a cap before cancellation is
@@ -135,8 +135,8 @@ run is `e2e-structured.mjs` (one prompt, read-only sampling), described in
 - Planning requires available quota for the configured Claude provider (`anthropic`
   or `claude-code`). Account authentication
   and model availability still come from the configured OpenCode environment.
-- Phone deployment and the independent watchdog service are not included. The
-  runner's saved receipts and reserved-recovery checks remain intact.
+- The runner's saved receipts and reserved-recovery checks remain part of the
+  standalone workflow.
 
-These are the standalone baseline's limits. See the coordinator guide for its
-execution and recovery boundaries; existing workflows remain separate.
+These are the standalone workflow's limits. See the coordinator guide for its
+execution and recovery boundaries.
