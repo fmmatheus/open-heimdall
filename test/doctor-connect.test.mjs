@@ -122,8 +122,21 @@ function assertOnlyInfo(log, count) {
   assert.equal(log.length, count);
 }
 
-function assertFailed(result, pattern) {
+/** A connection-only failure: the local checks passed. `localFailed` is for fixtures whose local checks fail as well. */
+function assertFailed(result, pattern, { localFailed = false } = {}) {
   const { document, connection, human, machine } = result;
+  if (localFailed) {
+    assert.equal(machine.status, 1);
+    assert.equal(human.status, 1);
+    assert.equal(document.ok, false);
+    assert.equal(connection.status, 'fail');
+    assert.equal(document.verification.local, 'failed');
+    assert.equal(document.verification.connection, 'failed');
+    assert.match(connection.message, pattern);
+    assert.match(human.stdout, /Local checks failed: \d+ required checks? failed\./);
+    assert.match(human.stdout, /Connection verification: failed/);
+    return;
+  }
   assert.equal(machine.status, 1);
   assert.equal(human.status, 1);
   assert.equal(document.ok, false);
@@ -131,8 +144,16 @@ function assertFailed(result, pattern) {
   assert.equal(connection.fatal, true);
   assert.equal(document.verification.connection, 'failed');
   assert.match(connection.message, pattern);
+  // The local verdict covers the local checks only: a failed connection never turns it into a local failure.
+  assert.equal(document.verification.local, 'passed');
+  assert.deepEqual(document.checks.filter(check => check.fatal && check.status === 'fail').map(check => check.id), ['connection']);
+  assert.match(human.stdout, /Local checks passed \(\d+ passed, \d+ warnings, \d+ skipped\)\./);
+  assert.doesNotMatch(human.stdout, /Local checks failed/);
   assert.match(human.stdout, /Connection verification: failed/);
-  assert.match(human.stderr, /required checks? failed: .*connection/);
+  assert.equal(human.stderr, 'Heimdall doctor: required check failed: connection\n');
+  const localChecks = document.checks.filter(check => check.id !== 'connection');
+  const localPassed = localChecks.filter(check => check.status === 'pass').length;
+  assert.ok(human.stdout.includes(`Local checks passed (${localPassed} passed, `), human.stdout);
   for (const key of ['protectedApiAuthorization', 'modelAvailability', 'providerLogin', 'quota']) assert.equal(document.verification[key], 'unverified');
 }
 
@@ -144,6 +165,10 @@ test('basic authentication with the environment password verifies GET /api/info 
   assert.equal(result.machine.status, 0, result.machine.stdout);
   assert.equal(document.ok, true);
   assert.equal(document.verification.connection, 'verified');
+  assert.equal(document.verification.local, 'passed');
+  assert.equal(result.human.status, 0);
+  assert.equal(human.stderr, '');
+  assert.match(human.stdout, /Local checks passed/);
   assert.equal(connection.status, 'pass');
   assert.equal(connection.fatal, true);
   assert.match(connection.message, /GET \/api\/info/);
@@ -366,7 +391,7 @@ test('a wrong OpenCode version fails, with and without the data envelope', async
 test('a missing baseUrl fails the connection check as incomplete configuration', async t => {
   const s = await sandbox(t, { baseUrl: false });
   const result = await doctor(s);
-  assertFailed(result, /opencode\.baseUrl is not configured.*incomplete/);
+  assertFailed(result, /opencode\.baseUrl is not configured.*incomplete/, { localFailed: true });
 });
 
 test('an unavailable project configuration fails the connection check without a request', async t => {
@@ -374,8 +399,23 @@ test('an unavailable project configuration fails the connection check without a 
   const s = await sandbox(t, { url: server.url });
   await fs.rm(path.join(s.project, '.heimdall.toml'));
   const result = await doctor(s);
-  assertFailed(result, /project configuration is unavailable/);
+  assertFailed(result, /project configuration is unavailable/, { localFailed: true });
   assertOnlyInfo(server.log, 0);
+});
+
+test('a local failure with a verified connection reports local failed and connection verified', async t => {
+  const server = await fixtureServer(t, info(basic(SENTINEL)));
+  const s = await sandbox(t, { url: server.url });
+  await fs.mkdir(path.join(s.home, '.config', 'heimdall'), { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(s.home, '.config', 'heimdall', 'coordinator.toml'), '[coordinator\nstateDirectory = ', { mode: 0o600 });
+  const { document, human, machine } = await doctor(s);
+  assert.equal(machine.status, 1);
+  assert.equal(document.ok, false);
+  assert.equal(document.verification.local, 'failed');
+  assert.equal(document.verification.connection, 'verified');
+  assert.match(human.stdout, /Local checks failed/);
+  assert.match(human.stdout, /Connection verification: verified/);
+  assert.doesNotMatch(human.stderr, /connection/);
 });
 
 test('without --connect nothing is contacted and the connection stays unverified', async t => {

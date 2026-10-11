@@ -489,6 +489,46 @@ test('permission findings are advisory warnings, never repaired', { skip: proces
     assert.match(human.stdout, /\[warn\] permissions \(advisory\)/);
   });
 
+  await t.test('configuration file exposure is described by the access it grants', async t => {
+    const cases = [
+      [0o600, null],
+      [0o640, 'readable by group or others'], [0o604, 'readable by group or others'], [0o644, 'readable by group or others'],
+      [0o620, 'writable by group or others'], [0o602, 'writable by group or others'], [0o622, 'writable by group or others'],
+      [0o660, 'readable and writable by group or others'], [0o606, 'readable and writable by group or others'], [0o666, 'readable and writable by group or others'],
+    ];
+    for (const [mode, wording] of cases) {
+      const octal = mode.toString(8);
+      const s = await sandbox(t);
+      createSetup(s);
+      await fs.chmod(s.projectFile, mode);
+      await fs.chmod(s.coordinatorFile, mode);
+      const bytes = [await fs.readFile(s.projectFile), await fs.readFile(s.coordinatorFile)];
+      const { document, human, json } = await both(s);
+      const permissions = checkOf(document, 'permissions');
+      // Warnings never change the exit status.
+      assert.equal(human.status, 0, octal);
+      assert.equal(json.status, 0, octal);
+      assert.equal(document.ok, true, octal);
+      assert.equal(permissions.fatal, false, octal);
+      if (wording === null) {
+        assert.equal(permissions.status, 'pass', permissions.message);
+        assert.doesNotMatch(permissions.message, /chmod/);
+      } else {
+        assert.equal(permissions.status, 'warn', octal);
+        for (const [label, file] of [['Project configuration', s.projectFile], ['Coordinator configuration', s.coordinatorFile]]) {
+          assert.ok(permissions.message.includes(`${label} ${file} is ${wording} (mode ${octal}); consider chmod 600`), permissions.message);
+        }
+        assert.match(permissions.message, /never changes permissions/);
+        assert.match(human.stdout, /\[warn\] permissions \(advisory\)/);
+      }
+      assert.equal(human.stderr, '', octal);
+      // Reported, never repaired.
+      assert.equal((await fs.stat(s.projectFile)).mode & 0o777, mode);
+      assert.equal((await fs.stat(s.coordinatorFile)).mode & 0o777, mode);
+      assert.deepEqual([await fs.readFile(s.projectFile), await fs.readFile(s.coordinatorFile)], bytes);
+    }
+  });
+
   await t.test('group-writable state and workflow directories', async t => {
     const s = await sandbox(t);
     const state = path.join(s.root, 'state');
