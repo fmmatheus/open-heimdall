@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SUBMISSION_KINDS, SUBMISSION_PROTOCOL, contractRef } from './contracts.js';
@@ -41,12 +41,20 @@ function treeHash(root: string, asset: typeof RUNTIME_ASSETS[number]): string {
   return hash.digest('hex');
 }
 
-/** The node_modules directory the package at `root` resolves its dependencies from. */
+const isDirectory = (target: string) => { try { return statSync(target).isDirectory(); } catch { return false; } };
+
+/**
+ * The main node_modules directory the package at `root` resolves its dependencies from: its own when it has one (a source
+ * checkout, or a global install, where npm nests the dependencies inside the package), otherwise the one it is installed into
+ * (a consumer install, where npm hoists them beside the package).
+ */
 export function dependencyDirectory(root: string): string {
+  const own = path.join(root, 'node_modules');
+  if (isDirectory(own)) return own;
   const parent = path.dirname(root);
   if (path.basename(parent) === 'node_modules') return parent;
   if (path.basename(parent).startsWith('@') && path.basename(path.dirname(parent)) === 'node_modules') return path.dirname(parent);
-  return path.join(root, 'node_modules');
+  return own;
 }
 
 function installedVersion(directory: string): string {
@@ -56,15 +64,94 @@ function installedVersion(directory: string): string {
   } catch { return 'missing'; }
 }
 
+/** The installed package a dependency named `name` of the package at `from` resolves to, by Node's node_modules lookup. */
+function resolveInstalled(from: string, name: string): string | undefined {
+  for (let directory = from; ; directory = path.dirname(directory)) {
+    const candidate = path.join(directory, 'node_modules', name);
+    if (existsSync(path.join(candidate, 'package.json'))) return realpathSync(candidate);
+    if (path.dirname(directory) === directory) return undefined;
+  }
+}
+
+const stringKeys = (value: unknown): string[] => record(value) ? Object.keys(value) : [];
+
+/** Dependencies a package loads: required, optional, and peers that happen to be installed. */
+function declaredDependencies(manifest: unknown): { name: string; kind: 'required' | 'optional' | 'peer' }[] {
+  if (!record(manifest)) return [];
+  const seen = new Set<string>();
+  const out: { name: string; kind: 'required' | 'optional' | 'peer' }[] = [];
+  for (const [field, kind] of [['dependencies', 'required'], ['optionalDependencies', 'optional'], ['peerDependencies', 'peer']] as const) {
+    for (const name of stringKeys(manifest[field]).sort()) if (!seen.has(name)) { seen.add(name); out.push({ name, kind }); }
+  }
+  return out;
+}
+
+function readManifest(directory: string): unknown {
+  try { return JSON.parse(readFileSync(path.join(directory, 'package.json'), 'utf8')); } catch { return undefined; }
+}
+
+/** The installed runtime dependency tree of a package, resolved the way Node resolves it, whatever the layout. */
+export interface InstalledDependencies {
+  /** Real directory of every dependency the package itself resolves (what a snapshot must be able to import), by name. */
+  links: Record<string, string>;
+  /** Layout-independent description of every reachable installed package: name, version and what each dependency resolved to. */
+  entries: string[];
+  /** Required dependencies (of the package or any reachable one) that are not installed. */
+  missing: string[];
+}
+
+/**
+ * Walk the dependency graph from the package at `root` using the installed `package.json` files. Hoisted copies, copies nested in
+ * any package's own node_modules and the global layout all resolve identically to how Node would resolve them. Nothing here
+ * depends on a lockfile or on where a package sits, so the same tree has the same description before and after being copied
+ * into a snapshot whose node_modules links to the same real directories.
+ */
+export function installedDependencies(root: string): InstalledDependencies {
+  const links: Record<string, string> = {};
+  const entries: string[] = [];
+  const missing: string[] = [];
+  const visited = new Set<string>();
+  const describe = (directory: string, label: string, isRoot: boolean): void => {
+    const edges: string[] = [];
+    for (const { name, kind } of declaredDependencies(readManifest(directory))) {
+      const found = resolveInstalled(directory, name);
+      if (!found) {
+        if (kind === 'peer') continue;
+        if (kind === 'required') missing.push(label + ' > ' + name);
+        edges.push(name + '@' + (kind === 'optional' ? 'optional-absent' : 'missing'));
+        continue;
+      }
+      if (isRoot) links[name] = found;
+      edges.push(name + '@' + installedVersion(found));
+      if (!visited.has(found)) {
+        visited.add(found);
+        const manifest = readManifest(found);
+        describe(found, record(manifest) && typeof manifest.name === 'string' ? manifest.name : name, false);
+      }
+    }
+    entries.push((isRoot ? '(package)' : label + '@' + installedVersion(directory)) + '[' + edges.join(',') + ']');
+  };
+  describe(root, '(package)', true);
+  return { links, entries: entries.sort(), missing: missing.sort() };
+}
+
 function dependencyIdentity(root: string, manifest: Record<string, unknown>): RuntimeBuildIdentity['dependencies'] {
   const modules = dependencyDirectory(root);
   const lockFile = path.join(root, 'package-lock.json');
   const lockfile = existsSync(lockFile) ? sha256(readFileSync(lockFile)) : null;
   const names = record(manifest.dependencies) ? Object.keys(manifest.dependencies).sort() : [];
-  const direct = Object.fromEntries(names.map(name => [name, installedVersion(path.join(modules, name))]));
+  let lockless: InstalledDependencies | undefined;
+  const direct = Object.fromEntries(names.map(name => {
+    if (lockfile) return [name, installedVersion(path.join(modules, name))];
+    // Without a lockfile (an installed package: npm never packs one) the installed tree itself is the lock data.
+    lockless ??= installedDependencies(root);
+    const found = lockless.links[name];
+    return [name, found ? installedVersion(found) : 'missing'];
+  }));
   let entries: string[];
   const lock: unknown = lockfile ? JSON.parse(readFileSync(lockFile, 'utf8')) : undefined;
-  if (record(lock) && record(lock.packages)) {
+  if (!lockfile) entries = (lockless ?? installedDependencies(root)).entries;
+  else if (record(lock) && record(lock.packages)) {
     // Every locked runtime package, resolved against the dependency directory actually in use.
     entries = Object.entries(lock.packages)
       .filter(([key, value]) => key.startsWith('node_modules/') && record(value) && value.dev !== true)

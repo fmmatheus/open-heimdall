@@ -24,6 +24,13 @@ export interface RuntimeSnapshotSpecification {
   identity: RuntimeIdentity;
   /** Absolute dependency directory the snapshot resolves packages through. Its installed versions are part of the identity. */
   modules: string;
+  /**
+   * Real directory of each dependency the package resolves, by package name, for a package identified from its installed tree
+   * (no lockfile). The snapshot's node_modules then holds exactly these links instead of one symlink to `modules`, which is
+   * how it reproduces nested and hoisted layouts. Absent on records admitted with a lockfile or earlier: those keep the single
+   * symlink to `modules`.
+   */
+  links?: Record<string, string>;
 }
 
 export type RunStatus = 'queued' | 'preparing' | 'running' | 'paused' | 'succeeded' | 'failed' | 'reconciliation-required';
