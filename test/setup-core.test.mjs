@@ -564,5 +564,5 @@ test('setup performs no network access and imports no network module', async t =
   const relative = [...seen].map(file => path.relative(distribution, file)).sort();
   for (const expected of ['config.js', path.join('coordinator', 'config.js'), path.join('coordinator', 'worktrees.js'), path.join('setup', 'core.js'), path.join('setup', 'publish.js')]) assert.ok(relative.includes(expected), expected);
   for (const forbidden of ['http', 'https', 'http2', 'net', 'tls', 'dgram', 'dns', 'dns/promises', 'undici', 'ws']) assert.equal(external.has(forbidden), false, `imports ${forbidden}`);
-  assert.deepEqual([...external].filter(name => !name.startsWith('fs') && !['path', 'os', 'crypto', 'url', 'child_process', 'util'].includes(name)), ['smol-toml']);
+  assert.deepEqual([...external].filter(name => !name.startsWith('fs') && !['path', 'os', 'crypto', 'url', 'child_process', 'util', 'readline/promises'].includes(name)), ['smol-toml']);
 });
