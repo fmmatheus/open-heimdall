@@ -29,3 +29,25 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run build
       - run: node --test test/live-harness.test.mjs
+  installed-package:
+    name: installed-package (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        # The declared minimum and a maintained LTS line. Each runs with the npm bundled with that Node.
+        node: ['22.19.0', '24']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: |
+          node -v
+          npm -v
+      - run: npm ci --ignore-scripts
+      - run: npm run test:package
+      - run: node --test --test-concurrency=1 test/setup-*.test.mjs test/doctor*.test.mjs
