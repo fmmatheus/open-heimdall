@@ -66,6 +66,25 @@ export async function loadConfiguration({ projectDirectory = process.cwd(), conf
   return parseConfiguration(content, { projectDirectory: directory, file });
 }
 
+const ENVIRONMENT_VARIABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * Returns the `opencode.passwordEnvironmentVariable` name from syntactically valid TOML, even when the rest of the file
+ * would fail validation, or undefined when there is no usable name. It returns only a valid variable name, never throws
+ * and does not apply the `OPENCODE_PASSWORD` default. It exists to sanitize diagnostics and never replaces
+ * `parseConfiguration`, which remains the only validation of a configuration.
+ */
+export function credentialReference(content: string): string | undefined {
+  try {
+    const opencode = parse(content, { unsafeKeyBehaviour: 'throw' }).opencode;
+    if (!record(opencode)) return undefined;
+    const name = opencode.passwordEnvironmentVariable;
+    return typeof name === 'string' && ENVIRONMENT_VARIABLE_NAME.test(name) ? name : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Validates configuration text without touching the filesystem; `file` and `projectDirectory` are absolute. */
 export function parseConfiguration(content: string, { projectDirectory: directory, file }: { projectDirectory: string; file: string }): Configuration {
   const document = parse(content, { unsafeKeyBehaviour: 'throw' });
@@ -116,7 +135,7 @@ export function parseConfiguration(content: string, { projectDirectory: director
   const authentication = opencode.authentication ?? 'basic';
   if (authentication !== 'basic' && authentication !== 'none' && authentication !== 'openchamber') throw new Error('opencode.authentication must be basic, none, or openchamber');
   const passwordEnvironmentVariable = text(opencode.passwordEnvironmentVariable, 'opencode.passwordEnvironmentVariable', 'OPENCODE_PASSWORD');
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(passwordEnvironmentVariable)) throw new Error('passwordEnvironmentVariable must be an environment variable name');
+  if (!ENVIRONMENT_VARIABLE_NAME.test(passwordEnvironmentVariable)) throw new Error('passwordEnvironmentVariable must be an environment variable name');
   const baseUrl = opencode.baseUrl === undefined ? undefined : text(opencode.baseUrl, 'opencode.baseUrl');
   if (baseUrl !== undefined) {
     const url = new URL(baseUrl);

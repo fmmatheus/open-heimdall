@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { loadConfiguration } from '../dist/config.js';
+import { credentialReference, loadConfiguration, parseConfiguration } from '../dist/config.js';
 
 const minimal = `[workflow]\nplannerModel = "anthropic/planner"\nexecutorModel = "anthropic/executor"\nexecutorFallbackModel = "kimi-code-plan-global/fallback"\n`;
 async function fixture(t, content = minimal) {
@@ -113,4 +113,30 @@ test('Desktop authentication persists only the selected connection mode and requ
   await assert.rejects(c.readSettings(), /connection settings requires reloading/);
   const inline = await fixture(t, minimal + '[opencode]\nauthentication = "openchamber"\ndesktopLocalClientToken = "synthetic-token"\n');
   await assert.rejects(inline.load(), /Unknown opencode setting/);
+});
+
+test('credentialReference extracts only a valid variable name from parseable TOML and never throws', () => {
+  const fixtureFor = body => minimal + body;
+  assert.equal(credentialReference(fixtureFor('[opencode]\npasswordEnvironmentVariable = "HEIMDALL_SYNTHETIC_PASSWORD"\n')), 'HEIMDALL_SYNTHETIC_PASSWORD');
+  // Full validation rejects the file, yet the reference is still extracted.
+  const invalid = '[workflow]\nplannerModel = "anthropic/planner"\n[[workflow.executorCandidates]]\nkey = "x"\nquotaProvider = "unsupported"\nmodel = "a/b"\n[opencode]\npasswordEnvironmentVariable = "SYNTHETIC_REF"\n';
+  assert.throws(() => parseConfiguration(invalid, { projectDirectory: '/tmp/project', file: '/tmp/project/.heimdall.toml' }), /quotaProvider must be/);
+  assert.equal(credentialReference(invalid), 'SYNTHETIC_REF');
+
+  const undefinedCases = {
+    malformed: '[opencode\npasswordEnvironmentVariable = "SYNTHETIC_REF"\n',
+    'unsafe __proto__ table': '[__proto__]\nx = 1\n[opencode]\npasswordEnvironmentVariable = "SYNTHETIC_REF"\n',
+    'unsafe constructor table': '[constructor]\nx = 1\n[opencode]\npasswordEnvironmentVariable = "SYNTHETIC_REF"\n',
+    'non-table opencode': 'opencode = "SYNTHETIC_REF"\n',
+    'array opencode': 'opencode = ["SYNTHETIC_REF"]\n',
+    'non-string value': '[opencode]\npasswordEnvironmentVariable = 12345\n',
+    'invalid name with spaces': '[opencode]\npasswordEnvironmentVariable = "not a name"\n',
+    'invalid name with dash': '[opencode]\npasswordEnvironmentVariable = "A-B"\n',
+    'absent key': '[opencode]\nauthentication = "basic"\n',
+    'absent table': minimal,
+    empty: '',
+  };
+  for (const [name, content] of Object.entries(undefinedCases)) assert.equal(credentialReference(content), undefined, name);
+  assert.doesNotThrow(() => credentialReference('\u0000 not toml {{{'));
+  assert.equal(credentialReference(undefined), undefined, 'non-string input does not throw');
 });
