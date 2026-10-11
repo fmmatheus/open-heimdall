@@ -6,3 +6,7 @@ dist/
 coverage/
 
 /local-features/
+
+.DS_STORE
+
+.omc/
