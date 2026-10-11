@@ -63,6 +63,11 @@ export async function loadConfiguration({ projectDirectory = process.cwd(), conf
   let content: string;
   try { content = await fs.readFile(file, 'utf8'); }
   catch (cause) { throw new Error(`Cannot read Heimdall configuration ${file}. Create it with heimdall init.`, { cause }); }
+  return parseConfiguration(content, { projectDirectory: directory, file });
+}
+
+/** Validates configuration text without touching the filesystem; `file` and `projectDirectory` are absolute. */
+export function parseConfiguration(content: string, { projectDirectory: directory, file }: { projectDirectory: string; file: string }): Configuration {
   const document = parse(content, { unsafeKeyBehaviour: 'throw' });
   keys(document, ['workflow', 'paths', 'opencode'], 'top-level');
   const workflow = table(document.workflow, 'workflow');

@@ -11,7 +11,7 @@ export interface CoordinatorConfiguration {
   projectConcurrency: number;
 }
 
-async function canonicalPlannedDirectory(value: string): Promise<string> {
+export async function canonicalPlannedDirectory(value: string): Promise<string> {
   const suffix: string[] = [];
   let ancestor = path.resolve(value);
   while (true) {
@@ -39,6 +39,11 @@ export async function loadCoordinatorConfiguration(configPath?: string): Promise
     if (configPath || process.env.HEIMDALL_COORDINATOR_CONFIG || (error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     content = '';
   }
+  return parseCoordinatorConfiguration(content, file);
+}
+
+/** Validates coordinator configuration text; `file` is the absolute path used to resolve a relative stateDirectory. */
+export async function parseCoordinatorConfiguration(content: string, file: string): Promise<CoordinatorConfiguration> {
   const document = parse(content, { unsafeKeyBehaviour: 'throw' });
   if (Object.keys(document).some(key => key !== 'coordinator')) throw new Error('Only [coordinator] settings are accepted');
   const settings = document.coordinator ?? {};
