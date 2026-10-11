@@ -10,15 +10,28 @@ Usage:
   heimdall init [--project DIRECTORY] [--config FILE]
   heimdall check [--project DIRECTORY] [--config FILE]
   heimdall status RUN_ID [--project DIRECTORY] [--config FILE]
+  heimdall setup [flags]
   heimdall coordinator --help
   heimdall --version
 
 init writes a new configuration without overwriting existing files.
 check validates configuration without contacting OpenCode or starting agents.
 status reads saved progress. Start/resume work through the OpenCode plugin.
+setup creates the coordinator and project configuration when absent and reuses existing files
+unchanged. It never contacts OpenCode or providers. See heimdall setup --help. Flags:
+  --project DIRECTORY  --config FILE  --coordinator-config FILE
+  --planner-model PROVIDER/MODEL  --executor-model PROVIDER/MODEL  --quota-provider PROVIDER
+  --opencode-url URL  --opencode-auth basic|none|openchamber  --password-env NAME
+  --state-directory DIRECTORY  --global-concurrency NUMBER  --project-concurrency NUMBER
+  --no-input  --json  --help
 `;
 
 async function main(args: string[]): Promise<void> {
+  if (args[0] === 'setup') {
+    const { setupMain } = await import('./setup/cli.js');
+    process.exitCode = await setupMain(args.slice(1));
+    return;
+  }
   if (args[0] === 'coordinator') {
     const { coordinatorMain } = await import('./coordinator/cli.js');
     await coordinatorMain(args.slice(1));
