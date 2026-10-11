@@ -146,7 +146,7 @@ function assertSchema(document) {
   document.checks.forEach(assertCheckShape);
   assert.deepEqual(Object.keys(document.verification).sort(), ['connection', 'local', 'modelAvailability', 'protectedApiAuthorization', 'providerLogin', 'quota']);
   assert.ok(['passed', 'failed'].includes(document.verification.local));
-  assert.ok(['not-requested', 'pending'].includes(document.verification.connection));
+  assert.ok(['not-requested', 'verified', 'failed'].includes(document.verification.connection));
   for (const key of ['protectedApiAuthorization', 'modelAvailability', 'providerLogin', 'quota']) assert.equal(document.verification[key], 'unverified', key);
   assert.equal(document.verification.local, document.ok ? 'passed' : 'failed');
   if (document.error === null) {
@@ -154,7 +154,7 @@ function assertSchema(document) {
     assert.equal(document.ok, !document.checks.some(check => check.fatal && check.status === 'fail'));
     for (const check of document.checks) assert.equal(check.fatal, !ADVISORY.includes(check.id), check.id);
     const connection = document.checks.find(check => check.id === 'connection');
-    assert.equal(connection.status, 'not-verified');
+    assert.equal(connection.status, 'not-verified', 'connection is verified only by test/doctor-connect.test.mjs');
   } else {
     assert.equal(document.ok, false);
     assert.deepEqual(Object.keys(document.error).sort(), ['code', 'message']);
@@ -186,7 +186,7 @@ async function both(s, args = [], options = {}) {
   if (document.error === null) {
     const lines = [...human.stdout.matchAll(/^\[(\S+)\] ([\w.-]+)/gm)].map(match => [match[2], match[1]]);
     assert.deepEqual(lines, document.checks.map(check => [check.id, check.status]), 'human report differs from the JSON report');
-    assert.match(human.stdout, /Connection verification: pending/);
+    assert.match(human.stdout, /Connection verification: not requested/);
     assert.match(human.stdout, /Unverified: protected-API authorization, model availability, provider login and quota\./);
     const failed = document.checks.filter(check => check.fatal && check.status === 'fail').map(check => check.id);
     if (failed.length) assert.ok(human.stderr.includes(failed[0]) && /required checks? failed/.test(human.stderr), human.stderr);
@@ -208,7 +208,7 @@ test('the network guard records an attempted request', async t => {
   assert.equal(await read(s.log), 'fetch\n');
 });
 
-test('a setup-created project passes offline, changes nothing and leaves connection verification pending', async t => {
+test('a setup-created project passes offline, changes nothing and leaves the connection unverified', async t => {
   const s = await sandbox(t);
   createSetup(s);
   const stateDirectory = path.join(s.home, '.local', 'state', 'heimdall');
@@ -231,7 +231,7 @@ test('a setup-created project passes offline, changes nothing and leaves connect
   const entries = Object.keys(await snapshot(s));
   for (const entry of entries) assert.doesNotMatch(entry, /\.sock$|\.sqlite|\.db$|\.db-|runtime|\.local|\.heimdall\/|\/runs\/|\.tmp$|coordinator\.token/i, `unexpected artifact ${entry}`);
   assert.match(human.stdout, /Local checks passed/);
-  assert.match(human.stdout, /Connection verification: pending \(not requested\)/);
+  assert.match(human.stdout, /Connection verification: not requested/);
   assert.match(human.stdout, /Passing local checks does not show that a run can execute/);
 });
 
@@ -549,26 +549,13 @@ test('selectors follow the setup precedence: flags, then environment, then defau
   assert.equal(checkOf(document, 'project.config').status, 'fail');
 });
 
-test('--connect is accepted and leaves connection verification pending', async t => {
+test('JSON reports state what stays unverified without a connection request', async t => {
   const s = await sandbox(t);
   createSetup(s);
-  const { document, human } = await both(s, ['--connect']);
-  assert.equal(human.status, 0);
-  assert.equal(document.ok, true);
-  assert.equal(document.verification.connection, 'pending');
-  assert.equal(checkOf(document, 'connection').status, 'not-verified');
-  assert.equal(checkOf(document, 'connection').fatal, false);
-  assert.match(human.stdout, /Connection verification: pending/);
-  assert.match(human.stdout, /Unverified: protected-API authorization, model availability, provider login and quota/);
-});
-
-test('JSON reports state what stays unverified, with or without a connection request', async t => {
-  const s = await sandbox(t);
-  createSetup(s);
-  for (const args of [[], ['--connect']]) {
-    const { document } = await both(s, args);
+  {
+    const { document } = await both(s, []);
     assert.deepEqual(document.verification, {
-      local: 'passed', connection: args.length ? 'pending' : 'not-requested',
+      local: 'passed', connection: 'not-requested',
       protectedApiAuthorization: 'unverified', modelAvailability: 'unverified', providerLogin: 'unverified', quota: 'unverified',
     });
   }
@@ -709,7 +696,7 @@ test('local checks reach no network and make no filesystem writes in-process', a
   globalThis.fetch = () => { attempts.push('fetch'); throw new Error('network blocked'); };
   t.after(() => { globalThis.fetch = originalFetch; });
   const out = [];
-  const code = await doctorMain(['--connect', '--json'], { environment: { ...s.env }, cwd: s.project, homeDirectory: s.home, stdout: { write: text => out.push(text) }, stderr: { write: () => undefined } });
+  const code = await doctorMain(['--json'], { environment: { ...s.env }, cwd: s.project, homeDirectory: s.home, stdout: { write: text => out.push(text) }, stderr: { write: () => undefined } });
   assert.equal(code, 0);
   assert.deepEqual(attempts, []);
   assert.deepEqual(await snapshot(s), before);

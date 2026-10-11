@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 import { parseConfiguration, type Configuration } from '../config.js';
 import { parseCoordinatorConfiguration, type CoordinatorConfiguration } from '../coordinator/config.js';
 import { admitRuntime, sourcePackageRoot } from '../coordinator/runtime-snapshot.js';
+import type { ConnectionOptions } from '../opencode/observer.js';
 import { gitEnvironment, inspectProject, resolveBaseCommit } from '../coordinator/worktrees.js';
 import { moduleFiles as quotaModuleFiles, resolveQuotaPackage } from '../policy/quota.js';
 import { describe, incompleteSettings } from '../setup/core.js';
@@ -40,6 +41,8 @@ export interface DoctorOptions {
   packageRoot?: string;
   /** Overrides the running Node.js version (tests). */
   nodeVersion?: string;
+  /** Test seams for the `--connect` probe; production uses the global fetch, the default settings location and 10 s. */
+  connection?: Pick<ConnectionOptions, 'fetchImpl' | 'timeoutMilliseconds' | 'openchamber'>;
 }
 
 export interface DoctorTargets {
@@ -52,7 +55,8 @@ export interface DoctorTargets {
 /** What local checks established and what they deliberately leave open. */
 export interface DoctorVerification {
   local: 'passed' | 'failed';
-  connection: 'not-requested' | 'pending';
+  /** `not-requested` unless `--connect` was passed; then `verified` or `failed`. */
+  connection: 'not-requested' | 'verified' | 'failed';
   protectedApiAuthorization: 'unverified';
   modelAvailability: 'unverified';
   providerLogin: 'unverified';
@@ -148,7 +152,7 @@ export function resolveDoctorTargets(input: DoctorInput, options: DoctorOptions 
  * Runs every offline, read-only local check. Nothing here writes, creates, changes permissions, starts a process other than
  * `git` read commands, or opens a network connection. Never throws for a problem the report can describe.
  */
-export async function runLocalChecks(input: DoctorInput, options: DoctorOptions = {}): Promise<{ checks: DoctorCheck[]; targets: DoctorTargets }> {
+export async function runLocalChecks(input: DoctorInput, options: DoctorOptions = {}): Promise<{ checks: DoctorCheck[]; targets: DoctorTargets; projectDirectory?: string; configuration?: Configuration }> {
   const checks: DoctorCheck[] = [];
   const targets: DoctorTargets = { projectDirectory: null, projectConfig: null, coordinatorConfig: null, stateDirectory: null };
   const add = (id: string, status: CheckStatus, fatal: boolean, message: string): void => { checks.push({ id, status, fatal, message }); };
@@ -301,5 +305,5 @@ export async function runLocalChecks(input: DoctorInput, options: DoctorOptions 
   if (findings.length) add('permissions', 'warn', false, `${findings.join('; ')}. Advisory only; doctor never changes permissions.`);
   else add('permissions', 'pass', false, 'No group- or world-accessible configuration files or writable directories were found');
 
-  return { checks, targets };
+  return { checks, targets, ...(projectDirectory === undefined ? {} : { projectDirectory }), ...(configuration === undefined ? {} : { configuration }) };
 }

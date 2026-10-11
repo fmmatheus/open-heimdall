@@ -1,8 +1,9 @@
 import { createRedactor } from '../setup/cli.js';
+import { connectionNotRequested, verifyConnection, type ConnectionResult } from './connection.js';
 import { runLocalChecks, type DoctorCheck, type DoctorInput, type DoctorOptions, type DoctorReport, type DoctorTargets, type DoctorVerification } from './checks.js';
 
 /*
- * `heimdall doctor` command line front end over the offline local checks (checks.ts).
+ * `heimdall doctor` command line front end over the offline local checks (checks.ts) and the optional connection check (connection.ts).
  *
  * Output contract
  * ---------------
@@ -20,14 +21,17 @@ import { runLocalChecks, type DoctorCheck, type DoctorInput, type DoctorOptions,
  *                  status: "pass" | "fail" | "warn" | "not-verified" | "skipped"
  *                  fatal: true for a required check (only a "fail" status on it makes ok false), false for advisory checks
  *   verification   { local: "passed" | "failed",
- *                    connection: "not-requested" | "pending",
+ *                    connection: "not-requested" | "verified" | "failed",
  *                    protectedApiAuthorization, modelAvailability, providerLogin, quota: always "unverified" }
  *   error          null, or { code: "invalid-input" | "unexpected", message } when no checks could run
  * Every string is redacted: credential values taken from the environment, URL user information and
  * Authorization-style values never appear.
  *
- * Exit status: 0 when ok is true (warnings and unverified items do not change it); 1 when a required local check
- * failed or the arguments were invalid.
+ * The connection check is advisory and "not-verified" unless --connect is passed; then it is required: it passes when
+ * GET /api/info answers with the supported version, a positive pid and the selected authentication, and fails otherwise.
+ *
+ * Exit status: 0 when ok is true (warnings and unverified items do not change it); 1 when a required check
+ * failed (including a requested connection check) or the arguments were invalid.
  */
 
 export const doctorHelp = `Run offline, read-only diagnostics
@@ -38,23 +42,25 @@ Usage:
 Checks the local installation without changing anything: the Node.js minimum, Git and the Git project with a
 commit, the installed runtime files and dependencies, the project and coordinator configuration and whether setup
 is complete, and the configured paths. A state directory that does not exist yet is not a failure. Permission
-findings are advisory. Doctor never creates files, changes permissions, starts the coordinator, repairs
-configuration, contacts OpenCode or reaches any network.
+findings are advisory. Doctor never creates files, changes permissions, starts the coordinator or repairs
+configuration. By default it makes no network request. With --connect it sends one GET /api/info request to the
+loopback OpenCode URL from the project configuration, with the configured authentication source, and nothing else.
 
 Flags:
   --project DIRECTORY             Git project to inspect (default: the current Git project)
   --config FILE                   project configuration (default: $HEIMDALL_CONFIG, else .heimdall.toml in the project)
   --coordinator-config FILE       coordinator configuration (default: $HEIMDALL_COORDINATOR_CONFIG,
                                   else ~/.config/heimdall/coordinator.toml)
-  --connect                       request the OpenCode connection check
+  --connect                       also verify the configured OpenCode endpoint (GET /api/info, 10 s limit)
   --json                          print one JSON document on stdout (schemaVersion 1)
   --help                          show this help
 
-Passing local checks does not verify the OpenCode connection, authorization to protected APIs, model
-availability, provider login or quota, and does not show that a run can execute.
+A successful connection check verifies the endpoint, the supported OpenCode version and the selected
+authentication source. Doctor never verifies authorization to protected APIs, model availability, provider login
+or quota, and neither local checks nor the connection check show that a run can execute.
 
-Exit status is 0 when no required local check failed and 1 otherwise. Warnings and unverified items do not
-change it. The report goes to stdout; diagnostics go to stderr. With --json, stdout is a single document with
+Exit status is 0 when no required check failed and 1 otherwise; a requested connection check that fails is
+required. Warnings and unverified items do not change it. The report goes to stdout; diagnostics go to stderr. With --json, stdout is a single document with
 fields schemaVersion, ok, targets, checks, verification and error.
 `;
 
@@ -115,20 +121,15 @@ export interface DoctorCommandOptions extends DoctorOptions {
 const NO_TARGETS: DoctorTargets = { projectDirectory: null, projectConfig: null, coordinatorConfig: null, stateDirectory: null };
 
 function verificationFor(ok: boolean, connect: boolean): DoctorVerification {
-  return { local: ok ? 'passed' : 'failed', connection: connect ? 'pending' : 'not-requested', protectedApiAuthorization: 'unverified', modelAvailability: 'unverified', providerLogin: 'unverified', quota: 'unverified' };
+  return { local: ok ? 'passed' : 'failed', connection: connect ? 'failed' : 'not-requested', protectedApiAuthorization: 'unverified', modelAvailability: 'unverified', providerLogin: 'unverified', quota: 'unverified' };
 }
 
-const connectionCheck = (connect: boolean): DoctorCheck => ({
-  id: 'connection', status: 'not-verified', fatal: false,
-  message: connect
-    ? 'Requested with --connect, but the connection probe is not available in this build; connection verification is pending'
-    : 'Not requested; connection verification is pending. Request it with --connect',
-});
-
-function buildReport(checks: DoctorCheck[], targets: DoctorTargets, connect: boolean): DoctorReport {
-  const all = [...checks, connectionCheck(connect)];
+function buildReport(checks: DoctorCheck[], targets: DoctorTargets, connection: ConnectionResult, connect: boolean): DoctorReport {
+  const all = [...checks, connection.check];
   const ok = !all.some(check => check.fatal && check.status === 'fail');
-  return { schemaVersion: 1, ok, targets, checks: all, verification: verificationFor(ok, connect), error: null };
+  const verification = verificationFor(ok, connect);
+  if (connect) verification.connection = connection.verified ? 'verified' : 'failed';
+  return { schemaVersion: 1, ok, targets, checks: all, verification, error: null };
 }
 
 function failureReport(code: 'invalid-input' | 'unexpected', message: string, connect: boolean): DoctorReport {
@@ -146,7 +147,7 @@ function redactReport(report: DoctorReport, redact: (text: string) => string): D
 }
 
 function humanReport(report: DoctorReport): string {
-  const lines = ['Heimdall doctor (offline, read-only local checks)'];
+  const lines = ['Heimdall doctor (read-only checks)'];
   const { targets } = report;
   if (targets.projectDirectory) lines.push(`Project: ${targets.projectDirectory}`);
   if (targets.projectConfig) lines.push(`Project configuration: ${targets.projectConfig}`);
@@ -159,9 +160,11 @@ function humanReport(report: DoctorReport): string {
   lines.push('', report.ok
     ? `Local checks passed (${counts('pass')} passed, ${counts('warn')} warnings, ${counts('skipped')} skipped).`
     : `Local checks failed: ${failed} required check${failed === 1 ? '' : 's'} failed.`);
-  lines.push(report.verification.connection === 'pending'
-    ? 'Connection verification: pending (--connect was requested but is not available in this build).'
-    : 'Connection verification: pending (not requested).');
+  lines.push({
+    'not-requested': 'Connection verification: not requested (use --connect).',
+    verified: 'Connection verification: verified (GET /api/info with the selected authentication source only).',
+    failed: 'Connection verification: failed.',
+  }[report.verification.connection]);
   lines.push('Unverified: protected-API authorization, model availability, provider login and quota. Passing local checks does not show that a run can execute.', '');
   return lines.join('\n');
 }
@@ -190,14 +193,18 @@ export async function doctorMain(args: readonly string[], options: DoctorCommand
   try { parsed = parseDoctorArguments(args); }
   catch (error) { return emit(failureReport('invalid-input', error instanceof UsageError ? error.message : 'Invalid doctor arguments', connectRequested)); }
   try {
-    const { checks, targets } = await runLocalChecks(parsed.input, {
+    const { checks, targets, projectDirectory, configuration } = await runLocalChecks(parsed.input, {
       environment,
       ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
       ...(options.homeDirectory === undefined ? {} : { homeDirectory: options.homeDirectory }),
       ...(options.packageRoot === undefined ? {} : { packageRoot: options.packageRoot }),
       ...(options.nodeVersion === undefined ? {} : { nodeVersion: options.nodeVersion }),
     });
-    return emit(buildReport(checks, targets, parsed.input.connect === true));
+    const connect = parsed.input.connect === true;
+    const connection = connect
+      ? await verifyConnection({ configuration, projectDirectory, environment, ...(options.connection === undefined ? {} : { connection: options.connection }) })
+      : connectionNotRequested();
+    return emit(buildReport(checks, targets, connection, connect));
   } catch (error) {
     const code = (error as NodeJS.ErrnoException | null)?.code;
     return emit(failureReport('unexpected', `Doctor failed unexpectedly (${code ?? (error instanceof Error ? error.name : 'error')})`, connectRequested));
