@@ -126,6 +126,64 @@ remain held for inspection after restart.
 Runs can also be watched and reviewed read-only from OpenChamber 2.1.0; see the
 [OpenChamber extension guide](openchamber-extension.md).
 
+## Status
+
+`coordinator status` asks an already running coordinator whether it is running
+or draining and how many runs are queued or hold capacity. It selects the
+coordinator through the same `--coordinator-config` option, environment variable
+and default path as the other commands.
+
+```sh
+node dist/cli.js coordinator status [--json] [--coordinator-config FILE]
+node dist/cli.js coordinator status --coordinator-config /path/to/coordinator.toml
+node dist/cli.js coordinator status --json --coordinator-config /path/to/coordinator.toml
+```
+
+The default output is a short summary:
+
+```text
+Coordinator running; accepting new runs.
+Queued runs: 1
+Reserved runs: 2 (retained capacity, including uncertain execution)
+```
+
+`--json` prints the validated schema-1 document instead. It has exactly these
+fields; any other shape is rejected as an invalid response:
+
+```json
+{
+  "schemaVersion": 1,
+  "service": "heimdall-coordinator",
+  "status": "running",
+  "acceptingNewRuns": true,
+  "queuedRuns": 1,
+  "reservedRuns": 2
+}
+```
+
+- `status` is `running` or `draining`. `draining` means the coordinator received
+  SIGINT/SIGTERM, stopped admission and is waiting for reservations to resolve;
+  it is reported exactly when `acceptingNewRuns` is `false`.
+- `queuedRuns` counts runs waiting for admission.
+- `reservedRuns` counts runs holding capacity. It includes runs with uncertain
+  execution that keep their reservation, so it is not a count of working agents.
+
+Access and behavior:
+
+- The route accepts only the administrator key from the coordinator state
+  directory. Run-owner capabilities, wrong keys and missing keys are refused.
+- Status gives up after a 10 second overall deadline, including when the
+  coordinator keeps a connection open without finishing its response.
+- Exit code 0 means a valid `running` or `draining` response was received
+  (draining is not an error). Any other outcome exits 1 with a diagnostic on
+  stderr and nothing on stdout: missing configuration or key, unavailable
+  endpoint, refused authorization, a starting or stopping coordinator, an
+  expired deadline, or an invalid response.
+- A coordinator from an older version has no status route. It is reported as
+  incompatible, and Heimdall never restarts or replaces it.
+- Status is read-only. It does not create configuration, keys, sockets or
+  databases, does not start or stop a coordinator, and does not contact OpenCode.
+
 ## Structured completion protocol
 
 New runs persist `structured-v1` at start. The planner and the executor no longer
@@ -284,6 +342,9 @@ forces a full re-run. Verification record:
   loses them (nothing is released or claimed for them); recovery then relies on
   the durable checkpoint and a manual resume.
 
+- `coordinator status` is covered by automated tests with temporary fixtures on
+  macOS only; Linux and Windows behavior and a live installed coordinator are
+  unverified.
 - SQLite uses Node's built-in `node:sqlite`, still experimental on Node 22.
 - Usage is unlimited by default. Existing optional caps cover cumulative child
   session/run tokens; parent orchestration tokens are outside those caps. Active
