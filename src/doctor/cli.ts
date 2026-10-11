@@ -1,6 +1,6 @@
 import { createRedactor } from '../setup/cli.js';
 import { connectionNotRequested, verifyConnection, type ConnectionResult } from './connection.js';
-import { runLocalChecks, type DoctorCheck, type DoctorInput, type DoctorOptions, type DoctorReport, type DoctorTargets, type DoctorVerification } from './checks.js';
+import { runLocalChecks, type DoctorCheck, type DoctorInput, type DoctorTrace, type DoctorOptions, type DoctorReport, type DoctorTargets, type DoctorVerification } from './checks.js';
 
 /*
  * `heimdall doctor` command line front end over the offline local checks (checks.ts) and the optional connection check (connection.ts).
@@ -197,6 +197,7 @@ export async function doctorMain(args: readonly string[], options: DoctorCommand
   let parsed: ParsedDoctorArguments;
   try { parsed = parseDoctorArguments(args); }
   catch (error) { return emit(failureReport('invalid-input', error instanceof UsageError ? error.message : 'Invalid doctor arguments', connectRequested)); }
+  const trace: DoctorTrace = {};
   try {
     const { checks, targets, projectDirectory, configuration } = await runLocalChecks(parsed.input, {
       environment,
@@ -204,9 +205,10 @@ export async function doctorMain(args: readonly string[], options: DoctorCommand
       ...(options.homeDirectory === undefined ? {} : { homeDirectory: options.homeDirectory }),
       ...(options.packageRoot === undefined ? {} : { packageRoot: options.packageRoot }),
       ...(options.nodeVersion === undefined ? {} : { nodeVersion: options.nodeVersion }),
-    });
-    // The selected project configuration names the variable that holds the OpenCode password, whatever its name.
-    redact.addReferences([configuration?.opencode.passwordEnvironmentVariable]);
+    }, trace);
+    // The selected project configuration names the variable that holds the OpenCode password, whatever its name,
+    // even when the rest of the configuration is invalid.
+    redact.addReferences([...(trace.credentialReferences ?? []), configuration?.opencode.passwordEnvironmentVariable]);
     const connect = parsed.input.connect === true;
     const connection = connect
       ? await verifyConnection({ configuration, projectDirectory, environment, ...(options.connection === undefined ? {} : { connection: options.connection }) })
@@ -214,6 +216,7 @@ export async function doctorMain(args: readonly string[], options: DoctorCommand
     return emit(buildReport(checks, targets, connection, connect));
   } catch (error) {
     const code = (error as NodeJS.ErrnoException | null)?.code;
+    redact.addReferences(trace.credentialReferences ?? []);
     return emit(failureReport('unexpected', `Doctor failed unexpectedly (${code ?? (error instanceof Error ? error.name : 'error')})`, connectRequested));
   }
 }

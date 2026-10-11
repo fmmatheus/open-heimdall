@@ -677,6 +677,70 @@ test('the password variable selected by the project configuration is redacted wh
   assert.match(human.stdout, /Project configuration: .*\[redacted\]/);
 });
 
+/** A syntactically valid project file whose only schema problem is the unsupported quota provider. */
+const invalidWorkflowProject = reference => `[workflow]
+plannerModel = "anthropic/planner-x"
+
+[[workflow.executorCandidates]]
+key = "primary"
+quotaProvider = "unsupported-provider"
+model = "openai/executor-x"
+
+[opencode]
+baseUrl = "http://127.0.0.1:9"
+authentication = "basic"
+passwordEnvironmentVariable = "${reference}"
+`;
+
+test('a project credential reference is redacted when project validation fails', async t => {
+  const s = await sandbox(t);
+  const opaque = 'zq-opaque-3e6a90d4f1b7';
+  const configuration = path.join(s.project, `${opaque}.toml`);
+  createSetup(s);
+  await fs.writeFile(configuration, invalidWorkflowProject('OPAQUE'), { mode: 0o600 });
+  await fs.chmod(configuration, 0o600);
+  const bytes = await fs.readFile(configuration);
+  const { human, json, document } = await both(s, ['--config', configuration], { env: { OPAQUE: opaque } });
+  assert.deepEqual(await fs.readFile(configuration), bytes, 'doctor changed the project file');
+  // The original validation failure stays a required, actionable failure.
+  assert.equal(human.status, 1);
+  assert.equal(json.status, 1);
+  const project = checkOf(document, 'project.config');
+  assert.equal(project.status, 'fail');
+  assert.equal(project.fatal, true);
+  assert.match(project.message, /is not valid/);
+  assert.match(project.message, /quotaProvider must be/);
+  assert.equal(checkOf(document, 'project.setup').status, 'skipped');
+  assert.equal(checkOf(document, 'paths.project').status, 'skipped');
+  assert.equal(checkOf(document, 'coordinator.config').status, 'pass');
+  assert.equal(document.ok, false);
+  assert.equal(document.verification.local, 'failed');
+  assert.equal(document.verification.connection, 'not-requested');
+  assert.match(human.stderr, /required checks? failed: .*project\.config/);
+  // The credential value appears nowhere, while non-secret paths stay readable.
+  for (const output of [human.stdout, human.stderr, json.stdout, json.stderr]) assert.ok(!output.includes(opaque), `the referenced credential appeared in output:\n${output}`);
+  const walk = value => typeof value === 'string' ? assert.ok(!value.includes(opaque), value) : value && typeof value === 'object' && Object.values(value).forEach(walk);
+  walk(document);
+  assert.ok(document.targets.projectConfig.includes('[redacted]'));
+  assert.equal(document.targets.projectDirectory, s.project);
+  assert.equal(document.targets.coordinatorConfig, s.coordinatorFile);
+  assert.match(human.stdout, /Project configuration: .*\[redacted\]/);
+});
+
+test('an invalid project credential reference still fails project validation', async t => {
+  const s = await sandbox(t);
+  createSetup(s);
+  const bytes = invalidWorkflowProject('not a name').replace('unsupported-provider', 'openai');
+  await fs.writeFile(s.projectFile, bytes, { mode: 0o600 });
+  const { human, document } = await both(s, [], { env: { OPAQUE: 'zq-opaque-3e6a90d4f1b7' } });
+  assert.equal(human.status, 1);
+  assert.equal(checkOf(document, 'project.config').status, 'fail');
+  assert.equal(checkOf(document, 'project.config').fatal, true);
+  assert.match(checkOf(document, 'project.config').message, /is not valid/);
+  assert.equal(document.verification.local, 'failed');
+  assert.equal(await read(s.projectFile), bytes);
+});
+
 test('node version minimum is enforced in-process', async t => {
   const s = await sandbox(t);
   createSetup(s, ['--state-directory', path.join(s.root, 'state')]);
