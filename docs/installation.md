@@ -212,7 +212,11 @@ information and Authorization-style values never appear in output. This includes
 the value of the environment variable named by `--password-env` (in either the
 `--password-env NAME` or `--password-env=NAME` form), chosen in the wizard or
 named by the existing project file that setup reuses, whatever the variable is
-called.
+called. The selected project's variable is also masked when validation of either
+configuration file fails, for example when an existing coordinator file is
+malformed, provided the project file is readable and valid TOML. If the
+coordinator file cannot be read at all, setup fails before it reads the project
+file and cannot mask that variable's value.
 
 Example of a successful result (abbreviated paths):
 
@@ -374,7 +378,10 @@ Schema version 1:
 | `verification` | `{ "local": "passed" \| "failed" (local checks only), "connection": "not-requested" \| "verified" \| "failed", "protectedApiAuthorization", "modelAvailability", "providerLogin", "quota" }`. The last four are always `"unverified"`. |
 | `error` | `null`, or `{ "code": "invalid-input" \| "unexpected", "message" }` when no checks could run. |
 
-Strings are redacted in the same way as setup output.
+Strings are redacted in the same way as setup output, including the password
+variable named by a project configuration that is valid TOML but fails
+validation. A project file that is not valid TOML names no variable that can be
+read, so nothing is masked for it.
 
 ## Next step
 
