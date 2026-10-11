@@ -300,6 +300,14 @@ export class CoordinatorStore {
     const row = this.db.prepare('SELECT * FROM runs WHERE id = ?').get(id);
     return row ? runFromRow(row) : null;
   }
+  /** Read-only admission counts: no transaction, no event. */
+  statusCounts(): { queuedRuns: number; reservedRuns: number } {
+    const value = (sql: string) => Number(this.db.prepare(sql).get()!.count);
+    return {
+      queuedRuns: value("SELECT count(*) AS count FROM runs WHERE status = 'queued'"),
+      reservedRuns: value('SELECT count(*) AS count FROM runs WHERE capacity_reserved = 1'),
+    };
+  }
   events(after = 0): CoordinatorEvent[] {
     if (!Number.isSafeInteger(after) || after < 0) throw new Error('Event cursor must be a nonnegative safe integer');
     return this.db.prepare('SELECT * FROM events WHERE sequence > ? ORDER BY sequence LIMIT 500').all(after).map(row => ({

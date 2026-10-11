@@ -8,6 +8,7 @@ import { createManagedExecutor } from './executor.js';
 import { inspectProject, planManagedWorktree, resolveBaseCommit } from './worktrees.js';
 import { checkRuntimeConflicts, snapshotSpecification } from './runtime.js';
 import { positiveInteger } from './config.js';
+import { COORDINATOR_SERVICE_ID, COORDINATOR_STATUS_SCHEMA_VERSION, parseCoordinatorStatus } from './status.js';
 import { privateFile, readCoordinatorToken } from './token.js';
 import type { CoordinatorConfiguration } from './config.js';
 import type { ManagedExecutor, Receipt, RunRecord, StartBinding } from './types.js';
@@ -176,6 +177,12 @@ export async function startCoordinatorService(options: ServiceOptions) {
         const after = Number(url.searchParams.get('after') ?? 0);
         if (!Number.isSafeInteger(after) || after < 0) throw new Error('Event cursor must be a nonnegative integer');
         send(200, store.events(after)); return;
+      }
+      if (method === 'GET' && segments.length === 1 && segments[0] === 'status') {
+        send(200, parseCoordinatorStatus({
+          schemaVersion: COORDINATOR_STATUS_SCHEMA_VERSION, service: COORDINATOR_SERVICE_ID,
+          status: draining ? 'draining' : 'running', acceptingNewRuns: !draining, ...store.statusCounts(),
+        })); return;
       }
       send(404, { error: 'Unknown coordinator route' });
     })().catch((error: unknown) => { if (!response.headersSent) send(400, { error: error instanceof Error ? error.message : 'Coordinator request failed' }); else response.destroy(); });
