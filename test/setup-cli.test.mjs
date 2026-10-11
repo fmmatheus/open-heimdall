@@ -695,6 +695,84 @@ test('the password variable of an existing project file is redacted without any 
   }
 });
 
+const completeProjectLines = reference => ['[workflow]', 'plannerModel = "anthropic/planner-x"', '', '[[workflow.executorCandidates]]', 'key = "primary"', 'quotaProvider = "openai"', 'model = "openai/executor-x"', '', '[opencode]', 'baseUrl = "http://127.0.0.1:9"', 'authentication = "basic"', `passwordEnvironmentVariable = ${JSON.stringify(reference)}`, ''].join('\n');
+
+/** Bytes, mode and mtime of each file, plus the full listing of the sandbox. */
+async function snapshot(s, files) {
+  const state = {};
+  for (const file of files) {
+    const stat = await fs.stat(file);
+    state[file] = { bytes: (await fs.readFile(file)).toString('base64'), mode: stat.mode, mtimeMs: stat.mtimeMs };
+  }
+  return { files: state, listing: await tree(s.root) };
+}
+
+test('a project credential reference is redacted when the coordinator file is malformed', async t => {
+  for (const json of [false, true]) {
+    const s = await sandbox(t);
+    const coordinatorFile = path.join(s.root, `${OPAQUE_VALUE}.toml`);
+    await fs.writeFile(s.projectFile, completeProjectLines('OPAQUE'), { mode: 0o600 });
+    await fs.writeFile(coordinatorFile, 'this is = = not toml\n[unterminated\n', { mode: 0o600 });
+    const before = await snapshot(s, [s.projectFile, coordinatorFile]);
+    const result = setup(s, ['--coordinator-config', coordinatorFile, '--no-input', ...(json ? ['--json'] : [])], { env: { OPAQUE: OPAQUE_VALUE } });
+    const context = json ? 'json' : 'human';
+    assert.equal(result.status, 1, result.stderr);
+    assertNoOpaque([result.stdout, result.stderr], context);
+    if (json) {
+      const document = jsonDocument(result);
+      assert.equal(document.error.code, 'invalid-configuration');
+      assert.match(document.error.message, /coordinator configuration .*is not valid: .+/);
+      assert.match(document.error.message, /\[redacted\]/);
+      assert.doesNotMatch(document.error.message, /project configuration/);
+      assert.ok(document.targets.coordinator.path.includes('[redacted]'));
+      assert.equal(document.targets.project.path, s.projectFile);
+      assert.equal(document.projectDirectory, s.project);
+      assert.deepEqual([document.targets.coordinator.outcome, document.targets.project.outcome], ['not-written', 'not-written']);
+      const strings = [];
+      const collect = value => { if (typeof value === 'string') strings.push(value); else if (value && typeof value === 'object') Object.values(value).forEach(collect); };
+      collect(document);
+      assertNoOpaque(strings, 'json string fields');
+    } else {
+      assert.equal(result.stdout, '');
+      assert.ok(result.stderr.includes('Heimdall setup failed (invalid-configuration)'), result.stderr);
+      assert.ok(result.stderr.includes('[redacted]'), result.stderr);
+      assert.ok(result.stderr.includes(s.root), 'the non-secret part of the path stays readable');
+      assert.match(result.stderr, /coordinator configuration .*is not valid: .+/);
+    }
+    assert.deepEqual(await snapshot(s, [s.projectFile, coordinatorFile]), before);
+    assertNoServiceArtifacts(await tree(s.root));
+    assert.equal(await exists(path.join(s.home, '.local')), false);
+    assert.equal(await exists(path.join(s.project, '.heimdall')), false);
+    await assertNoNetworkAttempts(s);
+  }
+});
+
+test('an invalid project credential reference still fails full validation without leaking', async t => {
+  for (const json of [false, true]) {
+    const s = await sandbox(t);
+    const state = path.join(s.root, 'state');
+    await fs.mkdir(path.dirname(s.coordinatorFile), { recursive: true });
+    await fs.writeFile(s.coordinatorFile, `[coordinator]\nstateDirectory = ${JSON.stringify(state)}\nglobalConcurrency = 2\n`, { mode: 0o600 });
+    await fs.writeFile(s.projectFile, completeProjectLines('not a name'), { mode: 0o600 });
+    const before = await snapshot(s, [s.projectFile, s.coordinatorFile]);
+    const result = setup(s, ['--no-input', ...(json ? ['--json'] : [])], { env: { OPAQUE: OPAQUE_VALUE } });
+    assert.equal(result.status, 1, result.stderr);
+    assertNoOpaque([result.stdout, result.stderr], json ? 'json' : 'human');
+    if (json) {
+      const document = jsonDocument(result);
+      assert.equal(document.error.code, 'invalid-configuration');
+      assert.match(document.error.message, /project configuration .*is not valid/);
+    } else {
+      assert.equal(result.stdout, '');
+      assert.match(result.stderr, /invalid-configuration/);
+      assert.match(result.stderr, /project configuration .*is not valid/);
+    }
+    assert.deepEqual(await snapshot(s, [s.projectFile, s.coordinatorFile]), before);
+    assertNoServiceArtifacts(await tree(s.root));
+    await assertNoNetworkAttempts(s);
+  }
+});
+
 /** A prompt hook that behaves like the wizard answering the missing decisions, including a custom password variable. */
 const wizardAnswers = { plannerModel: 'anthropic/planner-x', executorModel: 'openai/executor-x', quotaProvider: 'openai', opencodeUrl: 'http://127.0.0.1:4096', opencodeAuth: 'basic', passwordEnv: 'OPAQUE' };
 

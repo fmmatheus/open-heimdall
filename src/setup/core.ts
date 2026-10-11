@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { TomlError } from 'smol-toml';
-import { parseConfiguration, type Configuration } from '../config.js';
+import { credentialReference, parseConfiguration, type Configuration } from '../config.js';
 import { canonicalPlannedDirectory, parseCoordinatorConfiguration, positiveInteger, type CoordinatorConfiguration } from '../coordinator/config.js';
 import { inspectProject, resolveBaseCommit } from '../coordinator/worktrees.js';
 import { executorCandidates } from '../policy/quota.js';
@@ -325,6 +325,12 @@ export async function planSetup(input: SetupInput, options: SetupOptions = {}, t
 
   await assertDistinct(coordinatorFile, projectFile);
   const [coordinatorContent, projectContent] = [await readExisting(coordinatorFile, 'coordinator'), await readExisting(projectFile, 'project')];
+  // Record the reference before any validation so that failures raised below, including malformed coordinator
+  // configuration, are sanitized with the project's credential. The name is used for redaction only.
+  if (projectContent !== null) {
+    const reference = credentialReference(projectContent);
+    if (reference !== undefined) (trace.credentialReferences ??= []).push(reference);
+  }
 
   let coordinatorEffective: CoordinatorConfiguration | undefined;
   if (coordinatorContent !== null) {
