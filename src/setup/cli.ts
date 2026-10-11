@@ -171,7 +171,7 @@ export function parseSetupArguments(args: readonly string[]): ParsedSetupArgumen
 const SECRET_NAME = /pass|token|secret|credential|api_?key/i;
 
 /** Builds a redactor for diagnostics: environment credential values, URL user information and Authorization-style values. */
-function createRedactor(environment: NodeJS.ProcessEnv, args: readonly string[]): (text: string) => string {
+export function createRedactor(environment: NodeJS.ProcessEnv, args: readonly string[]): (text: string) => string {
   const secrets = new Set<string>();
   for (const [name, value] of Object.entries(environment)) if (value && value.length >= 4 && SECRET_NAME.test(name)) secrets.add(value);
   const indexOfPasswordName = args.indexOf('--password-env');

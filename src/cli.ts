@@ -11,6 +11,7 @@ Usage:
   heimdall check [--project DIRECTORY] [--config FILE]
   heimdall status RUN_ID [--project DIRECTORY] [--config FILE]
   heimdall setup [flags]
+  heimdall doctor [--project DIRECTORY] [--config FILE] [--coordinator-config FILE] [--connect] [--json]
   heimdall coordinator --help
   heimdall --version
 
@@ -24,12 +25,19 @@ unchanged. It never contacts OpenCode or providers. See heimdall setup --help. F
   --opencode-url URL  --opencode-auth basic|none|openchamber  --password-env NAME
   --state-directory DIRECTORY  --global-concurrency NUMBER  --project-concurrency NUMBER
   --no-input  --json  --help
+doctor runs offline, read-only local checks (Node.js, Git project, installed runtime, configuration, paths)
+and reports each check. It never changes files or contacts OpenCode or providers. See heimdall doctor --help.
 `;
 
 async function main(args: string[]): Promise<void> {
   if (args[0] === 'setup') {
     const [{ setupMain }, { runWizard }] = await Promise.all([import('./setup/cli.js'), import('./setup/wizard.js')]);
     process.exitCode = await setupMain(args.slice(1), { prompt: request => runWizard(request, { stdin: process.stdin, stdout: process.stdout }) });
+    return;
+  }
+  if (args[0] === 'doctor') {
+    const { doctorMain } = await import('./doctor/cli.js');
+    process.exitCode = await doctorMain(args.slice(1));
     return;
   }
   if (args[0] === 'coordinator') {

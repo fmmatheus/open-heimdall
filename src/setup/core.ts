@@ -86,7 +86,7 @@ const firstLine = (value: string): string => value.split('\n')[0]!.trim();
 const errorCode = (error: unknown): string | undefined => (error as NodeJS.ErrnoException | null)?.code;
 
 /** Parser failures can quote file content; report only the first line and position. */
-function describe(error: unknown): string {
+export function describe(error: unknown): string {
   if (error instanceof TomlError) return `${firstLine(error.message)} (line ${error.line}, column ${error.column})`;
   if (error instanceof TypeError && error.message === 'Invalid URL') return 'opencode.baseUrl must be a valid URL';
   return error instanceof Error ? firstLine(error.message) : 'unreadable content';
@@ -272,7 +272,7 @@ function compareProject(file: string, existing: Configuration, requested: Reques
 }
 
 /** Schema-valid is not setup-complete: the endpoint is optional in the loader and shipped template models are placeholders. */
-function incompleteSettings(existing: Configuration): string[] {
+export function incompleteSettings(existing: Configuration): string[] {
   const missing: string[] = [];
   if (existing.opencode.baseUrl === undefined) missing.push('opencode.baseUrl');
   const placeholder = (model: string | undefined): boolean => model !== undefined && SHIPPED_PLACEHOLDER_MODELS.includes(model);

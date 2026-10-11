@@ -121,7 +121,7 @@ export type QuotaModuleResolver = (specifier: string) => string;
 const vendoredEntry = fileURLToPath(new URL('../vendor/opencode-quota/dist/lib/opencode-auth.js', import.meta.url));
 const packageName = '@slkiser/opencode-quota';
 const packageVersion = '5.0.1';
-const moduleFiles = {
+export const moduleFiles = {
   auth: 'dist/lib/opencode-auth.js',
   anthropic: 'dist/providers/anthropic.js',
   kimi: 'dist/providers/kimi-code.js',
