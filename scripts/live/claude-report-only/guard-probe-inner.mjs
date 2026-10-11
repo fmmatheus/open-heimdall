@@ -10,7 +10,7 @@ const plan = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const results = [];
 
 // A guarded write that SUCCEEDS means the guard failed. Whatever it created is recorded in the ownership ledger
-// (intent first, then dev/ino of what exists) so the outer cleanup can remove exactly that and nothing else.
+// (intent first, then dev/ino/birthtimeNs of what exists) so the outer cleanup can remove exactly that and nothing else.
 const ledger = plan.ledger ? openLedger(plan.ledger) : null;
 const creates = new Set(['create', 'mkdir', 'symlink', 'hardlink', 'rename']);
 
@@ -20,7 +20,7 @@ function attempt(entry) {
   let identity = null;
   try {
     if (ledger && creates.has(op)) ledger.intent(destination, op);
-    if (op === 'rename') { const stat = fs.lstatSync(target); identity = { dev: stat.dev, ino: stat.ino }; }
+    if (op === 'rename') { const stat = fs.lstatSync(target, { bigint: true }); identity = { dev: String(stat.dev), ino: String(stat.ino), birthtimeNs: typeof stat.birthtimeNs === 'bigint' && stat.birthtimeNs > 0n ? String(stat.birthtimeNs) : null }; }
     if (op === 'create') fs.closeSync(fs.openSync(target, 'wx'));
     else if (op === 'overwrite') { const fd = fs.openSync(target, 'r+'); fs.writeSync(fd, 'GUARD-PROBE-OVERWRITE'); fs.closeSync(fd); }
     else if (op === 'truncate') fs.truncateSync(target, 0);

@@ -93,6 +93,73 @@ describe('ownership based cleanup', () => {
     assert.deepEqual(result.preserved.map(entry => entry.reason).sort(), ['replaced by a different object', 'replaced by a symlink']);
   });
 
+  test('a deterministic dev/ino collision with another birthtime preserves the foreign replacement', () => {
+    const { home, ledger, ledgerFile } = synthetic();
+    const replaced = path.join(home, '.claude', 'incarnation.json');
+    createExclusiveFile(ledger, replaced, 'MINE');
+    fs.unlinkSync(replaced);
+    write(replaced, 'FOREIGN-REPLACEMENT');
+    const current = fs.lstatSync(replaced, { bigint: true });
+    const entries = readLedger(ledgerFile), owned = entries.find(entry => entry.event === 'owned');
+    // Model inode reuse deterministically, without depending on the filesystem allocator.
+    owned.dev = String(current.dev); owned.ino = String(current.ino);
+    owned.birthtimeNs = String(current.birthtimeNs - 1n);
+    fs.writeFileSync(ledgerFile, entries.map(entry => JSON.stringify(entry)).join('\n') + '\n');
+    const result = cleanupOwned({ ledgerFile });
+    assert.equal(result.confirmed, false);
+    assert.deepEqual(result.removed, []);
+    assert.equal(result.preserved[0].reason, 'replaced by a different object');
+    assert.equal(fs.readFileSync(replaced, 'utf8'), 'FOREIGN-REPLACEMENT');
+  });
+
+  test('legacy and unavailable birthtime identities preserve present objects without upgrading by observation', () => {
+    for (const incarnation of [undefined, null, '0']) {
+      const { home, ledger, ledgerFile } = synthetic();
+      const file = path.join(home, '.claude', 'legacy.json');
+      createExclusiveFile(ledger, file, 'PRESERVE');
+      const entries = readLedger(ledgerFile), owned = entries.find(entry => entry.event === 'owned');
+      owned.birthtimeNs = incarnation;
+      fs.writeFileSync(ledgerFile, entries.map(entry => JSON.stringify(entry)).join('\n') + '\n');
+      const before = fs.readFileSync(ledgerFile, 'utf8');
+      const result = cleanupOwned({ ledgerFile });
+      assert.equal(result.confirmed, false);
+      assert.match(result.preserved[0].reason, /missing or unavailable/);
+      assert.equal(fs.readFileSync(file, 'utf8'), 'PRESERVE');
+      assert.equal(fs.readFileSync(ledgerFile, 'utf8'), before, 'cleanup cannot add a current incarnation to an old record');
+      fs.unlinkSync(file);
+      assert.deepEqual(cleanupOwned({ ledgerFile }).alreadyRemoved, [file]);
+      write(file, 'FOREIGN-AFTER-RELEASE');
+      assert.deepEqual(cleanupOwned({ ledgerFile }).removed, []);
+      assert.equal(fs.readFileSync(file, 'utf8'), 'FOREIGN-AFTER-RELEASE');
+    }
+  });
+
+  test('rename claims require the complete matching recorded incarnation', () => {
+    const { home, ledger, ledgerFile } = synthetic();
+    const source = path.join(home, '.claude', 'rename-source.json');
+    const destination = path.join(home, '.claude', 'rename-destination.json');
+    const identity = createExclusiveFile(ledger, source, 'MINE');
+    fs.renameSync(source, destination);
+    assert.equal(recordCreated(ledgerFile, destination, 'rename'), false);
+    assert.equal(recordCreated(ledgerFile, destination, 'rename', { dev: identity.dev, ino: identity.ino }), false);
+    assert.equal(recordCreated(ledgerFile, destination, 'rename', { ...identity, birthtimeNs: String(BigInt(identity.birthtimeNs) + 1n) }), false);
+    assert.equal(recordCreated(ledgerFile, destination, 'rename', identity), true);
+    assert.equal(cleanupOwned({ ledgerFile }).confirmed, true);
+  });
+
+  test('releasing an earlier incarnation cannot release a later same-inode ownership record', () => {
+    const { home, ledger, ledgerFile } = synthetic();
+    const file = path.join(home, '.claude', 'release.json');
+    createExclusiveFile(ledger, file, 'MINE');
+    const owned = readLedger(ledgerFile).find(entry => entry.event === 'owned');
+    const earlier = { ...owned, birthtimeNs: String(BigInt(owned.birthtimeNs) - 1n) };
+    const entries = [earlier, owned, { event: 'released', path: earlier.path, dev: earlier.dev, ino: earlier.ino, birthtimeNs: earlier.birthtimeNs }];
+    fs.writeFileSync(ledgerFile, entries.map(entry => JSON.stringify(entry)).join('\n') + '\n');
+    assert.deepEqual(cleanupOwned({ ledgerFile }).removed, [file]);
+    const release = readLedger(ledgerFile).filter(entry => entry.event === 'released').at(-1);
+    assert.equal(release.birthtimeNs, owned.birthtimeNs);
+  });
+
   test('a parent directory swapped for a symlink makes cleanup preserve instead of following it', () => {
     const { home, ledger, ledgerFile } = synthetic();
     const directory = path.join(home, '.claude', 'projects');
@@ -157,7 +224,8 @@ describe('ownership based cleanup', () => {
     assert.equal(recordCreated(ledgerFile, created, 'create'), true);
     const destination = write(path.join(home, '.claude', 'dest.renamed'), 'FOREIGN-DEST');
     const source = write(path.join(home, '.claude', 'source'), 'SOURCE');
-    const identity = { dev: fs.lstatSync(source).dev, ino: fs.lstatSync(source).ino };
+    const stat = fs.lstatSync(source, { bigint: true });
+    const identity = { dev: String(stat.dev), ino: String(stat.ino), birthtimeNs: String(stat.birthtimeNs) };
     assert.equal(recordCreated(ledgerFile, destination, 'rename', identity), false);
     const result = cleanupOwned({ ledgerFile });
     assert.deepEqual(result.removed, [created]);
@@ -215,7 +283,7 @@ const runServer = (root, home, { runtime = process.execPath, env = {}, wrap = nu
   return spawnSync(runtime, [server, '--root', root], { env: environment, encoding: 'utf8', cwd: root, timeout: 60_000 });
 };
 
-describe('guarded startup boundary', () => {
+describe('guarded startup boundary', { skip: process.platform !== 'darwin' && 'requires the macOS confinement fixture' }, () => {
   test('the check refuses an unconfined process and removes every object it created', () => {
     const { root, home } = fixtureRoot();
     const nonce = 'unconfined1';
