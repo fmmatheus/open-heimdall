@@ -15,6 +15,9 @@ export function requireIdle(value: SessionSnapshot, id: string, parent?: string,
   return value;
 }
 
+/** Minimum spacing of full-archive scans for one dispatch prompt that the compacted context does not hold. */
+const HISTORY_FALLBACK_MS = 1000;
+
 // Resolve after transforms: another plugin may namespace the built-in tool.
 export async function resolveSubagent(tool: NativeContext['tool']): Promise<NativeTool> {
   const matches = (await tool.list()).filter(t => t.id === 'subagent' || t.name === 'subagent' || /(?:[.:/]|__)subagent$/.test(t.id) || /(?:[.:/]|__)subagent$/.test(t.name));
@@ -92,6 +95,8 @@ export function createNativeBackend({ ctx, observe, history, pause = ms => new P
       for (const attemptId of attemptIds) reportOnly.releaseOwned({ parent, child, attemptId, runId });
     },
   };
+  // The runner polls for the dispatch prompt every few milliseconds; a full archive scan per poll would be wasteful.
+  const historyScans = new Map<string, number>();
   return {
     ...(capability ? { reportOnly: capability } : {}),
     async assertIdle(id, parent, signal) { return requireIdle(await observe(id, signal), id, parent, true); },
@@ -102,7 +107,22 @@ export function createNativeBackend({ ctx, observe, history, pause = ms => new P
       const marker = 'Workflow attempt: ' + attemptId;
       const messages = await ctx.session.context({ sessionID: child });
       const prompt = messages.filter(m => m.type === 'user' && typeof m.id === 'string' && m.id.length > 0 && m.text.includes(marker)).at(-1);
-      return prompt?.id;
+      if (prompt) return prompt.id;
+      // Compaction between dispatch and observation can drop the marker prompt from the active context. The archive keeps it.
+      if (!history) return undefined;
+      const key = child + '\0' + attemptId;
+      const last = historyScans.get(key);
+      if (last !== undefined && Date.now() - last < HISTORY_FALLBACK_MS) return undefined;
+      historyScans.set(key, Date.now());
+      try {
+        for await (const message of history(child, signal)) {
+          if (message.type === 'user' && typeof message.id === 'string' && message.id.length > 0 && typeof message.text === 'string' && message.text.includes(marker)) return message.id;
+        }
+      } catch (error) {
+        // An unprovable archive is no prompt: the next poll tries again, exactly as when the context lacks the marker.
+        if (!(error instanceof OriginProofError)) throw error;
+      }
+      return undefined;
     },
     async recoverResponse(id: string, parent: string, attempt: WorkflowAttempt) {
       const value = requireIdle(await observe(id), id, parent, true);

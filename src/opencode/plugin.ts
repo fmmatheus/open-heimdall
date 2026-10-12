@@ -94,7 +94,11 @@ export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
             try {
               // The boundary seals durably before any receipt is acknowledged; a seal that cannot be saved throws, so nothing is acknowledged.
               const response = await submissions.submit(kind, value, native, { seal: () => supervisor.seal(native.sessionID) });
-              if (!response.accepted && response.code === 'unauthorized') throw new Error(response.message);
+              if (!response.accepted && response.code === 'unauthorized') {
+                // The bound child's call was refused only because its origin is unverifiable: leave a bounded note for the pause reason, nothing else.
+                if (response.origin) supervisor.unverified(native.sessionID, response.origin);
+                throw new Error(response.message);
+              }
               if (!response.accepted && response.code === 'negative') {
                 // Explicit blocked or unpassed work is the outcome. It is recorded durably and pauses the run; it is never repaired.
                 await supervisor.negative(native.sessionID, { kind, outcome: response.outcome, gateIds: response.gateIds, fields: response.fields, ...(response.reason === undefined ? {} : { reason: response.reason }) });

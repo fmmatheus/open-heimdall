@@ -227,3 +227,56 @@ test('binding a completed child output to its attempt uses the full archive when
   const broken = createNativeBackend({ ctx, observe, history: async function* () { throw new OriginProofError('history_unavailable'); } });
   await assert.rejects(broken.recoverResponse('child', 'parent', attempt), /history_unavailable/);
 });
+
+const dispatchInput = { child: 'child', parent: 'parent', attemptId: 'attempt-1' };
+const markerPrompt = (id, attempt = 'attempt-1') => ({ type: 'user', id, text: 'Workflow attempt: ' + attempt + '\nDo it' });
+
+test('dispatch prompt observation keeps the active context as the primary path and never reads the archive when it holds the prompt', async () => {
+  let scans = 0;
+  const history = async function* () { scans++; yield markerPrompt('msg_archived'); };
+  const ctx = { session: { context: async () => [markerPrompt('msg_old', 'attempt-0'), markerPrompt('msg_prompt'), { type: 'assistant', id: 'a' }] } };
+  const backend = createNativeBackend({ ctx, observe: async () => idle(), history });
+  assert.equal(await backend.observeDispatchPrompt(dispatchInput), 'msg_prompt');
+  assert.equal(scans, 0);
+});
+
+test('dispatch prompt observation falls back to the newest marker prompt of the archive only when compaction removed it from the context', async () => {
+  const ctx = { session: { context: async () => [{ type: 'compaction', id: 'c' }, { type: 'assistant', id: 'a' }, { type: 'user', id: 'msg_other', text: 'Workflow attempt: attempt-0' }] } };
+  const archive = [
+    { type: 'assistant', id: 'a2' }, { type: 'compaction', id: 'c' }, markerPrompt('msg_resumed'), { type: 'assistant', id: 'a1' },
+    markerPrompt('msg_first'), { type: 'user', id: 'msg_noise', text: 'Workflow attempt: attempt-0' },
+  ];
+  const seen = [];
+  const history = async function* (sessionID, signal) { seen.push([sessionID, signal]); yield* archive; };
+  const signal = new AbortController().signal;
+  const backend = createNativeBackend({ ctx, observe: async () => idle(), history });
+  assert.equal(await backend.observeDispatchPrompt({ ...dispatchInput, signal }), 'msg_resumed', 'newest first');
+  assert.deepEqual(seen, [['child', signal]]);
+  // The child must still belong to this parent before anything is read.
+  await assert.rejects(backend.observeDispatchPrompt({ ...dispatchInput, parent: 'someone-else' }), /belong/);
+});
+
+test('dispatch prompt observation yields nothing when neither the context nor the archive holds the marker prompt, and fails as before without an archive', async () => {
+  const ctx = { session: { context: async () => [{ type: 'compaction', id: 'c' }, { type: 'user', id: 'msg_other', text: 'Workflow attempt: attempt-0' }] } };
+  const missing = async function* () { yield { type: 'assistant', id: 'a' }; yield { type: 'user', id: 'msg_other', text: 'Workflow attempt: attempt-0' }; yield { type: 'user', id: '', text: 'Workflow attempt: attempt-1' }; yield { type: 'user', id: 'msg_notext' }; };
+  assert.equal(await createNativeBackend({ ctx, observe: async () => idle(), history: missing }).observeDispatchPrompt(dispatchInput), undefined);
+  assert.equal(await createNativeBackend({ ctx, observe: async () => idle() }).observeDispatchPrompt(dispatchInput), undefined);
+  // An archive that cannot be read proves nothing: the poll simply keeps waiting, exactly as for an absent context prompt.
+  const broken = async function* () { throw new OriginProofError('history_unavailable'); };
+  assert.equal(await createNativeBackend({ ctx, observe: async () => idle(), history: broken }).observeDispatchPrompt(dispatchInput), undefined);
+  // Anything else (an abort, say) still surfaces.
+  const aborted = async function* () { throw new Error('aborted'); };
+  await assert.rejects(createNativeBackend({ ctx, observe: async () => idle(), history: aborted }).observeDispatchPrompt(dispatchInput), /aborted/);
+});
+
+test('dispatch prompt archive scans for one attempt are spaced so the runner poll cannot rescan every few milliseconds', async () => {
+  let scans = 0;
+  const history = async function* () { scans++; yield { type: 'assistant', id: 'a' }; };
+  const ctx = { session: { context: async () => [] } };
+  const backend = createNativeBackend({ ctx, observe: async () => idle(), history });
+  await backend.observeDispatchPrompt(dispatchInput);
+  await backend.observeDispatchPrompt(dispatchInput);
+  assert.equal(scans, 1);
+  await backend.observeDispatchPrompt({ ...dispatchInput, attemptId: 'attempt-2' });
+  assert.equal(scans, 2, 'another attempt is scanned independently');
+});

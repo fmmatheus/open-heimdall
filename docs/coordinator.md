@@ -202,7 +202,12 @@ run. Live record (planner and executor, one task advancement):
   is confirmed once the host observes the dispatch prompt. A submission is
   authenticated against that binding and against the native caller (session,
   agent, message and call ID, proved from the host message timeline, failing
-  closed when no native origin exists). The accepted payload is written once as
+  closed when no native origin exists). A call by the bound child whose origin
+  cannot be verified is denied with a distinct message naming a bounded reason;
+  it is not a format error, spends no repair and leaves the binding usable, and
+  if the attempt then ends without a submission the pause reason says the origin
+  could not be verified. A wrong caller or a call from another dispatch gets the
+  plain denial. The accepted payload is written once as
   an immutable receipt (`submission-<attempt>-<phase>-<kind>.json`, schema v3
   `submissions` table in the coordinator) before it is acknowledged.
 - **Advancement.** A plan or task advances only with a matching durable receipt

@@ -3,15 +3,16 @@ import type { ExecutorOutcome, ExecutorResult, PlannedTask, PlannerOutcome, Plan
 import { planDigest, loadPlanSnapshot } from './plan-snapshot.js';
 import { runtimeIdentity } from './runtime-identity.js';
 import { sameSubmission, submissionKindForPhase } from './submission-store.js';
-import { rejectedSubmission, SUBMISSION_DENIAL } from './submission.js';
-import type { NativeCallContext, SubmissionGate, SubmissionResponse } from './submission.js';
+import { ORIGIN_REASONS, originUnverifiedDenial, rejectedSubmission, SUBMISSION_DENIAL } from './submission.js';
+import type { NativeCallContext, OriginReason, SubmissionGate, SubmissionResponse } from './submission.js';
 import type { RunnerPersistence, RunState, RuntimeIdentity, SubmissionBinding, SubmissionReceipt } from './types.js';
 
 /**
  * Proves, from native observation of the bound child session, which dispatch prompt a tool call descends from.
  * Returns the native prompt message id, or undefined when that cannot be established. Implementations must use
- * host-observed native state only (never a model-supplied attempt or generation), and the gate treats a missing,
- * throwing or non-matching resolver as unauthorized.
+ * host-observed native state only (never a model-supplied attempt or generation). The gate denies a call whose resolved
+ * origin differs from the binding's prompt as plain unauthorized, and one whose origin is missing, unresolved or
+ * throwing as an unverifiable-origin denial (an OriginProofError carries the bounded reason).
  */
 export type NativeOriginResolver = (native: NativeCallContext, binding: SubmissionBinding) => Promise<string | undefined> | string | undefined;
 
@@ -29,6 +30,12 @@ export interface DurableSubmissionGateOptions {
 
 const ACKNOWLEDGEMENT = 'Submission recorded. Stop now; do not call any other tool.';
 const unauthorized = (): SubmissionResponse => ({ accepted: false, code: 'unauthorized', repairable: false, errors: [], message: SUBMISSION_DENIAL });
+const unverifiedOrigin = (origin: OriginReason): SubmissionResponse => ({ accepted: false, code: 'unauthorized', repairable: false, errors: [], message: originUnverifiedDenial(origin), origin });
+/** The bounded reason of an origin-proof failure. Error text is never used: anything unrecognized is `unverifiable`. */
+const originReasonOf = (error: unknown): OriginReason => {
+  const reason = error instanceof Error && error.name === 'OriginProofError' ? (error as { reason?: unknown }).reason : undefined;
+  return (ORIGIN_REASONS as readonly unknown[]).includes(reason) ? reason as OriginReason : 'unverifiable';
+};
 const conflict = (): SubmissionResponse => ({ accepted: false, code: 'conflict', repairable: false, errors: [], message: 'A different submission was already recorded for this attempt; it cannot be replaced.' });
 
 const acknowledge = (receipt: SubmissionReceipt): SubmissionResponse => ({
@@ -83,9 +90,12 @@ export function createDurableSubmissionGate(options: DurableSubmissionGateOption
       if (!state || !binding || binding.kind !== kind) return unauthorized();
       // A delayed call from an earlier dispatch on the same reused child passes the session/agent checks above, so its
       // native origin must also resolve to this binding's recorded dispatch prompt. Unverifiable origin fails closed.
+      // A proven origin that differs is another dispatch (plain denial); one that cannot be proven is reported distinctly.
       let proven: string | undefined;
-      try { proven = origin ? await origin(native, binding) : undefined; } catch { proven = undefined; }
-      if (!proven || proven !== binding.prompt) return unauthorized();
+      let unverified: OriginReason = 'unverifiable';
+      try { proven = origin ? await origin(native, binding) : undefined; } catch (error) { unverified = originReasonOf(error); }
+      if (!proven) return unverifiedOrigin(unverified);
+      if (proven !== binding.prompt) return unauthorized();
       // Clone before validation: the receipt keeps exactly what was submitted.
       let rawPayload: unknown;
       try { rawPayload = structuredClone(raw); } catch { rawPayload = undefined; }

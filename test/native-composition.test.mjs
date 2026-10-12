@@ -10,7 +10,7 @@ import { createRunner } from '../dist/workflow/runner.js';
 import { loadConfiguration } from '../dist/config.js';
 import { createMessageHistory } from '../dist/opencode/observer.js';
 import { SUBMISSION_TOOL_IDS } from '../dist/workflow/contracts.js';
-import { SUBMISSION_DENIAL } from '../dist/workflow/submission.js';
+import { originUnverifiedDenial, SUBMISSION_DENIAL } from '../dist/workflow/submission.js';
 
 const PLANNER_TOOL = SUBMISSION_TOOL_IDS['planner-plan'];
 const EXECUTOR_TOOL = SUBMISSION_TOOL_IDS['executor-result'];
@@ -51,6 +51,7 @@ function nativeHost(directory, script, { pageSize = 2 } = {}) {
   const addSession = (id, parentID) => sessions.set(id, { id, parentID, messages: [], archive: [], outcome: undefined, idle: undefined, active: false });
   const admit = (s, message) => { s.messages.push(message); s.archive.push(message); };
   const requests = [];
+  const interrupts = [];
   let compactions = 0;
   // Host-side compaction: the archive keeps everything; the active context restarts at the summary, and the model
   // continues in a NEW assistant message that now carries the submission calls.
@@ -109,10 +110,10 @@ function nativeHost(directory, script, { pageSize = 2 } = {}) {
       await hooks.get('session.context')?.(event);
       contexts.push({ n, child, agent: input.agent, tools: Object.keys(event.tools) });
       admit(s, assistant);
-      const submit = async (name, payload, messageID = dispatch.assistant.id) => {
+      const submit = async (name, payload, messageID = dispatch.assistant.id, listed = {}) => {
         const info = { tool: name, sessionID: child, agent: input.agent, messageID, id: 'call_' + ++calls, input: payload };
-        // The host lists the call on the assistant message that carries it.
-        s.archive.find(m => m.id === messageID)?.content?.push({ type: 'tool', id: info.id, name, state: { status: 'running' }, time: { created: Date.now() } });
+        // The host lists the call on the assistant message that carries it; `listed` makes the archive disagree with the call.
+        s.archive.find(m => m.id === messageID)?.content?.push({ type: 'tool', id: listed.id ?? info.id, name: listed.name ?? name, state: { status: 'running' }, time: { created: Date.now() } });
         await hooks.get('tool.execute.before')(info);
         return registered.get(name).execute(payload, { sessionID: child, agent: input.agent, messageID, id: info.id, signal: native.signal, progress: async () => {} });
       };
@@ -136,7 +137,7 @@ function nativeHost(directory, script, { pageSize = 2 } = {}) {
     session: {
       context: async ({ sessionID }) => (sessions.get(sessionID)?.messages ?? []).slice(),
       get: async ({ sessionID }) => ({ id: sessionID, tokens: ZERO }),
-      interrupt: async () => {},
+      interrupt: async ({ sessionID }) => { interrupts.push(sessionID); },
       hook: async (name, callback) => { hooks.set('session.' + name, callback); return registration(); },
     },
     rpc: { register: async () => registration() },
@@ -146,7 +147,7 @@ function nativeHost(directory, script, { pageSize = 2 } = {}) {
     const s = sessions.get(dispatch.child);
     for (let i = 0; i < count; i++) admit(s, { type: 'assistant', id: 'msg_step_' + ++messages, agent: dispatch.agent, content: [], time: { created: Date.now() } });
   };
-  return { ctx, observe, registered, contexts, dispatches, ctrl, sessions, addSession, compact, chat, steps, fetchImpl, requests };
+  return { ctx, observe, registered, contexts, dispatches, ctrl, sessions, addSession, compact, chat, steps, fetchImpl, requests, interrupts };
 }
 
 /** The real full-archive reader over the fixture's v2 message-list route. */
@@ -186,7 +187,7 @@ test('an unknown call origin and a late call from an earlier dispatch on a reuse
     async ({ submit, dispatch }) => {
       // A delayed call from the earlier dispatch's assistant message must not bind to the newest attempt.
       await assert.rejects(submit(EXECUTOR_TOOL, completed(), stale), new Error(SUBMISSION_DENIAL));
-      await assert.rejects(submit(EXECUTOR_TOOL, completed(), 'msg_unknown'), new Error(SUBMISSION_DENIAL));
+      await assert.rejects(submit(EXECUTOR_TOOL, completed(), 'msg_unknown'), new Error(originUnverifiedDenial('call_not_found')));
       assert.equal((await submit(EXECUTOR_TOOL, completed(), dispatch.assistant.id)).output.accepted, true);
     },
   ]);
@@ -258,7 +259,7 @@ test('after compaction and a plugin restart, a reused child accepts its own call
       assert.equal(hasUser(host, dispatch.child), false);
       // The earlier call still resolves, but to the earlier prompt: it is not this dispatch's.
       await assert.rejects(submit(EXECUTOR_TOOL, completed(), stale), new Error(SUBMISSION_DENIAL));
-      await assert.rejects(submit(EXECUTOR_TOOL, completed(), 'msg_unknown'), new Error(SUBMISSION_DENIAL));
+      await assert.rejects(submit(EXECUTOR_TOOL, completed(), 'msg_unknown'), new Error(originUnverifiedDenial('call_not_found')));
       assert.equal((await submit(EXECUTOR_TOOL, completed())).output.accepted, true);
     },
   ]);
@@ -279,6 +280,7 @@ test('after compaction and a plugin restart, a reused child accepts its own call
 test('unverifiable provenance denies without a receipt, is not a format repair and does not block the genuine retry', async t => {
   const { directory, configuration } = await project(t, 'heimdall-native-unavailable-');
   let mode = 'up';
+  let cycles = 0;
   const attempts = [];
   const host = nativeHost(directory, [planStep('T1'), async ({ submit, dispatch }) => {
     host.compact(dispatch);
@@ -295,7 +297,8 @@ test('unverifiable provenance denies without a receipt, is not a format repair a
     if (mode === 'up' || !url.pathname.endsWith('/message')) return host.fetchImpl(url);
     if (mode === 'http') return new Response('boom', { status: 500 });
     if (mode === 'malformed') return Response.json({ data: 'not a list', cursor: {} });
-    if (mode === 'cycle') return Response.json({ data: [{ type: 'compaction', id: 'msg_cycle' }], cursor: { next: url.searchParams.get('cursor') ?? 'again' } });
+    // Distinct messages on every page, but the cursor never advances: only the repeated cursor can stop the scan.
+    if (mode === 'cycle') return Response.json({ data: [{ type: 'compaction', id: 'msg_cycle_' + ++cycles }], cursor: { next: 'again' } });
     if (mode === 'duplicate') return Response.json({ data: [{ type: 'compaction', id: 'msg_dup' }, { type: 'compaction', id: 'msg_dup' }], cursor: {} });
     // Exhausted: a well-formed endless history that never reaches the prompt within the bound.
     const start = Number(url.searchParams.get('cursor') ?? 0);
@@ -305,12 +308,120 @@ test('unverifiable provenance denies without a receipt, is not a format repair a
   const setup = await createPlugin({ configuration, observe: host.observe, history: bounded, quota, git }).setup(host.ctx);
   t.after(setup);
   const result = JSON.parse((await host.registered.get('adr_workflow').execute({ action: 'start', adr: '.heimdall/feature.md' }, caller())).content);
-  assert.deepEqual(attempts, Array(5).fill(SUBMISSION_DENIAL));
+  assert.deepEqual(attempts, ['history_unavailable', 'page_malformed', 'cursor_repeated', 'duplicate_message', 'scan_exhausted'].map(originUnverifiedDenial));
   assert.equal(result.status, 'completed');
   const state = await readState(directory, result.runId);
   assert.equal(state.results.length, 1);
   // The planner receipt and the single genuine executor receipt only.
   assert.equal((await receiptFiles(directory, result.runId)).length, 2);
+});
+
+const runOf = async directory => (await fs.readdir(path.join(directory, '.heimdall/runs')))[0];
+
+test('every unverifiable native origin is denied with its own message, records nothing and leaves the binding usable, while wrong callers keep the plain denial', async t => {
+  const { directory, configuration } = await project(t, 'heimdall-native-origin-cases-');
+  const outcomes = [];
+  const host = nativeHost(directory, [planStep('T1'), async ({ submit, dispatch }) => {
+    const runId = await runOf(directory);
+    const s = host.sessions.get(dispatch.child);
+    const carrier = s.archive.find(m => m.id === dispatch.assistant.id);
+    const denied = async (label, run, expected) => {
+      const message = await run().then(() => 'accepted', error => error.message);
+      outcomes.push([label, message]);
+      assert.equal(message, expected, label);
+      assert.equal((await readState(directory, runId)).submissionRepair, undefined, label + ': no repair is spent or recorded');
+      assert.equal((await receiptFiles(directory, runId)).length, 1, label + ': only the planner receipt exists');
+    };
+    await denied('missing call', () => submit(EXECUTOR_TOOL, completed(), 'msg_unknown'), originUnverifiedDenial('call_not_found'));
+    await denied('wrong call id', () => submit(EXECUTOR_TOOL, completed(), dispatch.assistant.id, { id: 'call_other' }), originUnverifiedDenial('call_mismatch'));
+    await denied('wrong call name', () => submit(EXECUTOR_TOOL, completed(), dispatch.assistant.id, { name: PLANNER_TOOL }), originUnverifiedDenial('call_mismatch'));
+    carrier.agent = 'build';
+    await denied('wrong agent', () => submit(EXECUTOR_TOOL, completed()), originUnverifiedDenial('agent_mismatch'));
+    carrier.agent = dispatch.agent;
+    const at = s.archive.indexOf(dispatch.user);
+    s.archive.splice(at, 1);
+    await denied('missing prompt', () => submit(EXECUTOR_TOOL, completed()), originUnverifiedDenial('prompt_not_found'));
+    s.archive.splice(at, 0, dispatch.user);
+    // Not the bound child, not the configured role, not this kind: none of these reaches origin proof.
+    const tool = host.registered.get(EXECUTOR_TOOL);
+    const native = { messageID: dispatch.assistant.id, id: 'call_forged', signal: new AbortController().signal, progress: async () => {} };
+    await denied('wrong session', () => tool.execute(completed(), { ...native, sessionID: 'ses_other', agent: dispatch.agent }), SUBMISSION_DENIAL);
+    await denied('wrong role', () => tool.execute(completed(), { ...native, sessionID: dispatch.child, agent: 'build' }), SUBMISSION_DENIAL);
+    await denied('wrong kind', () => submit(PLANNER_TOOL, plan('T9')), SUBMISSION_DENIAL);
+    assert.equal((await submit(EXECUTOR_TOOL, completed())).output.accepted, true);
+  }]);
+  const setup = await createPlugin({ configuration, observe: host.observe, history: history(host, directory), quota, git }).setup(host.ctx);
+  t.after(setup);
+  const result = JSON.parse((await host.registered.get('adr_workflow').execute({ action: 'start', adr: '.heimdall/feature.md' }, caller())).content);
+  assert.equal(result.status, 'completed', JSON.stringify(result));
+  assert.equal(outcomes.length, 8);
+  for (const [, message] of outcomes) assert.doesNotMatch(message, /msg_|call_[0-9]|Older question|Workflow attempt/, 'no transcript or identity text in a denial');
+  assert.equal((await readState(directory, result.runId)).results.length, 1);
+  assert.equal((await receiptFiles(directory, result.runId)).length, 2);
+  assert.deepEqual(host.interrupts, []);
+});
+
+test('an attempt that ends after only unverifiable submission calls pauses naming the unverifiable origin, never a malformed output, and changes nothing else', async t => {
+  const { directory, configuration } = await project(t, 'heimdall-native-origin-pause-');
+  const host = nativeHost(directory, [
+    planStep('T1'),
+    async ({ submit }) => { await assert.rejects(submit(EXECUTOR_TOOL, completed(), 'msg_unknown'), new Error(originUnverifiedDenial('call_not_found'))); },
+    async () => {},
+  ]);
+  const setup = await createPlugin({ configuration, observe: host.observe, history: history(host, directory), quota, git }).setup(host.ctx);
+  t.after(setup);
+  const paused = JSON.parse((await host.registered.get('adr_workflow').execute({ action: 'start', adr: '.heimdall/feature.md' }, caller())).content);
+  assert.equal(paused.status, 'paused');
+  assert.match(paused.reason, /No valid submission was recorded for T1/);
+  assert.match(paused.reason, /a submission call was denied because its native origin could not be verified/i);
+  assert.match(paused.reason, /\(call_not_found\)/);
+  assert.match(paused.reason, /payload was not evaluated/);
+  assert.doesNotMatch(paused.reason, /malformed|invalid|format/i);
+  assert.doesNotMatch(paused.reason, /msg_unknown|call_[0-9]/);
+  const state = await readState(directory, paused.runId);
+  assert.equal(state.reason, paused.reason);
+  assert.equal(state.reportRecovery.diagnostic.code, 'submission_missing');
+  assert.equal(state.submissionRepair, undefined, 'no repair counter, refusal or restriction was recorded');
+  assert.equal(state.results.length, 0);
+  assert.equal(host.dispatches.length, 2, 'nothing was rerun');
+  assert.deepEqual(host.interrupts, [], 'the dispatch was neither aborted nor interrupted by the denial');
+  assert.equal((await receiptFiles(directory, paused.runId)).length, 1, 'only the planner receipt exists');
+  // A later attempt with no denial of its own gets the plain missing-submission reason: the note belonged to the earlier attempt.
+  const again = JSON.parse((await host.registered.get('adr_workflow').execute({ action: 'resume', runId: paused.runId, input: 'Try again' }, caller())).content);
+  assert.equal(again.status, 'paused');
+  assert.match(again.reason, /No valid submission was recorded for T1/);
+  assert.doesNotMatch(again.reason, /native origin|verified/);
+});
+
+test('a receipt proven from the full archive after compaction is replayed after a crash and advances exactly once', async t => {
+  const { directory, configuration } = await project(t, 'heimdall-native-replay-');
+  const host = nativeHost(directory, [planStep('T1'), async ({ submit, dispatch }) => {
+    host.steps(dispatch, 3);
+    host.compact(dispatch);
+    host.compact(dispatch);
+    assert.equal(hasUser(host, dispatch.child), false, 'the active context no longer holds the dispatch prompt');
+    assert.equal((await submit(EXECUTOR_TOOL, completed())).output.accepted, true);
+    host.ctrl.outcome = 'failed'; // The process dies before the native stop is confirmed or the run advances.
+  }], { pageSize: 3 });
+  const first = await createPlugin({ configuration, observe: host.observe, history: history(host, directory), quota, git }).setup(host.ctx);
+  const paused = JSON.parse((await host.registered.get('adr_workflow').execute({ action: 'start', adr: '.heimdall/feature.md' }, caller())).content);
+  assert.equal(paused.status, 'paused');
+  const before = await readState(directory, paused.runId);
+  assert.equal(before.results.length, 0);
+  assert.equal((await receiptFiles(directory, paused.runId)).length, 2);
+  await first();
+  // The restarted host: a fresh plugin, supervisor and history reader, and the child now stopped cleanly.
+  host.ctrl.outcome = 'succeeded';
+  Object.assign(host.sessions.get(host.dispatches[1].child), { outcome: 'succeeded', idle: Date.now() });
+  const second = await createPlugin({ configuration, observe: host.observe, history: history(host, directory), quota, git }).setup(host.ctx);
+  t.after(second);
+  const resumed = JSON.parse((await host.registered.get('adr_workflow').execute({ action: 'resume', runId: paused.runId, input: 'Child stopped' }, caller())).content);
+  assert.equal(resumed.status, 'completed', JSON.stringify(resumed));
+  const after = await readState(directory, paused.runId);
+  assert.equal(after.results.length, 1);
+  assert.equal(after.index, 1);
+  assert.equal(host.dispatches.length, 2, 'the receipt was replayed; no work was redone');
+  assert.equal((await receiptFiles(directory, paused.runId)).length, 2, 'no second receipt');
 });
 
 test('a submission followed by a failed native outcome never advances', async t => {

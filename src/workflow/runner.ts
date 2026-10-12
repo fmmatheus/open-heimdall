@@ -9,6 +9,7 @@ import { MAX_SUBMISSION_REPAIRS } from './submission-repair.js';
 import { writeCheckpointFile } from './repair-state.js';
 import { runtimeIdentity } from './runtime-identity.js';
 import type { ConflictInfo, RepairDecision, RepairHandler, RepairRequest } from './submission-repair.js';
+import type { OriginReason } from './submission.js';
 import { isTaskId, SUBMISSION_PROTOCOL, SUBMISSION_TOOL_IDS } from './contracts.js';
 import { closeSubmissionBinding, createLocalSubmissionStore, openSubmissionBinding, recordDispatchPrompt, submissionKindForPhase } from './submission-store.js';
 import type {
@@ -274,6 +275,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
     let state!: RunState;
     let started = false;
     let rejection: ReportDiagnostic | undefined; // Set only when an executor completion report is rejected.
+    let unverifiedOrigin: { attemptId: string; reason: OriginReason } | undefined; // Process-local note of a submission call denied for an unverifiable origin.
     let pendingCorrection: string | undefined; // A correction attempt persisted by this invocation and not yet dispatched.
     let correctionRelease: (() => Promise<void>) | undefined; // Report-only restriction held for the pending or running correction.
     let terminationUnconfirmed = false; // True while an interrupt is unconfirmed: the restriction then stays in force.
@@ -788,8 +790,13 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
               controller.abort(stop); // Stops the dispatch even when the save failed: it is never silently dropped.
               return saved;
             },
+            unverified(reason) {
+              // A bounded note only: nothing is saved, counted, aborted or interrupted. It is ignored once the attempt has changed.
+              if (state.attempt?.id === attempt.id) unverifiedOrigin = { attemptId: attempt.id, reason };
+            },
             seal(info) {
               // Saved before the receipt is acknowledged. Work still running is recorded in the same save.
+              if (unverifiedOrigin?.attemptId === attempt.id) unverifiedOrigin = undefined; // A genuine submission was accepted: the earlier denial no longer explains anything.
               state.submissionRepair = { ...repairRecord(), sealed: { attemptId: attempt.id }, ...(info ? { conflict: { attemptId: attempt.id, kind: info.kind, tool: info.tool } } : {}) };
               if (info) conflicting ??= info;
               return heldUntilSaved(save(state)).catch((error: unknown) => { guardError ??= error; controller.abort(error); throw error; }); // Fail closed.
@@ -898,7 +905,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
             if (!stored) {
               attempt.status = 'rejected';
               if (!planning) rejection = { code: 'submission_missing' };
-              throw new Error(submissionPauseReason('submission_missing', planning ? 'the plan' : task.id));
+              throw new Error(submissionPauseReason('submission_missing', planning ? 'the plan' : task.id, unverifiedOrigin?.attemptId === attempt.id ? unverifiedOrigin.reason : ''));
             }
             await admitSubmission(planning, task, stored);
             continue;
@@ -946,7 +953,9 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
       const failedTask = state.phase === 'executor' ? state.tasks[state.index] : undefined;
       if (rejection && failedTask) {
         state.reportRecovery = pauseReportRecovery(state.reportRecovery, { index: state.index, taskId: failedTask.id, child: state.child, attemptId: state.attempt?.id ?? '' }, rejection);
-        state.reason = reportPauseReason(rejection, failedTask, state.reason);
+        // A missing submission explains itself with the bounded origin reason only; every other code keeps the stored reason as its detail.
+        const pausedAttempt = state.attempt?.id;
+        state.reason = reportPauseReason(rejection, failedTask, rejection.code === 'submission_missing' ? (unverifiedOrigin && unverifiedOrigin.attemptId === pausedAttempt ? unverifiedOrigin.reason : '') : state.reason);
       }
       // A pause is never "correcting": cancellation, budget and quota stops keep the counter and clear the mode.
       if (state.reportRecovery?.mode === 'correcting') state.reportRecovery = { ...state.reportRecovery, mode: 'paused' };
