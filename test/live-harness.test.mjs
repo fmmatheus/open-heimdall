@@ -438,7 +438,7 @@ describe('fixture provider list preparation', () => {
 });
 
 test('new fixture roots use the 0006 prefix and the retained 0005 root is not accepted', async () => {
-  assert.equal(FIXTURE_PREFIX, 'heimdall-0006.');
-  assert.doesNotThrow(() => assertFixtureRoot('/private/tmp/heimdall-0006.abc123'));
-  assert.throws(() => assertFixtureRoot('/private/tmp/heimdall-0005.mZaL06'), /Fixture root must be/);
+  assert.equal(FIXTURE_PREFIX, 'heimdall-0008.');
+  assert.doesNotThrow(() => assertFixtureRoot('/private/tmp/heimdall-0008.abc123'));
+  assert.throws(() => assertFixtureRoot('/private/tmp/heimdall-0006.jFpXF9'), /Fixture root must be/);
 });
