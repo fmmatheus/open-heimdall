@@ -1,6 +1,7 @@
 import { submissionKindOfTool } from './contracts.js';
 import type { ContractError, SubmissionKind } from './contracts.js';
 import type { SubmissionRepairRefusal } from './types.js';
+import type { OriginReason } from './submission.js';
 
 /**
  * Format-repair opportunities per planner phase or executor task, after the initial submission. The count is
@@ -53,6 +54,11 @@ export interface RepairHandler {
   seal(conflict?: ConflictInfo): Promise<void>;
   /** Saves a conflict found after the boundary was sealed: implementation work tried to start. */
   conflict(info: ConflictInfo): Promise<void>;
+  /**
+   * Notes, process-locally and for the current attempt only, that a submission call was denied because its native origin
+   * could not be verified. It saves nothing, spends no repair and stops nothing: it only explains a later missing submission.
+   */
+  unverified?(reason: OriginReason): void;
 }
 
 /**
@@ -80,6 +86,8 @@ export interface SubmissionSupervisor {
   /** Closes the reporting boundary and saves it. Rejects when it could not be saved (fail closed) or no dispatch owns the child. */
   seal(sessionID: string): Promise<void>;
   conflict(child: string): ConflictInfo | undefined;
+  /** A submission call by this child was denied for an unverifiable native origin. A no-op when no dispatch owns the child. */
+  unverified(child: string, reason: OriginReason): void;
 }
 
 interface Timeline {
@@ -157,5 +165,6 @@ export function createSubmissionSupervisor(): SubmissionSupervisor {
       await timeline.handler.seal(timeline.conflict);
     },
     conflict: child => timelines.get(child)?.conflict,
+    unverified(child, reason) { timelines.get(child)?.handler.unverified?.(reason); },
   };
 }

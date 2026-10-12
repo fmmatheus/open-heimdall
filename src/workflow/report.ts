@@ -77,7 +77,9 @@ const gates = (ids: string[] | undefined) => ids?.length ? ids.slice(0, 10).join
  */
 export function submissionPauseReason(code: 'submission_missing' | 'submission_unconfirmed', subject: string, detail = ''): string {
   if (code === 'submission_missing') {
-    return 'No valid submission was recorded for ' + subject + ': the child ended without a successful call to its submission tool (refusal, omission, a limit, or a rejected call). '
+    // For a missing submission `detail` is the bounded reason a denied call's native origin could not be verified.
+    const unverified = detail ? 'A submission call was denied because its native origin could not be verified against the current dispatch (' + bounded(detail, 60) + '); its payload was not evaluated. ' : '';
+    return 'No valid submission was recorded for ' + subject + ': the child ended without a successful call to its submission tool (refusal, omission, a limit, or a rejected call). ' + unverified
       + 'Its final chat text is not a result and was not parsed. Inspect the child session, then resume with guidance to submit the result through the tool; nothing was advanced.';
   }
   return 'A submission was recorded for ' + subject + ' but the child\'s successful stop could not be confirmed' + (detail ? ' (' + bounded(detail, 300) + ')' : '') + ', so it was not applied. '

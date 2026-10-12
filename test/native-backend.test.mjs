@@ -1,7 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createReportOnlyRegistry, VERIFIED_REPORT_ONLY_PROVIDERS } from '../dist/opencode/report-only.js';
-import { createNativeBackend, requireIdle, resolveSubagent, nativeModel } from '../dist/opencode/native-backend.js';
+import { createNativeBackend, createNativeOriginResolver, requireIdle, resolveSubagent, nativeModel } from '../dist/opencode/native-backend.js';
+import { OriginProofError } from '../dist/opencode/types.js';
+import { SUBMISSION_TOOL_IDS } from '../dist/workflow/contracts.js';
 
 const idle = () => ({ session: { id: 'child', parentID: 'parent', tokens: { input: 2, output: 3, reasoning: 4, cache: { read: 5, write: 6 } }, outcome: 'succeeded', time: { idle: 10 } }, active: false, inbox: [], permissions: [], forms: [] });
 const context = () => ({ id: 'call_1', messageID: 'msg_1', sessionID: 'parent', agent: 'adr-orchestrator', signal: new AbortController().signal, progress: async () => {} });
@@ -162,4 +164,119 @@ test('report-only restrictions are released by owner identity, idempotently, wit
   assert.equal(registry.count('other'), 1);
   assert.equal(registry.releaseOwned({ parent: 'parent', child: 'unknown', attemptId: 'x' }), 0);
   assert.throws(() => registry.restrict('child', { parent: 'parent', child: 'other', attemptId: 'x' }), /must name its parent, child and attempt/);
+});
+
+const TOOL = SUBMISSION_TOOL_IDS['executor-result'];
+const call = { sessionID: 'child', agent: 'adr-executor', messageID: 'msg_asst', id: 'call_1' };
+/** A newest-first archive, as the supported message-history reader yields it. */
+const archive = (...messages) => async function* (sessionID) { assert.equal(sessionID, 'child'); yield* messages; };
+const assistant = (overrides = {}) => ({ type: 'assistant', id: 'msg_asst', agent: 'adr-executor', content: [{ type: 'tool', id: 'call_1', name: TOOL }], ...overrides });
+const user = id => ({ type: 'user', id, text: 'a prompt' });
+const reason = promise => promise.then(() => 'resolved', error => error instanceof OriginProofError ? error.reason : 'other:' + error.message);
+
+test('origin resolves to the nearest real user prompt before the carrying assistant, across every other record type', async () => {
+  const resolve = createNativeOriginResolver(archive(
+    assistant({ id: 'msg_later', agent: 'other' }), { type: 'compaction', id: 'c2', status: 'completed' }, assistant(), { type: 'assistant', id: 'msg_mid', agent: 'adr-executor', content: [] },
+    { type: 'synthetic', id: 's1' }, { type: 'system', id: 'sy' }, { type: 'skill', id: 'sk' }, { type: 'shell', id: 'sh' }, { type: 'agent-switched', id: 'sw' }, { type: 'idle', id: 'i' }, { type: 'compaction', id: 'c1', status: 'completed' },
+    user('msg_dispatch'), user('msg_older'),
+  ));
+  assert.equal(await resolve(call, { kind: 'executor-result' }), 'msg_dispatch');
+  // The carrying message may list no tool calls yet (not available): the id and agent still bind it.
+  assert.equal(await createNativeOriginResolver(archive(assistant({ content: [] }), user('msg_dispatch')))(call, { kind: 'executor-result' }), 'msg_dispatch');
+});
+
+test('origin proof fails closed with a bounded reason for each unprovable relationship', async () => {
+  const binding = { kind: 'executor-result' };
+  const prove = (history, native = call, bound = binding) => reason(createNativeOriginResolver(history)(native, bound));
+  assert.equal(await prove(archive(user('u'), { type: 'assistant', id: 'msg_other', agent: 'adr-executor' })), 'call_not_found');
+  assert.equal(await prove(archive()), 'call_not_found');
+  assert.equal(await prove(archive({ ...assistant(), type: 'user' }, user('u'))), 'call_not_found');
+  assert.equal(await prove(archive(assistant(), { type: 'compaction', id: 'c' }, { type: 'synthetic', id: 's' })), 'prompt_not_found');
+  assert.equal(await prove(archive(assistant({ agent: 'adr-planner' }), user('u'))), 'agent_mismatch');
+  assert.equal(await prove(archive(assistant({ content: [{ type: 'tool', id: 'call_9', name: TOOL }] }), user('u'))), 'call_mismatch');
+  assert.equal(await prove(archive(assistant({ content: [{ type: 'text', text: 'hi' }, { type: 'tool', id: 'call_1', name: 'bash' }] }), user('u'))), 'call_mismatch');
+  assert.equal(await prove(archive(assistant({ content: [{ type: 'tool', id: 'call_1', name: 'namespaced__' + TOOL }] }), user('u'))), 'call_mismatch');
+  // A real submission tool of the other kind is not this binding's tool.
+  assert.equal(await prove(archive(assistant(), user('u')), call, { kind: 'planner-plan' }), 'call_mismatch');
+  // Reader failures keep their own reason and carry no transcript text.
+  const failing = async function* () { throw new OriginProofError('page_malformed'); };
+  assert.equal(await prove(failing), 'page_malformed');
+  const error = await createNativeOriginResolver(archive(assistant({ agent: 'x' })))(call, { kind: 'executor-result' }).catch(value => value);
+  assert.match(error.message, /agent_mismatch/);
+  assert.ok(!error.message.includes('a prompt'));
+});
+
+test('the resolver stops reading the archive once the prompt is found', async () => {
+  let pulled = 0;
+  const lazy = async function* () { for (const message of [assistant(), user('msg_dispatch'), user('msg_older'), user('msg_oldest')]) { pulled++; yield message; } };
+  assert.equal(await createNativeOriginResolver(lazy)(call, { kind: 'executor-result' }), 'msg_dispatch');
+  assert.equal(pulled, 2);
+});
+
+test('binding a completed child output to its attempt uses the full archive when the active context lost the prompt', async () => {
+  const final = { type: 'assistant', id: 'a', finish: 'stop', content: [{ type: 'text', text: '{"status":"completed"}' }], time: { completed: 20 } };
+  const prompt = { type: 'user', id: 'u', text: 'Workflow attempt: attempt-1\nDo it' };
+  const ctx = { session: { context: async () => [{ type: 'compaction', id: 'c' }, final] } };
+  const observe = async () => idle();
+  const attempt = { id: 'attempt-1', startedAt: 10 };
+  const compacted = createNativeBackend({ ctx, observe });
+  await assert.rejects(compacted.recoverResponse('child', 'parent', attempt), /bind completed/);
+  const full = createNativeBackend({ ctx, observe, history: async function* () { yield final; yield { type: 'compaction', id: 'c' }; yield prompt; } });
+  assert.equal(await full.recoverResponse('child', 'parent', attempt), '{"status":"completed"}');
+  await assert.rejects(full.recoverResponse('child', 'parent', { id: 'different', startedAt: 10 }), /bind completed/);
+  const broken = createNativeBackend({ ctx, observe, history: async function* () { throw new OriginProofError('history_unavailable'); } });
+  await assert.rejects(broken.recoverResponse('child', 'parent', attempt), /history_unavailable/);
+});
+
+const dispatchInput = { child: 'child', parent: 'parent', attemptId: 'attempt-1' };
+const markerPrompt = (id, attempt = 'attempt-1') => ({ type: 'user', id, text: 'Workflow attempt: ' + attempt + '\nDo it' });
+
+test('dispatch prompt observation keeps the active context as the primary path and never reads the archive when it holds the prompt', async () => {
+  let scans = 0;
+  const history = async function* () { scans++; yield markerPrompt('msg_archived'); };
+  const ctx = { session: { context: async () => [markerPrompt('msg_old', 'attempt-0'), markerPrompt('msg_prompt'), { type: 'assistant', id: 'a' }] } };
+  const backend = createNativeBackend({ ctx, observe: async () => idle(), history });
+  assert.equal(await backend.observeDispatchPrompt(dispatchInput), 'msg_prompt');
+  assert.equal(scans, 0);
+});
+
+test('dispatch prompt observation falls back to the newest marker prompt of the archive only when compaction removed it from the context', async () => {
+  const ctx = { session: { context: async () => [{ type: 'compaction', id: 'c' }, { type: 'assistant', id: 'a' }, { type: 'user', id: 'msg_other', text: 'Workflow attempt: attempt-0' }] } };
+  const archive = [
+    { type: 'assistant', id: 'a2' }, { type: 'compaction', id: 'c' }, markerPrompt('msg_resumed'), { type: 'assistant', id: 'a1' },
+    markerPrompt('msg_first'), { type: 'user', id: 'msg_noise', text: 'Workflow attempt: attempt-0' },
+  ];
+  const seen = [];
+  const history = async function* (sessionID, signal) { seen.push([sessionID, signal]); yield* archive; };
+  const signal = new AbortController().signal;
+  const backend = createNativeBackend({ ctx, observe: async () => idle(), history });
+  assert.equal(await backend.observeDispatchPrompt({ ...dispatchInput, signal }), 'msg_resumed', 'newest first');
+  assert.deepEqual(seen, [['child', signal]]);
+  // The child must still belong to this parent before anything is read.
+  await assert.rejects(backend.observeDispatchPrompt({ ...dispatchInput, parent: 'someone-else' }), /belong/);
+});
+
+test('dispatch prompt observation yields nothing when neither the context nor the archive holds the marker prompt, and fails as before without an archive', async () => {
+  const ctx = { session: { context: async () => [{ type: 'compaction', id: 'c' }, { type: 'user', id: 'msg_other', text: 'Workflow attempt: attempt-0' }] } };
+  const missing = async function* () { yield { type: 'assistant', id: 'a' }; yield { type: 'user', id: 'msg_other', text: 'Workflow attempt: attempt-0' }; yield { type: 'user', id: '', text: 'Workflow attempt: attempt-1' }; yield { type: 'user', id: 'msg_notext' }; };
+  assert.equal(await createNativeBackend({ ctx, observe: async () => idle(), history: missing }).observeDispatchPrompt(dispatchInput), undefined);
+  assert.equal(await createNativeBackend({ ctx, observe: async () => idle() }).observeDispatchPrompt(dispatchInput), undefined);
+  // An archive that cannot be read proves nothing: the poll simply keeps waiting, exactly as for an absent context prompt.
+  const broken = async function* () { throw new OriginProofError('history_unavailable'); };
+  assert.equal(await createNativeBackend({ ctx, observe: async () => idle(), history: broken }).observeDispatchPrompt(dispatchInput), undefined);
+  // Anything else (an abort, say) still surfaces.
+  const aborted = async function* () { throw new Error('aborted'); };
+  await assert.rejects(createNativeBackend({ ctx, observe: async () => idle(), history: aborted }).observeDispatchPrompt(dispatchInput), /aborted/);
+});
+
+test('dispatch prompt archive scans for one attempt are spaced so the runner poll cannot rescan every few milliseconds', async () => {
+  let scans = 0;
+  const history = async function* () { scans++; yield { type: 'assistant', id: 'a' }; };
+  const ctx = { session: { context: async () => [] } };
+  const backend = createNativeBackend({ ctx, observe: async () => idle(), history });
+  await backend.observeDispatchPrompt(dispatchInput);
+  await backend.observeDispatchPrompt(dispatchInput);
+  assert.equal(scans, 1);
+  await backend.observeDispatchPrompt({ ...dispatchInput, attemptId: 'attempt-2' });
+  assert.equal(scans, 2, 'another attempt is scanned independently');
 });

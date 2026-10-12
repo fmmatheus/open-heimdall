@@ -9,7 +9,8 @@ import type { RunnerPersistence } from '../workflow/types.js';
 import { createManagedPersistence, readManagedMetadata } from './managed.js';
 import type { ManagedMetadata } from './managed.js';
 import { createNativeOriginResolver } from './native-backend.js';
-import type { NativeContext } from './types.js';
+import { createMessageHistory } from './observer.js';
+import type { MessageHistory } from './types.js';
 
 const SAFE = /^[A-Za-z0-9_-]+$/;
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -17,17 +18,18 @@ const record = (value: unknown): value is Record<string, unknown> => value !== n
 /**
  * The production submission gate. Nothing here is process-local authority: every call re-derives the run and its
  * authoritative store (the active owner's coordinator checkpoint for a managed run, the local checkpoint of the run
- * that holds the workflow lock otherwise), and origin is proven from the host's own message timeline.
+ * that holds the workflow lock otherwise), and origin is proven from the complete native message archive (not the compacted context).
  */
-export function createNativeSubmissionGate({ configuration, ctx, metadata }: {
+export function createNativeSubmissionGate({ configuration, history, metadata }: {
   configuration: Configuration;
-  ctx: Pick<NativeContext, 'session'>;
+  /** The complete message archive used to prove call origin. Defaults to the supported OpenCode message-history API. */
+  history?: MessageHistory;
   metadata?: ManagedMetadata;
 }): SubmissionGate {
   const directory = configuration.projectDirectory;
   const roles = () => [configuration.settings.plannerAgent, configuration.settings.executorAgent];
   const workflowRoot = path.resolve(directory, configuration.workflowRoot);
-  const origin = createNativeOriginResolver(ctx);
+  const origin = createNativeOriginResolver(history ?? createMessageHistory({ directory, ...configuration.opencode }));
   const local = createLocalSubmissionStore(workflowRoot);
   const build = (runId: string, persistence: Pick<RunnerPersistence, 'load' | 'readSubmission' | 'writeSubmission'>) =>
     createDurableSubmissionGate({ runId, directory, planRoot: configuration.planRoot, persistence, origin });

@@ -6,6 +6,8 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { CoordinatorStore } from '../dist/coordinator/store.js';
 import { createDurableSubmissionGate, authenticateSubmissionCaller } from '../dist/workflow/durable-submission.js';
+import { ORIGIN_REASONS, originUnverifiedDenial, SUBMISSION_DENIAL } from '../dist/workflow/submission.js';
+import { OriginProofError } from '../dist/opencode/types.js';
 import { createLocalSubmissionStore, openSubmissionBinding, closeSubmissionBinding, recordDispatchPrompt, sameSubmission } from '../dist/workflow/submission-store.js';
 
 const settings = { plannerAgent: 'planner', executorAgent: 'executor', plannerModel: 'anthropic/planner', executorModel: 'anthropic/executor', executorFallbackModel: 'kimi/fallback', maxTasks: 10, minQuotaRemainingPercent: 10, tokenLimitsDisabled: true };
@@ -461,14 +463,36 @@ for (const [name, make] of backends) {
     const stale = await gate.submit('executor-result', completed(), caller({ messageID: 'msg_old', id: 'call_stale' }));
     assert.equal(stale.accepted, false);
     assert.equal(stale.code, 'unauthorized');
+    assert.equal(stale.message, SUBMISSION_DENIAL, 'a proven other dispatch is a plain denial, not an unverifiable origin');
+    assert.equal('origin' in stale, false);
     assert.equal(await persistence.readSubmission(backend.id, 'attempt_2', 'executor-result'), null, 'no receipt for the newer dispatch');
     assert.equal(await persistence.readSubmission(backend.id, 'attempt_1', 'executor-result'), null);
     // A message the host cannot place, a throwing resolver, and a missing resolver all fail closed.
-    assert.equal((await gate.submit('executor-result', completed(), caller({ messageID: 'msg_unknown' }))).code, 'unauthorized');
-    const throwing = createDurableSubmissionGate({ runId: backend.id, directory: backend.directory, persistence, origin: () => { throw new Error('native unavailable'); } });
-    assert.equal((await throwing.submit('executor-result', completed(), caller({ messageID: 'msg_2' }))).code, 'unauthorized');
+    const unplaced = await gate.submit('executor-result', completed(), caller({ messageID: 'msg_unknown' }));
+    assert.deepEqual({ code: unplaced.code, repairable: unplaced.repairable, errors: unplaced.errors, message: unplaced.message, origin: unplaced.origin }, { code: 'unauthorized', repairable: false, errors: [], message: originUnverifiedDenial('unverifiable'), origin: 'unverifiable' });
+    const throwing = createDurableSubmissionGate({ runId: backend.id, directory: backend.directory, persistence, origin: () => { throw new Error('native unavailable sk-secret-token'); } });
+    const thrown = await throwing.submit('executor-result', completed(), caller({ messageID: 'msg_2' }));
+    assert.equal(thrown.code, 'unauthorized');
+    assert.equal(thrown.message, originUnverifiedDenial('unverifiable'), 'error text never reaches the denial');
+    assert.doesNotMatch(JSON.stringify(thrown), /native unavailable|sk-secret/);
     const unwired = createDurableSubmissionGate({ runId: backend.id, directory: backend.directory, persistence });
-    assert.equal((await unwired.submit('executor-result', completed(), caller({ messageID: 'msg_2' }))).code, 'unauthorized', 'session and agent alone never authenticate');
+    const unproven = await unwired.submit('executor-result', completed(), caller({ messageID: 'msg_2' }));
+    assert.equal(unproven.code, 'unauthorized', 'session and agent alone never authenticate');
+    assert.equal(unproven.message, originUnverifiedDenial('unverifiable'));
+    // A bounded OriginProofError keeps its allowlisted reason; a lookalike carrying anything else collapses to the generic one.
+    for (const reason of ORIGIN_REASONS.filter(value => value !== 'unverifiable')) {
+      const proof = createDurableSubmissionGate({ runId: backend.id, directory: backend.directory, persistence, origin: () => { throw new OriginProofError(reason); } });
+      const denied = await proof.submit('executor-result', completed(), caller({ messageID: 'msg_2' }));
+      assert.deepEqual({ code: denied.code, repairable: denied.repairable, errors: denied.errors, message: denied.message, origin: denied.origin }, { code: 'unauthorized', repairable: false, errors: [], message: originUnverifiedDenial(reason), origin: reason });
+    }
+    const forged = createDurableSubmissionGate({ runId: backend.id, directory: backend.directory, persistence, origin: () => { throw Object.assign(new Error('x'), { name: 'OriginProofError', reason: 'transcript text sk-secret' }); } });
+    assert.equal((await forged.submit('executor-result', completed(), caller({ messageID: 'msg_2' }))).message, originUnverifiedDenial('unverifiable'));
+    const absent = createDurableSubmissionGate({ runId: backend.id, directory: backend.directory, persistence, origin: () => undefined });
+    assert.equal((await absent.submit('executor-result', completed(), caller({ messageID: 'msg_2' }))).message, originUnverifiedDenial('unverifiable'));
+    // Wrong caller, wrong kind and a delayed call keep the plain denial even though the resolver would also fail.
+    assert.equal((await throwing.submit('executor-result', completed(), caller({ sessionID: 'ses_forged' }))).message, SUBMISSION_DENIAL);
+    assert.equal((await throwing.submit('executor-result', completed(), caller({ agent: 'planner' }))).message, SUBMISSION_DENIAL);
+    assert.equal((await throwing.submit('planner-plan', plan, caller())).message, SUBMISSION_DENIAL);
     assert.equal(await persistence.readSubmission(backend.id, 'attempt_2', 'executor-result'), null);
     // The genuine call for dispatch 2 works and records the proven origin.
     const genuine = await gate.submit('executor-result', completed(), caller({ messageID: 'msg_2', id: 'call_b' }));
