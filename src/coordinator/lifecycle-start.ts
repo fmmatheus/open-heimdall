@@ -41,6 +41,10 @@ export interface LifecycleDependencies {
   progress(text: string): void;
   /** Aborts the waiting client operation (Ctrl-C). It never reverses a launch that was already requested. */
   signal?: AbortSignal;
+  /** `logs` on Linux: absolute journalctl path. Resolved from fixed system locations when omitted. */
+  journalctl?: string;
+  /** `logs` on Linux: starts the journal reader with an argument array. Defaults to `child_process.spawn`. */
+  spawnProcess?: typeof import('node:child_process').spawn;
 }
 
 export function sleepUnlessAborted(milliseconds: number, signal?: AbortSignal): Promise<void> {
@@ -68,10 +72,10 @@ export function defaultLifecycleDependencies(overrides: Partial<LifecycleDepende
   };
 }
 
-type Bounded<T> = { kind: 'value'; value: T } | { kind: 'timeout' } | { kind: 'aborted' };
+export type Bounded<T> = { kind: 'value'; value: T } | { kind: 'timeout' } | { kind: 'aborted' };
 
 /** Waits for `promise` until the overall deadline or an interruption. A late rejection of an abandoned call is ignored. */
-function bounded<T>(promise: Promise<T>, deps: LifecycleDependencies, deadlineAt: number): Promise<Bounded<T>> {
+export function bounded<T>(promise: Promise<T>, deps: LifecycleDependencies, deadlineAt: number): Promise<Bounded<T>> {
   const remaining = deadlineAt - deps.now();
   if (remaining <= 0) { promise.catch(() => {}); return Promise.resolve({ kind: 'timeout' }); }
   if (deps.signal?.aborted) { promise.catch(() => {}); return Promise.resolve({ kind: 'aborted' }); }
@@ -85,14 +89,14 @@ function bounded<T>(promise: Promise<T>, deps: LifecycleDependencies, deadlineAt
   });
 }
 
-type Probe =
+export type Probe =
   | { kind: 'absent' }
   | { kind: 'answered'; lifecycle: CoordinatorLifecycle; status: CoordinatorStatus | null }
   | { kind: 'problem'; code: LifecycleErrorCode; message: string; transient: boolean };
 
-const problem = (code: LifecycleErrorCode, message: string, transient = false): Probe => ({ kind: 'problem', code, message, transient });
+export const problem = (code: LifecycleErrorCode, message: string, transient = false): Probe => ({ kind: 'problem', code, message, transient });
 
-function classifyRequestFailure(error: unknown, endpoint: string): Probe {
+export function classifyRequestFailure(error: unknown, endpoint: string): Probe {
   const statusCode = (error as { statusCode?: unknown }).statusCode;
   const message = error instanceof Error ? error.message : 'unknown error';
   if (statusCode === 404) return problem('unsupported-lifecycle-protocol', `The coordinator at ${endpoint} does not support the lifecycle protocol; it was started by an older Heimdall version. Heimdall does not signal or restart it.`);
@@ -109,7 +113,7 @@ async function endpointExists(endpoint: string): Promise<boolean> {
 }
 
 /** One authenticated lifecycle (and, for a running coordinator, status) request. Creates and changes nothing. */
-async function probeEndpoint(configuration: CoordinatorConfiguration, deps: LifecycleDependencies, deadlineAt: number, learned: (secret: string) => void): Promise<Probe> {
+export async function probeEndpoint(configuration: CoordinatorConfiguration, deps: LifecycleDependencies, deadlineAt: number, learned: (secret: string) => void): Promise<Probe> {
   let key: string;
   try { key = await readCoordinatorToken(configuration.stateDirectory); }
   catch (error) {
@@ -135,7 +139,7 @@ async function probeEndpoint(configuration: CoordinatorConfiguration, deps: Life
   catch (error) { return classifyRequestFailure(error, configuration.endpoint); }
 }
 
-const observed = (lifecycle: CoordinatorLifecycle): ObservedInstance => ({ instanceId: lifecycle.instanceId, pid: lifecycle.pid, mode: lifecycle.mode });
+export const observed = (lifecycle: CoordinatorLifecycle): ObservedInstance => ({ instanceId: lifecycle.instanceId, pid: lifecycle.pid, mode: lifecycle.mode });
 
 function fromConflicts(conflicts: ServiceConflict[], fallback: string): { outcome: 'conflict' | 'failed'; code: LifecycleErrorCode; message: string } {
   const first = conflicts[0];
@@ -145,7 +149,7 @@ function fromConflicts(conflicts: ServiceConflict[], fallback: string): { outcom
   return { outcome: 'conflict', code: first.code, message: detail };
 }
 
-const errorText = (error: unknown) => error instanceof Error ? error.message : 'unknown error';
+export const errorText = (error: unknown) => error instanceof Error ? error.message : 'unknown error';
 
 /**
  * `heimdall coordinator start`: serialize with other lifecycle operations for the same target, recognize an

@@ -15,6 +15,32 @@ export interface CoordinatorOwnership {
 
 export const OWNERSHIP_CONFLICT_MESSAGE = 'Another coordinator owns this state directory; stop that coordinator before starting another';
 
+export type OwnershipProbe = 'free' | 'held' | 'absent';
+
+/**
+ * Check, without creating anything, whether a coordinator currently holds the ownership lock. The lock is taken and
+ * dropped within one call, so `free` means no process owned the state at that moment. `absent` means no coordinator
+ * ever created the lock database in this state directory.
+ */
+export async function probeCoordinatorOwnership(stateDirectory: string): Promise<OwnershipProbe> {
+  const lockPath = path.join(stateDirectory, 'coordinator.owner.sqlite');
+  try { await privateFile(lockPath); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'absent'; throw error; }
+  const db = new DatabaseSync(lockPath, { timeout: 0 });
+  try {
+    db.exec('PRAGMA journal_mode = MEMORY');
+    db.exec('PRAGMA locking_mode = EXCLUSIVE');
+    db.exec('BEGIN EXCLUSIVE');
+    return 'free';
+  } catch (error) {
+    const code = (error as { errcode?: unknown }).errcode;
+    if (code === SQLITE_BUSY || code === SQLITE_LOCKED) return 'held';
+    throw error;
+  } finally {
+    try { if (db.isOpen && db.isTransaction) db.exec('ROLLBACK'); } finally { if (db.isOpen) db.close(); }
+  }
+}
+
 /**
  * Take exclusive ownership of an already canonical, private coordinator state directory.
  *
