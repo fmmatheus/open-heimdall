@@ -6,7 +6,7 @@ import { createManagedExecutor, managedPrompt } from '../dist/coordinator/execut
 const tokens = value => ({ input: value, output: 0, reasoning: 0, cache: { read: 0, write: 0 } });
 const runFixture = () => ({ id: 'run-one', ownerToken: 'synthetic-owner', capacityReserved: true, version: 1, parentSessionId: 'ses_reserved', promptMessageId: 'msg_reserved', worktreePath: '/synthetic/managed/checkout', launchAction: 'start', resolution: null, checkpoint: null, specification: { settings: { plannerAgent: 'adr-planner', executorAgent: 'adr-executor', plannerModel: 'anthropic/planner', plannerVariant: 'max' }, opencode: { baseUrl: 'http://127.0.0.1:4096', passwordEnvironmentVariable: 'SYNTHETIC_PASSWORD' } } });
 
-function fixture(run = runFixture(), connectionOverrides = {}) {
+function fixture(run = runFixture(), connectionOverrides = {}, executorOptions = {}) {
   const calls = [], projected = new Map(), sessions = new Map();
   let active = {}, inbox = [], permissions = [], forms = [], pluginsValid = true, listingAvailable = true, coldReads = 0, pluginFailed = false, clock = 0;
   const delays = [];
@@ -49,7 +49,7 @@ function fixture(run = runFixture(), connectionOverrides = {}) {
     }
     return new Response('', { status: 404 });
   };
-  const executor = createManagedExecutor({ getRun: () => run, preflightTimeoutMs: 1000, now: () => clock, pause: async ms => { assert.ok(!calls.some(call => call.method === 'POST'), 'readiness never writes before active inventory'); delays.push(ms); clock += ms; }, connection: { environment: { SYNTHETIC_PASSWORD: 'synthetic-test-secret' }, fetchImpl, ...connectionOverrides } });
+  const executor = createManagedExecutor({ getRun: () => run, preflightTimeoutMs: 1000, now: () => clock, pause: async ms => { assert.ok(!calls.some(call => call.method === 'POST'), 'readiness never writes before active inventory'); delays.push(ms); clock += ms; }, connection: { environment: { SYNTHETIC_PASSWORD: 'synthetic-test-secret' }, fetchImpl, ...connectionOverrides }, ...executorOptions });
   const settled = (id, parentID) => ({ id, ...(parentID ? { parentID } : {}), location: { directory: run.worktreePath }, tokens: tokens(1), outcome: 'succeeded', time: { idle: 10 } });
   return { run, executor, calls, parent, sessions, projected, settled, delays,
     set active(value) { active = value; }, set inbox(value) { inbox = value; }, set permissions(value) { permissions = value; }, set forms(value) { forms = value; }, set pluginsValid(value) { pluginsValid = value; }, set listingAvailable(value) { listingAvailable = value; }, set coldReads(value) { coldReads = value; }, set pluginFailed(value) { pluginFailed = value; } };
@@ -214,4 +214,41 @@ test('saved Desktop mode reaches managed native launch with token-free run metad
   const created = f.calls.find(call => call.method === 'POST' && call.route === '/api/session');
   assert.deepEqual(created.body.metadata, { heimdallRunId: run.id });
   assert.deepEqual(f.calls.filter(call => call.route.endsWith('/prompt')).map(call => call.body.resume), [false, true]);
+});
+
+const basicHeader = value => 'Basic ' + Buffer.from('opencode:' + value).toString('base64');
+
+test('a selected credential file is the only source of the Basic password and the process environment is untouched', async () => {
+  const { loadCredentialFile } = await import('../dist/coordinator/credentials.js');
+  const fs = await import('node:fs/promises');
+  const os = await import('node:os');
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'hdx-'));
+  try {
+    const file = path.join(directory, 'credentials.env');
+    await fs.writeFile(file, 'SYNTHETIC_PASSWORD=synthetic-file-secret\nUNRELATED_VALUE=synthetic-unrelated\n', { mode: 0o600 });
+    const credentials = await loadCredentialFile(file);
+    const before = JSON.stringify(process.env);
+    const f = fixture(runFixture(), { environment: { SYNTHETIC_PASSWORD: 'synthetic-ambient-secret' } }, { credentials });
+    await f.executor.launch(f.run);
+    assert.ok(f.calls.length > 0);
+    assert.ok(f.calls.every(call => call.headers.Authorization === basicHeader('synthetic-file-secret')), 'file value, never the ambient value');
+    assert.equal(JSON.stringify(process.env), before);
+    assert.equal(process.env.SYNTHETIC_PASSWORD, undefined);
+    assert.equal(process.env.UNRELATED_VALUE, undefined);
+  } finally { await fs.rm(directory, { recursive: true, force: true }); }
+});
+
+test('a selected credential file without the referenced value fails at connection time without using the ambient password', async () => {
+  const { loadCredentialFile } = await import('../dist/coordinator/credentials.js');
+  const fs = await import('node:fs/promises');
+  const os = await import('node:os');
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'hdx-'));
+  try {
+    const file = path.join(directory, 'credentials.env');
+    await fs.writeFile(file, 'OTHER_PASSWORD=synthetic-other-secret\n', { mode: 0o600 });
+    const credentials = await loadCredentialFile(file);
+    const f = fixture(runFixture(), { environment: { SYNTHETIC_PASSWORD: 'synthetic-ambient-secret' } }, { credentials });
+    await assert.rejects(f.executor.launch(f.run), /Set the configured OpenCode password environment variable/);
+    assert.equal(f.calls.length, 0);
+  } finally { await fs.rm(directory, { recursive: true, force: true }); }
 });

@@ -103,7 +103,7 @@ async function until(predicate, message) {
 }
 
 /** A real coordinator holding one admitted synthetic native run and one queued run. */
-async function heldFixture(t, { testHooks } = {}) {
+async function heldFixture(t, { testHooks, credentials } = {}) {
   const temporary = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'hdd-')));
   const stateDirectory = path.join(temporary, 'state');
   const endpoint = process.platform === 'win32' ? '\\\\.\\pipe\\heimdall-shutdown-' + randomUUID() : path.join(stateDirectory, 'coordinator.sock');
@@ -111,7 +111,7 @@ async function heldFixture(t, { testHooks } = {}) {
   let acknowledge;
   const acknowledgement = new Promise(resolve => { acknowledge = resolve; });
   const service = await startCoordinatorService({
-    configuration: { stateDirectory, endpoint, globalConcurrency: 1, projectConcurrency: 2 }, pollIntervalMs: 5, testHooks,
+    configuration: { stateDirectory, endpoint, globalConcurrency: 1, projectConcurrency: 2 }, pollIntervalMs: 5, testHooks, credentials,
     executor: {
       launch: async run => { control.launches.push(run); await acknowledgement; },
       inspect: async run => {
@@ -433,4 +433,24 @@ test('the foreground supervisor stays open after a drain failure and a repeated 
   f.control.proof = true;
   assert.equal(await supervised, true);
   assert.equal((await readShutdownRecord(f.stateDirectory, f.instanceId)).attempts, 2);
+});
+
+test('a drain failure that echoes a credential-file value is sanitized in the lifecycle error, record and error message', { timeout: 20000 }, async t => {
+  const { loadCredentialFile } = await import('../dist/coordinator/credentials.js');
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'hdd-cred-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const file = path.join(directory, 'credentials.env');
+  // Shorter than the generic eight-character threshold, so only the credential context can mask it.
+  await fs.writeFile(file, 'SYNTHETIC_PASSWORD=pw-7x\n', { mode: 0o600 });
+  const credentials = await loadCredentialFile(file);
+  let injected = 0;
+  const f = await heldFixture(t, { credentials, testHooks: { shutdownStage: stage => { if (stage === 'drain' && injected++ === 0) throw new Error('injected drain failure with pw-7x inside'); } } });
+  await requestCoordinatorShutdown(f.admin, f.instanceId);
+  await until(() => f.service.lifecycle().phase === 'drain-failed', 'drain failure was not exposed');
+  const failed = await f.admin.request('GET', '/lifecycle');
+  assert.match(failed.shutdown.error, /^Drain failed: injected drain failure with \[redacted\] inside/);
+  let record;
+  await until(async () => { record = await readShutdownRecord(f.stateDirectory, f.instanceId); return record.status === 'drain-failed'; }, 'drain failure was not recorded');
+  assert.match(record.error, /with \[redacted\] inside/);
+  assert.ok(!JSON.stringify(record).includes('pw-7x'));
 });

@@ -12,6 +12,8 @@ import { COORDINATOR_SERVICE_ID, COORDINATOR_STATUS_SCHEMA_VERSION, parseCoordin
 import { privateFile, readCoordinatorToken } from './token.js';
 import { acquireCoordinatorOwnership } from './ownership.js';
 import type { CoordinatorOwnership } from './ownership.js';
+import type { CredentialContext } from './credentials.js';
+import { maskSecrets } from '../redaction.js';
 import {
   buildCoordinatorLifecycle, COORDINATOR_LIFECYCLE_PROTOCOL, CoordinatorShutdownError, createCoordinatorInstance,
   privateLifecycleDirectory, sanitizeShutdownError, writeInstanceRecord, writeShutdownRecord,
@@ -67,6 +69,8 @@ export interface ServiceOptions {
   executor?: ManagedExecutor;
   scheduler?: Omit<ConstructorParameters<typeof CoordinatorScheduler>[0], 'store' | 'executor' | 'endpoint'>;
   pollIntervalMs?: number;
+  /** Explicitly selected credential file for Basic authentication; without it the process environment is used. */
+  credentials?: CredentialContext;
   /** How this process was launched; defaults to a foreground coordinator. */
   lifecycle?: LifecycleOptions;
   /** Failure injection for tests. A hook that throws makes the named shutdown stage fail before it runs. */
@@ -111,7 +115,7 @@ async function startOwnedService(options: ServiceOptions, root: string, ownershi
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
   await privateFile(databasePath);
   const store = new CoordinatorStore({ databasePath, globalConcurrency: configuration.globalConcurrency });
-  const executor = options.executor ?? createManagedExecutor({ getRun: runId => store.getRun(runId)! });
+  const executor = options.executor ?? createManagedExecutor({ getRun: runId => store.getRun(runId)!, credentials: options.credentials });
   const scheduler = new CoordinatorScheduler({ ...options.scheduler, store, executor, endpoint: configuration.endpoint });
   let ready = false;
   let draining = false;
@@ -267,7 +271,10 @@ async function startOwnedService(options: ServiceOptions, root: string, ownershi
   const describe = (error: unknown) => {
     const secrets = [accessToken];
     try { for (const candidate of store.listRuns()) if (candidate.ownerToken) secrets.push(candidate.ownerToken); } catch { /* The store may be the failing part. */ }
-    return sanitizeShutdownError(error, secrets);
+    // Credential values may be shorter than the generic sanitizer's threshold, so mask them first.
+    const credentialValues = options.credentials?.values() ?? [];
+    const raw = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
+    return sanitizeShutdownError(credentialValues.length ? maskSecrets(raw, credentialValues.filter(value => value.length >= 4)) : error, secrets);
   };
   const persist = (status: ShutdownStatus, extra: { stage?: ShutdownStage; error?: string; completedAt?: number } = {}): Promise<string> => {
     const record: ShutdownRecord = {

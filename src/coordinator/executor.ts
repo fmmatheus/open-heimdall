@@ -3,6 +3,7 @@ import { connect, snapshot } from '../opencode/observer.js';
 import type { ConnectionOptions } from '../opencode/observer.js';
 import type { SessionAPI, SessionSnapshot } from '../opencode/types.js';
 import { verifyRuntimeSnapshot } from './runtime-snapshot.js';
+import type { CredentialContext } from './credentials.js';
 import type { ExecutorInspection, ManagedExecutor, RunRecord } from './types.js';
 
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -23,9 +24,14 @@ export function managedPrompt(run: RunRecord): string {
   return 'Heimdall managed run: ' + run.id + '\nCall the native adr_workflow tool exactly once with these arguments:\n' + JSON.stringify(args) + '\nReport its result and wait. Do not implement, delegate directly, or retry a paused run.';
 }
 
-export function createManagedExecutor({ getRun, connection = {}, preflightTimeoutMs = 10000, pause = ms => new Promise<void>(resolve => setTimeout(resolve, ms)), now = Date.now }: {
+export function createManagedExecutor({ getRun, connection = {}, credentials, preflightTimeoutMs = 10000, pause = ms => new Promise<void>(resolve => setTimeout(resolve, ms)), now = Date.now }: {
   getRun: (id: string) => RunRecord | Promise<RunRecord>;
   connection?: ConnectionOptions;
+  /**
+   * An explicitly selected credential file. Basic authentication then reads its password only from this context and
+   * never falls back to the process environment; without it the connection environment is used unchanged.
+   */
+  credentials?: CredentialContext;
   preflightTimeoutMs?: number;
   pause?: (ms: number) => Promise<void>;
   now?: () => number;
@@ -37,7 +43,12 @@ export function createManagedExecutor({ getRun, connection = {}, preflightTimeou
     if (run.ownerToken !== expected.ownerToken || run.version !== expected.version || (launching && (!run.ownerToken || !run.capacityReserved))) throw new Error('Managed executor ownership or version changed');
     return run;
   };
-  const apiFor = (run: RunRecord) => connect(run.worktreePath, undefined, { ...connection, ...run.specification.opencode, authentication: run.specification.opencode.authentication ?? 'basic' });
+  const apiFor = (run: RunRecord) => {
+    const options = { ...connection, ...run.specification.opencode, authentication: run.specification.opencode.authentication ?? 'basic' };
+    // The selected file resolves only the configured password reference; the ambient password is never consulted.
+    if (credentials) options.environment = credentials.environmentFor(options.passwordEnvironmentVariable ?? 'OPENCODE_PASSWORD', connection.environment ?? process.env);
+    return connect(run.worktreePath, undefined, options);
+  };
   const verifySession = (value: SessionSnapshot, run: RunRecord, parent?: string) => {
     if (typeof value.session.location?.directory !== 'string' || path.resolve(value.session.location.directory) !== path.resolve(run.worktreePath) || (parent !== undefined && value.session.parentID !== parent)) throw new Error('Native session escaped the managed worktree or parent');
   };

@@ -7,13 +7,15 @@ import { readCoordinatorToken } from './token.js';
 import { parseCoordinatorStatus } from './status.js';
 import { CoordinatorShutdownError } from './lifecycle.js';
 import type { ServiceOptions } from './service.js';
+import { loadCredentialFile } from './credentials.js';
+import { createOutputSanitizer, sanitizeProcessOutput } from './output.js';
 
 const STATUS_DEADLINE_MS = 10000;
 
 export const coordinatorHelp = `Global coordinator (explicit opt-in)
 
 Usage:
-  heimdall coordinator serve [--coordinator-config FILE]
+  heimdall coordinator serve [--coordinator-config FILE] [--env-file FILE]
   heimdall coordinator project add DIRECTORY [--project-config FILE] [--limit N]
   heimdall coordinator project list
   heimdall coordinator run submit PROJECT_ID --feature FILE [--base REF]
@@ -25,6 +27,9 @@ Usage:
   heimdall coordinator status [--json] [--coordinator-config FILE]
 
 All commands accept --coordinator-config FILE. Start serve in a separate terminal.
+serve --env-file FILE reads Basic authentication credentials (NAME=value lines) from a private
+regular file (owner-only, not a symbolic link). The file is read at every launch, never changes
+the process environment, and its values are masked in coordinator output.
 Submission schedules agents in a new managed worktree. Existing runs are untouched.
 
 status asks the running coordinator whether it is running or draining, whether it accepts
@@ -121,7 +126,7 @@ export async function coordinatorMain(args: string[], internals: CoordinatorMain
   const positional: string[] = [];
   const options = new Map<string, string>();
   let json = false;
-  const allowed = new Set(['--coordinator-config', '--project-config', '--limit', '--feature', '--base', '--input', '--after']);
+  const allowed = new Set(['--coordinator-config', '--project-config', '--limit', '--feature', '--base', '--input', '--after', '--env-file']);
   while (args.length) {
     const argument = args.shift()!;
     if (!argument.startsWith('-')) { positional.push(argument); continue; }
@@ -149,16 +154,34 @@ export async function coordinatorMain(args: string[], internals: CoordinatorMain
     return;
   }
   if (command === 'serve') {
-    check(1, []);
-    const { startCoordinatorService } = await import('./service.js');
-    const service = await startCoordinatorService({ ...internals.serviceOptions, configuration });
-    process.stdout.write(`Coordinator listening at ${configuration.endpoint}\n`);
-    if (!await superviseForeground(service)) {
-      // A failed close stage may leave resources open; end the process instead of waiting on them.
-      process.exitCode = 1;
-      await new Promise<void>(resolve => process.stderr.write('', () => resolve()));
-      process.exit(1);
-    }
+    check(1, ['--env-file']);
+    // Validate the selected credential file before anything is created or started.
+    const envFile = options.get('--env-file');
+    const credentials = envFile === undefined ? undefined : await loadCredentialFile(envFile);
+    let service: Awaited<ReturnType<typeof import('./service.js').startCoordinatorService>> | undefined;
+    let coordinatorKey: string | undefined;
+    // Everything this process writes passes through the sanitizer, seeded with the credentials and capabilities it knows.
+    const sanitize = createOutputSanitizer(() => {
+      const secrets: string[] = [...(credentials?.values() ?? [])];
+      if (coordinatorKey) secrets.push(coordinatorKey);
+      if (service) for (const run of service.store.listRuns()) if (run.ownerToken) secrets.push(run.ownerToken);
+      return secrets;
+    });
+    const restoreOutput = sanitizeProcessOutput(sanitize);
+    try {
+      const { startCoordinatorService } = await import('./service.js');
+      service = await startCoordinatorService({ ...internals.serviceOptions, configuration, credentials });
+      coordinatorKey = await readCoordinatorToken(configuration.stateDirectory).catch(() => undefined);
+      process.stdout.write(`Coordinator listening at ${configuration.endpoint}\n`);
+      if (!await superviseForeground(service)) {
+        // A failed close stage may leave resources open; end the process instead of waiting on them.
+        process.exitCode = 1;
+        await new Promise<void>(resolve => process.stderr.write('', () => resolve()));
+        process.exit(1);
+      }
+    } catch (error) {
+      throw new Error(sanitize(error instanceof Error ? error.message : 'Coordinator failed'));
+    } finally { restoreOutput(); }
     return;
   }
   const client = createCoordinatorClient(configuration.endpoint, await readCoordinatorToken(configuration.stateDirectory));

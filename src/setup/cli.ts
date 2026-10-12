@@ -1,4 +1,5 @@
 import { runSetup, UNVERIFIED_BY_SETUP, type SetupInput, type SetupOptions, type SetupResult, type SetupTrace } from './core.js';
+import { maskSecrets } from '../redaction.js';
 
 /*
  * `heimdall setup` command line front end over the shared setup core (core.ts).
@@ -216,13 +217,7 @@ export function createRedactor(environment: NodeJS.ProcessEnv, args: readonly st
     const match = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)@/i.exec(argument.includes('=') && argument.startsWith('--') ? argument.slice(argument.indexOf('=') + 1) : argument);
     if (match?.[1]) { secrets.add(match[1]); for (const part of match[1].split(':')) if (part.length >= 3) secrets.add(part); }
   }
-  const redact = (text: string): string => {
-    let result = text;
-    for (const secret of [...secrets].sort((a, b) => b.length - a.length)) result = result.split(secret).join('[redacted]');
-    return result
-      .replace(/(:\/\/)[^/?#\s@]*@/g, '$1[redacted]@')
-      .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{6,}/gi, '$1 [redacted]');
-  };
+  const redact = (text: string): string => maskSecrets(text, secrets);
   return Object.assign(redact, { addReferences });
 }
 
