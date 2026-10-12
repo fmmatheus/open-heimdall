@@ -201,8 +201,18 @@ run. Live record (planner and executor, one task advancement):
   before each dispatch and bound to the child before the prompt is admitted; it
   is confirmed once the host observes the dispatch prompt. A submission is
   authenticated against that binding and against the native caller (session,
-  agent, message and call ID, proved from the host message timeline, failing
-  closed when no native origin exists). The accepted payload is written once as
+  agent, message and call ID). The origin is proved from the full native message
+  archive, read page by page, not from the child's compacted active context, so a
+  child whose context the host compacted past the dispatch prompt is still
+  authenticated. A null cursor ends the scan; a repeated cursor is rejected before
+  any of its messages is used, and a bounded scan that finds no proof fails closed,
+  as does a missing native origin. Live record:
+  [compaction-safe-provenance.md](validation/compaction-safe-provenance.md). A call by the bound child whose origin
+  cannot be verified is denied with a distinct message naming a bounded reason;
+  it is not a format error, spends no repair and leaves the binding usable, and
+  if the attempt then ends without a submission the pause reason says the origin
+  could not be verified. A wrong caller or a call from another dispatch gets the
+  plain denial. The accepted payload is written once as
   an immutable receipt (`submission-<attempt>-<phase>-<kind>.json`, schema v3
   `submissions` table in the coordinator) before it is acknowledged.
 - **Advancement.** A plan or task advances only with a matching durable receipt

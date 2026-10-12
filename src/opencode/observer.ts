@@ -2,7 +2,8 @@ import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import { readDesktopConnection } from './openchamber.js';
 import type { DesktopClientConnection, DesktopConnectionOptions } from './openchamber.js';
-import type { ObservedSession, SessionAPI, SessionObserver, SessionSnapshot } from './types.js';
+import { OriginProofError } from './types.js';
+import type { HistoryMessage, MessageHistory, ObservedSession, SessionAPI, SessionObserver, SessionSnapshot } from './types.js';
 
 export const supportedOpenCodeVersion = '2.0.22';
 export type OpenCodeAuthentication = 'basic' | 'none' | 'openchamber';
@@ -119,4 +120,63 @@ export async function snapshot(api: SessionAPI, id: string, { limit = 5, signal 
 
 export function createObserver({ directory, ...connection }: ConnectionOptions & { directory: string }): SessionObserver {
   return async (id, signal) => snapshot(await connect(directory, id, connection), id, { signal });
+}
+
+/** The server's maximum page size for `session.message.list`. */
+export const MESSAGE_HISTORY_PAGE_SIZE = 200;
+/** 200 000 messages: far beyond a bounded workflow child, yet a hard stop so a misbehaving server cannot hold a scan open. */
+export const MESSAGE_HISTORY_MAX_PAGES = 1000;
+
+/**
+ * Reads the complete projected message archive of a session, newest first, through the supported
+ * `GET /api/session/:id/message` route. Unlike the plugin context (which starts after the latest completed
+ * compaction) this retains every message.
+ *
+ * Pinned 2.0.22 contract (`@opencode/protocol` `session.message.list`): `order` (asc|desc) applies to the first page
+ * only; later pages send just the opaque `cursor` returned by the previous response (plus `limit` and the same
+ * `type` filter, never `order`); the response envelope is `{ data: Message[], cursor: { previous?, next? } }` and
+ * "items keep the requested order across pages". The pinned typings do not state which cursor continues toward older
+ * items for `order=desc`; `cursor.next` is followed as the continuation of the requested order. That direction is
+ * not provable from the packages and is confirmed by the live smoke with a small page size.
+ *
+ * The scan is lazy: it stops fetching as soon as the consumer stops. It never sorts, deduplicates or truncates, and
+ * throws an OriginProofError for an unreachable or failing API, a malformed envelope, a cursor seen before, a message
+ * id seen twice, or a scan longer than `maxPages`.
+ */
+export function createMessageHistory({ directory, pageSize = MESSAGE_HISTORY_PAGE_SIZE, maxPages = MESSAGE_HISTORY_MAX_PAGES, ...connection }: ConnectionOptions & {
+  directory: string;
+  pageSize?: number;
+  maxPages?: number;
+}): MessageHistory {
+  if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > MESSAGE_HISTORY_PAGE_SIZE || !Number.isInteger(maxPages) || maxPages < 1) throw new Error('Invalid message history bounds');
+  return async function* (sessionID, signal) {
+    let api: SessionAPI;
+    try { api = await connect(directory, sessionID, connection); } catch { throw new OriginProofError('history_unavailable'); }
+    const base = '/api/session/' + encodeURIComponent(sessionID) + '/message';
+    const cursors = new Set<string>();
+    const ids = new Set<string>();
+    let cursor: string | undefined;
+    for (let page = 1; ; page++) {
+      const route = base + '?' + (cursor === undefined ? 'order=desc&limit=' + pageSize : 'cursor=' + encodeURIComponent(cursor) + '&limit=' + pageSize);
+      let value: unknown;
+      try { value = await api.request(route, { signal, raw: true }); } catch { throw new OriginProofError('history_unavailable'); }
+      if (!record(value) || !Array.isArray(value.data) || !record(value.cursor)) throw new OriginProofError('page_malformed');
+      // The server reports an absent cursor as `null` (the empty page past the end carries `{ previous: null, next: null }`).
+      const next = value.cursor.next ?? undefined;
+      const previous = value.cursor.previous ?? undefined;
+      if ((next !== undefined && (typeof next !== 'string' || !next)) || (previous !== undefined && typeof previous !== 'string')) throw new OriginProofError('page_malformed');
+      if (next !== undefined && (cursors.has(next) || next === cursor)) throw new OriginProofError('cursor_repeated');
+      // The whole page is validated before any of it is consumed.
+      for (const item of value.data) {
+        if (!record(item) || typeof item.id !== 'string' || !item.id || typeof item.type !== 'string') throw new OriginProofError('page_malformed');
+        if (ids.has(item.id)) throw new OriginProofError('duplicate_message');
+        ids.add(item.id);
+      }
+      yield* value.data as HistoryMessage[];
+      if (next === undefined || value.data.length === 0) return;
+      if (page >= maxPages) throw new OriginProofError('scan_exhausted');
+      cursors.add(next);
+      cursor = next;
+    }
+  };
 }

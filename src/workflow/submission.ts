@@ -17,7 +17,21 @@ export type SubmissionResponse =
     accepted: false; code: 'negative'; repairable: false; outcome: 'blocked' | 'unfinished';
     gateIds: string[]; fields: string[]; reason?: string; errors: ContractError[]; message: string;
   }
-  | { accepted: false; code: 'unauthorized' | 'conflict'; repairable: false; errors: []; message: string };
+  | {
+    /** `origin` is set only when the caller is the bound child but its native origin could not be verified; the payload was not evaluated. */
+    accepted: false; code: 'unauthorized'; repairable: false; errors: []; message: string; origin?: OriginReason;
+  }
+  | { accepted: false; code: 'conflict'; repairable: false; errors: []; message: string };
+
+/**
+ * Bounded reasons a call's native origin cannot be verified. The first nine mirror the OpenCode origin-proof failures;
+ * `unverifiable` stands for anything else (no resolver, an undefined origin, an unexpected error). Never transcript text.
+ */
+export const ORIGIN_REASONS = [
+  'history_unavailable', 'page_malformed', 'cursor_repeated', 'duplicate_message', 'scan_exhausted',
+  'call_not_found', 'agent_mismatch', 'call_mismatch', 'prompt_not_found', 'unverifiable',
+] as const;
+export type OriginReason = typeof ORIGIN_REASONS[number];
 
 /**
  * The reporting boundary of the dispatch that owns a submission. `seal` closes it durably BEFORE a receipt is
@@ -44,6 +58,9 @@ export interface SubmissionGate {
 }
 
 export const SUBMISSION_DENIAL = 'Heimdall submission denied: this session is not the bound child for this submission kind.';
+/** Denial for a call by the bound child whose native origin could not be proven current. It is not a format error and spends no repair. */
+export const originUnverifiedDenial = (reason: OriginReason): string =>
+  'Heimdall submission denied: the native origin of this call could not be verified against the current dispatch (' + reason + '). The payload was not evaluated; this is not a format error.';
 export const SEALED_DENIAL = 'Heimdall denied this tool call: the reporting boundary for this attempt is sealed, so no further implementation work is allowed. Stop now.';
 
 /** Exposes nothing and accepts nothing. The default when no gate is injected. */

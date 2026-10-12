@@ -1110,3 +1110,16 @@ test('the standalone checkpoint file refuses a stale view that drops a marker or
   assert.equal(repairRegression(sealed, { ...base, results: [{}], index: 1, attempt: undefined }), undefined);
   assert.equal(repairRegression(sealed, { ...sealed, submissionRepair: record({ ...sealed.submissionRepair, repairs: 2 }) }), undefined);
 });
+
+test('an unverifiable-origin note reaches only the handler of the owning child and is a no-op otherwise', () => {
+  const supervisor = createSubmissionSupervisor();
+  const noted = [];
+  const handler = extra => ({ reject: async () => { throw new Error('unused'); }, negative: async () => {}, seal: async () => {}, conflict: async () => {}, ...extra });
+  supervisor.unverified('ses_unowned', 'call_not_found'); // No dispatch owns the child.
+  supervisor.register('ses_plain', handler()); // A handler without the optional method.
+  supervisor.unverified('ses_plain', 'call_not_found');
+  supervisor.register('ses_owned', handler({ unverified: reason => noted.push(['owned', reason]) }));
+  supervisor.register('ses_other', handler({ unverified: reason => noted.push(['other', reason]) }));
+  supervisor.unverified('ses_owned', 'prompt_not_found');
+  assert.deepEqual(noted, [['owned', 'prompt_not_found']]);
+});
