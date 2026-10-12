@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { loadCoordinatorConfiguration, positiveInteger } from './config.js';
+import { implicitDefaultMarkerApplies, managerLabelFromEnvironment } from './launch-context.js';
 import type { CoordinatorConfiguration } from './config.js';
 import { createCoordinatorClient } from './client.js';
 import { readCoordinatorToken } from './token.js';
@@ -147,7 +148,9 @@ export async function coordinatorMain(args: string[], internals: CoordinatorMain
     for (const name of options.keys()) if (name !== '--coordinator-config' && !names.includes(name)) throw new Error(`${name} does not apply to this command`);
   };
   if (json && command !== 'status') check(positional.length, []);
-  const configuration = await loadCoordinatorConfiguration(options.get('--coordinator-config'));
+  const configurationFlag = options.get('--coordinator-config');
+  // A native service definition passes the resolved default file and marks it as implicitly selected.
+  const configuration = await loadCoordinatorConfiguration(configurationFlag, { implicitDefault: command === 'serve' && implicitDefaultMarkerApplies(configurationFlag) });
   if (command === 'status') {
     check(1, []);
     await coordinatorStatus({ configuration, json });
@@ -170,7 +173,9 @@ export async function coordinatorMain(args: string[], internals: CoordinatorMain
     const restoreOutput = sanitizeProcessOutput(sanitize);
     try {
       const { startCoordinatorService } = await import('./service.js');
-      service = await startCoordinatorService({ ...internals.serviceOptions, configuration, credentials });
+      const managerLabel = managerLabelFromEnvironment(configuration.stateDirectory);
+      const lifecycle = managerLabel ? { mode: 'managed' as const, label: managerLabel } : undefined;
+      service = await startCoordinatorService({ ...internals.serviceOptions, configuration, credentials, ...(lifecycle ? { lifecycle } : {}) });
       coordinatorKey = await readCoordinatorToken(configuration.stateDirectory).catch(() => undefined);
       process.stdout.write(`Coordinator listening at ${configuration.endpoint}\n`);
       if (!await superviseForeground(service)) {

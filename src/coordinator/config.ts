@@ -31,12 +31,26 @@ export function positiveInteger(value: unknown, name: string): number {
   return value;
 }
 
-export async function loadCoordinatorConfiguration(configPath?: string): Promise<CoordinatorConfiguration> {
-  const file = path.resolve(configPath ?? process.env.HEIMDALL_COORDINATOR_CONFIG ?? path.join(os.homedir(), '.config', 'heimdall', 'coordinator.toml'));
+/** The file used when neither a flag nor `HEIMDALL_COORDINATOR_CONFIG` selects one. */
+export function defaultCoordinatorConfigurationFile(): string {
+  return path.join(os.homedir(), '.config', 'heimdall', 'coordinator.toml');
+}
+
+export interface LoadConfigurationOptions {
+  /**
+   * The path in `configPath` is the default file passed on by a launcher that selected it implicitly,
+   * so a missing file keeps the loader defaults exactly as if no selector had been given.
+   */
+  implicitDefault?: boolean;
+}
+
+export async function loadCoordinatorConfiguration(configPath?: string, options: LoadConfigurationOptions = {}): Promise<CoordinatorConfiguration> {
+  const file = path.resolve(configPath ?? process.env.HEIMDALL_COORDINATOR_CONFIG ?? defaultCoordinatorConfigurationFile());
   let content: string;
   try { content = await fs.readFile(file, 'utf8'); }
   catch (error) {
-    if (configPath || process.env.HEIMDALL_COORDINATOR_CONFIG || (error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    const required = configPath ? !options.implicitDefault : Boolean(process.env.HEIMDALL_COORDINATOR_CONFIG);
+    if (required || (error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     content = '';
   }
   return parseCoordinatorConfiguration(content, file);
