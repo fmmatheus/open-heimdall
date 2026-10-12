@@ -161,8 +161,10 @@ export function createMessageHistory({ directory, pageSize = MESSAGE_HISTORY_PAG
       let value: unknown;
       try { value = await api.request(route, { signal, raw: true }); } catch { throw new OriginProofError('history_unavailable'); }
       if (!record(value) || !Array.isArray(value.data) || !record(value.cursor)) throw new OriginProofError('page_malformed');
-      const next = value.cursor.next;
-      if ((next !== undefined && (typeof next !== 'string' || !next)) || (value.cursor.previous !== undefined && typeof value.cursor.previous !== 'string')) throw new OriginProofError('page_malformed');
+      // The server reports an absent cursor as `null` (the empty page past the end carries `{ previous: null, next: null }`).
+      const next = value.cursor.next ?? undefined;
+      const previous = value.cursor.previous ?? undefined;
+      if ((next !== undefined && (typeof next !== 'string' || !next)) || (previous !== undefined && typeof previous !== 'string')) throw new OriginProofError('page_malformed');
       // The whole page is validated before any of it is consumed.
       for (const item of value.data) {
         if (!record(item) || typeof item.id !== 'string' || !item.id || typeof item.type !== 'string') throw new OriginProofError('page_malformed');

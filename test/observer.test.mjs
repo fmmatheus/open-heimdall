@@ -248,6 +248,14 @@ test('message history follows the opaque cursor in native order and sends order 
   assert.deepEqual(server.routes.slice(0, 2), ['/api/info', '/api/session/ses_child']);
 });
 
+test('message history treats null cursors as absent, as the server reports them on the page past the end', async () => {
+  const pages = { first: { data: [message('m2'), message('m1')], cursor: { previous: null, next: 'c1' } }, c1: { data: [], cursor: { previous: null, next: null } } };
+  const server = archiveServer(url => Response.json(pages[url.searchParams.get('cursor') ?? 'first']));
+  assert.deepEqual((await collect(server.history({ pageSize: 2 })('ses_child'))).map(m => m.id), ['m2', 'm1']);
+  const last = archiveServer(() => Response.json({ data: [message('m0')], cursor: { previous: null, next: null } }));
+  assert.deepEqual((await collect(last.history()('ses_child'))).map(m => m.id), ['m0']);
+});
+
 test('message history is lazy: it stops fetching when the consumer stops', async () => {
   const server = archiveServer(url => Response.json({ data: [message('a' + (url.searchParams.get('cursor') ?? '0'))], cursor: { next: String(Number(url.searchParams.get('cursor') ?? 0) + 1) } }));
   for await (const item of server.history()('ses_child')) { assert.equal(item.id, 'a0'); break; }
