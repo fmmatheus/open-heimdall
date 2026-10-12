@@ -42,7 +42,8 @@ export function createExecFileRunner(): CommandRunner {
 }
 
 export interface ServiceIdentity {
-  manager: 'launchd';
+  manager: 'launchd' | 'systemd';
+  /** The launchd label or the systemd unit name; it is also the managed lifecycle identity. */
   label: string;
   /** Owned service definition in Heimdall private storage. */
   definitionPath: string;
@@ -65,7 +66,8 @@ export type ServiceConflictCode =
   | 'registered-elsewhere'
   | 'running-context-changed'
   | 'inactive-registration-stale'
-  | 'state-unknown';
+  | 'state-unknown'
+  | 'manager-unavailable';
 
 export interface ServiceConflict {
   code: ServiceConflictCode;
