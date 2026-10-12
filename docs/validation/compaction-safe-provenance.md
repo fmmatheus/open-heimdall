@@ -185,9 +185,22 @@ node --test test/live-harness.test.mjs test/observer.test.mjs test/native-compos
 
 ## Final checks
 
-<!-- PENDING: to be filled by the final verification task with the actual commands,
-exit codes and totals for `npm run check`, `npm test` and `npm run build:extension`
-on Node v22.22.3. Until then no final result is claimed. -->
+Run from the repository root on the final branch head (after the harness and
+documentation changes), under Node v22.22.3, with dependencies reused from an
+existing install whose `package-lock.json` hash matched the checkout's. Nothing was
+installed. These are automated checks; they are not live validation.
+
+| Command | Exit code | Result |
+| --- | --- | --- |
+| `npm run check` | 0 | `tsc --noEmit` reported no errors |
+| `npm test` | 0 | Build, then `node --test test/*.test.mjs`; totals below |
+| `npm run build:extension` | 0 | Build and extension bundle completed |
+
+`npm test` totals from the TAP footer of this run:
+
+| tests | suites | pass | fail | cancelled | skipped | todo |
+| --- | --- | --- | --- | --- | --- | --- |
+| 958 | 4 | 958 | 0 | 0 | 0 | 0 |
 
 ## Not proven and remaining limits
 
