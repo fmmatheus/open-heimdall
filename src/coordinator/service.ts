@@ -12,8 +12,11 @@ import { COORDINATOR_SERVICE_ID, COORDINATOR_STATUS_SCHEMA_VERSION, parseCoordin
 import { privateFile, readCoordinatorToken } from './token.js';
 import { acquireCoordinatorOwnership } from './ownership.js';
 import type { CoordinatorOwnership } from './ownership.js';
-import { buildCoordinatorLifecycle, createCoordinatorInstance, privateLifecycleDirectory, writeInstanceRecord } from './lifecycle.js';
-import type { CoordinatorInstance, CoordinatorShutdownSummary, LifecycleOptions } from './lifecycle.js';
+import {
+  buildCoordinatorLifecycle, COORDINATOR_LIFECYCLE_PROTOCOL, CoordinatorShutdownError, createCoordinatorInstance,
+  privateLifecycleDirectory, sanitizeShutdownError, writeInstanceRecord, writeShutdownRecord,
+} from './lifecycle.js';
+import type { CoordinatorInstance, CoordinatorPhase, CoordinatorShutdownSummary, LifecycleOptions, ShutdownAcknowledgement, ShutdownRecord, ShutdownStage, ShutdownStatus } from './lifecycle.js';
 import type { CoordinatorConfiguration } from './config.js';
 import type { ManagedExecutor, Receipt, RunRecord, StartBinding } from './types.js';
 import { isSubmissionKind } from '../workflow/submission-store.js';
@@ -66,6 +69,20 @@ export interface ServiceOptions {
   pollIntervalMs?: number;
   /** How this process was launched; defaults to a foreground coordinator. */
   lifecycle?: LifecycleOptions;
+  /** Failure injection for tests. A hook that throws makes the named shutdown stage fail before it runs. */
+  testHooks?: ServiceTestHooks;
+}
+
+export interface ServiceTestHooks {
+  shutdownStage?(stage: ShutdownStage | 'publish-failure'): void | Promise<void>;
+}
+
+type ShutdownState = 'running' | 'draining' | 'drain-failed' | 'drained' | 'closing' | 'closed' | 'close-failed';
+interface DrainAttempt {
+  /** Settles after the shutdown request evidence was recorded or failed to record. Never rejects. */
+  acknowledged: Promise<unknown>;
+  /** Resolves when no reservation remains. Rejects with a retryable error after recording drain-failed. */
+  done: Promise<void>;
 }
 
 export async function startCoordinatorService(options: ServiceOptions) {
@@ -98,11 +115,15 @@ async function startOwnedService(options: ServiceOptions, root: string, ownershi
   const scheduler = new CoordinatorScheduler({ ...options.scheduler, store, executor, endpoint: configuration.endpoint });
   let ready = false;
   let draining = false;
-  let closing = false;
+  let state: ShutdownState = 'running';
   let shutdownRequestedAt: number | null = null;
+  let drainError: string | null = null;
+  let attempts = 0;
+  const completedStages: ShutdownStage[] = [];
+  const phases: Record<ShutdownState, CoordinatorPhase> = { running: 'running', draining: 'draining', 'drain-failed': 'drain-failed', drained: 'draining', closing: 'closing', closed: 'closing', 'close-failed': 'closing' };
   const lifecycle = () => {
-    const shutdown: CoordinatorShutdownSummary | null = shutdownRequestedAt === null ? null : { requestedAt: shutdownRequestedAt, error: null };
-    return buildCoordinatorLifecycle(instance, { phase: closing ? 'closing' : draining ? 'draining' : 'running', shutdown });
+    const shutdown: CoordinatorShutdownSummary | null = shutdownRequestedAt === null ? null : { requestedAt: shutdownRequestedAt, error: state === 'drain-failed' ? drainError : null };
+    return buildCoordinatorLifecycle(instance, { phase: phases[state], shutdown });
   };
   const server = http.createServer((request, response) => {
     const send = (status: number, value: unknown) => {
@@ -119,7 +140,14 @@ async function startOwnedService(options: ServiceOptions, root: string, ownershi
       const runId = segments[0] === 'runs' && segments[1] ? id(segments[1]) : undefined;
       const run = runId ? store.getRun(runId) : null;
       const owner = !!run?.ownerToken && !!token && equal(token, run.ownerToken);
-      if (!administrator && !owner) { send(401, { error: 'Coordinator authorization required' }); return; }
+      const shutdownRoute = segments.length === 2 && segments[0] === 'lifecycle' && segments[1] === 'shutdown';
+      if (!administrator && !owner) {
+        // A run capability is recognized only to answer the shutdown route precisely; other routes keep their 401.
+        if (shutdownRoute && token && store.listRuns().some(candidate => !!candidate.ownerToken && equal(token, candidate.ownerToken))) {
+          send(403, { error: 'Run capability cannot administer the coordinator', code: 'forbidden' }); return;
+        }
+        send(401, { error: 'Coordinator authorization required' }); return;
+      }
       if (runId && !run) { send(404, { error: 'Run not found' }); return; }
       if (owner && run && !administrator) {
         if (method === 'GET' && segments.length === 2) { send(200, run); return; }
@@ -159,6 +187,18 @@ async function startOwnedService(options: ServiceOptions, root: string, ownershi
           }
         }
         send(403, { error: 'Run capability cannot administer the coordinator' }); return;
+      }
+      if (shutdownRoute) {
+        // Handled before the draining guard so repeated requests observe the same operation.
+        if (method !== 'POST') { send(405, { error: 'Shutdown requires POST', code: 'method-not-allowed' }); return; }
+        const input = await body(request);
+        if (input.protocol !== COORDINATOR_LIFECYCLE_PROTOCOL) { send(400, { error: 'Unsupported coordinator lifecycle protocol', code: 'unsupported-protocol' }); return; }
+        if (typeof input.instanceId !== 'string' || !input.instanceId) { send(400, { error: 'instanceId must be nonempty text', code: 'invalid-request' }); return; }
+        if (input.instanceId !== instance.instanceId) { send(409, { error: 'Shutdown request names a different coordinator instance', code: 'instance-mismatch' }); return; }
+        const operation = beginShutdown();
+        await operation.drain.acknowledged;
+        const acknowledgement: ShutdownAcknowledgement = { lifecycleProtocol: COORDINATOR_LIFECYCLE_PROTOCOL, accepted: true, retried: operation.retried, previousError: operation.previousError, lifecycle: lifecycle() };
+        send(202, acknowledgement); return;
       }
       if (draining && method !== 'GET') { send(503, { error: 'Coordinator is draining; new work is disabled' }); return; }
       if (segments.length === 1 && segments[0] === 'projects') {
@@ -222,27 +262,142 @@ async function startOwnedService(options: ServiceOptions, root: string, ownershi
   }
   const pollIntervalMs = positiveInteger(options.pollIntervalMs ?? 1000, 'pollIntervalMs');
   const timer = setInterval(() => { void scheduler.tick().catch(() => {}); }, pollIntervalMs);
-  return {
-    store, scheduler, endpoint: configuration.endpoint, instance, lifecycle,
-    async drain(): Promise<void> {
-      draining = true;
-      shutdownRequestedAt ??= Date.now();
-      scheduler.pauseAdmission();
-      while (store.listRuns().some(run => run.capacityReserved)) {
-        await scheduler.tick();
-        for (const run of store.listRuns()) if (run.capacityReserved && run.status === 'reconciliation-required') await scheduler.reconcile(run.id).catch(() => {});
-        if (store.listRuns().some(run => run.capacityReserved)) await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
-      }
-    },
-    async close(): Promise<void> {
+
+  const hook = async (stage: ShutdownStage | 'publish-failure') => { await options.testHooks?.shutdownStage?.(stage); };
+  const describe = (error: unknown) => {
+    const secrets = [accessToken];
+    try { for (const candidate of store.listRuns()) if (candidate.ownerToken) secrets.push(candidate.ownerToken); } catch { /* The store may be the failing part. */ }
+    return sanitizeShutdownError(error, secrets);
+  };
+  const persist = (status: ShutdownStatus, extra: { stage?: ShutdownStage; error?: string; completedAt?: number } = {}): Promise<string> => {
+    const record: ShutdownRecord = {
+      lifecycleProtocol: COORDINATOR_LIFECYCLE_PROTOCOL, service: COORDINATOR_SERVICE_ID, instanceId: instance.instanceId, status, attempts,
+      requestedAt: shutdownRequestedAt!, updatedAt: Date.now(), completedAt: extra.completedAt ?? null, stage: extra.stage ?? null, error: extra.error ?? null, completedStages: [...completedStages],
+    };
+    return writeShutdownRecord(root, record);
+  };
+
+  /** Keep admission disabled and reservations held until every reserved run has native idle proof. */
+  const drainReservations = async () => {
+    while (store.listRuns().some(run => run.capacityReserved)) {
+      await hook('drain');
+      await scheduler.tick();
+      for (const run of store.listRuns()) if (run.capacityReserved && run.status === 'reconciliation-required') await scheduler.reconcile(run.id).catch(() => {});
+      if (store.listRuns().some(run => run.capacityReserved)) await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+    }
+  };
+
+  /** Record a drain failure. Admission, reservations and owner persistence are left exactly as they were. */
+  const failDrain = async (stage: 'request' | 'drain', error: unknown): Promise<CoordinatorShutdownError> => {
+    const message = `${stage === 'request' ? 'Shutdown request could not be recorded' : 'Drain failed'}: ${describe(error)}`;
+    if (state !== 'draining') return new CoordinatorShutdownError(stage, message, false);
+    state = 'drain-failed';
+    drainError = message;
+    await persist('drain-failed', { stage, error: message }).catch(() => {});
+    return new CoordinatorShutdownError(stage, message, true);
+  };
+
+  let drainAttempt: DrainAttempt | null = null;
+  const startDrain = (): DrainAttempt => {
+    // Admission is disabled before anything is acknowledged, recorded or awaited.
+    draining = true;
+    scheduler.pauseAdmission();
+    shutdownRequestedAt ??= Date.now();
+    drainError = null;
+    state = 'draining';
+    attempts += 1;
+    const acknowledged = (async (): Promise<CoordinatorShutdownError | null> => {
+      try { await hook('request'); await persist('requested'); return null; }
+      catch (error) { return failDrain('request', error); }
+    })();
+    const done = (async () => {
+      const requestFailure = await acknowledged;
+      if (requestFailure) throw requestFailure;
+      try { await drainReservations(); }
+      catch (error) { throw await failDrain('drain', error); }
+      if (state === 'draining') state = 'drained';
+    })();
+    done.catch(() => {});
+    return { acknowledged, done };
+  };
+
+  /** Start a drain, join the one in progress, or retry one that failed. Never re-enables admission. */
+  const ensureDrain = (): { drain: DrainAttempt; retried: boolean; previousError: string | null } => {
+    if (state === 'drain-failed') { const previousError = drainError; drainAttempt = startDrain(); return { drain: drainAttempt, retried: true, previousError }; }
+    drainAttempt ??= startDrain();
+    return { drain: drainAttempt, retried: false, previousError: null };
+  };
+
+  let closeOperation: Promise<void> | null = null;
+  const settleClosed = (() => {
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<void>((accept, decline) => { resolve = accept; reject = decline; });
+    promise.catch(() => {});
+    return { promise, resolve, reject };
+  })();
+
+  /** Close in order; clean completion is published only after every stage succeeded. A close failure is terminal. */
+  const ensureClose = (): Promise<void> => {
+    closeOperation ??= (async () => {
+      const clean = state === 'drained';
       ready = false;
-      closing = true;
+      state = 'closing';
       shutdownRequestedAt ??= Date.now();
       clearInterval(timer);
-      await scheduler.stop();
-      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
-      store.close();
-      ownership.release();
-    },
+      const stages: Array<[ShutdownStage, () => void | Promise<void>]> = [
+        ['scheduler-stop', () => scheduler.stop()],
+        ['server-close', () => new Promise<void>((resolve, reject) => { server.close(error => error ? reject(error) : resolve()); server.closeIdleConnections(); })],
+        ['store-close', () => store.close()],
+        ['ownership-release', () => ownership.release()],
+      ];
+      let stage: ShutdownStage = 'scheduler-stop';
+      try {
+        for (const [name, run] of stages) { stage = name; await hook(name); await run(); completedStages.push(name); }
+      } catch (error) {
+        state = 'close-failed';
+        const message = `Close failed at ${stage}: ${describe(error)}`;
+        if (attempts > 0) await persist('close-failed', { stage, error: message }).catch(() => {});
+        throw new CoordinatorShutdownError(stage, message, false);
+      }
+      if (clean) {
+        stage = 'publish-completion';
+        try { await hook('publish-completion'); await persist('completed', { completedAt: Date.now() }); }
+        catch (error) {
+          state = 'close-failed';
+          const message = `Completion evidence could not be published: ${describe(error)}`;
+          await (async () => { await hook('publish-failure'); await persist('completion-unknown', { stage, error: message }); })().catch(() => {});
+          throw new CoordinatorShutdownError(stage, message, false);
+        }
+      }
+      state = 'closed';
+    })();
+    closeOperation.then(settleClosed.resolve, settleClosed.reject);
+    return closeOperation;
+  };
+
+  /** One drain-then-close operation per instance, shared by IPC requests, signals and direct callers. */
+  let shutdownOperation: { drain: DrainAttempt; completion: Promise<void> } | null = null;
+  const beginShutdown = () => {
+    const { drain, retried, previousError } = ensureDrain();
+    if (!shutdownOperation || shutdownOperation.drain !== drain) {
+      const completion = (async () => { await drain.done; await ensureClose(); })();
+      completion.catch(() => {});
+      shutdownOperation = { drain, completion };
+    }
+    return { drain, completion: shutdownOperation.completion, retried, previousError };
+  };
+
+  return {
+    store, scheduler, endpoint: configuration.endpoint, instance, lifecycle,
+    /** Settles when the service is fully closed: resolves after clean completion, rejects after a failed close stage. */
+    closed: settleClosed.promise,
+    /**
+     * Drain and close once. Resolves only after clean completion evidence is published; rejects with a
+     * CoordinatorShutdownError otherwise. A rejected drain leaves the coordinator open, so a later call retries it.
+     */
+    shutdown(): Promise<void> { return beginShutdown().completion; },
+    async drain(): Promise<void> { await ensureDrain().drain.done; },
+    close(): Promise<void> { return ensureClose(); },
   };
 }

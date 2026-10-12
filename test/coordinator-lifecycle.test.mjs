@@ -10,7 +10,10 @@ import { pathToFileURL } from 'node:url';
 import { startCoordinatorService, readCoordinatorToken } from '../dist/coordinator/service.js';
 import { createCoordinatorClient } from '../dist/coordinator/client.js';
 import { acquireCoordinatorOwnership } from '../dist/coordinator/ownership.js';
-import { COORDINATOR_LIFECYCLE_PROTOCOL, fetchCoordinatorLifecycle, parseCoordinatorLifecycle, readInstanceRecord } from '../dist/coordinator/lifecycle.js';
+import {
+  COORDINATOR_LIFECYCLE_PROTOCOL, CoordinatorShutdownError, fetchCoordinatorLifecycle, parseCoordinatorLifecycle, parseShutdownRecord, readInstanceRecord,
+  readShutdownRecord, requestCoordinatorShutdown, sanitizeShutdownError, writeShutdownRecord,
+} from '../dist/coordinator/lifecycle.js';
 
 const posix = process.platform !== 'win32';
 const settings = { plannerAgent: 'planner', executorAgent: 'executor', plannerModel: 'anthropic/planner', executorModel: 'anthropic/executor', executorFallbackModel: 'kimi/fallback', maxTasks: 10, minQuotaRemainingPercent: 10, tokenLimitsDisabled: true };
@@ -333,5 +336,193 @@ test('an insecure or symlinked lifecycle path is rejected without repair and rel
     const service = await start(stateDirectory);
     assert.equal(parseCoordinatorLifecycle(service.lifecycle()).phase, 'running', scenario.name);
     await service.close();
+  }
+});
+
+const CLOSE_STAGES = ['scheduler-stop', 'server-close', 'store-close', 'ownership-release'];
+const cliUrl = pathToFileURL(path.resolve('dist/coordinator/cli.js')).href;
+const cliPath = path.resolve('dist/cli.js');
+
+/** Clean shutdown is a completion record for the instance plus a released owner lock; anything else with a free lock is a crash. */
+async function classifyShutdown(stateDirectory, instanceId) {
+  let lock;
+  try { lock = await acquireCoordinatorOwnership(stateDirectory); }
+  catch (error) { if (/another coordinator owns/i.test(error.message)) return 'running-or-partially-closed'; throw error; }
+  lock.release();
+  const record = await readShutdownRecord(stateDirectory, instanceId);
+  if (record?.status === 'completed') return 'clean';
+  if (record === null || record.status === 'requested') return record === null ? 'crashed-unacknowledged' : 'crashed-after-acknowledgement';
+  return `failed:${record.status}`;
+}
+
+async function childFixture(t, { environment = {}, script, args } = {}) {
+  const temporary = await temporaryRoot(t);
+  const stateDirectory = path.join(temporary, 's');
+  const home = path.join(temporary, 'home');
+  await fs.mkdir(home);
+  const config = path.join(temporary, 'coordinator.toml');
+  await fs.writeFile(config, `[coordinator]\nstateDirectory = ${JSON.stringify(stateDirectory)}\n`);
+  const command = script ? ['--no-warnings', '--input-type=module', '-e', script] : ['--no-warnings', cliPath, 'coordinator', 'serve', '--coordinator-config', config];
+  const child = spawn(process.execPath, args ?? command, { env: { ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, 'c'), XDG_STATE_HOME: path.join(home, 's'), HEIMDALL_COORDINATOR_CONFIG: '', CONFIG: config, ...environment }, stdio: ['ignore', 'pipe', 'pipe'] });
+  t.after(() => { child.kill('SIGKILL'); });
+  const output = { stdout: '', stderr: '' };
+  child.stdout.on('data', chunk => { output.stdout += chunk; });
+  child.stderr.on('data', chunk => { output.stderr += chunk; });
+  const exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
+  const waitFor = async (pattern, label) => {
+    for (let index = 0; index < 1000; index++) {
+      if (pattern.test(output.stdout)) return;
+      if (child.exitCode !== null) throw new Error(`child exited before ${label}: ${output.stderr}`);
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    throw new Error(`child did not report ${label}: ${output.stdout} ${output.stderr}`);
+  };
+  await waitFor(/Coordinator listening/, 'listening');
+  const instance = await readInstanceRecord(stateDirectory);
+  const token = await readCoordinatorToken(stateDirectory);
+  return { child, output, exited, waitFor, stateDirectory, instance, admin: createCoordinatorClient(instance.endpoint, token) };
+}
+
+const hookedServe = `import { coordinatorMain } from ${JSON.stringify(cliUrl)};
+const fail = process.env.FAIL_STAGES ? process.env.FAIL_STAGES.split(',') : [];
+const hang = process.env.HANG_STAGE;
+await coordinatorMain(['serve', '--coordinator-config', process.env.CONFIG], { serviceOptions: { testHooks: { shutdownStage: async stage => {
+  if (stage === hang) { process.stdout.write('hanging at ' + stage + '\\n'); await new Promise(() => {}); }
+  if (fail.includes(stage)) throw new Error('injected ' + stage + ' failure Bearer synthetic-credential-value');
+} } } });`;
+
+test('close-stage and completion-publication failures never publish a clean marker and report partial state', { skip: !posix, timeout: 30000 }, async t => {
+  const cases = [
+    { fail: ['store-close'], status: 'close-failed', stage: 'store-close', stages: CLOSE_STAGES.slice(0, 2), locked: true },
+    { fail: ['ownership-release'], status: 'close-failed', stage: 'ownership-release', stages: CLOSE_STAGES.slice(0, 3), locked: true },
+    { fail: ['publish-completion'], status: 'completion-unknown', stage: 'publish-completion', stages: CLOSE_STAGES, locked: false },
+    { fail: ['publish-completion', 'publish-failure'], status: 'requested', stage: null, stages: [], locked: false },
+  ];
+  for (const scenario of cases) {
+    const name = scenario.fail.join('+');
+    const f = await runningFixture(t, { testHooks: { shutdownStage: stage => { if (scenario.fail.includes(stage)) throw new Error(`injected ${stage} failure Bearer synthetic-credential-value`); } } });
+    const instanceId = f.service.instance.instanceId;
+    const acknowledgement = await requestCoordinatorShutdown(f.admin, instanceId);
+    assert.equal(acknowledgement.lifecycle.phase, 'draining', name);
+    await assert.rejects(f.service.closed, error => error instanceof CoordinatorShutdownError && error.retryable === false && !/synthetic-credential-value/.test(error.message), name);
+    await assert.rejects(f.service.shutdown(), CoordinatorShutdownError, name);
+    const record = await readShutdownRecord(f.stateDirectory, instanceId);
+    assert.equal(record.status, scenario.status, name);
+    assert.notEqual(record.status, 'completed', name);
+    assert.equal(record.stage, scenario.stage, name);
+    assert.deepEqual(record.completedStages.length ? record.completedStages : [], scenario.stages.length ? scenario.stages : [], name);
+    assert.equal(JSON.stringify(record).includes('synthetic-credential-value'), false, `${name}: failure text is sanitized`);
+    if (scenario.stage) assert.match(record.error, /injected/, name);
+    // Partially closed state is real: the lock is still held until the earlier stages complete.
+    if (scenario.locked) await assert.rejects(acquireCoordinatorOwnership(f.stateDirectory), /another coordinator owns/i, name);
+    else (await acquireCoordinatorOwnership(f.stateDirectory)).release();
+    assert.notEqual(await classifyShutdown(f.stateDirectory, instanceId), 'clean', name);
+    // The server was closed before any of these stages, so the endpoint is not usable.
+    await assert.rejects(f.admin.request('GET', '/status'), /unavailable/, name);
+    if (name === 'store-close') f.service.store.close();
+  }
+});
+
+test('shutdown evidence records are strict, private and bound to one instance', { skip: !posix }, async t => {
+  const temporary = await temporaryRoot(t);
+  const stateDirectory = path.join(temporary, 's');
+  const service = await start(stateDirectory);
+  const instanceId = service.instance.instanceId;
+  const base = { lifecycleProtocol: 1, service: 'heimdall-coordinator', instanceId, status: 'requested', attempts: 1, requestedAt: 1, updatedAt: 2, completedAt: null, stage: null, error: null, completedStages: [] };
+  const completed = { ...base, status: 'completed', completedAt: 3, completedStages: CLOSE_STAGES };
+  assert.deepEqual(parseShutdownRecord(base), base);
+  assert.deepEqual(parseShutdownRecord(completed), completed);
+  for (const [name, record] of [
+    ['unknown field', { ...base, extra: 1 }], ['missing field', (({ error: _error, ...rest }) => rest)(base)], ['protocol', { ...base, lifecycleProtocol: 2 }],
+    ['bad instance', { ...base, instanceId: 'x' }], ['unknown status', { ...base, status: 'clean' }], ['unknown stage', { ...base, status: 'close-failed', stage: 'nope', error: 'e' }],
+    ['requested with error', { ...base, error: 'e' }], ['failed without error', { ...base, status: 'drain-failed', stage: 'drain' }],
+    ['completed without time', { ...completed, completedAt: null }], ['failed with time', { ...base, status: 'close-failed', stage: 'store-close', error: 'e', completedAt: 3 }],
+    ['completed with partial stages', { ...completed, completedStages: CLOSE_STAGES.slice(0, 2) }], ['completed with error', { ...completed, error: 'e' }],
+    ['unknown unclean completion', { ...base, status: 'completion-unknown', stage: 'publish-completion', error: 'e', completedStages: [] }],
+    ['zero attempts', { ...base, attempts: 0 }], ['non-object', null],
+  ]) assert.throws(() => parseShutdownRecord(record), /Invalid coordinator/, name);
+  // A running instance has no shutdown evidence; a record is private and read back only for its own instance.
+  assert.equal(await readShutdownRecord(stateDirectory, instanceId), null);
+  const file = await writeShutdownRecord(stateDirectory, base);
+  assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
+  assert.deepEqual(await readShutdownRecord(stateDirectory, instanceId), base);
+  assert.deepEqual((await fs.readdir(path.join(stateDirectory, 'lifecycle'))).filter(name => name.endsWith('.tmp')), []);
+  await assert.rejects(readShutdownRecord(stateDirectory, '../escape'), /UUID/);
+  await fs.chmod(file, 0o644);
+  await assert.rejects(readShutdownRecord(stateDirectory, instanceId), /0600|private/);
+  await assert.rejects(writeShutdownRecord(stateDirectory, base), /not private/);
+  await fs.chmod(file, 0o600);
+  await fs.rm(file);
+  await fs.symlink(path.join(temporary, 'elsewhere'), file);
+  await assert.rejects(readShutdownRecord(stateDirectory, instanceId), /regular file/);
+  await assert.rejects(writeShutdownRecord(stateDirectory, base), /not private/);
+  await fs.rm(file);
+  await service.close();
+  assert.equal(await readShutdownRecord(stateDirectory, instanceId), null, 'a close without a drain publishes no clean marker');
+});
+
+test('failure text is bounded and stripped of credentials, URL userinfo and control characters', () => {
+  const token = 'a1'.repeat(32);
+  const text = sanitizeShutdownError(new Error(`failed\u0000\n with Bearer abcdef Basic Zm9v https://user:secret@host/x ${token} custom-secret-value ${'x'.repeat(900)}`), ['custom-secret-value']);
+  assert.ok(text.length <= 500);
+  for (const secret of ['abcdef', 'Zm9v', 'user:secret', token, 'custom-secret-value']) assert.equal(text.includes(secret), false, secret);
+  assert.equal(/[\u0000-\u001f]/.test(text), false);
+  assert.equal(sanitizeShutdownError(undefined), 'Shutdown failed without a message');
+});
+
+test('a crash after acknowledgement leaves requested-without-completion evidence that differs from clean shutdown', { skip: !posix, timeout: 30000 }, async t => {
+  const crashed = await childFixture(t, { script: hookedServe, environment: { HANG_STAGE: 'scheduler-stop' } });
+  assert.equal(await classifyShutdown(crashed.stateDirectory, crashed.instance.instanceId), 'running-or-partially-closed');
+  const acknowledgement = await requestCoordinatorShutdown(crashed.admin, crashed.instance.instanceId);
+  assert.equal(acknowledgement.lifecycle.phase, 'draining');
+  await crashed.waitFor(/hanging at scheduler-stop/, 'the close stage');
+  assert.equal((await readShutdownRecord(crashed.stateDirectory, crashed.instance.instanceId)).status, 'requested');
+  crashed.child.kill('SIGKILL');
+  assert.equal((await crashed.exited).signal, 'SIGKILL');
+  assert.equal(await classifyShutdown(crashed.stateDirectory, crashed.instance.instanceId), 'crashed-after-acknowledgement');
+  const record = await readShutdownRecord(crashed.stateDirectory, crashed.instance.instanceId);
+  assert.equal(record.status, 'requested');
+  assert.equal(record.completedAt, null);
+  assert.equal((await readInstanceRecord(crashed.stateDirectory)).instanceId, crashed.instance.instanceId);
+
+  const clean = await childFixture(t);
+  await requestCoordinatorShutdown(clean.admin, clean.instance.instanceId);
+  assert.deepEqual(await clean.exited, { code: 0, signal: null });
+  assert.equal(await classifyShutdown(clean.stateDirectory, clean.instance.instanceId), 'clean');
+  assert.equal((await readShutdownRecord(clean.stateDirectory, clean.instance.instanceId)).status, 'completed');
+  // A completion record belongs to its instance: it never vouches for the crashed one.
+  assert.equal(await readShutdownRecord(clean.stateDirectory, crashed.instance.instanceId), null);
+});
+
+test('a foreground coordinator exits nonzero after a failed close or unpublished completion', { skip: !posix, timeout: 30000 }, async t => {
+  for (const [stage, status] of [['scheduler-stop', 'close-failed'], ['store-close', 'close-failed'], ['publish-completion', 'completion-unknown']]) {
+    const f = await childFixture(t, { script: hookedServe, environment: { FAIL_STAGES: stage } });
+    await requestCoordinatorShutdown(f.admin, f.instance.instanceId);
+    const result = await f.exited;
+    assert.equal(result.code, 1, stage);
+    assert.match(f.output.stderr, /did not complete cleanly/, stage);
+    assert.equal(f.output.stderr.includes('synthetic-credential-value'), false, stage);
+    const record = await readShutdownRecord(f.stateDirectory, f.instance.instanceId);
+    assert.equal(record.status, status, stage);
+    assert.equal(record.stage, stage);
+    assert.notEqual(await classifyShutdown(f.stateDirectory, f.instance.instanceId), 'clean', stage);
+  }
+});
+
+test('SIGINT, SIGTERM and an authenticated request share one shutdown and the process exits 0 after clean completion', { skip: !posix, timeout: 60000 }, async t => {
+  for (const sequence of [['SIGINT'], ['SIGTERM'], ['SIGTERM', 'http', 'SIGINT', 'http', 'SIGTERM']]) {
+    const f = await childFixture(t);
+    for (const step of sequence) {
+      if (step === 'http') await requestCoordinatorShutdown(f.admin, f.instance.instanceId).catch(() => {});
+      else f.child.kill(step);
+    }
+    assert.deepEqual(await f.exited, { code: 0, signal: null }, sequence.join());
+    assert.equal(f.output.stderr.replace(/\(node:\d+\)[^\n]*\n|\(Use `node[^\n]*\n/g, ''), '', sequence.join());
+    assert.ok(f.output.stdout.split('Stopping admission and draining managed runs').length <= 2, sequence.join());
+    const record = await readShutdownRecord(f.stateDirectory, f.instance.instanceId);
+    assert.equal(record.status, 'completed', sequence.join());
+    assert.equal(record.attempts, 1, sequence.join());
+    assert.equal(await classifyShutdown(f.stateDirectory, f.instance.instanceId), 'clean', sequence.join());
+    await assert.rejects(fs.lstat(f.instance.endpoint), { code: 'ENOENT' }, 'the closed server removed its socket');
   }
 });
