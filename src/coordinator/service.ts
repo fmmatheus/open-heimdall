@@ -7,9 +7,13 @@ import { CoordinatorScheduler } from './scheduler.js';
 import { createManagedExecutor } from './executor.js';
 import { inspectProject, planManagedWorktree, resolveBaseCommit } from './worktrees.js';
 import { checkRuntimeConflicts, snapshotSpecification } from './runtime.js';
-import { positiveInteger } from './config.js';
+import { canonicalPlannedDirectory, positiveInteger } from './config.js';
 import { COORDINATOR_SERVICE_ID, COORDINATOR_STATUS_SCHEMA_VERSION, parseCoordinatorStatus } from './status.js';
 import { privateFile, readCoordinatorToken } from './token.js';
+import { acquireCoordinatorOwnership } from './ownership.js';
+import type { CoordinatorOwnership } from './ownership.js';
+import { buildCoordinatorLifecycle, createCoordinatorInstance, privateLifecycleDirectory, writeInstanceRecord } from './lifecycle.js';
+import type { CoordinatorInstance, CoordinatorShutdownSummary, LifecycleOptions } from './lifecycle.js';
 import type { CoordinatorConfiguration } from './config.js';
 import type { ManagedExecutor, Receipt, RunRecord, StartBinding } from './types.js';
 import { isSubmissionKind } from '../workflow/submission-store.js';
@@ -60,15 +64,26 @@ export interface ServiceOptions {
   executor?: ManagedExecutor;
   scheduler?: Omit<ConstructorParameters<typeof CoordinatorScheduler>[0], 'store' | 'executor' | 'endpoint'>;
   pollIntervalMs?: number;
+  /** How this process was launched; defaults to a foreground coordinator. */
+  lifecycle?: LifecycleOptions;
 }
 
 export async function startCoordinatorService(options: ServiceOptions) {
+  const instance = createCoordinatorInstance({ stateDirectory: '', endpoint: options.configuration.endpoint, lifecycle: options.lifecycle });
+  // Resolve every spelling of the state directory to one canonical owner before any state is touched.
+  const root = await privateDirectory(await canonicalPlannedDirectory(options.configuration.stateDirectory));
+  const ownership = await acquireCoordinatorOwnership(root);
+  try { return await startOwnedService(options, root, ownership, { ...instance, stateDirectory: root }); }
+  catch (error) { ownership.release(); throw error; }
+}
+
+async function startOwnedService(options: ServiceOptions, root: string, ownership: CoordinatorOwnership, instance: CoordinatorInstance) {
   const { configuration } = options;
-  const root = await privateDirectory(configuration.stateDirectory);
   if (process.platform !== 'win32') {
     try { await fs.lstat(configuration.endpoint); throw new Error('Coordinator endpoint already exists; inspect its owner rather than replacing it'); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   }
+  await privateLifecycleDirectory(root);
   const key = path.join(root, 'coordinator.key');
   try { await fs.writeFile(key, randomBytes(32).toString('hex'), { flag: 'wx', mode: 0o600 }); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
@@ -83,6 +98,12 @@ export async function startCoordinatorService(options: ServiceOptions) {
   const scheduler = new CoordinatorScheduler({ ...options.scheduler, store, executor, endpoint: configuration.endpoint });
   let ready = false;
   let draining = false;
+  let closing = false;
+  let shutdownRequestedAt: number | null = null;
+  const lifecycle = () => {
+    const shutdown: CoordinatorShutdownSummary | null = shutdownRequestedAt === null ? null : { requestedAt: shutdownRequestedAt, error: null };
+    return buildCoordinatorLifecycle(instance, { phase: closing ? 'closing' : draining ? 'draining' : 'running', shutdown });
+  };
   const server = http.createServer((request, response) => {
     const send = (status: number, value: unknown) => {
       response.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
@@ -178,6 +199,7 @@ export async function startCoordinatorService(options: ServiceOptions) {
         if (!Number.isSafeInteger(after) || after < 0) throw new Error('Event cursor must be a nonnegative integer');
         send(200, store.events(after)); return;
       }
+      if (method === 'GET' && segments.length === 1 && segments[0] === 'lifecycle') { send(200, lifecycle()); return; }
       if (method === 'GET' && segments.length === 1 && segments[0] === 'status') {
         send(200, parseCoordinatorStatus({
           schemaVersion: COORDINATOR_STATUS_SCHEMA_VERSION, service: COORDINATOR_SERVICE_ID,
@@ -191,6 +213,7 @@ export async function startCoordinatorService(options: ServiceOptions) {
   try {
     await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(configuration.endpoint, () => { server.off('error', reject); resolve(); }); });
     if (process.platform !== 'win32') await fs.chmod(configuration.endpoint, 0o600);
+    await writeInstanceRecord(root, instance);
     scheduler.markInterrupted();
     ready = true;
   } catch (error) {
@@ -200,9 +223,10 @@ export async function startCoordinatorService(options: ServiceOptions) {
   const pollIntervalMs = positiveInteger(options.pollIntervalMs ?? 1000, 'pollIntervalMs');
   const timer = setInterval(() => { void scheduler.tick().catch(() => {}); }, pollIntervalMs);
   return {
-    store, scheduler, endpoint: configuration.endpoint,
+    store, scheduler, endpoint: configuration.endpoint, instance, lifecycle,
     async drain(): Promise<void> {
       draining = true;
+      shutdownRequestedAt ??= Date.now();
       scheduler.pauseAdmission();
       while (store.listRuns().some(run => run.capacityReserved)) {
         await scheduler.tick();
@@ -212,10 +236,13 @@ export async function startCoordinatorService(options: ServiceOptions) {
     },
     async close(): Promise<void> {
       ready = false;
+      closing = true;
+      shutdownRequestedAt ??= Date.now();
       clearInterval(timer);
       await scheduler.stop();
       await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
       store.close();
+      ownership.release();
     },
   };
 }
