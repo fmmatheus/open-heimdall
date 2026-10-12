@@ -37,6 +37,7 @@ export const LIFECYCLE_ERROR_CODES = [
   'foreign-registration', 'foreign-definition', 'registered-elsewhere', 'state-unknown', 'inactive-registration-stale', 'running-context-changed',
   'endpoint-unreachable', 'endpoint-refused', 'endpoint-transitioning', 'endpoint-invalid', 'endpoint-not-ready', 'unsupported-lifecycle-protocol',
   'shutdown-in-progress', 'startup-timeout', 'service-exited', 'deadline-exceeded', 'interrupted', 'not-implemented', 'internal',
+  'not-managed', 'foreground-coordinator', 'instance-mismatch', 'drain-failed', 'completion-unknown', 'crashed-after-acknowledgement', 'shutdown-failed',
 ] as const;
 export type LifecycleErrorCode = typeof LIFECYCLE_ERROR_CODES[number];
 
