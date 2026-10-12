@@ -16,6 +16,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { FORMAT_REPAIR_LIMIT, compactionVerdict, countFormatCorrections } from './compaction-verdict.mjs';
 import { assertFixtureRoot, capture, parseArguments } from './lib.mjs';
 import { gitEnvironment } from './repo.mjs';
 import { connect, control, createSession, prompt, readLog, sleep, waitIdle, waitUntil } from './t2-client.mjs';
@@ -161,7 +162,7 @@ if (found) {
   summary.runtime = { stateDigest: found.state.runtime?.build?.digest, snapshot: found.state.runtime?.build?.snapshot, packageVersion: found.state.runtime?.packageVersion, protocol: found.state.runtime?.protocol };
   summary.receiptFiles = files.filter(name => /^submission-/.test(name));
   summary.results = found.state.results?.map(result => ({ taskId: result.taskId, sessionId: result.sessionId, model: result.model, reportCorrections: result.reportCorrections ?? 0, gates: result.evidence?.map(item => ({ gateId: item.gateId, passed: item.passed })) }));
-  summary.repair = found.state.submissionRepair ?? null;
+  summary.repair = found.state.submissionRepair ?? null; // informational: cleared after acceptance, so no check reads it
   checks.receiptPresent = Boolean(receipt);
 
   if (receipt) {
@@ -229,6 +230,9 @@ if (found) {
       return undefined;
     };
     summary.submissionCalls = calls.map(event => ({ at: event.at, tool: event.tool, accepted: event.callID === receipt.caller.callId, result: callResult(event.callID) }));
+    // Corrections come from the observed calls above; the run state's repair counter is cleared once the task is accepted.
+    summary.formatCorrections = countFormatCorrections(summary.submissionCalls);
+    checks.formatCorrectionsWithinLimit = summary.formatCorrections <= FORMAT_REPAIR_LIMIT;
     const executorReceipts = files.filter(name => /^submission-.*-executor-result\.json$/.test(name));
     checks.singleAcceptedSubmission = executorReceipts.length === 1 && calls.length >= 1 && calls.at(-1).callID === receipt.caller.callId
       && calls.slice(0, -1).every(event => { const result = callResult(event.callID); return result && result.accepted === false && result.repairable === true && result.code === 'format'; });
@@ -250,7 +254,6 @@ if (found) {
     const transitions = indexes.filter((index, at) => at === 0 || index !== indexes[at - 1]);
     summary.indexTransitions = transitions;
     checks.checkpointAdvancedExactlyOnce = found.state.status === 'completed' && found.state.index === 1 && found.state.results?.length === 1 && JSON.stringify(transitions) === JSON.stringify([0, 1]);
-    checks.noRepair = !found.state.submissionRepair || (found.state.submissionRepair.repairs ?? 0) === 0;
     // Counts of completed tools in the child around the compaction request, to show the submission followed further steps.
     const childTools = observer.filter(event => event.stage === 'post' && event.event === 'execute.after' && event.sessionID === child);
     summary.executorTools = { total: childTools.length, afterCompactionRequest: childTools.filter(event => event.at > (compaction.requestedAt ?? Infinity)).map(event => event.tool) };
@@ -278,6 +281,8 @@ if (found) {
   }
   checks.cursorNextContinuesTowardOlder = children.length > 0 && children.every(child => summary.cursorProbe[child].messages <= 2 || (summary.cursorProbe[child].secondPageContinuesTowardOlder && summary.cursorProbe[child].pageSize2WalkEqualsSinglePage));
 }
-summary.pass = Object.values(checks).length > 0 && Object.values(checks).every(Boolean);
+const verdict = compactionVerdict({ checks, waitFailure: summary.waitFailure, compactionError: compaction.error });
+summary.pass = verdict.pass;
 fs.writeFileSync(path.join(root, 'evidence', 'e2e-compaction.json'), JSON.stringify(summary, null, 2));
-process.stdout.write(JSON.stringify({ pass: summary.pass, checks, checkpoint: summary.checkpoint, compaction: { requested: Boolean(compaction.requestedAt), error: compaction.error }, waitFailure: summary.waitFailure }, null, 1) + '\n');
+process.stdout.write(JSON.stringify({ pass: summary.pass, checks, checkpoint: summary.checkpoint, compaction: { requested: Boolean(compaction.requestedAt), error: compaction.error }, formatCorrections: summary.formatCorrections ?? null, waitFailure: summary.waitFailure }, null, 1) + '\n');
+process.exitCode = verdict.exitCode;

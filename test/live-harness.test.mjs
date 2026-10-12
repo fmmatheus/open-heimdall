@@ -14,6 +14,7 @@ const load = name => import(path.join(harness, name));
 const { cleanupOwned, createExclusiveDirectory, createExclusiveFile, newNonce, openLedger, probeOutcome, readLedger, recordCreated } = await load('ownership.mjs');
 const { proveConfinement, verifyGuardMaterial } = await load('confinement.mjs');
 const { FINAL_PROVIDER_LIST, HISTORICAL_PROVIDER_LIST, prepareProviderList } = await load('provider-list.mjs');
+const { FORMAT_REPAIR_LIMIT, compactionVerdict, countFormatCorrections } = await load('compaction-verdict.mjs');
 const { guardPaths, guardedCommand, install } = await load('guard.mjs');
 const { FIXTURE_PREFIX, assertFixtureRoot, writeManifest, updateManifest, readManifest, sha256 } = await load('lib.mjs');
 
@@ -441,4 +442,75 @@ test('new fixture roots use the 0006 prefix and the retained 0005 root is not ac
   assert.equal(FIXTURE_PREFIX, 'heimdall-0008.');
   assert.doesNotThrow(() => assertFixtureRoot('/private/tmp/heimdall-0008.abc123'));
   assert.throws(() => assertFixtureRoot('/private/tmp/heimdall-0006.jFpXF9'), /Fixture root must be/);
+});
+
+describe('compaction live check verdict', () => {
+  const rejection = { accepted: false, result: { accepted: false, code: 'format', repairable: true, errorPaths: ['missing_gate@$.evidence'] } };
+  const acceptance = { accepted: true, result: { accepted: true, code: null, repairable: null, errorPaths: [] } };
+  const passing = { receiptPresent: true, singleAcceptedSubmission: true, formatCorrectionsWithinLimit: true };
+
+  test('all checks true passes with exit status 0', () => {
+    assert.deepEqual(compactionVerdict({ checks: passing }), { pass: true, exitCode: 0 });
+    assert.deepEqual(compactionVerdict({ checks: passing, waitFailure: null, compactionError: null }), { pass: true, exitCode: 0 });
+  });
+
+  test('any false check fails with exit status 1', () => {
+    for (const name of Object.keys(passing)) assert.deepEqual(compactionVerdict({ checks: { ...passing, [name]: false } }), { pass: false, exitCode: 1 }, name);
+    assert.deepEqual(compactionVerdict({ checks: { ...passing, extra: undefined } }), { pass: false, exitCode: 1 });
+  });
+
+  test('no checks fails', () => {
+    assert.deepEqual(compactionVerdict({ checks: {} }), { pass: false, exitCode: 1 });
+    assert.deepEqual(compactionVerdict({}), { pass: false, exitCode: 1 });
+  });
+
+  test('a wait failure or a compaction request error fails even when every check is true', () => {
+    assert.deepEqual(compactionVerdict({ checks: passing, waitFailure: 'timed out waiting for idle' }), { pass: false, exitCode: 1 });
+    assert.deepEqual(compactionVerdict({ checks: passing, compactionError: 'request failed' }), { pass: false, exitCode: 1 });
+  });
+
+  test('format corrections are counted from the observed submission calls', () => {
+    assert.equal(countFormatCorrections([rejection, acceptance]), 1);
+    assert.equal(countFormatCorrections([acceptance]), 0);
+    assert.equal(countFormatCorrections([rejection, rejection, acceptance]), 2);
+    assert.equal(countFormatCorrections([]), 0);
+    assert.equal(countFormatCorrections(undefined), 0);
+  });
+
+  test('only repairable format rejections before the accepted call count as corrections', () => {
+    const other = { accepted: false, result: { accepted: false, code: 'provenance', repairable: false, errorPaths: [] } };
+    const unparsed = { accepted: false, result: { accepted: false, code: 'unparsed', repairable: null, errorPaths: [] } };
+    assert.equal(countFormatCorrections([other, unparsed, rejection, acceptance]), 1);
+    assert.equal(countFormatCorrections([rejection, acceptance, rejection]), 1);
+    assert.equal(countFormatCorrections([{ accepted: false }, rejection, acceptance]), 1);
+  });
+
+  test('the run state repair counter is not an input of the verdict or of the correction count', () => {
+    // The counter is cleared once the task is accepted, so a cleared or stale value must not change the result.
+    assert.equal(countFormatCorrections([acceptance], { submissionRepair: { repairs: 2 } }), 0);
+    assert.equal(countFormatCorrections([rejection, acceptance], { submissionRepair: null }), 1);
+    for (const file of ['compaction-verdict.mjs', 'e2e-compaction.mjs']) {
+      const source = fs.readFileSync(path.join(harness, file), 'utf8');
+      assert.doesNotMatch(source, /checks\.noRepair/, file);
+      assert.doesNotMatch(source, /checks\.[A-Za-z]+\s*=[^;]*submissionRepair/, file);
+    }
+    assert.doesNotMatch(fs.readFileSync(path.join(harness, 'compaction-verdict.mjs'), 'utf8'), /submissionRepair/);
+  });
+
+  test('a correction count above the documented limit of two fails the limit check', () => {
+    assert.equal(FORMAT_REPAIR_LIMIT, 2);
+    const within = count => countFormatCorrections(Array.from({ length: count }, () => rejection).concat(acceptance)) <= FORMAT_REPAIR_LIMIT;
+    assert.equal(within(0), true);
+    assert.equal(within(2), true);
+    assert.equal(within(3), false);
+    assert.deepEqual(compactionVerdict({ checks: { ...passing, formatCorrectionsWithinLimit: within(3) } }), { pass: false, exitCode: 1 });
+  });
+
+  test('the live script derives its exit status from the verdict and counts corrections from the observed calls', () => {
+    const source = fs.readFileSync(path.join(harness, 'e2e-compaction.mjs'), 'utf8');
+    assert.match(source, /compactionVerdict\(\{ checks, waitFailure: summary\.waitFailure, compactionError: compaction\.error \}\)/);
+    assert.match(source, /process\.exitCode = verdict\.exitCode/);
+    assert.match(source, /summary\.formatCorrections = countFormatCorrections\(summary\.submissionCalls\)/);
+    assert.match(source, /checks\.formatCorrectionsWithinLimit = summary\.formatCorrections <= FORMAT_REPAIR_LIMIT/);
+  });
 });
