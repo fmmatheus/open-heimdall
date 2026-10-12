@@ -5,6 +5,8 @@ import type { CoordinatorConfiguration } from './config.js';
 import { createCoordinatorClient } from './client.js';
 import { readCoordinatorToken } from './token.js';
 import { parseCoordinatorStatus } from './status.js';
+import { CoordinatorShutdownError } from './lifecycle.js';
+import type { ServiceOptions } from './service.js';
 
 const STATUS_DEADLINE_MS = 10000;
 
@@ -73,7 +75,48 @@ export async function coordinatorStatus(options: { configuration: CoordinatorCon
   ].join('\n'));
 }
 
-export async function coordinatorMain(args: string[]): Promise<void> {
+/** The part of a started coordinator that the foreground supervisor needs. */
+export interface ForegroundService {
+  lifecycle(): { phase: string };
+  shutdown(): Promise<void>;
+  closed: Promise<void>;
+}
+
+/**
+ * Keep a foreground coordinator running until one shared shutdown operation closes it.
+ * SIGINT and SIGTERM request that operation; an authenticated IPC request may also complete it.
+ * Resolves true only after clean completion and false after a terminal close failure. A drain failure
+ * keeps the coordinator open with admission disabled; the next signal retries the drain.
+ */
+export function superviseForeground(
+  service: ForegroundService,
+  host: Pick<NodeJS.Process, 'on' | 'off'> = process,
+  output: { stdout: { write(text: string): unknown }; stderr: { write(text: string): unknown } } = process,
+): Promise<boolean> {
+  return new Promise(resolve => {
+    const request = () => {
+      const phase = service.lifecycle().phase;
+      if (phase === 'running') output.stdout.write('Stopping admission and draining managed runs before closing their checkpoint connection.\n');
+      else if (phase === 'drain-failed') output.stdout.write('Retrying the failed drain; admission stays disabled.\n');
+      service.shutdown().catch((error: unknown) => {
+        if (error instanceof CoordinatorShutdownError && error.retryable) output.stderr.write(`${error.message}\nThe coordinator remains open with admission disabled; signal it again to retry the drain.\n`);
+      });
+    };
+    const finish = (clean: boolean) => { host.off('SIGINT', request); host.off('SIGTERM', request); resolve(clean); };
+    host.on('SIGINT', request); host.on('SIGTERM', request);
+    service.closed.then(() => finish(true), (error: unknown) => {
+      output.stderr.write(`Coordinator shutdown did not complete cleanly: ${error instanceof Error ? error.message : 'unknown failure'}\n`);
+      finish(false);
+    });
+  });
+}
+
+/** Programmatic seams for tests; the command line exposes none of them. */
+export interface CoordinatorMainInternals {
+  serviceOptions?: Pick<ServiceOptions, 'executor' | 'scheduler' | 'pollIntervalMs' | 'testHooks'>;
+}
+
+export async function coordinatorMain(args: string[], internals: CoordinatorMainInternals = {}): Promise<void> {
   if (!args.length || args.includes('--help') || args[0] === 'help') { process.stdout.write(coordinatorHelp); return; }
   const positional: string[] = [];
   const options = new Map<string, string>();
@@ -108,18 +151,14 @@ export async function coordinatorMain(args: string[]): Promise<void> {
   if (command === 'serve') {
     check(1, []);
     const { startCoordinatorService } = await import('./service.js');
-    const service = await startCoordinatorService({ configuration });
+    const service = await startCoordinatorService({ ...internals.serviceOptions, configuration });
     process.stdout.write(`Coordinator listening at ${configuration.endpoint}\n`);
-    await new Promise<void>((resolve, reject) => {
-      let closing = false;
-      const close = () => {
-        if (closing) return;
-        closing = true;
-        process.stdout.write('Stopping admission and draining managed runs before closing their checkpoint connection.\n');
-        void service.drain().then(() => service.close()).then(resolve, reject).finally(() => { process.off('SIGINT', close); process.off('SIGTERM', close); });
-      };
-      process.on('SIGINT', close); process.on('SIGTERM', close);
-    });
+    if (!await superviseForeground(service)) {
+      // A failed close stage may leave resources open; end the process instead of waiting on them.
+      process.exitCode = 1;
+      await new Promise<void>(resolve => process.stderr.write('', () => resolve()));
+      process.exit(1);
+    }
     return;
   }
   const client = createCoordinatorClient(configuration.endpoint, await readCoordinatorToken(configuration.stateDirectory));

@@ -40,7 +40,8 @@ export function createCoordinatorClient(endpoint: string, accessToken?: string, 
             const statusCode = response.statusCode ?? 500;
             if (statusCode >= 400) {
               const message = value && typeof value === 'object' && 'error' in value ? String(value.error) : 'Coordinator request failed';
-              fail(Object.assign(new Error(message), { statusCode }));
+              const code = value && typeof value === 'object' && 'code' in value && typeof value.code === 'string' ? value.code : undefined;
+              fail(Object.assign(new Error(message), { statusCode }, code === undefined ? {} : { code }));
             } else succeed(value);
           });
         });
