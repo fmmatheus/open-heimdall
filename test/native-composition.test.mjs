@@ -209,6 +209,78 @@ test('an unknown call origin and a late call from an earlier dispatch on a reuse
 const receiptFiles = async (directory, runId) => (await fs.readdir(path.join(directory, '.heimdall/runs', runId), { recursive: true })).filter(file => /submission/i.test(file) && file.endsWith('.json'));
 const hasUser = (host, child) => host.sessions.get(child).messages.some(m => m.type === 'user');
 
+test('a cyclic archive page cannot authenticate a submission even when it carries the exact call and dispatch prompt', async t => {
+  for (const steps of [2, 4]) await t.test(steps === 2 ? 'current cursor repeats' : 'earlier cursor repeats', async t => {
+    const { directory, configuration } = await project(t, 'heimdall-native-cyclic-proof-');
+    let denial;
+    let cyclic = true;
+    const host = nativeHost(directory, [planStep('T1'), async ({ submit, dispatch }) => {
+      host.steps(dispatch, steps);
+      denial = await submit(EXECUTOR_TOOL, completed()).then(() => 'accepted', error => error.message);
+      cyclic = false;
+      // The native final turn remains readable after the rejected call; no second submission is made.
+      const session = host.sessions.get(dispatch.child);
+      for (const timeline of [session.archive, session.messages]) {
+        timeline.splice(timeline.indexOf(dispatch.assistant), 1);
+        timeline.push(dispatch.assistant);
+      }
+    }]);
+    const firstCursors = new Map();
+    const fetchImpl = async url => {
+      const response = await host.fetchImpl(url);
+      if (!url.pathname.endsWith('/message')) return response;
+      const page = await response.json();
+      const cursor = url.searchParams.get('cursor');
+      if (!cursor) firstCursors.set(url.pathname, page.cursor.next);
+      else if (cyclic && page.data.some(message => message.type === 'user')) page.cursor.next = firstCursors.get(url.pathname);
+      return Response.json(page);
+    };
+    const archive = createMessageHistory({ directory, baseUrl: 'http://127.0.0.1:4096', authentication: 'none', fetchImpl });
+    const setup = await createPlugin({ configuration, observe: host.observe, history: archive, quota, git }).setup(host.ctx);
+    t.after(setup);
+    const result = JSON.parse((await host.registered.get('adr_workflow').execute({ action: 'start', adr: '.heimdall/feature.md' }, caller())).content);
+    assert.equal(denial, originUnverifiedDenial('cursor_repeated'));
+    assert.equal(result.status, 'paused');
+    const state = await readState(directory, result.runId);
+    assert.equal(state.index, 0);
+    assert.equal(state.results.length, 0);
+    assert.equal(state.submissionRepair, undefined);
+    assert.equal((await receiptFiles(directory, result.runId)).length, 1, 'only the planner receipt exists');
+    assert.deepEqual(host.interrupts, []);
+  });
+});
+
+test('a genuine submission can prove its origin on the final permitted archive page without following another cursor', async t => {
+  const { directory, configuration } = await project(t, 'heimdall-native-final-proof-');
+  const host = nativeHost(directory, [planStep('T1'), async ({ submit, dispatch }) => {
+    host.steps(dispatch, 2);
+    const session = host.sessions.get(dispatch.child);
+    // Keep the submitting assistant as the final native turn, with the prompt on the next page.
+    for (const timeline of [session.archive, session.messages]) {
+      timeline.splice(timeline.indexOf(dispatch.assistant), 1);
+      timeline.push(dispatch.assistant);
+    }
+    assert.equal((await submit(EXECUTOR_TOOL, completed())).output.accepted, true);
+  }]);
+  const fetchImpl = async url => {
+    const response = await host.fetchImpl(url);
+    if (!url.pathname.endsWith('/message')) return response;
+    assert.notEqual(url.searchParams.get('cursor'), 'older-unvisited', 'proof must not fetch a third page');
+    const page = await response.json();
+    if (url.searchParams.has('cursor')) page.cursor.next = 'older-unvisited';
+    return Response.json(page);
+  };
+  const archive = createMessageHistory({ directory, baseUrl: 'http://127.0.0.1:4096', authentication: 'none', fetchImpl, maxPages: 2 });
+  const setup = await createPlugin({ configuration, observe: host.observe, history: archive, quota, git }).setup(host.ctx);
+  t.after(setup);
+  const result = JSON.parse((await host.registered.get('adr_workflow').execute({ action: 'start', adr: '.heimdall/feature.md' }, caller())).content);
+  assert.equal(result.status, 'completed', JSON.stringify(result));
+  const state = await readState(directory, result.runId);
+  assert.equal(state.results.length, 1);
+  assert.equal(state.index, 1);
+  assert.equal((await receiptFiles(directory, result.runId)).length, 2);
+});
+
 test('a compacted active context without the dispatch prompt still authenticates the genuine submission from the full archive', async t => {
   const { directory, configuration } = await project(t, 'heimdall-native-compacted-');
   const compacted = async ({ submit, dispatch }) => {

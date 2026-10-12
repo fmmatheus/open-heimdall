@@ -286,3 +286,10 @@ test('message history fails closed with a bounded reason for unreachable, wrong-
 test('message history rejects invalid bounds at construction', () => {
   for (const bounds of [{ pageSize: 0 }, { pageSize: 201 }, { pageSize: 1.5 }, { maxPages: 0 }]) assert.throws(() => createMessageHistory({ directory, ...connection, ...bounds }), /Invalid message history bounds/);
 });
+
+test('message history rejects a repeated cursor even on an empty terminal page', async () => {
+  const server = archiveServer(url => Response.json(url.searchParams.has('cursor')
+    ? { data: [], cursor: { next: 'same' } }
+    : { data: [message('m1')], cursor: { next: 'same' } }));
+  assert.equal(await failure(collect(server.history()('ses_child'))), 'cursor_repeated');
+});

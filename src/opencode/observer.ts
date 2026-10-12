@@ -165,6 +165,7 @@ export function createMessageHistory({ directory, pageSize = MESSAGE_HISTORY_PAG
       const next = value.cursor.next ?? undefined;
       const previous = value.cursor.previous ?? undefined;
       if ((next !== undefined && (typeof next !== 'string' || !next)) || (previous !== undefined && typeof previous !== 'string')) throw new OriginProofError('page_malformed');
+      if (next !== undefined && (cursors.has(next) || next === cursor)) throw new OriginProofError('cursor_repeated');
       // The whole page is validated before any of it is consumed.
       for (const item of value.data) {
         if (!record(item) || typeof item.id !== 'string' || !item.id || typeof item.type !== 'string') throw new OriginProofError('page_malformed');
@@ -173,7 +174,6 @@ export function createMessageHistory({ directory, pageSize = MESSAGE_HISTORY_PAG
       }
       yield* value.data as HistoryMessage[];
       if (next === undefined || value.data.length === 0) return;
-      if (cursors.has(next) || next === cursor) throw new OriginProofError('cursor_repeated');
       if (page >= maxPages) throw new OriginProofError('scan_exhausted');
       cursors.add(next);
       cursor = next;
