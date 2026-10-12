@@ -16,6 +16,9 @@ const STATUS_DEADLINE_MS = 10000;
 export const coordinatorHelp = `Global coordinator (explicit opt-in)
 
 Usage:
+  heimdall coordinator start [--coordinator-config FILE] [--env-file FILE] [--timeout SECONDS] [--json]
+  heimdall coordinator stop [--coordinator-config FILE] [--timeout SECONDS] [--no-wait] [--json]
+  heimdall coordinator logs [--coordinator-config FILE] [--lines N] [--follow]
   heimdall coordinator serve [--coordinator-config FILE] [--env-file FILE]
   heimdall coordinator project add DIRECTORY [--project-config FILE] [--limit N]
   heimdall coordinator project list
@@ -27,7 +30,9 @@ Usage:
   heimdall coordinator events [--after SEQUENCE]
   heimdall coordinator status [--json] [--coordinator-config FILE]
 
-All commands accept --coordinator-config FILE. Start serve in a separate terminal.
+All commands accept --coordinator-config FILE. start runs the coordinator in the background through the
+native user service manager; serve runs it in the foreground in a separate terminal. See
+"heimdall coordinator start --help", "stop --help" and "logs --help".
 serve --env-file FILE reads Basic authentication credentials (NAME=value lines) from a private
 regular file (owner-only, not a symbolic link). The file is read at every launch, never changes
 the process environment, and its values are masked in coordinator output.
@@ -120,9 +125,16 @@ export function superviseForeground(
 /** Programmatic seams for tests; the command line exposes none of them. */
 export interface CoordinatorMainInternals {
   serviceOptions?: Pick<ServiceOptions, 'executor' | 'scheduler' | 'pollIntervalMs' | 'testHooks'>;
+  lifecycle?: import('./lifecycle-cli.js').LifecycleInternals;
 }
 
 export async function coordinatorMain(args: string[], internals: CoordinatorMainInternals = {}): Promise<void> {
+  // Lifecycle commands validate their own arguments before the configuration or any service is consulted.
+  if (args[0] === 'start' || args[0] === 'stop' || args[0] === 'logs') {
+    const { lifecycleCommandMain } = await import('./lifecycle-cli.js');
+    process.exitCode = await lifecycleCommandMain(args[0], args.slice(1), internals.lifecycle);
+    return;
+  }
   if (!args.length || args.includes('--help') || args[0] === 'help') { process.stdout.write(coordinatorHelp); return; }
   const positional: string[] = [];
   const options = new Map<string, string>();

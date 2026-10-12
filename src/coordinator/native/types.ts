@@ -97,6 +97,12 @@ export interface CleanupResult {
   detail: string;
 }
 
+/** The nonsecret references an owned service definition remembers; an absent or foreign definition remembers none. */
+export type RememberedContext =
+  | { kind: 'absent' }
+  | { kind: 'owned'; credentialFile: string | null; openchamberDataDirectory: string | null }
+  | { kind: 'foreign'; reason: string };
+
 /**
  * Native service manager adapter. Methods only ever start the service on `start`; nothing here sends a stop,
  * kill or restart request, and a loaded running definition is never replaced.
@@ -105,6 +111,10 @@ export interface NativeServiceAdapter {
   identity(): ServiceIdentity;
   /** The definition text for the current launch context. */
   render(): string;
+  /** Read the credential file and OpenChamber data directory references stored in the owned definition, changing nothing. */
+  remembered(): Promise<RememberedContext>;
+  /** Where the service's process output can be read, for diagnostics. Touches nothing. */
+  logLocation(): string;
   /** Read manager state without starting, stopping or changing anything. */
   inspect(): Promise<ServiceInspection>;
   /** Write the owned definition when needed and register it when it is not loaded. */

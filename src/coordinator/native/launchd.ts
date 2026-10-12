@@ -4,7 +4,7 @@ import { MANAGER_LABEL_VARIABLE } from '../launch-context.js';
 import type { LaunchContext } from '../launch-context.js';
 import { ensurePrivateDirectory, prepareLogFile, readPrivateText, validatePrivateDirectory, writePrivateFile } from './private-files.js';
 import { createExecFileRunner, nativeServiceNames } from './types.js';
-import type { CleanupResult, CommandRunner, InstallResult, NativeServiceAdapter, ServiceConflict, ServiceIdentity, ServiceInspection, StartResult } from './types.js';
+import type { CleanupResult, CommandRunner, InstallResult, NativeServiceAdapter, RememberedContext, ServiceConflict, ServiceIdentity, ServiceInspection, StartResult } from './types.js';
 
 export const LAUNCHCTL = '/bin/launchctl';
 const DEFINITION_DIRECTORY = 'service';
@@ -379,5 +379,17 @@ export function createLaunchdAdapter(options: LaunchdAdapterOptions): NativeServ
     return { outcome: 'removed', detail: `${label} unloaded and ${paths.definition} removed` };
   }
 
-  return { identity, render: () => desiredText, inspect, install, start, unloadInactive, cleanupFixture };
+  async function remembered(): Promise<RememberedContext> {
+    const existing = await existingDefinition();
+    if (existing.kind !== 'owned') return existing;
+    return {
+      kind: 'owned',
+      credentialFile: optionValue(existing.definition.ProgramArguments.slice(2), '--env-file'),
+      openchamberDataDirectory: existing.definition.EnvironmentVariables.OPENCHAMBER_DATA_DIR ?? null,
+    };
+  }
+
+  const logLocation = () => `Standard output: ${paths.standardOut}; standard error: ${paths.standardError}`;
+
+  return { identity, render: () => desiredText, remembered, logLocation, inspect, install, start, unloadInactive, cleanupFixture };
 }

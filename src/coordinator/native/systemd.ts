@@ -4,7 +4,7 @@ import { MANAGER_LABEL_VARIABLE } from '../launch-context.js';
 import type { LaunchContext } from '../launch-context.js';
 import { ensurePrivateDirectory, readPrivateText, validatePrivateDirectory, writePrivateFile } from './private-files.js';
 import { createExecFileRunner, nativeServiceNames } from './types.js';
-import type { CleanupResult, CommandRunner, InstallResult, NativeServiceAdapter, ServiceConflict, ServiceIdentity, ServiceInspection, StartResult } from './types.js';
+import type { CleanupResult, CommandRunner, InstallResult, NativeServiceAdapter, RememberedContext, ServiceConflict, ServiceIdentity, ServiceInspection, StartResult } from './types.js';
 
 const SYSTEMCTL_CANDIDATES = ['/usr/bin/systemctl', '/bin/systemctl', '/usr/local/bin/systemctl'];
 const DEFINITION_DIRECTORY = 'service';
@@ -462,5 +462,17 @@ export function createSystemdAdapter(options: SystemdAdapterOptions): NativeServ
     return { outcome: 'removed', detail: `${unit} unlinked and ${paths.definition} removed` };
   }
 
-  return { identity, render: () => desiredText, inspect, install, start, unloadInactive, cleanupFixture };
+  async function remembered(): Promise<RememberedContext> {
+    const existing = await existingDefinition();
+    if (existing.kind !== 'owned') return existing;
+    return {
+      kind: 'owned',
+      credentialFile: optionValue(existing.definition.execStart.slice(2), '--env-file'),
+      openchamberDataDirectory: existing.definition.environment.OPENCHAMBER_DATA_DIR ?? null,
+    };
+  }
+
+  const logLocation = () => `systemd journal of the user unit ${unit} (journalctl --user -u ${unit})`;
+
+  return { identity, render: () => desiredText, remembered, logLocation, inspect, install, start, unloadInactive, cleanupFixture };
 }
