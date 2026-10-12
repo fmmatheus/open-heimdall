@@ -14,8 +14,9 @@ export function countFormatCorrections(calls) {
 }
 
 // Pass needs at least one check, every check true, no failure while waiting for the workflow and no compaction request error.
+// Only null or undefined means no failure was recorded; any other value, including an empty message, false or 0, is a failure.
 export function compactionVerdict({ checks, waitFailure = null, compactionError = null }) {
   const values = Object.values(checks ?? {});
-  const pass = values.length > 0 && values.every(value => value === true) && !waitFailure && !compactionError;
+  const pass = values.length > 0 && values.every(value => value === true) && waitFailure == null && compactionError == null;
   return { pass, exitCode: pass ? 0 : 1 };
 }

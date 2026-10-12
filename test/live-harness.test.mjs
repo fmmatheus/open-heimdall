@@ -469,6 +469,32 @@ describe('compaction live check verdict', () => {
     assert.deepEqual(compactionVerdict({ checks: passing, compactionError: 'request failed' }), { pass: false, exitCode: 1 });
   });
 
+  test('an empty recorded error message fails for each failure field', () => {
+    const empty = new Error('').message;
+    assert.equal(empty, '');
+    assert.deepEqual(compactionVerdict({ checks: passing, waitFailure: empty }), { pass: false, exitCode: 1 });
+    assert.deepEqual(compactionVerdict({ checks: passing, compactionError: empty }), { pass: false, exitCode: 1 });
+    assert.deepEqual(compactionVerdict({ checks: passing, waitFailure: empty, compactionError: empty }), { pass: false, exitCode: 1 });
+  });
+
+  test('falsy non-nullish failure values fail closed', () => {
+    for (const value of ['', false, 0]) {
+      assert.deepEqual(compactionVerdict({ checks: passing, waitFailure: value }), { pass: false, exitCode: 1 }, `waitFailure ${JSON.stringify(value)}`);
+      assert.deepEqual(compactionVerdict({ checks: passing, compactionError: value }), { pass: false, exitCode: 1 }, `compactionError ${JSON.stringify(value)}`);
+    }
+  });
+
+  test('absent failure fields allow a passing verdict', () => {
+    const pass = { pass: true, exitCode: 0 };
+    assert.deepEqual(compactionVerdict({ checks: passing }), pass);
+    assert.deepEqual(compactionVerdict({ checks: passing, waitFailure: null }), pass);
+    assert.deepEqual(compactionVerdict({ checks: passing, waitFailure: undefined }), pass);
+    assert.deepEqual(compactionVerdict({ checks: passing, compactionError: null }), pass);
+    assert.deepEqual(compactionVerdict({ checks: passing, compactionError: undefined }), pass);
+    assert.deepEqual(compactionVerdict({ checks: passing, waitFailure: null, compactionError: null }), pass);
+    assert.deepEqual(compactionVerdict({ checks: passing, waitFailure: undefined, compactionError: undefined }), pass);
+  });
+
   test('format corrections are counted from the observed submission calls', () => {
     assert.equal(countFormatCorrections([rejection, acceptance]), 1);
     assert.equal(countFormatCorrections([acceptance]), 0);

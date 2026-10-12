@@ -202,6 +202,24 @@ installed. These are automated checks; they are not live validation.
 | --- | --- | --- | --- | --- | --- | --- |
 | 958 | 4 | 958 | 0 | 0 | 0 | 0 |
 
+### Follow-up: recorded errors are detected by nullish absence
+
+The verdict previously tested `!waitFailure && !compactionError`, so a recorded error
+whose message was empty (for example `new Error('').message`) was treated as no error.
+Now only `null` or `undefined` (including an omitted field) means no failure was
+recorded; any other value, including `''`, `false` and `0`, fails the verdict. The
+tables above are kept as the historical record of the earlier head. These are
+automated checks, under Node v22.22.3 with dependencies reused from an existing
+matching install; they are not live validation and the live script was not rerun.
+
+| Check | Result |
+| --- | --- |
+| Focused verdict tests against the previous helper | exit 1; 12 tests, 10 pass, 2 fail (empty recorded error, falsy non-nullish values) |
+| Focused verdict tests after the change | exit 0; 12 tests, 12 pass, 0 fail |
+| `npm run check` | exit 0 |
+| `npm run build:extension` | exit 0 |
+| `npm test` | exit 0; tests 961, suites 4, pass 961, fail 0, cancelled 0, skipped 0, todo 0 |
+
 ## Not proven and remaining limits
 
 - **Coordinator-managed compaction.** Compaction was exercised only in the standalone
