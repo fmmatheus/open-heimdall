@@ -252,3 +252,16 @@ test('a selected credential file without the referenced value fails at connectio
     assert.equal(f.calls.length, 0);
   } finally { await fs.rm(directory, { recursive: true, force: true }); }
 });
+
+test('a none credential source fails Basic authentication at connection time without using the connection environment', async () => {
+  const f = fixture(runFixture(), { environment: { SYNTHETIC_PASSWORD: 'synthetic-ambient-secret' } }, { credentialSource: { kind: 'none' } });
+  await assert.rejects(f.executor.launch(f.run), /credential file/);
+  assert.equal(f.calls.length, 0);
+});
+
+test('an ambient credential source keeps authenticating from the connection environment', async () => {
+  const f = fixture(runFixture(), { environment: { SYNTHETIC_PASSWORD: 'synthetic-ambient-secret' } }, { credentialSource: { kind: 'ambient' } });
+  await f.executor.launch(f.run);
+  assert.ok(f.calls.length > 0);
+  assert.ok(f.calls.every(call => call.headers.Authorization === basicHeader('synthetic-ambient-secret')));
+});

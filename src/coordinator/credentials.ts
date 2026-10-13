@@ -132,6 +132,13 @@ export async function loadCredentialFile(file: string, options: LoadCredentialFi
   } finally { await handle.close(); }
 }
 
+/** A fresh environment carrying only the nonsecret OpenChamber data directory selection from `base`. */
+export function selectionEnvironment(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = Object.create(null);
+  if (typeof base.OPENCHAMBER_DATA_DIR === 'string') environment.OPENCHAMBER_DATA_DIR = base.OPENCHAMBER_DATA_DIR;
+  return environment;
+}
+
 function context(file: string, entries: Map<string, string>): CredentialContext {
   const names = Object.freeze([...entries.keys()]);
   const values = Object.freeze([...entries.values()]);
@@ -140,8 +147,7 @@ function context(file: string, entries: Map<string, string>): CredentialContext 
     has: (name: string) => entries.has(name),
     lookup: (name: string) => entries.get(name),
     environmentFor(reference: string, base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-      const environment: NodeJS.ProcessEnv = Object.create(null);
-      if (typeof base.OPENCHAMBER_DATA_DIR === 'string') environment.OPENCHAMBER_DATA_DIR = base.OPENCHAMBER_DATA_DIR;
+      const environment = selectionEnvironment(base);
       const value = entries.get(reference);
       if (value !== undefined) environment[reference] = value;
       return environment;

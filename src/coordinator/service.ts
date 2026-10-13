@@ -4,7 +4,8 @@ import http from 'node:http';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { CoordinatorStore } from './store.js';
 import { CoordinatorScheduler } from './scheduler.js';
-import { createManagedExecutor } from './executor.js';
+import { createManagedExecutor, credentialSourceFor } from './executor.js';
+import type { CredentialSource } from './executor.js';
 import { inspectProject, planManagedWorktree, resolveBaseCommit } from './worktrees.js';
 import { checkRuntimeConflicts, snapshotSpecification } from './runtime.js';
 import { canonicalPlannedDirectory, positiveInteger } from './config.js';
@@ -69,8 +70,13 @@ export interface ServiceOptions {
   executor?: ManagedExecutor;
   scheduler?: Omit<ConstructorParameters<typeof CoordinatorScheduler>[0], 'store' | 'executor' | 'endpoint'>;
   pollIntervalMs?: number;
-  /** Explicitly selected credential file for Basic authentication; without it the process environment is used. */
+  /** Explicitly selected credential file for Basic authentication. */
   credentials?: CredentialContext;
+  /**
+   * Where Basic authentication may read its password. Defaults to the selected file, otherwise to no source for a
+   * managed service and to the process environment for a foreground coordinator.
+   */
+  credentialSource?: CredentialSource;
   /** How this process was launched; defaults to a foreground coordinator. */
   lifecycle?: LifecycleOptions;
   /** Failure injection for tests. A hook that throws makes the named shutdown stage fail before it runs. */
@@ -115,7 +121,7 @@ async function startOwnedService(options: ServiceOptions, root: string, ownershi
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
   await privateFile(databasePath);
   const store = new CoordinatorStore({ databasePath, globalConcurrency: configuration.globalConcurrency });
-  const executor = options.executor ?? createManagedExecutor({ getRun: runId => store.getRun(runId)!, credentials: options.credentials });
+  const executor = options.executor ?? createManagedExecutor({ getRun: runId => store.getRun(runId)!, credentialSource: options.credentialSource ?? credentialSourceFor({ credentials: options.credentials, managed: options.lifecycle?.mode === 'managed' }) });
   const scheduler = new CoordinatorScheduler({ ...options.scheduler, store, executor, endpoint: configuration.endpoint });
   let ready = false;
   let draining = false;

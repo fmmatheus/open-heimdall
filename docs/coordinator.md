@@ -234,13 +234,27 @@ A managed service does not inherit the credentials of the terminal that ran
   (explicit or remembered) fails with `invalid-credentials` before a new service is
   launched. Passing a different file while the coordinator runs is a
   `credential-conflict`: stop, then start with the new file.
-- **Exclusive use.** With a file selected, the Basic password comes only from that
-  file, never from the ambient environment, and the values are never copied into
-  `process.env`. Without a file, a managed service has no Basic password, and the
-  failure appears when a connection is made (the existing "Set the configured
-  OpenCode password environment variable" error), not at `start`. `openchamber`
-  and `none` authentication need no file. `serve --env-file` behaves the same in
-  the foreground; `serve` without it keeps using the terminal's environment.
+- **Exclusive use.** The Basic password source depends on how the coordinator
+  runs:
+  - *Managed service with a file.* The password comes only from the configured
+    `passwordEnvironmentVariable` inside that file. A file that does not define
+    that name never falls back to an environment variable inherited from the
+    service manager, and the connection fails before any OpenCode request
+    ("Set the configured OpenCode password environment variable").
+  - *Managed service without a file.* There is no Basic password source at all:
+    `OPENCODE_PASSWORD`, or a custom reference, present in the manager's
+    environment is ignored, and the connection fails before any OpenCode request
+    with an error that asks for a credential file.
+  - *Foreground `serve --env-file FILE`.* Exclusive to the file, like a managed
+    service with a file.
+  - *Foreground `serve` without a file.* Keeps using the terminal's environment.
+
+  Missing Basic input is reported when a run's connection is made, not at `start`:
+  the coordinator still becomes ready, because readiness confirms coordinator IPC
+  only. File values are never copied into `process.env`, and the manager-wide
+  environment is not modified. `openchamber` and `none` authentication read no
+  password and need no file; `openchamber` still locates the Desktop token through
+  the nonsecret `OPENCHAMBER_DATA_DIR` selection.
 - **Masking.** Known credential values, the coordinator key, run capabilities,
   authorization headers and URL credentials are masked before coordinator output is
   written to a log or printed by a lifecycle command. Values that were never
