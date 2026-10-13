@@ -123,7 +123,8 @@ test('the output sanitizer masks credentials, capabilities and authorization pat
   const sanitize = createOutputSanitizer(() => ['abcd', 'ab', undefined, 'synthetic-owner-token']);
   const text = sanitize('x abcd ab synthetic-owner-token Authorization: Bearer syntheticbearer123 Basic c3ludGhldGljOnNlY3JldA== https://user:pass@example.test/a');
   assert.ok(!/abcd|synthetic-owner-token|syntheticbearer123|c3ludGhldGljOnNlY3JldA|user:pass/.test(text), text);
-  assert.ok(text.includes(' ab '), 'values under four characters are not masked');
+  assert.ok(!/\bab\b/.test(text), 'a known value is masked whatever its length');
+  assert.ok(text.startsWith('x [redacted] [redacted] [redacted] Authorization: Bearer [redacted]'), text);
   assert.equal(createOutputSanitizer(() => { throw new Error('source failed'); })('Bearer syntheticbearer123 kept'), 'Bearer [redacted] kept');
 });
 

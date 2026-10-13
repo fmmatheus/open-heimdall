@@ -1,17 +1,14 @@
 import { maskSecrets } from '../redaction.js';
 
-/** Credentials shorter than this are not masked: doing so would corrupt unrelated text. */
-const MINIMUM_SECRET_LENGTH = 4;
-
 /**
  * Builds the sanitizer applied to everything a coordinator process writes. Secrets are asked for on every call so
  * values learned after startup (the coordinator key, run owner tokens) are covered; only values the process holds
- * can be masked, plus Authorization-style values and URL user information by pattern.
+ * can be masked, whatever their length, plus Authorization-style values and URL user information by pattern.
  */
 export function createOutputSanitizer(secrets: () => Iterable<string | undefined>): (text: string) => string {
   return text => {
     const known = new Set<string>();
-    try { for (const secret of secrets()) if (secret && secret.length >= MINIMUM_SECRET_LENGTH) known.add(secret); }
+    try { for (const secret of secrets()) if (secret) known.add(secret); }
     catch { /* A failing source must not stop output; the pattern masks still apply. */ }
     return maskSecrets(text, known);
   };
