@@ -292,8 +292,9 @@ Regression file: `test/coordinator-lifecycle-launch-uncertainty.test.mjs` (10 ca
 held on the gate: the invoking CLI is killed with `SIGKILL`; a separate-process `stop` (twice) does not report
 `stopped` or `already-stopped`, the record stays unchanged, the synthetic tool saw no violation and no signal; the gate
 is released, the coordinator launches, `stop` reports `stopped` and the record is gone; a later `stop` reports
-`already-stopped` and a later explicit `start` reaches `ready`. Also: the invoking CLI timing out while alive
-(`startup-not-confirmed`, a `stop` meanwhile is not a stopped claim, then `stopped`); systemd resolving by absence only
+`already-stopped` and a later explicit `start` reaches `ready`. Also: the invoking CLI reaching its deadline
+(`startup-not-confirmed`, a `stop` meanwhile is not a stopped claim, then `stopped`; since the next subsection the CLI
+exits at the deadline instead of staying alive for the request); systemd resolving by absence only
 after the queued job ended; launchd staying unresolved after a failed `kickstart` until a `start` is run; and controls
 for a coordinator that never ran (`not-managed`, as before) and for a start the tool refused (no record left).
 
@@ -308,6 +309,56 @@ unrelated test failed in some runs (different tests each time, including runs th
 of three runs on the unmodified `HEAD`: for example "Invalid coordinator access key" while reading a token, a drain
 record `requested` instead of `drain-failed`); each passed when run alone and in the serial run. They are not
 attributed to this change and are unresolved.
+
+### The command's lifetime is bound by its deadline and Ctrl-C
+
+Evidence label: **subprocess, synthetic native tool** (mocked manager), same harness as the previous subsection. Not
+launchd or systemd evidence; **real-manager check: pending.**
+
+Defect: the overall `--timeout` and Ctrl-C bounded when the result was printed, not how long the process lived. Native
+tool calls ran under their own 15 second timeout (`execFile`) that neither the remaining budget nor Ctrl-C reached, so a
+slow `launchctl`/`systemctl` kept the process alive well past the requested deadline, and Ctrl-C waited for the tool.
+
+Correction (`src/coordinator/native/types.ts`, `lifecycle-start.ts`, `lifecycle-stop.ts`, both adapters): each lifecycle
+command runs inside a command budget (its deadline and abort signal) that `createExecFileRunner` reads for every native
+tool call, including calls of work the command gave up on. No tool starts once the budget is spent. A tool still
+running at the deadline or on Ctrl-C has its own client ended (`SIGTERM`, then `SIGKILL` after 250 ms; the runner stops
+waiting after 500 ms); only that client is signalled, never the coordinator, the supervisor or a process the manager
+started. The one exception is the start request (`kickstart`, `systemctl start`): its client is left running and
+detached, because ending it could drop a request the manager has not received, and the durable launch attempt record
+from the previous subsection is what keeps `stop` from claiming a stopped state while it is unresolved. A late
+installation tool call therefore cannot write the definition or turn into a start after the command ended. No flag,
+result field or error code was added.
+
+Regression file: `test/coordinator-lifecycle-process-exit.test.mjs` (22 cases, both managers), each lifecycle command in
+its own process with the production runner and one exact JSON document on stdout. A tool call is delayed 4 s (what the
+earlier code waited for) and `--timeout 1` is used; a command passes within `1000 ms + 1500 ms` tolerance (process
+start, termination grace, scheduling noise), which is more than a second below the delayed call. Ctrl-C cases must end
+within 1500 ms of the signal. Further cases: a first tool call and an installation call released after a timeout or
+Ctrl-C never write the definition or start the service, and the definition does not change after the first command
+exited or behind a second lifecycle command (sampled every 10 ms); an already-issued start followed by a timeout or
+Ctrl-C ends the command with `startup-not-confirmed`, leaves the request running with no signal sent, keeps the
+`dispatching` record, makes a separate `stop` answer `completion-unknown`, and resolves to `stopped` once the request is
+released. In every case the synthetic tool saw no stop, kill, restart, disable or removal verb and no signal reached the
+coordinator or its supervisor.
+`test/coordinator-lifecycle-launch-uncertainty.test.mjs` had one case that asserted the old behavior (the invoking
+command staying alive after its deadline to learn the request outcome); it now asserts that the command has exited, the
+request is untouched and the record stays `dispatching` until an observation resolves it.
+
+Measured exit times (macOS host, one run each; the baseline is a disposable copy of `0651d81` outside the repository
+with the new test and the harness fixtures copied in unchanged; the same cases measured the same on the parent commit):
+
+| Case (both managers) | Baseline | Fixed | Limit |
+| --- | --- | --- | --- |
+| start, installation tool delayed 4 s, `--timeout 1` | 4.4 s | 1.06-1.07 s | 2.5 s |
+| start, manager inspection delayed 4 s, `--timeout 1` | 4.4 s | 1.06 s | 2.5 s |
+| stop, manager inspection delayed 4 s, `--timeout 1` | 4.1-4.2 s | 1.06 s | 2.5 s |
+| start, Ctrl-C during the installation tool | 15.0 s after the signal | 6 ms after the signal | 1.5 s |
+| stop, Ctrl-C during manager inspection | 14.9-15.0 s after the signal | 6-7 ms after the signal | 1.5 s |
+| start, issued start request, `--timeout 1` | not measured | 1.06 s | 2.5 s |
+| start, issued start request, Ctrl-C | not measured | 4-6 ms after the signal | 1.5 s |
+
+Baseline run of the first five rows: 10 tests, 0 pass, 10 fail. Fixed code: 22 of 22 pass.
 
 ## Historical evidence at `3bfdc76`
 

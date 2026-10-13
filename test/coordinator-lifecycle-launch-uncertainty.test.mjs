@@ -89,26 +89,26 @@ for (const manager of MANAGERS) {
     assertNoDestructiveVerb(h);
   });
 
-  test(`${manager}: a start whose invoking command timed out while alive leaves a stop without a stopped claim`, { skip }, async t => {
+  test(`${manager}: a start whose invoking command ended at its deadline leaves a stop without a stopped claim`, { skip }, async t => {
     const h = await createSubprocessNative(t, manager);
     await h.gate(h.startVerb);
     const invoking = h.spawnStart(['--timeout', '2']);
     const tool = await h.reached(h.startVerb);
 
-    // The deadline passes while the request is held; the command reports it truthfully and stays alive for the tool.
-    await until(() => /startup-timeout|startup-not-confirmed/.test(invoking.stdout), 'the start to report the passed deadline', 15_000);
+    // The deadline passes while the request is held; the command reports it truthfully and ends with the deadline, while
+    // the request it issued is left to the manager.
+    await invoking.exit;
     const report = JSON.parse(invoking.stdout);
     assert.equal(report.outcome, 'startup-not-confirmed');
-    assert.equal(h.toolAlive(tool), true);
+    assert.equal(h.toolAlive(tool), true, 'the issued start request was not ended');
 
     const during = await h.stop(['--timeout', '3']);
-    assertNoStopClaim(during, 'stop while the invoking command still waits on the request');
+    assertNoStopClaim(during, 'stop while the start request is unresolved');
     assert.ok(h.readRecord(), 'the launch attempt is recorded before the manager is asked to start');
 
     await h.ungate(h.startVerb);
-    await invoking.exit;
     await h.coordinatorUp();
-    assert.equal(h.readRecord()?.phase, 'requested', 'the manager accepted the request, so nothing is in flight');
+    assert.equal(h.readRecord()?.phase, 'dispatching', 'no process was left to learn that the request was accepted; an observation resolves it');
 
     const stopped = await h.stop(['--timeout', '30']);
     assert.equal(stopped.document.outcome, 'stopped', `${stopped.stdout}\n${stopped.stderr}`);

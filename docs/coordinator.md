@@ -275,7 +275,9 @@ another definition as a `conflict`. A successful call to the service manager is
 only a launch result. One
 deadline (`--timeout`, default 30 seconds) covers the manager calls and every
 retry, and each coordinator request is limited to what remains of it, so a command
-does not outlast its timeout by more than a small margin. Ctrl-C ends a request
+does not outlast its timeout by more than a small margin: each service manager tool
+call is given only what remains of the deadline, and the process exits when the
+deadline passes or on Ctrl-C even while such a call is still running. Ctrl-C ends a request
 that is in flight. An answer that arrives after the deadline is never reported as
 success. When the deadline passes before the command changed anything, the result
 is a `conflict` (`deadline-exceeded`) that says nothing was started or changed. If
@@ -303,9 +305,11 @@ Other starts:
   accepted or an `already-stopped` result was confirmed does not run afterwards
   (`conflict`, `superseded-by-stop`); run `start` again.
 - A `start` whose deadline ends or that is interrupted while the service definition
-  is still being installed requests no start afterwards; the installation under way
-  finishes while the command keeps the per-target lock, so no other lifecycle command
-  overlaps it. A start that was already requested from the service manager stays
+  is still being installed requests no start afterwards, and the command ends with
+  the deadline or the interrupt: the service manager tool it was waiting on (only
+  that tool client) is ended, and no tool is started once the allowance is spent. The
+  command holds the per-target lock until the tool client has ended, so no other
+  lifecycle command overlaps a definition change. A start that was already requested from the service manager stays
   `startup-not-confirmed`: Heimdall does not undo it, and `stop` does not report
   `stopped` or `already-stopped` for the target until that call has settled.
 - Before it asks the service manager to start, `start` records the launch attempt in a

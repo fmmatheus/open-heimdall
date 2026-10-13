@@ -13,7 +13,7 @@ import type { LifecycleErrorCode, LifecycleResult, LifecycleResultInput, Lifecyc
 import { bounded, errorText, observed, probeEndpoint, problem, requestBudget } from './lifecycle-start.js';
 import type { LifecycleDependencies, Probe } from './lifecycle-start.js';
 import { selectNativeManager } from './native/platform.js';
-import { confirmOwnedProcess, inspectOwnership, nativeServiceNames } from './native/types.js';
+import { confirmOwnedProcess, inspectOwnership, nativeServiceNames, withCommandBudget } from './native/types.js';
 import type { NativeServiceAdapter, ServiceInspection } from './native/types.js';
 import { probeCoordinatorOwnership } from './ownership.js';
 
@@ -31,8 +31,13 @@ type Exit =
  * It never throws and never stops, kills, restarts or unregisters anything, deletes state or sends a signal. A wait
  * that ends early (deadline, Ctrl-C) leaves the coordinator draining.
  */
-export async function runCoordinatorStop(args: ParsedLifecycleArguments, deps: LifecycleDependencies): Promise<LifecycleResult> {
+export function runCoordinatorStop(args: ParsedLifecycleArguments, deps: LifecycleDependencies): Promise<LifecycleResult> {
   const deadlineAt = deps.now() + args.timeoutSeconds * 1000;
+  // Every native tool call of this command is bound by the same deadline and Ctrl-C, so none outlives the wait.
+  return withCommandBudget({ deadlineAt, now: deps.now, signal: deps.signal }, () => stopBefore(args, deps, deadlineAt));
+}
+
+async function stopBefore(args: ParsedLifecycleArguments, deps: LifecycleDependencies, deadlineAt: number): Promise<LifecycleResult> {
   const secrets = new Set<string>();
   let key: string | null = null;
   let target: LifecycleTarget | null = null;

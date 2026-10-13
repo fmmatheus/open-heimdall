@@ -4,7 +4,7 @@ import { MANAGER_LABEL_VARIABLE } from '../launch-context.js';
 import type { LaunchContext } from '../launch-context.js';
 import { ensurePrivateDirectory, readPrivateText, validatePrivateDirectory, writePrivateFile } from './private-files.js';
 import { createExecFileRunner, nativeServiceNames } from './types.js';
-import type { CleanupResult, CommandRunner, InstallResult, NativeServiceAdapter, RegistrationOwnership, RememberedContext, ServiceConflict, ServiceIdentity, ServiceInspection, StartResult } from './types.js';
+import type { CleanupResult, CommandRunOptions, CommandRunner, InstallResult, NativeServiceAdapter, RegistrationOwnership, RememberedContext, ServiceConflict, ServiceIdentity, ServiceInspection, StartResult } from './types.js';
 
 const SYSTEMCTL_CANDIDATES = ['/usr/bin/systemctl', '/bin/systemctl', '/usr/local/bin/systemctl'];
 const DEFINITION_DIRECTORY = 'service';
@@ -296,10 +296,10 @@ export function createSystemdAdapter(options: SystemdAdapterOptions): NativeServ
   const conflict = (code: ServiceConflict['code'], message: string, action: string, changes?: string[]): ServiceConflict => ({ code, message, action, ...(changes ? { changes } : {}) });
   const unavailable = (reason: string): ServiceConflict => conflict('manager-unavailable', `The systemd user manager is not usable: ${reason}.`, MANAGER_UNAVAILABLE_ACTION);
 
-  async function run(args: readonly string[], timeoutMs?: number) {
+  async function run(args: readonly string[], options?: CommandRunOptions) {
     const systemctl = await systemctlPath();
     if (!systemctl) return { exitCode: null, stdout: '', stderr: '', error: 'systemctl was not found' };
-    return runner.run(systemctl, ['--user', ...args], timeoutMs ? { timeoutMs } : undefined);
+    return runner.run(systemctl, ['--user', ...args], options);
   }
 
   const preflight = async () => checkUserManager(runner, await systemctlPath(), environment);
@@ -463,7 +463,8 @@ export function createSystemdAdapter(options: SystemdAdapterOptions): NativeServ
     // The fragment is resolved again immediately before the start request, which acts on whatever the link names.
     const rechecked = await refusal();
     if (rechecked) return rechecked;
-    const started = await run(['start', unit], START_TIMEOUT_MS);
+    // The tool client of a start request outlives the command that gave up on it; see CommandRunOptions.outlivesCommand.
+    const started = await run(['start', unit], { timeoutMs: START_TIMEOUT_MS, outlivesCommand: true });
     if (started.error || started.exitCode !== 0) return { outcome: 'failed', conflicts: [], detail: `systemctl start failed: ${clip(started.error ?? `${started.stderr} ${started.stdout}`)}`, ...(started.timedOut ? { unresolved: true } : {}) };
     return { outcome: 'started', conflicts: [], detail: `${unit} start requested; readiness is not yet confirmed` };
   }
