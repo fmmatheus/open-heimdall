@@ -464,8 +464,23 @@ export function createSystemdAdapter(options: SystemdAdapterOptions): NativeServ
     const rechecked = await refusal();
     if (rechecked) return rechecked;
     const started = await run(['start', unit], START_TIMEOUT_MS);
-    if (started.error || started.exitCode !== 0) return { outcome: 'failed', conflicts: [], detail: `systemctl start failed: ${clip(started.error ?? `${started.stderr} ${started.stdout}`)}` };
+    if (started.error || started.exitCode !== 0) return { outcome: 'failed', conflicts: [], detail: `systemctl start failed: ${clip(started.error ?? `${started.stderr} ${started.stdout}`)}`, ...(started.timedOut ? { unresolved: true } : {}) };
     return { outcome: 'started', conflicts: [], detail: `${unit} start requested; readiness is not yet confirmed` };
+  }
+
+  /**
+   * `systemctl show -p Job` prints a job id only while a job (a queued or running start) is outstanding for the unit,
+   * and nothing otherwise. Anything else, including a failed query, is `unknown`.
+   */
+  async function startJobPending(): Promise<boolean | 'unknown'> {
+    const manager = await preflight();
+    if (!manager.available) return 'unknown';
+    const result = await run(['show', unit, '-p', 'Job']);
+    if (result.error || result.exitCode !== 0) return 'unknown';
+    const lines = result.stdout.split('\n').map(line => line.trim()).filter(Boolean);
+    const job = lines.find(line => line.startsWith('Job='));
+    if (job === undefined) return lines.length === 0 ? false : 'unknown';
+    return /^Job=[1-9]\d*$/.test(job) ? true : /^Job=0?$/.test(job) ? false : 'unknown';
   }
 
   /** Remove the user-config link of an owned, proven-inactive unit. The private definition file is retained. */
@@ -509,5 +524,5 @@ export function createSystemdAdapter(options: SystemdAdapterOptions): NativeServ
 
   const logLocation = () => `systemd journal of the user unit ${unit} (journalctl --user -u ${unit})`;
 
-  return { identity, render: () => desiredText, remembered, logLocation, inspect, registrationOwnership, install, start, unloadInactive, cleanupFixture };
+  return { identity, render: () => desiredText, remembered, logLocation, inspect, registrationOwnership, startJobPending, install, start, unloadInactive, cleanupFixture };
 }

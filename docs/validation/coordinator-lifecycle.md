@@ -263,6 +263,52 @@ Other checks on the fixed code (macOS host, Node v22.22.3, npm 10.9.8):
 | `npm test` | exit 0; 1340 tests, 1340 pass, 0 fail, 0 skipped |
 | `npm run build:extension` | exit 0 |
 
+### Launch attempts survive the invoking process
+
+Evidence label: **subprocess, synthetic native tool** (mocked manager). Each lifecycle command runs in its own
+process (`test/fixtures/lifecycle-cli-entry.mjs`) with the production adapter and `createExecFileRunner`. `systemctl`
+and `launchctl` are explicit synthetic executables (`test/fixtures/synthetic-native-tool.mjs`) that keep their state in
+files, hold a verb on a gate file, spawn the real coordinator from the registered definition when released, and refuse
+(and record) any verb that could stop, kill, restart or enable a service. Not launchd or systemd evidence; **real-manager
+check: pending.**
+
+Defect: the evidence that a native start was requested lived in the operation lock held by the invoking process. When
+that process was killed after the request was dispatched, the lock disappeared and a `stop` from another process saw no
+coordinator and no lock, so it could not tell that the request was still in flight.
+
+Correction (`src/coordinator/lifecycle-launch.ts`, used by `lifecycle-start.ts` and `lifecycle-stop.ts`): `start` writes
+`<state>/lifecycle/launch-attempt.json` (mode `0600`, atomic) under the operation lock after the last chance to abandon
+the launch and before the native start is issued; if it cannot be written, no start is requested. The record is
+`dispatching` until the manager answers the request, then `requested`. It is removed when a start was not needed, was
+refused before dispatch or definitively failed, and when an observation correlates it with the service: the
+authenticated instance running as the owned registration's main process, or the service proven inactive with the
+request accepted (`requested`) or, for systemd, `systemctl --user show -p Job` reporting no queued job. A start
+tool that was ended by its timeout keeps the record `dispatching`. `stop` with no answering coordinator reads the
+record after inspecting ownership and, while it is unresolved, returns `completion-unknown` (`completion-unknown`)
+without a stopped claim and without any native stop, kill or removal. An unreadable record is `state-unknown`. An
+explicit `start` replaces an unresolved record. No flag, result field or error code was added.
+
+Regression file: `test/coordinator-lifecycle-launch-uncertainty.test.mjs` (10 cases, both managers). With the start
+held on the gate: the invoking CLI is killed with `SIGKILL`; a separate-process `stop` (twice) does not report
+`stopped` or `already-stopped`, the record stays unchanged, the synthetic tool saw no violation and no signal; the gate
+is released, the coordinator launches, `stop` reports `stopped` and the record is gone; a later `stop` reports
+`already-stopped` and a later explicit `start` reaches `ready`. Also: the invoking CLI timing out while alive
+(`startup-not-confirmed`, a `stop` meanwhile is not a stopped claim, then `stopped`); systemd resolving by absence only
+after the queued job ended; launchd staying unresolved after a failed `kickstart` until a `start` is run; and controls
+for a coordinator that never ran (`not-managed`, as before) and for a start the tool refused (no record left).
+
+| Run | Command | Result |
+| --- | --- | --- |
+| Baseline `0651d81` (disposable worktree, tests and fixtures copied in unchanged) | `node --test test/coordinator-lifecycle-launch-uncertainty.test.mjs` | 10 tests, 4 pass (controls), 6 fail: in the process-death cases the separate-process `stop` answered `failed` / `not-managed` ("nothing to stop") instead of `completion-unknown`; in the other cases no launch attempt record existed |
+| Fixed code | same command | 10 tests, 10 pass |
+
+Other checks on the fixed code (macOS host, Node v22.22.3): `npm run check` exit 0; `npm run build:extension` exit 0;
+`node --test --test-concurrency=1 test/*.test.mjs`: 1350 tests, 1350 pass. Under the default parallel `npm test` an
+unrelated test failed in some runs (different tests each time, including runs that excluded the new file, and one
+of three runs on the unmodified `HEAD`: for example "Invalid coordinator access key" while reading a token, a drain
+record `requested` instead of `drain-failed`); each passed when run alone and in the serial run. They are not
+attributed to this change and are unresolved.
+
 ## Historical evidence at `3bfdc76`
 
 The remaining sections record the earlier run. They describe code at `3bfdc76` and are not repeated for the
@@ -518,9 +564,10 @@ entry existed in the user's domain. All commands ran with an isolated `HOME` and
   credential test file on macOS. Native service-manager checks used Node.js 22.
 - The Node.js 26 diagnosis is established for the failure mode (handlers installed after the readiness line). A
   flush or `process.exit` problem was not demonstrated and is not claimed.
-- Stop-ordering protection for a start whose native call was already issued in another process relies on the
-  operation lock held by that process; no durable cross-process launch record exists. Real launchd and systemd
-  behavior for these races was not exercised.
+- A start whose native call was already issued survives the death of its process only through the private launch
+  attempt record (see "Launch attempts survive the invoking process"). Real launchd and systemd behavior for these
+  races was not exercised, and launchd cannot report a queued start request, so an issued `kickstart` that never
+  produced the coordinator stays unresolved until a `start` is run again.
 - The post-deadline shutdown-request defect and the failing-install variant of the abandoned-start defect did not
   reproduce as runtime failures; they are covered by invariant tests only.
 - Windows is unsupported and was not exercised.

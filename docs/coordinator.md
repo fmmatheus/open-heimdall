@@ -308,6 +308,18 @@ Other starts:
   overlaps it. A start that was already requested from the service manager stays
   `startup-not-confirmed`: Heimdall does not undo it, and `stop` does not report
   `stopped` or `already-stopped` for the target until that call has settled.
+- Before it asks the service manager to start, `start` records the launch attempt in a
+  private file (`launch-attempt.json`, mode `0600`) in the `lifecycle` state directory.
+  The record outlives the command that wrote it and the operation lock, so a `stop`
+  run from another process after the first command was killed or timed out still
+  treats the request as possibly in flight: it reports `completion-unknown` and does
+  not report `stopped` or `already-stopped`. It sends no stop, kill or removal. The
+  record is cleared when the authenticated coordinator instance runs as the owned
+  service's main process, or when the service is proven inactive and nothing of the
+  request can still be queued (the manager accepted it, or systemd reports no queued
+  start job). launchd cannot report a queued request, so a `kickstart` whose command
+  ended before it finished stays unresolved until the coordinator appears or `start`
+  is run again, which replaces the record.
 - A foreign service registration, a mismatched target, a changed credential or data
   directory selection, or an endpoint that cannot be verified is a `conflict`.
   Heimdall does not remove a socket, take over a registration or signal a process.

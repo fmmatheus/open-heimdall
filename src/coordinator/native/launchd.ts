@@ -442,7 +442,7 @@ export function createLaunchdAdapter(options: LaunchdAdapterOptions): NativeServ
     if (inspection.running === true) return { outcome: 'already-running', conflicts: [], detail: `${label} is already running; no start was requested` };
     // Never `-k`: a start request must not terminate an existing instance.
     const kickstart = await runner.run(launchctl, ['kickstart', target]);
-    if (kickstart.error || kickstart.exitCode !== 0) return { outcome: 'failed', conflicts: [], detail: `launchctl kickstart failed: ${clip(kickstart.error ?? `${kickstart.stderr} ${kickstart.stdout}`)}` };
+    if (kickstart.error || kickstart.exitCode !== 0) return { outcome: 'failed', conflicts: [], detail: `launchctl kickstart failed: ${clip(kickstart.error ?? `${kickstart.stderr} ${kickstart.stdout}`)}`, ...(kickstart.timedOut ? { unresolved: true } : {}) };
     return { outcome: 'started', conflicts: [], detail: `${label} start requested; readiness is not yet confirmed` };
   }
 

@@ -6,6 +6,7 @@ import type { CoordinatorLifecycle, ShutdownAcknowledgement, ShutdownRecord } fr
 import { resolveLaunchContext, selectConfigurationFile } from './launch-context.js';
 import type { ConfigurationSelection, LaunchContext } from './launch-context.js';
 import { acquireOperationLock, advanceStopGeneration } from './lifecycle-lock.js';
+import { assessLaunchAttempt, clearLaunchAttempt, unresolvedLaunchMessage } from './lifecycle-launch.js';
 import type { ParsedLifecycleArguments } from './lifecycle-arguments.js';
 import { createLifecycleResult, sanitizeResultText } from './lifecycle-result.js';
 import type { LifecycleErrorCode, LifecycleResult, LifecycleResultInput, LifecycleTarget, ObservedInstance } from './lifecycle-result.js';
@@ -143,6 +144,8 @@ export async function runCoordinatorStop(args: ParsedLifecycleArguments, deps: L
       if (prepared) return prepared;
       const verified = await verifyOwned(lifecycle, instance);
       if (verified) return verified;
+      // Owned registration plus the authenticated instance's own process: a start attempt recorded earlier has landed.
+      await clearLaunchAttempt(configuration.stateDirectory).catch(() => undefined);
 
       progress(`Requesting a graceful drain of coordinator instance ${lifecycle.instanceId}.`);
       // Ownership can change between the inspection above and the action: look again immediately before the request.
@@ -442,6 +445,12 @@ export async function runCoordinatorStop(args: ParsedLifecycleArguments, deps: L
       if (inspection.running === 'unknown' || inspection.registration === 'unknown') {
         return unknown(`The service manager state of ${target!.label} could not be determined (${inspection.detail}), so absence of the coordinator is not established.`, 'state-unknown');
       }
+      // A start request recorded by an earlier command may still be in flight, whichever process issued it and
+      // whether or not that process is alive. Until an observation resolves it, nothing is claimed stopped.
+      let launch;
+      try { launch = await assessLaunchAttempt(configuration.stateDirectory, adapter!, ownership); }
+      catch (error) { return unknown(`The record of an earlier start request cannot be used (${errorText(error)}), so absence of the coordinator is not established. Nothing was changed.`, 'state-unknown'); }
+      if (launch.kind === 'unresolved') return unknown(unresolvedLaunchMessage(launch.attempt, launch.reason, 'whether the coordinator is stopped'));
       let record;
       try { record = await readInstanceRecord(configuration.stateDirectory); }
       catch (error) {
