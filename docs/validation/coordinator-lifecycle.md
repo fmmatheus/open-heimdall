@@ -195,6 +195,74 @@ Other checks on the fixed code:
 Scope of the evidence: automated tests against the controlled native runner on a macOS host. No real launchd or
 systemd service was involved.
 
+### systemd ownership: the expected user-unit link must resolve to the owned definition
+
+Evidence label: **controlled-runner** (mocked manager). The production systemd adapter, the unit definitions, the
+public lifecycle commands, the coordinator process and the state files are real; `systemctl --user` is a stateful
+stand-in. Upstream behavior is cited from the systemd v255 sources (link handling in `unit-file.c`, fragment storage
+in `load-fragment.c`, the exported property in `dbus-unit.c`): a unit linked from outside the search paths keeps the
+link source as its `FragmentPath`. The reported fragment can therefore be the expected link. **Real-manager check:
+pending.** The foreign-link refusal has not been run under a real systemd user manager; that check belongs to the
+later real-native task, and the actual `FragmentPath` is not recorded here.
+
+Defect: `ownsFragment` accepted a reported fragment equal to the expected link path (`$XDG_CONFIG_HOME/systemd/user/<unit>`)
+without resolving it. With a valid owned definition kept under the state directory, the expected link pointing at a
+different complete unit, the manager reporting the link as the fragment, and the authenticated instance and process id
+matching, `start` reported `already-running` and `stop` sent the shutdown request.
+
+Correction (`src/coordinator/native/systemd.ts`): the reported fragment, the expected link and the definition path are
+all resolved with `realpath`, and ownership requires equality with the resolved owned definition (a missing, looping,
+unreadable, dangling or foreign target is not ownership). The definition itself must still pass the existing
+no-follow read and shape validation. Rechecks: `start` resolves the fragment and validates the definition again
+immediately before the start request; the in-place refresh of an inactive unit resolves it before the rewrite and
+again before the reload; a first install refuses to run `systemctl link` over an unowned link that already occupies
+the expected path; `unloadInactive` resolves the link immediately before unlinking. The lifecycle layer already
+inspects ownership twice before a shutdown request (`stop`) and once more on every readiness pass (`start`), so those
+paths pick the corrected check up. Canonical aliases and links that resolve to the owned definition (any number of
+hops) remain owned, and the macOS launchd adapter is unchanged. The remaining window between the final resolution and
+the manager acting on the unit cannot be closed from the client side.
+
+Review of every `ownsFragment` call site: `registrationOwnership` (feeds `inspectOwnership`, used by the start
+readiness loop, the already-running adoption, and both `stop` checks) now resolves; `install` (loaded: refuse unless
+resolved, resolved again before rewrite and reload; not loaded: pre-check of an occupying link before `systemctl
+link`); `start` (resolved plus definition validation, repeated before the request); `unloadInactive` (resolved, then
+the link itself resolved again before `unlink`). `cleanupFixture` goes through `unloadInactive`.
+
+Regression file: `test/coordinator-systemd-link-ownership.test.mjs` (43 cases) with a small runner extension in
+`test/fixtures/controlled-native-runner.mjs` (`observe`, which records on `start`, `link` and `daemon-reload` where the
+unit's link resolved when the manager began the call). A complete foreign unit, a missing target, a link loop and a
+two-hop link ending at the foreign unit are each placed at the expected link path while the manager reports the link as
+the fragment with the coordinator's own process id. For each: an existing managed `start` (conflict, not
+`already-running`), `stop` and `stop --no-wait` (conflict, no shutdown request: no shutdown record, lifecycle phase
+still `running`, process alive), a new start whose link changes after the service started (never `ready`), start of an
+inactive unit, a refresh of a changed credential (the owned definition is not rewritten, no `daemon-reload`), and
+`unloadInactive` (link kept). Also: an unreadable target, a first start over an occupying foreign link, and a link
+swapped after the manager's inspection for start, both stop ownership checks, the new-start launch, a refresh and
+`unloadInactive`. Controls: the normal owned file and legitimate link (start adopts, stop drains), links reaching the
+owned definition through 1, 2 and 3 extra hops, a stopped owned unit starting again, `unloadInactive` of an owned
+link, and a link restored after a refusal. The refusal cases assert that the runner recorded no forbidden verb and
+that no `start`, `link` or `daemon-reload` ran after the command began.
+
+| Run | Command | Result |
+| --- | --- | --- |
+| Baseline `0651d81` | `node --test test/coordinator-systemd-link-ownership.test.mjs` | 43 tests, 11 pass, 32 fail (every foreign, dangling, looping and swapped-link case; all controls and the `unloadInactive` cases, which already checked the link, pass) |
+| Fixed code | same command | 43 tests, 43 pass |
+
+Decisive baseline assertions: with the link on the foreign unit, `start` exited 0 with `already-running` and `stop`
+exited 0 with `stopped` (a shutdown request was sent to a coordinator owned by a different definition).
+
+Other checks on the fixed code (macOS host, Node v22.22.3, npm 10.9.8):
+
+| Command | Result |
+| --- | --- |
+| `test/coordinator-lifecycle-ownership.test.mjs` | 51 tests, 51 pass |
+| `test/coordinator-native-systemd.test.mjs`, `test/coordinator-native-launchd.test.mjs` | 25 and 28 tests, all pass |
+| `test/coordinator-lifecycle-ordering.test.mjs` | 21 tests, 21 pass |
+| `test/coordinator-lifecycle-refresh.test.mjs` | 16 tests, 16 pass on repeated runs; one earlier run reported a single failure that was not captured and did not reproduce in nine later runs (alone, in parallel and inside `npm test`) |
+| `npm run check` | exit 0 |
+| `npm test` | exit 0; 1340 tests, 1340 pass, 0 fail, 0 skipped |
+| `npm run build:extension` | exit 0 |
+
 ## Historical evidence at `3bfdc76`
 
 The remaining sections record the earlier run. They describe code at `3bfdc76` and are not repeated for the
