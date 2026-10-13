@@ -4,7 +4,7 @@ import { MANAGER_LABEL_VARIABLE } from '../launch-context.js';
 import type { LaunchContext } from '../launch-context.js';
 import { ensurePrivateDirectory, prepareLogFile, readPrivateText, validatePrivateDirectory, writePrivateFile } from './private-files.js';
 import { createExecFileRunner, nativeServiceNames } from './types.js';
-import type { CleanupResult, CommandRunner, InstallResult, NativeServiceAdapter, RememberedContext, ServiceConflict, ServiceIdentity, ServiceInspection, StartResult } from './types.js';
+import type { CleanupResult, CommandRunner, InstallResult, NativeServiceAdapter, RegistrationOwnership, RememberedContext, ServiceConflict, ServiceIdentity, ServiceInspection, StartResult } from './types.js';
 
 export const LAUNCHCTL = '/bin/launchctl';
 const DEFINITION_DIRECTORY = 'service';
@@ -274,6 +274,25 @@ export function createLaunchdAdapter(options: LaunchdAdapterOptions): NativeServ
     `A service definition exists at ${paths.definition} but ${reason}.`,
     'Inspect or move that file yourself; Heimdall will not overwrite or load it.');
 
+  /** The reported definition path is ours when it is the owned definition or resolves to that same file. */
+  async function ownsRegistration(registered: string | null): Promise<boolean> {
+    if (!registered) return false;
+    if (registered === paths.definition) return true;
+    const [real, owned] = await Promise.all([fs.realpath(registered).catch(() => undefined), fs.realpath(paths.definition).catch(() => undefined)]);
+    return real !== undefined && real === owned;
+  }
+
+  async function registrationOwnership(inspection: ServiceInspection): Promise<RegistrationOwnership> {
+    if (inspection.registration !== 'loaded') return { kind: 'refused', code: 'state-unknown', reason: `${label} is not a loaded registration (${inspection.detail})` };
+    if (!await ownsRegistration(inspection.registeredPath)) {
+      return { kind: 'refused', code: 'registered-elsewhere', reason: `${label} is loaded from ${inspection.registeredPath ?? 'an unreported path'}, not from ${paths.definition}` };
+    }
+    const existing = await existingDefinition();
+    if (existing.kind === 'foreign') return { kind: 'refused', code: 'foreign-definition', reason: `its definition ${paths.definition} ${existing.reason}` };
+    if (existing.kind === 'absent') return { kind: 'refused', code: 'registered-elsewhere', reason: `${label} is loaded but its definition file ${paths.definition} is missing` };
+    return { kind: 'owned' };
+  }
+
   async function writeAndRegister(existing: Exclude<Existing, { kind: 'foreign' }>, inspection: ServiceInspection): Promise<InstallResult> {
     try {
       await ensurePrivateDirectory(stateDirectory, 'Coordinator state directory', { recursive: true });
@@ -391,5 +410,5 @@ export function createLaunchdAdapter(options: LaunchdAdapterOptions): NativeServ
 
   const logLocation = () => `Standard output: ${paths.standardOut}; standard error: ${paths.standardError}`;
 
-  return { identity, render: () => desiredText, remembered, logLocation, inspect, install, start, unloadInactive, cleanupFixture };
+  return { identity, render: () => desiredText, remembered, logLocation, inspect, registrationOwnership, install, start, unloadInactive, cleanupFixture };
 }

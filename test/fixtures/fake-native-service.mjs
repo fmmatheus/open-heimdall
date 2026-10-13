@@ -56,6 +56,12 @@ export class FakeServiceManager {
           registeredPath: manager.definition ? definitionPath : null, detail: running ? 'fake service running' : 'fake service not running',
         };
       },
+      async registrationOwnership(inspection) {
+        if (inspection.registration !== 'loaded') return { kind: 'refused', code: 'state-unknown', reason: 'the fake service is not loaded' };
+        if (inspection.registeredPath !== definitionPath) return { kind: 'refused', code: 'registered-elsewhere', reason: `the fake service is registered from ${inspection.registeredPath ?? 'an unreported path'}` };
+        if (manager.foreign) return { kind: 'refused', code: 'foreign-definition', reason: manager.foreign };
+        return { kind: 'owned' };
+      },
       async install() {
         record('install');
         if (manager.installFailure) return manager.installFailure;

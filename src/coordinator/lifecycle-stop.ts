@@ -13,7 +13,7 @@ import type { LifecycleErrorCode, LifecycleResult, LifecycleResultInput, Lifecyc
 import { bounded, errorText, observed, probeEndpoint, problem } from './lifecycle-start.js';
 import type { LifecycleDependencies, Probe } from './lifecycle-start.js';
 import { selectNativeManager } from './native/platform.js';
-import { nativeServiceNames } from './native/types.js';
+import { confirmOwnedProcess, inspectOwnership, nativeServiceNames } from './native/types.js';
 import type { NativeServiceAdapter, ServiceInspection } from './native/types.js';
 import { probeCoordinatorOwnership } from './ownership.js';
 import { parseCoordinatorStatus } from './status.js';
@@ -144,9 +144,12 @@ export async function runCoordinatorStop(args: ParsedLifecycleArguments, deps: L
       const verified = await verifyOwned(lifecycle, instance);
       if (verified) return verified;
 
+      progress(`Requesting a graceful drain of coordinator instance ${lifecycle.instanceId}.`);
+      // Ownership can change between the inspection above and the action: look again immediately before the request.
+      const rechecked = await verifyOwned(lifecycle, instance);
+      if (rechecked) return rechecked;
       const milliseconds = Math.max(1, Math.floor(Math.min(remaining(), deps.requestTimeoutMs)));
       const client = createCoordinatorClient(configuration.endpoint, key!, { timeoutMs: milliseconds, deadlineMs: milliseconds });
-      progress(`Requesting a graceful drain of coordinator instance ${lifecycle.instanceId}.`);
       const sent = await bounded(requestCoordinatorShutdown(client, lifecycle.instanceId), deps, deadlineAt).catch((error: unknown) => ({ kind: 'error' as const, error }));
       if (sent.kind === 'aborted') {
         const message = 'Interrupted while sending the drain request; it may or may not have been accepted. Nothing was stopped, killed or restarted.';
@@ -169,7 +172,11 @@ export async function runCoordinatorStop(args: ParsedLifecycleArguments, deps: L
       return await acknowledged(lifecycle, sent.value);
     }
 
-    /** Nothing is requested unless the answering process is the loaded, owned service with the same process id. */
+    /**
+     * Nothing is requested unless positive evidence ties the answering process to the owned service: the loaded
+     * registration resolves to the owned definition and its running main process has the answering instance's process id.
+     * The ownership of the service that started the process is what counts, not the newly invoked command's launch context.
+     */
     async function verifyOwned(lifecycle: CoordinatorLifecycle, instance: ObservedInstance): Promise<LifecycleResult | undefined> {
       const inspected = await inspectService();
       if (inspected.kind === 'aborted') return failed('interrupted', 'Interrupted before any drain was requested. Nothing was changed.', { instance });
@@ -177,25 +184,22 @@ export async function runCoordinatorStop(args: ParsedLifecycleArguments, deps: L
         const message = `The service manager could not confirm the running coordinator (${inspected.kind === 'error' ? errorText(inspected.error) : inspected.kind}), so nothing was requested.`;
         return finish({ outcome: 'conflict', message, error: { code: 'state-unknown', message }, instance, logs: logsHint() });
       }
-      const inspection = inspected.value;
-      if (inspection.registration === 'unknown' || inspection.running === 'unknown') {
-        const message = `The service manager state of ${target!.label} could not be determined (${inspection.detail}), so nothing was requested.`;
+      const confirmed = confirmOwnedProcess(inspected.value, lifecycle.pid, target!.label!);
+      if (confirmed.kind === 'process') return undefined;
+      if (confirmed.code === 'state-unknown') {
+        const message = `The service manager state of ${target!.label} could not be confirmed (${confirmed.reason}), so nothing was requested.`;
         return finish({ outcome: 'conflict', message, error: { code: 'state-unknown', message }, instance, logs: logsHint() });
       }
-      if (inspection.registration !== 'loaded' || inspection.running !== true || (inspection.pid !== null && inspection.pid !== lifecycle.pid)) {
-        const message = `A coordinator answered as a managed instance (process ${lifecycle.pid}), but ${target!.label} is ${inspection.running === true ? `running process ${inspection.pid}` : 'not running'}. Nothing was requested.`;
-        return finish({ outcome: 'conflict', message, error: { code: 'registered-elsewhere', message }, instance, logs: logsHint() });
-      }
-      const remembered = await adapter!.remembered().catch((error: unknown) => ({ kind: 'foreign' as const, reason: errorText(error) }));
-      if (remembered.kind !== 'owned') {
-        const message = `The running managed coordinator has no service definition owned by Heimdall${remembered.kind === 'foreign' ? ` (${remembered.reason})` : ''}. Nothing was requested.`;
+      if (confirmed.code === 'foreign-definition') {
+        const message = `The running managed coordinator has no service definition owned by Heimdall (${confirmed.reason}). Nothing was requested.`;
         return finish({ outcome: 'conflict', message, error: { code: 'foreign-definition', message }, instance });
       }
-      return undefined;
+      const message = `A coordinator answered as a managed instance (process ${lifecycle.pid}), but ${confirmed.reason}. Nothing was requested.`;
+      return finish({ outcome: 'conflict', message, error: { code: 'registered-elsewhere', message }, instance, logs: logsHint() });
     }
 
     function inspectService() {
-      return bounded(adapter!.inspect(), deps, deadlineAt).catch((error: unknown) => ({ kind: 'error' as const, error }));
+      return bounded(inspectOwnership(adapter!), deps, deadlineAt).catch((error: unknown) => ({ kind: 'error' as const, error }));
     }
 
     function requestFailure(error: unknown, instance: ObservedInstance): { kind: 'result'; result: LifecycleResult } | { kind: 'closing' } {
@@ -308,7 +312,14 @@ export async function runCoordinatorStop(args: ParsedLifecycleArguments, deps: L
       const inspected = await inspectService();
       if (inspected.kind === 'aborted') return { kind: 'pending', observation: 'Interrupted.' };
       if (inspected.kind !== 'value') return { kind: 'pending', observation: `The service manager state could not be read${inspected.kind === 'error' ? ` (${errorText(inspected.error)})` : ''}.` };
-      const inspection = inspected.value;
+      const ownership = inspected.value;
+      const inspection = ownership.inspection;
+      // Exit evidence only counts when it comes from the owned registration, not from whatever else is now registered.
+      if (ownership.kind === 'refused') {
+        if (ownership.code === 'state-unknown') return { kind: 'pending', observation: `The service registration could not be confirmed as owned (${ownership.reason}).` };
+        const message = `The service ${target!.label} is no longer confirmed as the owned registration of instance ${expected.instanceId} (${ownership.reason}); its completion cannot be confirmed. Nothing was stopped, killed or restarted.`;
+        return { kind: 'final', result: finish({ outcome: 'completion-unknown', message, error: { code: ownership.code, message }, logs: logsHint() }) };
+      }
       if (inspection.running === true) {
         if (inspection.pid !== null && inspection.pid !== expected.pid) {
           const message = `The service now runs process ${inspection.pid}, not instance ${expected.instanceId} (process ${expected.pid}); its completion cannot be confirmed. Nothing was stopped, killed or restarted.`;
@@ -383,7 +394,12 @@ export async function runCoordinatorStop(args: ParsedLifecycleArguments, deps: L
       const unknown = (message: string, code: LifecycleErrorCode = 'completion-unknown') =>
         finish({ outcome: 'completion-unknown', message, error: { code, message }, logs: logsHint() });
       if (inspected.kind !== 'value') return unknown(`The service manager state could not be read (${inspected.kind === 'error' ? errorText(inspected.error) : inspected.kind}), so absence of the coordinator is not established.`, 'state-unknown');
-      const inspection = inspected.value;
+      const ownership = inspected.value;
+      const inspection = ownership.inspection;
+      if (ownership.kind === 'refused' && ownership.code !== 'state-unknown') {
+        const message = `No coordinator answers at ${configuration.endpoint}, but ${target!.label} is not confirmed as the owned registration (${ownership.reason}). Nothing was requested.`;
+        return finish({ outcome: 'conflict', message, error: { code: ownership.code, message }, logs: logsHint() });
+      }
       if (inspection.running === true) {
         return unknown(`No coordinator answers at ${configuration.endpoint}, but the service manager reports ${target!.label} running${inspection.pid === null ? '' : ` as process ${inspection.pid}`}; it may be starting or closing. Nothing was requested.`, 'endpoint-unreachable');
       }

@@ -12,8 +12,8 @@ import { acquireOperationLock, readStopGeneration } from './lifecycle-lock.js';
 import type { ParsedLifecycleArguments } from './lifecycle-arguments.js';
 import { createLifecycleResult, sanitizeResultText } from './lifecycle-result.js';
 import type { LifecycleErrorCode, LifecycleResult, LifecycleResultInput, LifecycleTarget, ObservedInstance } from './lifecycle-result.js';
-import { launchNativeService, nativeServiceNames } from './native/types.js';
-import type { NativeServiceAdapter, ServiceConflict } from './native/types.js';
+import { confirmOwnedProcess, inspectOwnership, launchNativeService, nativeServiceNames } from './native/types.js';
+import type { NativeOwnership, NativeServiceAdapter, ServiceConflict } from './native/types.js';
 import { selectNativeAdapter, selectNativeManager } from './native/platform.js';
 import type { NativeAdapterSelection } from './native/platform.js';
 import { parseCoordinatorStatus } from './status.js';
@@ -289,19 +289,22 @@ export async function runCoordinatorStart(args: ParsedLifecycleArguments, deps: 
         progress(`Waiting up to ${args.timeoutSeconds} seconds for the coordinator to become ready.`);
         let observation = 'No coordinator has answered yet.';
         let absentChecks = 0;
-        let managerPid: number | null = null;
+        let ownership: NativeOwnership | null = null;
         while (true) {
           if (deps.signal?.aborted) {
             return finish({ outcome: 'startup-not-confirmed', message: `Interrupted while waiting. The service was started and keeps running or starting; it was not stopped. ${observation}`, error: { code: 'interrupted', message: 'Interrupted while waiting for readiness' }, logs: logsHint() });
           }
           if (deadlineAt - deps.now() <= 0) break;
-          const inspected = await bounded(adapter!.inspect(), deps, deadlineAt).catch(() => ({ kind: 'timeout' as const }));
+          // Each pass starts without evidence: an unreadable manager state never carries over as ownership.
+          ownership = null;
+          const inspected = await bounded(inspectOwnership(adapter!), deps, deadlineAt).catch(() => ({ kind: 'timeout' as const }));
           if (inspected.kind === 'value') {
-            managerPid = inspected.value.pid;
-            absentChecks = inspected.value.running === false ? absentChecks + 1 : 0;
+            ownership = inspected.value;
+            const inspection = ownership.inspection;
+            absentChecks = inspection.running === false ? absentChecks + 1 : 0;
             if (absentChecks >= 3) {
-              const status = inspected.value.lastExitStatus === null ? '' : ` (last exit status ${inspected.value.lastExitStatus})`;
-              const message = `The service exited before the coordinator became ready${status}. Nothing was changed after the exit. ${inspected.value.detail}`;
+              const status = inspection.lastExitStatus === null ? '' : ` (last exit status ${inspection.lastExitStatus})`;
+              const message = `The service exited before the coordinator became ready${status}. Nothing was changed after the exit. ${inspection.detail}`;
               return finish({ outcome: 'startup-not-confirmed', message, error: { code: 'service-exited', message }, logs: logsHint() });
             }
           }
@@ -318,10 +321,19 @@ export async function runCoordinatorStart(args: ParsedLifecycleArguments, deps: 
               return finish({ outcome: 'conflict', message, error: { code: 'target-mismatch', message }, instance: observed(lifecycle), logs: logsHint() });
             }
             if (lifecycle.phase !== 'running') return shutdownInProgress(lifecycle);
-            if (managerPid !== null && lifecycle.pid !== managerPid) observation = `An instance answered with process ${lifecycle.pid}, but the service manager reports process ${managerPid}.`;
-            else if (answer.status?.status === 'running' && answer.status.acceptingNewRuns) {
-              return finish({ outcome: 'ready', message: 'Coordinator started and ready. Readiness confirms coordinator IPC only; it does not check OpenCode connectivity, credentials or quota.', instance: observed(lifecycle) });
-            } else observation = 'The coordinator answered but is not yet running and accepting runs.';
+            // Readiness needs the answering instance to be the owned service's own main process. An answering
+            // endpoint with no manager evidence, or evidence that is unknown or points elsewhere, is not ready.
+            if (ownership === null) observation = 'The coordinator answered, but the service manager state could not be read, so the answering instance is not confirmed to be the started service.';
+            else if (ownership.kind === 'refused' && ownership.code !== 'state-unknown') {
+              const message = `The coordinator answered, but the service manager does not confirm it as the started service: ${ownership.reason}. Heimdall changed nothing. The launch was requested and may still start.`;
+              return finish({ outcome: 'conflict', message, error: { code: ownership.code, message }, instance: observed(lifecycle), logs: logsHint() });
+            } else {
+              const confirmed = confirmOwnedProcess(ownership, lifecycle.pid, label!);
+              if (confirmed.kind === 'refused') observation = `The coordinator answered with process ${lifecycle.pid}, but it is not confirmed as the started service: ${confirmed.reason}.`;
+              else if (answer.status?.status === 'running' && answer.status.acceptingNewRuns) {
+                return finish({ outcome: 'ready', message: 'Coordinator started and ready. Readiness confirms coordinator IPC only; it does not check OpenCode connectivity, credentials or quota.', instance: observed(lifecycle) });
+              } else observation = 'The coordinator answered but is not yet running and accepting runs.';
+            }
           }
           await deps.sleep(Math.max(1, Math.min(deps.pollIntervalMs, deadlineAt - deps.now())), deps.signal);
         }
@@ -371,15 +383,19 @@ export async function runCoordinatorStart(args: ParsedLifecycleArguments, deps: 
       if (!selected.supported) return failed('unsupported-platform', selected.message, { instance: observed(lifecycle) });
       const adapter = selected.adapter;
       const instance = observed(lifecycle);
-      const inspected = await bounded(adapter.inspect(), deps, deadlineAt).catch((error: unknown) => ({ kind: 'error' as const, error }));
+      // An answering endpoint, a disk definition or a process id alone never establishes ownership: the loaded
+      // registration must resolve to the owned definition and run exactly this instance's process.
+      const inspected = await bounded(inspectOwnership(adapter), deps, deadlineAt).catch((error: unknown) => ({ kind: 'error' as const, error }));
       if (inspected.kind !== 'value') {
         const message = `The service manager could not confirm the running coordinator: ${inspected.kind === 'error' ? errorText(inspected.error) : inspected.kind}. It was left unchanged.`;
         return finish({ outcome: 'conflict', message, error: { code: 'state-unknown', message }, instance });
       }
-      const inspection = inspected.value;
-      if (inspection.registration !== 'loaded' || inspection.running !== true || (inspection.pid !== null && inspection.pid !== lifecycle.pid)) {
-        const message = `A coordinator answered as a managed instance, but ${label} is ${inspection.running === true ? `running process ${inspection.pid}, not ${lifecycle.pid}` : 'not confirmed running'}. It was left unchanged.`;
-        return finish({ outcome: 'conflict', message, error: { code: 'registered-elsewhere', message }, instance });
+      const confirmed = confirmOwnedProcess(inspected.value, lifecycle.pid, label!);
+      if (confirmed.kind === 'refused') {
+        const message = confirmed.code === 'foreign-definition'
+          ? `The running managed coordinator has no definition owned by Heimdall (${confirmed.reason}). It was left unchanged.`
+          : `A coordinator answered as a managed instance, but ${confirmed.reason}. It was left unchanged.`;
+        return finish({ outcome: 'conflict', message, error: { code: confirmed.code, message }, instance });
       }
       const remembered = await adapter.remembered().catch((error: unknown) => ({ kind: 'foreign' as const, reason: errorText(error) }));
       if (remembered.kind !== 'owned') {
