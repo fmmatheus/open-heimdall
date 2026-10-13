@@ -7,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { createCoordinatorClient } from '../../dist/coordinator/client.js';
+import { lifecycleCommandMain } from '../../dist/coordinator/lifecycle-cli.js';
 import { resolveLaunchContext } from '../../dist/coordinator/launch-context.js';
 import { COORDINATOR_LIFECYCLE_PROTOCOL } from '../../dist/coordinator/lifecycle.js';
 import { selectNativeAdapter } from '../../dist/coordinator/native/platform.js';
@@ -36,6 +37,11 @@ import { readCoordinatorToken } from '../../dist/coordinator/token.js';
  * What this suite establishes is native-manager behavior of the coordinator lifecycle with an empty state. The
  * delayed-drain behavior with a held run is established by coordinator tests with a synthetic executor
  * (test/coordinator-stop-logs.test.mjs) and the fake service manager there is adapter/CLI evidence only.
+ *
+ * The second suite, "native delayed drain", is protocol-fixture evidence: the real launchd runs the production
+ * coordinator through test/fixtures/delayed-drain-entry.mjs, which injects a delay into the shutdown. It shows that
+ * the production `stop --timeout` command ends within its deadline without a success while the real service keeps
+ * draining, and that a later stop reports the clean stop. It does not involve a native run.
  */
 
 const enabled = process.env.HEIMDALL_NATIVE_LIFECYCLE === '1';
@@ -388,4 +394,108 @@ describe('native coordinator lifecycle (launchd or systemd user manager)', () =>
   });
 
   test('previously queued work follows normal admission after startup', { skip: 'the managed service always runs the production executor; admission after a restart with a synthetic executor is covered by test/coordinator-service.test.mjs ("a run queued before the coordinator started ...")' }, () => {});
+});
+
+describe('native delayed drain (protocol fixture; launchd on macOS)', () => {
+  const fixture = {};
+  let cleaned = false;
+  const darwinOnly = skip || (process.platform === 'darwin' ? false : 'the delayed-drain fixture is checked against launchd on macOS only');
+  const delayed = (name, body) => test(name, { skip: darwinOnly, timeout: 180 * SECONDS }, body);
+
+  /** The production lifecycle command in this process, against the real launchd, with the delayed-drain service entry. */
+  async function lifecycle(command, args) {
+    let stdout = '';
+    const startedAt = Date.now();
+    const status = await lifecycleCommandMain(command, ['--json', '--coordinator-config', fixture.configuration, ...args], {
+      streams: { stdout: { write: text => { stdout += text; } }, stderr: { write: () => {} } },
+      dependencies: { environment: fixture.env, launchOverrides: { nodeExecutable: process.execPath, entryPoint: path.join(checkout, 'test', 'fixtures', 'delayed-drain-entry.mjs') } },
+    });
+    const document = JSON.parse(stdout);
+    assert.ok(!stdout.includes(SENTINEL), `${command} leaked the credential value`);
+    return { status, document, elapsed: Date.now() - startedAt };
+  }
+
+  before(async () => {
+    if (darwinOnly) return;
+    const root = await fs.realpath(await fs.mkdtemp(path.join(await fs.access('/tmp').then(() => '/tmp', () => os.tmpdir()), 'hn-')));
+    Object.assign(fixture, { root, home: path.join(root, 'home'), state: path.join(root, 'state'), configuration: path.join(root, 'coordinator.toml'), credentials: path.join(root, 'credentials.env') });
+    await Promise.all([fixture.home, path.join(root, 'openchamber')].map(directory => fs.mkdir(directory, { recursive: true, mode: 0o700 })));
+    await fs.writeFile(fixture.configuration, `[coordinator]\nstateDirectory = ${JSON.stringify(fixture.state)}\nglobalConcurrency = 1\nprojectConcurrency = 1\n`);
+    await fs.writeFile(fixture.credentials, `OPENCODE_PASSWORD=${SENTINEL}\n`, { mode: 0o600 });
+    await fs.chmod(fixture.credentials, 0o600);
+    fixture.env = {
+      PATH: process.env.PATH ?? '', HOME: fixture.home, TMPDIR: process.env.TMPDIR ?? os.tmpdir(), LANG: process.env.LANG ?? 'C.UTF-8',
+      XDG_STATE_HOME: path.join(fixture.home, '.local', 'state'), XDG_DATA_HOME: path.join(fixture.home, '.local', 'share'),
+      XDG_CACHE_HOME: path.join(fixture.home, '.cache'), XDG_CONFIG_HOME: path.join(fixture.home, '.config'),
+      OPENCHAMBER_DATA_DIR: path.join(root, 'openchamber'), GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1',
+    };
+    fixture.context = await resolveLaunchContext({ coordinatorConfig: fixture.configuration, envFile: fixture.credentials }, fixture.env);
+    const selection = selectNativeAdapter({ context: fixture.context, environment: fixture.env });
+    assert.ok(selection.supported, `no native manager for ${process.platform}: ${selection.message}`);
+    fixture.adapter = selection.adapter;
+    const inspection = await fixture.adapter.inspect();
+    assert.equal(inspection.registration, 'not-loaded', `${fixture.adapter.identity().label} is already registered: ${inspection.detail}`);
+  });
+
+  after(async () => {
+    if (darwinOnly || cleaned || !fixture.adapter) return;
+    cleaned = true;
+    let pending;
+    let inspection = await fixture.adapter.inspect();
+    if (inspection.running === true) {
+      await lifecycle('stop', ['--timeout', '90']).catch(() => undefined);
+      inspection = await fixture.adapter.inspect();
+    }
+    if (inspection.registration === 'not-loaded' && !await exists(fixture.adapter.identity().definitionPath)) pending = undefined;
+    else if (inspection.running === false) {
+      const result = await fixture.adapter.cleanupFixture();
+      if (result.outcome === 'refused') pending = result.detail;
+      else if ((await fixture.adapter.inspect()).registration === 'loaded') pending = `${fixture.adapter.identity().label} is still registered after cleanup`;
+    } else pending = `${fixture.adapter.identity().label} is not proven stopped (${inspection.detail})`;
+    if (pending) {
+      process.stderr.write(`native delayed-drain cleanup pending: ${pending}; fixture preserved in ${fixture.root}\n`);
+      throw new Error(`Cleanup pending: ${pending}. The fixture in ${fixture.root} was preserved and nothing was escalated.`);
+    }
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  });
+
+  delayed('a stop whose drain outlasts its deadline reports no success, leaves the service draining, and a later stop completes', async t => {
+    const started = await lifecycle('start', ['--timeout', '90', '--env-file', fixture.credentials]);
+    assert.equal(started.document.outcome, 'ready', JSON.stringify(started.document));
+    const instance = started.document.instance;
+
+    const hurried = await lifecycle('stop', ['--timeout', '1']);
+    t.diagnostic(`stop --timeout 1 ended after ${hurried.elapsed} ms with ${hurried.document.outcome} (exit ${hurried.status})`);
+    assert.ok(hurried.elapsed <= 1000 + 1500, `stop took ${hurried.elapsed} ms for a 1000 ms deadline`);
+    assert.notEqual(hurried.status, 0);
+    assert.equal(hurried.document.ok, false);
+    assert.notEqual(hurried.document.outcome, 'stopped');
+    assert.ok(['still-draining', 'completion-unknown'].includes(hurried.document.outcome), hurried.document.outcome);
+    assert.ok(['deadline-exceeded', 'completion-unknown'].includes(hurried.document.error.code), hurried.document.error.code);
+    t.diagnostic(`message: ${hurried.document.message}`);
+
+    // The deadline ended the command, not the service: the real manager still runs the same process, which keeps draining.
+    const inspection = await fixture.adapter.inspect();
+    assert.equal(inspection.running, true);
+    assert.equal(inspection.pid, instance.pid);
+    assert.ok(processAlive(instance.pid));
+    assert.equal(await probeCoordinatorOwnership(fixture.state), 'held');
+    const reported = await createCoordinatorClient(fixture.context.configuration.endpoint, await readCoordinatorToken(fixture.state), { timeoutMs: 3000, deadlineMs: 5000 }).request('GET', '/lifecycle').catch(() => null);
+    if (reported) {
+      assert.equal(reported.instanceId, instance.instanceId);
+      assert.notEqual(reported.phase, 'running', 'the accepted drain stays in effect');
+    }
+
+    // The accepted drain finishes on its own; the service manager then reports the process gone with a clean exit.
+    await waitFor('the delayed shutdown to finish', async () => (await fixture.adapter.inspect()).running === false, { timeoutMs: 60 * SECONDS });
+    const record = JSON.parse(await fs.readFile(path.join(fixture.state, 'lifecycle', `shutdown-${instance.instanceId}.json`), 'utf8'));
+    assert.equal(record.status, 'completed');
+    assert.equal((await fixture.adapter.inspect()).lastExitStatus, 0);
+    // A later stop reports the completed clean shutdown; it does not claim to have stopped anything itself.
+    const finished = await lifecycle('stop', ['--timeout', '90']);
+    assert.equal(finished.status, 0, JSON.stringify(finished.document));
+    assert.equal(finished.document.outcome, 'already-stopped');
+    await waitFor('the service process to be gone', () => !processAlive(instance.pid));
+    assert.equal(await probeCoordinatorOwnership(fixture.state), 'free');
+  });
 });

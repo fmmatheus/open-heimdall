@@ -3,14 +3,19 @@ import http from 'node:http';
 /**
  * HTTP/JSON uses a Unix socket or a Windows named pipe, never a public listener.
  * `timeoutMs` bounds socket inactivity; the optional `deadlineMs` bounds total elapsed time per request,
- * so a peer that keeps trickling bytes cannot hold a request open past it.
+ * so a peer that keeps trickling bytes cannot hold a request open past it. The optional `signal` ends a request
+ * early on interruption: the connection is closed and the request rejects with code `aborted`; a signal that is
+ * already aborted rejects before any connection is made. Aborting only ends the client's wait: whether the
+ * coordinator received the request is unknown to the caller.
  */
-export function createCoordinatorClient(endpoint: string, accessToken?: string, options: { timeoutMs?: number; deadlineMs?: number } = {}) {
+export function createCoordinatorClient(endpoint: string, accessToken?: string, options: { timeoutMs?: number; deadlineMs?: number; signal?: AbortSignal } = {}) {
   const timeoutMs = options.timeoutMs ?? 30000;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new Error('Coordinator timeout must be a positive integer');
   const deadlineMs = options.deadlineMs;
   if (deadlineMs !== undefined && (!Number.isSafeInteger(deadlineMs) || deadlineMs < 1)) throw new Error('Coordinator deadline must be a positive integer');
   if (!endpoint) throw new Error('A coordinator IPC endpoint is required');
+  const signal = options.signal;
+  const abortError = () => Object.assign(new Error('Coordinator request aborted'), { code: 'aborted' });
   return {
     async request(method: string, route: string, body?: unknown, ownerToken?: string): Promise<unknown> {
       if (!route.startsWith('/') || route.startsWith('//') || route.includes('#')) throw new Error('Invalid coordinator route');
@@ -18,9 +23,12 @@ export function createCoordinatorClient(endpoint: string, accessToken?: string, 
       if (!token) throw new Error('A coordinator access token is required');
       const payload = body === undefined ? undefined : JSON.stringify(body);
       return new Promise((resolve, reject) => {
+        if (signal?.aborted) { reject(abortError()); return; }
         let deadlineTimer: NodeJS.Timeout | undefined;
-        const succeed = (value: unknown) => { clearTimeout(deadlineTimer); resolve(value); };
-        const fail = (error: Error) => { clearTimeout(deadlineTimer); reject(error); };
+        const onAbort = () => { fail(abortError()); request.destroy(); };
+        const settle = () => { clearTimeout(deadlineTimer); signal?.removeEventListener('abort', onAbort); };
+        const succeed = (value: unknown) => { settle(); resolve(value); };
+        const fail = (error: Error) => { settle(); reject(error); };
         const request = http.request({
           socketPath: endpoint, method, path: route,
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, ...(payload === undefined ? {} : { 'Content-Length': Buffer.byteLength(payload) }) },
@@ -47,6 +55,7 @@ export function createCoordinatorClient(endpoint: string, accessToken?: string, 
         });
         request.setTimeout(timeoutMs, () => request.destroy(new Error('Coordinator request timed out')));
         request.on('error', error => fail(new Error(`Coordinator unavailable: ${error.message}`)));
+        signal?.addEventListener('abort', onAbort, { once: true });
         if (deadlineMs !== undefined) {
           // Reject directly: once headers have arrived, destroying the request may not emit a request 'error'.
           deadlineTimer = setTimeout(() => {

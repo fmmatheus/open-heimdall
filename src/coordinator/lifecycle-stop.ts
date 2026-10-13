@@ -1,7 +1,6 @@
 import fs from 'node:fs/promises';
 import { loadCoordinatorConfiguration } from './config.js';
 import type { CoordinatorConfiguration } from './config.js';
-import { createCoordinatorClient } from './client.js';
 import { readInstanceRecord, readShutdownRecord, requestCoordinatorShutdown } from './lifecycle.js';
 import type { CoordinatorLifecycle, ShutdownAcknowledgement, ShutdownRecord } from './lifecycle.js';
 import { resolveLaunchContext, selectConfigurationFile } from './launch-context.js';
@@ -10,13 +9,12 @@ import { acquireOperationLock, advanceStopGeneration } from './lifecycle-lock.js
 import type { ParsedLifecycleArguments } from './lifecycle-arguments.js';
 import { createLifecycleResult, sanitizeResultText } from './lifecycle-result.js';
 import type { LifecycleErrorCode, LifecycleResult, LifecycleResultInput, LifecycleTarget, ObservedInstance } from './lifecycle-result.js';
-import { bounded, errorText, observed, probeEndpoint, problem } from './lifecycle-start.js';
+import { bounded, errorText, observed, probeEndpoint, problem, requestBudget } from './lifecycle-start.js';
 import type { LifecycleDependencies, Probe } from './lifecycle-start.js';
 import { selectNativeManager } from './native/platform.js';
 import { confirmOwnedProcess, inspectOwnership, nativeServiceNames } from './native/types.js';
 import type { NativeServiceAdapter, ServiceInspection } from './native/types.js';
 import { probeCoordinatorOwnership } from './ownership.js';
-import { parseCoordinatorStatus } from './status.js';
 
 type Exit =
   | { kind: 'clean' }
@@ -98,7 +96,7 @@ export async function runCoordinatorStop(args: ParsedLifecycleArguments, deps: L
     async function stopLocked(): Promise<LifecycleResult> {
       const first = await settle();
       if (first.kind === 'aborted') return failed('interrupted', 'Interrupted before any drain was requested. Nothing was changed.');
-      if (first.kind === 'timeout') return finish({ outcome: 'completion-unknown', message: first.message, error: { code: 'endpoint-transitioning', message: first.message } });
+      if (first.kind === 'timeout') return finish({ outcome: 'completion-unknown', message: first.message, error: { code: first.code, message: first.message } });
       const probe = first.probe;
       if (probe.kind === 'problem') return problemResult(probe);
       if (probe.kind === 'absent') return await stoppedBefore();
@@ -106,15 +104,17 @@ export async function runCoordinatorStop(args: ParsedLifecycleArguments, deps: L
     }
 
     /** Only a coordinator that is starting or closing (HTTP 503) settles; an unreachable endpoint that still exists is stale or unknown. */
-    async function settle(): Promise<{ kind: 'probe'; probe: Probe } | { kind: 'timeout'; message: string } | { kind: 'aborted' }> {
+    async function settle(): Promise<{ kind: 'probe'; probe: Extract<Probe, { kind: 'absent' | 'answered' | 'problem' }> } | { kind: 'timeout'; message: string; code: LifecycleErrorCode } | { kind: 'aborted' }> {
       while (true) {
         if (deps.signal?.aborted) return { kind: 'aborted' };
         let probe: Probe;
         try { probe = await probeEndpoint(configuration, deps, deadlineAt, learn); }
         catch (error) { probe = problem('state-unknown', `The endpoint could not be checked: ${errorText(error)}`); }
+        if (probe.kind === 'aborted') return { kind: 'aborted' };
+        if (probe.kind === 'expired') return { kind: 'timeout', code: 'deadline-exceeded', message: 'The coordinator did not answer within the stop deadline. Nothing was requested or changed.' };
         if (probe.kind === 'problem' && probe.code === 'endpoint-unreachable') probe = { ...probe, transient: false };
         if (probe.kind !== 'problem' || !probe.transient) return { kind: 'probe', probe };
-        if (remaining() <= 0) return { kind: 'timeout', message: `${probe.message} It did not settle before the stop deadline. Nothing was requested or changed.` };
+        if (remaining() <= 0) return { kind: 'timeout', code: 'endpoint-transitioning', message: `${probe.message} It did not settle before the stop deadline. Nothing was requested or changed.` };
         await deps.sleep(Math.max(1, Math.min(deps.pollIntervalMs, remaining())), deps.signal);
       }
     }
@@ -148,9 +148,11 @@ export async function runCoordinatorStop(args: ParsedLifecycleArguments, deps: L
       // Ownership can change between the inspection above and the action: look again immediately before the request.
       const rechecked = await verifyOwned(lifecycle, instance);
       if (rechecked) return rechecked;
-      const milliseconds = Math.max(1, Math.floor(Math.min(remaining(), deps.requestTimeoutMs)));
-      const client = createCoordinatorClient(configuration.endpoint, key!, { timeoutMs: milliseconds, deadlineMs: milliseconds });
-      const sent = await bounded(requestCoordinatorShutdown(client, lifecycle.instanceId), deps, deadlineAt).catch((error: unknown) => ({ kind: 'error' as const, error }));
+      // The request is created only while the deadline has not passed and nothing interrupted the stop.
+      const budget = requestBudget(configuration.endpoint, key!, deps, deadlineAt);
+      if (budget.kind === 'aborted') return failed('interrupted', 'Interrupted before any drain was requested. Nothing was changed.', { instance });
+      if (budget.kind === 'expired') return deadlineBeforeRequest(instance);
+      const sent = await bounded(() => requestCoordinatorShutdown(budget.client, lifecycle.instanceId), deps, deadlineAt).catch((error: unknown) => ({ kind: 'error' as const, error }));
       if (sent.kind === 'aborted') {
         const message = 'Interrupted while sending the drain request; it may or may not have been accepted. Nothing was stopped, killed or restarted.';
         return finish({ outcome: 'completion-unknown', message, error: { code: 'interrupted', message }, instance, logs: logsHint() });
@@ -172,6 +174,12 @@ export async function runCoordinatorStop(args: ParsedLifecycleArguments, deps: L
       return await acknowledged(lifecycle, sent.value);
     }
 
+    /** The deadline passed while the stop was still verifying the coordinator: no request was sent and nothing changed. */
+    function deadlineBeforeRequest(instance: ObservedInstance): LifecycleResult {
+      const message = 'The stop deadline passed before a drain was requested. Nothing was requested, stopped, killed or restarted. Run `heimdall coordinator stop` again.';
+      return finish({ outcome: 'completion-unknown', message, error: { code: 'deadline-exceeded', message }, instance, logs: logsHint() });
+    }
+
     /**
      * Nothing is requested unless positive evidence ties the answering process to the owned service: the loaded
      * registration resolves to the owned definition and its running main process has the answering instance's process id.
@@ -180,8 +188,9 @@ export async function runCoordinatorStop(args: ParsedLifecycleArguments, deps: L
     async function verifyOwned(lifecycle: CoordinatorLifecycle, instance: ObservedInstance): Promise<LifecycleResult | undefined> {
       const inspected = await inspectService();
       if (inspected.kind === 'aborted') return failed('interrupted', 'Interrupted before any drain was requested. Nothing was changed.', { instance });
+      if (inspected.kind === 'timeout') return deadlineBeforeRequest(instance);
       if (inspected.kind !== 'value') {
-        const message = `The service manager could not confirm the running coordinator (${inspected.kind === 'error' ? errorText(inspected.error) : inspected.kind}), so nothing was requested.`;
+        const message = `The service manager could not confirm the running coordinator (${errorText(inspected.error)}), so nothing was requested.`;
         return finish({ outcome: 'conflict', message, error: { code: 'state-unknown', message }, instance, logs: logsHint() });
       }
       const confirmed = confirmOwnedProcess(inspected.value, lifecycle.pid, target!.label!);
@@ -199,7 +208,7 @@ export async function runCoordinatorStop(args: ParsedLifecycleArguments, deps: L
     }
 
     function inspectService() {
-      return bounded(inspectOwnership(adapter!), deps, deadlineAt).catch((error: unknown) => ({ kind: 'error' as const, error }));
+      return bounded(() => inspectOwnership(adapter!), deps, deadlineAt).catch((error: unknown) => ({ kind: 'error' as const, error }));
     }
 
     function requestFailure(error: unknown, instance: ObservedInstance): { kind: 'result'; result: LifecycleResult } | { kind: 'closing' } {
@@ -246,12 +255,16 @@ export async function runCoordinatorStop(args: ParsedLifecycleArguments, deps: L
 
     async function awaitCompletion(expected: CoordinatorLifecycle, instance: ObservedInstance, note: string): Promise<LifecycleResult> {
       let draining = true;
+      let drainSummary = 'The coordinator is draining.';
       let observation = `${note} Waiting for active runs to reach native idle.`;
       progress(`Waiting up to ${args.timeoutSeconds} seconds for instance ${expected.instanceId} to finish draining and exit.`);
       while (true) {
         if (deps.signal?.aborted) return interrupted();
         if (remaining() <= 0) break;
-        const answer: Probe = await probeEndpoint(configuration, deps, deadlineAt, learn).catch((error: unknown) => problem('state-unknown', `The endpoint could not be checked: ${errorText(error)}`, true));
+        // The draining detail comes from a status request inside the same budget: nothing is requested once it is spent.
+        const answer: Probe = await probeEndpoint(configuration, deps, deadlineAt, learn, { statusWhenClosing: true }).catch((error: unknown) => problem('state-unknown', `The endpoint could not be checked: ${errorText(error)}`, true));
+        if (answer.kind === 'aborted') return interrupted();
+        if (answer.kind === 'expired') break;
         if (answer.kind === 'answered') {
           const lifecycle = answer.lifecycle;
           if (lifecycle.instanceId !== expected.instanceId) {
@@ -261,6 +274,7 @@ export async function runCoordinatorStop(args: ParsedLifecycleArguments, deps: L
           if (lifecycle.phase === 'drain-failed') return drainFailed(lifecycle);
           draining = true;
           observation = 'The coordinator is still draining.';
+          if (answer.status) drainSummary = `${answer.status.reservedRuns} reserved run(s) still hold capacity and ${answer.status.queuedRuns} queued run(s) stay queued.`;
         } else {
           if (answer.kind === 'problem' && !answer.transient) {
             const hard = problemResult(answer);
@@ -269,13 +283,18 @@ export async function runCoordinatorStop(args: ParsedLifecycleArguments, deps: L
           draining = false;
           observation = answer.kind === 'problem' ? answer.message : 'The coordinator endpoint no longer exists.';
           const exit = await assessExit(expected);
-          if (exit.kind === 'clean') return await stopped(expected, instance);
+          if (exit.kind === 'clean') {
+            if (remaining() > 0) return await stopped(expected, instance);
+            // A success is never reported after the deadline; the next stop reports the already-stopped coordinator.
+            observation = `Instance ${expected.instanceId} completed a clean shutdown, but that was established only after the stop deadline.`;
+            break;
+          }
           if (exit.kind === 'final') return exit.result;
           observation = exit.observation;
         }
         await deps.sleep(Math.max(1, Math.min(deps.pollIntervalMs, remaining())), deps.signal);
       }
-      const detail = draining ? await drainingDetail() : observation;
+      const detail = draining ? drainSummary : observation;
       const waited = `${args.timeoutSeconds} seconds`;
       if (draining) {
         const message = `The coordinator is still draining after ${waited}. ${detail} Admission is disabled and nothing was stopped, killed or restarted; it keeps draining. Run \`heimdall coordinator stop\` again to keep waiting.`;
@@ -296,15 +315,6 @@ export async function runCoordinatorStop(args: ParsedLifecycleArguments, deps: L
       const detail = lifecycle.shutdown?.error ? ` The drain failed: ${lifecycle.shutdown.error}.` : ' The drain failed.';
       const message = `Coordinator instance ${lifecycle.instanceId} could not finish draining.${detail} Admission stays disabled, reserved runs keep their capacity and owner persistence stays open; nothing was stopped, killed or restarted. Run \`heimdall coordinator stop\` again to retry the same drain.`;
       return failed('drain-failed', message, { instance: observed(lifecycle), logs: logsHint() });
-    }
-
-    async function drainingDetail(): Promise<string> {
-      if (key === null) return 'The coordinator is draining.';
-      const milliseconds = Math.max(1, Math.min(1000, deps.requestTimeoutMs));
-      try {
-        const status = parseCoordinatorStatus(await createCoordinatorClient(configuration.endpoint, key, { timeoutMs: milliseconds, deadlineMs: milliseconds }).request('GET', '/status'));
-        return `${status.reservedRuns} reserved run(s) still hold capacity and ${status.queuedRuns} queued run(s) stay queued.`;
-      } catch { return 'The coordinator is draining.'; }
     }
 
     /** Success requires clean completion evidence, a clean main-process exit and a free ownership lock for this instance. */
@@ -393,7 +403,8 @@ export async function runCoordinatorStop(args: ParsedLifecycleArguments, deps: L
       if (inspected.kind === 'aborted') return failed('interrupted', 'Interrupted before the service state was confirmed. Nothing was changed.');
       const unknown = (message: string, code: LifecycleErrorCode = 'completion-unknown') =>
         finish({ outcome: 'completion-unknown', message, error: { code, message }, logs: logsHint() });
-      if (inspected.kind !== 'value') return unknown(`The service manager state could not be read (${inspected.kind === 'error' ? errorText(inspected.error) : inspected.kind}), so absence of the coordinator is not established.`, 'state-unknown');
+      if (inspected.kind === 'timeout') return unknown('The stop deadline passed before the service manager state was read, so absence of the coordinator is not established. Nothing was changed.', 'deadline-exceeded');
+      if (inspected.kind !== 'value') return unknown(`The service manager state could not be read (${errorText(inspected.error)}), so absence of the coordinator is not established.`, 'state-unknown');
       const ownership = inspected.value;
       const inspection = ownership.inspection;
       if (ownership.kind === 'refused' && ownership.code !== 'state-unknown') {
@@ -415,6 +426,8 @@ export async function runCoordinatorStop(args: ParsedLifecycleArguments, deps: L
       const exit = await judgeAbsentProcess(record.instanceId, inspection, false, null);
       if (exit.kind === 'final') return exit.result;
       if (exit.kind === 'pending') return unknown(exit.observation);
+      // A success is never reported after the deadline.
+      if (remaining() <= 0) return unknown('The stop deadline passed before the stopped state was fully established. Nothing was changed. Run `heimdall coordinator stop` again.', 'deadline-exceeded');
       return finish({ outcome: 'already-stopped', message: `The coordinator is already stopped: its last instance ${record.instanceId} completed a clean shutdown, its process is absent and the ownership lock is free. Nothing was changed.` });
     }
   } catch (error) {
