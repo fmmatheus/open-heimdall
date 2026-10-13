@@ -103,6 +103,23 @@ export async function startCoordinatorService(options: ServiceOptions) {
   catch (error) { ownership.release(); throw error; }
 }
 
+/**
+ * Creates the access key with its content already in place. Other processes (lifecycle commands, the OpenChamber
+ * service) read the key without taking the ownership lock, and a file created and then written in two steps can be
+ * read while it is still empty. An existing entry is left alone. Runs under the state directory ownership, so no
+ * second service creates the key concurrently.
+ */
+async function createCoordinatorKey(key: string): Promise<void> {
+  try { await fs.lstat(key); return; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  const pending = `${key}.pending`;
+  await fs.rm(pending, { force: true });
+  try {
+    await fs.writeFile(pending, randomBytes(32).toString('hex'), { flag: 'wx', mode: 0o600 });
+    await fs.rename(pending, key);
+  } finally { await fs.rm(pending, { force: true }); }
+}
+
 async function startOwnedService(options: ServiceOptions, root: string, ownership: CoordinatorOwnership, instance: CoordinatorInstance) {
   const { configuration } = options;
   if (process.platform !== 'win32') {
@@ -110,9 +127,7 @@ async function startOwnedService(options: ServiceOptions, root: string, ownershi
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   }
   await privateLifecycleDirectory(root);
-  const key = path.join(root, 'coordinator.key');
-  try { await fs.writeFile(key, randomBytes(32).toString('hex'), { flag: 'wx', mode: 0o600 }); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+  await createCoordinatorKey(path.join(root, 'coordinator.key'));
   const accessToken = await readCoordinatorToken(root);
   const databasePath = path.join(root, 'coordinator.sqlite');
   // Create the database privately before SQLite opens it. Never follow a supplied symlink.
