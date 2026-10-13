@@ -281,8 +281,13 @@ the mode with `--opencode-auth` (the `authentication` key in `[opencode]`):
 - **`basic`** (the default when the key is omitted): the password is read at run
   time from an environment variable. The variable's name is
   `passwordEnvironmentVariable` in `[opencode]`, `OPENCODE_PASSWORD` unless you
-  pass `--password-env NAME`. Export it in the terminal that runs the coordinator
-  and `heimdall doctor --connect`; do not write the password to a file or a flag.
+  pass `--password-env NAME`. Export it in the terminal that runs
+  `heimdall doctor --connect` and a foreground `heimdall coordinator serve`; do
+  not put the password in a flag or in the Heimdall configuration. A coordinator
+  started with `heimdall coordinator start` runs under your service manager and
+  does not inherit that terminal's environment: select a private, owner-only
+  credential file with `--env-file` instead (see
+  [Credential context](coordinator.md#credential-context)).
 - **`none`**: no authorization header is sent. Use it only for an explicitly
   passwordless loopback server.
 - **`openchamber`**: for OpenChamber Desktop. Use Desktop's local HTTP port in
@@ -386,5 +391,26 @@ read, so nothing is masked for it.
 ## Next step
 
 With the configuration in place and the checks passing, start the coordinator in
-the foreground and submit a feature as described in
-[Global coordinator development](coordinator.md#setup).
+the background through your user service manager (launchd on macOS, a systemd
+user manager on Linux), then submit a feature as described in
+[Global coordinator development](coordinator.md#setup):
+
+```sh
+heimdall coordinator start
+heimdall coordinator status
+heimdall coordinator logs
+heimdall coordinator stop
+```
+
+Installing the package and running `heimdall setup` never start the coordinator
+or register a service; only `start` does, and nothing starts at login or boot.
+`start --env-file FILE` supplies a Basic password, `--coordinator-config FILE`
+selects a non-default configuration, and `--timeout SECONDS` changes the 30 second
+startup wait. `stop` drains safely and waits up to 60 seconds by default; it does
+not force a shutdown. A ready coordinator means only that its local IPC answers,
+not that OpenCode, credentials, models or quota are available. Add `--json` to
+`start` or `stop` for one versioned result document. Targets, credential files,
+stop outcomes and exit codes, logs and the supported service contexts are
+described in [Background service](coordinator.md#background-service-start-stop-and-logs).
+`heimdall coordinator serve` remains available to run the coordinator in a
+terminal.

@@ -40,11 +40,20 @@ Limits default to one global run and one run per project when omitted.
 An explicit project `--limit` overrides the registration default. Limits count
 whole admitted runs, including uncertain execution, rather than individual tasks.
 
+Start the coordinator in the background and confirm it is ready; see
+[Background service](#background-service-start-stop-and-logs) for what that
+confirms and how to stop it:
+
 ```sh
-node dist/cli.js coordinator serve --coordinator-config /path/to/coordinator.toml
+heimdall coordinator start --coordinator-config /path/to/coordinator.toml
+heimdall coordinator status --coordinator-config /path/to/coordinator.toml
 ```
 
-From another terminal, using the same coordinator configuration:
+To keep the coordinator in the foreground of a terminal instead, for example to
+troubleshoot, run `heimdall coordinator serve --coordinator-config /path/to/coordinator.toml`
+and stop it with Ctrl-C ([Foreground operation](#foreground-operation-and-troubleshooting)).
+
+With the coordinator running, using the same coordinator configuration:
 
 ```sh
 node dist/cli.js coordinator project add /path/to/development-project --limit 2
@@ -122,13 +131,338 @@ creation, unfinished checkpoints or stale local locks still need manual
 inspection; this version does not guess or repair them. Existing IPC endpoints
 are never replaced automatically.
 
-SIGINT/SIGTERM stops new admission and drains managed runs while keeping their
-checkpoint connection open. Unresolved execution can keep draining open until
-reconciled. Abrupt process loss can interrupt checkpoint writes; reservations
-remain held for inspection after restart.
+A drain stops new admission and keeps the checkpoint connection open for managed
+runs. It begins on `heimdall coordinator stop`, or on SIGINT/SIGTERM to a
+foreground coordinator, and both share one operation. Unresolved execution can
+keep draining open until reconciled. Abrupt process loss can interrupt checkpoint
+writes; reservations remain held for inspection after restart.
 
 Runs can also be watched and reviewed read-only from OpenChamber 2.1.0; see the
 [OpenChamber extension guide](openchamber-extension.md).
+
+## Background service: start, stop and logs
+
+`start`, `stop` and `logs` run one coordinator per state directory as a native
+user service and drain it safely. Starting is always an explicit command:
+installing the package, running `heimdall setup`, logging in or rebooting never
+starts the coordinator, and Heimdall never installs a login or boot trigger,
+enables linger, or adds automatic restart.
+
+### Installed-package flow
+
+```sh
+heimdall setup           # once; see Installation and setup
+heimdall doctor
+heimdall coordinator start
+heimdall coordinator status
+heimdall coordinator logs
+heimdall coordinator stop
+```
+
+The commands never prompt, including in a terminal. Human results are short;
+progress and diagnostics go to stderr. Installation and `setup` register nothing
+with launchd or systemd: the service definition is created by the first `start`.
+
+### Commands
+
+| Command | Behavior | Defaults and ranges |
+| --- | --- | --- |
+| `heimdall coordinator start [--coordinator-config FILE] [--env-file FILE] [--timeout SECONDS] [--json]` | Launch through the native user service manager and wait for authenticated readiness. | `--timeout` 1 to 3600 seconds (decimal, up to three fractional digits), default 30. |
+| `heimdall coordinator stop [--coordinator-config FILE] [--timeout SECONDS] [--no-wait] [--json]` | Request an authenticated drain and, by default, wait for confirmed clean shutdown. | `--timeout` 1 to 3600 seconds, default 60. `--no-wait` and `--timeout` cannot be combined. |
+| `heimdall coordinator status [--coordinator-config FILE] [--json]` | Read-only status; unchanged. See [Status](#status). | 10 second deadline. |
+| `heimdall coordinator logs [--coordinator-config FILE] [--lines N] [--follow]` | Print recent process logs, optionally following new lines. | `--lines` 1 to 10000, default 100. |
+| `heimdall coordinator serve [--coordinator-config FILE] [--env-file FILE]` | Foreground operation. | Stops on SIGINT/SIGTERM. |
+
+`start --help`, `stop --help` and `logs --help` show the same options. Malformed,
+repeated, unknown or inapplicable options are rejected before any state,
+configuration or service is touched and exit with status 2; with `--json` on
+`start` or `stop` the rejection is still one result document. `--help` exits 0
+and creates nothing. There is no force mode.
+
+### Targets and configuration
+
+The target is chosen like every other coordinator command: `--coordinator-config`,
+then `HEIMDALL_COORDINATOR_CONFIG`, then `~/.config/heimdall/coordinator.toml`.
+Heimdall remembers where the selection came from (`flag`, `env` or
+`implicit-default`, reported as `target.origin`):
+
+- A missing implicit default file is fine; the loader's defaults apply.
+- A missing file named by the flag or the environment variable fails with
+  `invalid-configuration` and nothing is started. Passing the default path with
+  `--coordinator-config` makes it an explicit selection, so it is then required.
+- The service receives the resolved absolute paths, so it keeps the same target
+  whatever directory it is later started from. Paths with spaces and shell
+  metacharacters are passed as literal arguments; no shell is involved.
+- Lifecycle commands never write or rewrite the coordinator or project TOML.
+
+The state directory (after canonicalization) identifies the coordinator. It is
+owned by one process at a time through a lock the operating system releases when
+that process exits, so a foreground `serve` and a managed `start` cannot run on the
+same state directory; the later one is refused before it creates anything. The
+service name is derived from the state directory
+(`dev.openheimdall.coordinator.<24 hex>` on launchd and
+`heimdall-coordinator-<24 hex>.service` on systemd).
+
+### Credential context
+
+A managed service does not inherit the credentials of the terminal that ran
+`start`; it gets only a small nonsecret environment.
+
+- **OpenChamber data directory.** When `OPENCHAMBER_DATA_DIR` is set at `start`,
+  its resolved path is recorded in the service definition so the service keeps
+  using that directory. Only the path is recorded: `start` does not read or copy
+  the token in it, and the existing profile and token lookup is unchanged. If it is
+  unset, the default OpenChamber location applies as before. A different explicit
+  value while the coordinator runs is reported as `data-directory-conflict`.
+- **Basic password file (`--env-file FILE`).** For `authentication = "basic"`,
+  the coordinator needs the password named by `passwordEnvironmentVariable`
+  (default `OPENCODE_PASSWORD`). The file holds one `NAME=value` per line. Blank
+  lines and lines starting with `#` are ignored. A value is literal, optionally
+  wrapped in one matching pair of single or double quotes; there is no `export`,
+  interpolation, escape, inline comment or command substitution. Values must be
+  nonempty and free of control characters, names may not repeat, and the file may
+  be at most 64 KiB. It must be a regular file you own, not a symbolic link, with
+  no group or other permissions (for example `chmod 600`). The opened file is
+  validated, and Heimdall never creates, repairs or changes the file. Names that
+  would change the execution environment (`HOME`, `PATH`, `NODE_*`, `HEIMDALL_*`,
+  `OPENCHAMBER_*`, `GIT_*`, `XDG_*`, proxy variables and similar) are rejected, and
+  diagnostics name only the file, line numbers and variable names, never values.
+- **Selection and persistence.** `start` uses the explicit `--env-file`, otherwise
+  the file remembered by the owned service definition, otherwise none. Only the
+  canonical path is stored, never the contents. The coordinator reads the file at
+  every fresh launch; there is no hot reload. An invalid or missing selected file
+  (explicit or remembered) fails with `invalid-credentials` before a new service is
+  launched. Passing a different file while the coordinator runs is a
+  `credential-conflict`: stop, then start with the new file.
+- **Exclusive use.** With a file selected, the Basic password comes only from that
+  file, never from the ambient environment, and the values are never copied into
+  `process.env`. Without a file, a managed service has no Basic password, and the
+  failure appears when a connection is made (the existing "Set the configured
+  OpenCode password environment variable" error), not at `start`. `openchamber`
+  and `none` authentication need no file. `serve --env-file` behaves the same in
+  the foreground; `serve` without it keeps using the terminal's environment.
+- **Masking.** Known credential values, the coordinator key, run capabilities,
+  authorization headers and URL credentials are masked before coordinator output is
+  written to a log or printed by a lifecycle command. Values that were never
+  available to Heimdall cannot be masked.
+
+### Readiness and its limits
+
+`start` reports ready only after the instance it launched answers an authenticated
+lifecycle identity request (`GET /lifecycle`, a separate versioned contract; the
+`/status` schema is unchanged) and `/status` shows it `running` and accepting
+runs. A successful call to the service manager is only a launch result. One
+deadline (`--timeout`, default 30 seconds) covers the manager calls and every
+retry. If readiness is not confirmed, the result is `startup-not-confirmed` or a
+failure with the observed state and where to read logs; Heimdall does not claim to
+have stopped an instance that may still start.
+
+Ready means coordinator IPC is available. It does not show that OpenCode is
+reachable, that a Basic password is present or accepted, or that provider login,
+a model or quota is available; `heimdall doctor --connect` and connection time
+still report those. Starting and the readiness probe create no OpenCode session
+and contact no provider. Runs already queued are admitted after startup under the
+normal admission rules when capacity is available; that is separate scheduling,
+not part of readiness.
+
+Other starts:
+
+- Repeating `start` on a ready managed coordinator returns `already-running`
+  without changing it. Simultaneous starts leave one process.
+- A matching foreground `serve` coordinator is reported as
+  `already-running-foreground`; nothing is registered and it is not taken over.
+- A draining coordinator is reported as `shutdown-in-progress`; it is not
+  restarted and admission is not re-enabled.
+- A `start` that was waiting on another lifecycle command while a stop completed
+  does not run afterwards (`conflict`, `superseded-by-stop`); run `start` again.
+- A foreign service registration, a mismatched target, a changed credential or data
+  directory selection, or an endpoint that cannot be verified is a `conflict`.
+  Heimdall does not remove a socket, take over a registration or signal a process.
+
+### Stopping
+
+`stop` verifies that the answering coordinator is the owned managed instance, then
+sends one authenticated shutdown request naming that instance. Only the
+coordinator key authorizes it; run-owner capabilities, wrong credentials, an
+instance mismatch and an older coordinator without the lifecycle protocol are
+refused, and there is no signal fallback. The coordinator disables admission
+before it acknowledges, then drains with the same operation as SIGINT/SIGTERM.
+Repeated or concurrent stops, and signals, share it.
+
+An acknowledgement means draining began, not that the process stopped. While runs
+hold capacity: queued runs stay queued, reservations are kept until the existing
+native idle and reconciliation rules release them, a completed checkpoint is not
+treated as idle proof, external sessions are not cancelled, and owner
+checkpoint, receipt and outcome persistence stays available. A drain can therefore
+stay open for a long time.
+
+By default `stop` then waits up to 60 seconds for all of: the clean completion
+record of that instance, a clean exit of the service's main process, and release
+of the ownership lock. A vanished socket, a failed status request or a zero
+reserved count is not proof. `stop --no-wait` returns after the acknowledgement.
+
+| Outcome | Exit | Meaning |
+| --- | --- | --- |
+| `stopped` | 0 | Clean completion, clean process exit and released lock were confirmed for the instance. |
+| `stop-requested` | 0 | `--no-wait` only: the matching coordinator accepted the drain request. It may still be running. |
+| `already-stopped` | 0 | An owned inactive definition, a clean previous shutdown and process absence were all established. |
+| `still-draining` | 1 | The wait ended while the coordinator was observed draining. It keeps draining; run `stop` again to keep waiting. |
+| `completion-unknown` | 1 | Completion or exit could not be observed. Treat it as unknown, not as stopped. |
+| `busy` | 1 | Another lifecycle command held the target for the whole wait. |
+| `conflict` | 1 | For example a foreground coordinator, a foreign registration or a mismatched instance. |
+| `failed` | 1 (2 for invalid arguments) | The operation could not be performed. |
+
+A foreground coordinator is never signalled by `stop`: the result is a `conflict`
+(`foreground-coordinator`) pointing to SIGINT/SIGTERM. If the drain fails, admission
+stays disabled, reservations and owner persistence stay intact, and the result is
+`drain-failed` with sanitized logs; running `stop` again observes and retries the
+same pending shutdown. An instance that exits after acknowledging without a clean
+completion record (`crashed-after-acknowledgement`) or fails while closing
+(`shutdown-failed`, possibly with resources partly closed) is never reported as
+stopped, and a later `stop` does not turn it into `already-stopped`.
+
+`stop` never uses the manager's stop, disable, boot-out or kill operations, never
+restarts the service and never deletes state. After a clean stop the owned
+definition is kept, inactive, for the next explicit `start`. A changed executable,
+configuration or credential source is applied to an inactive definition only after
+its previous process is proven absent; a live definition is never replaced and the
+conflict is reported.
+
+Ctrl-C (or SIGTERM) during `start`'s or `stop`'s wait, or during `logs --follow`,
+ends only that command. It does not reverse a requested drain, stop the
+coordinator or signal OpenCode. An interrupted `stop` exits 1 as `still-draining`
+or `completion-unknown` with error code `interrupted`; an interrupted `start`
+reports `startup-not-confirmed`. An interrupted `logs --follow` exits 130.
+
+Logout, reboot, operating-system shutdown and direct service-manager commands
+(`launchctl bootout`, `systemctl --user stop`) can terminate the coordinator
+under the manager's own timeout, before a drain finishes. The safe-wait guarantee
+applies to `heimdall coordinator stop`. Heimdall does not promise survival across
+logout or automatic recovery after a crash: nothing relaunches a crashed
+coordinator, a stale socket is reported but not removed, and reservations stay
+held for inspection.
+
+### Result document
+
+With `--json`, `start` and `stop` print exactly one document on stdout, including
+for argument, configuration and operational failures. Progress and diagnostics stay
+on stderr. Without `--json`, a successful result goes to stdout and a failure to
+stderr. The exit status is 0 exactly when `ok` is `true`, 2 for invalid arguments,
+and 1 otherwise.
+
+```json
+{
+  "schemaVersion": 1,
+  "command": "start",
+  "ok": true,
+  "outcome": "ready",
+  "message": "Coordinator started and ready. Readiness confirms coordinator IPC only; it does not check OpenCode connectivity, credentials or quota.",
+  "target": {
+    "configFile": "/path/to/coordinator.toml",
+    "origin": "flag",
+    "stateDirectory": "/path/to/state",
+    "endpoint": "/path/to/state/coordinator.sock",
+    "manager": "launchd",
+    "label": "dev.openheimdall.coordinator.0123456789abcdef01234567"
+  },
+  "instance": { "instanceId": "00000000-0000-4000-8000-000000000000", "pid": 4242, "mode": "managed" },
+  "error": null,
+  "logs": null
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `schemaVersion` | Result document version, currently `1`. It is independent of `/status` schema 1 and of the lifecycle protocol. |
+| `command` | `start` or `stop`. |
+| `ok` | `true` exactly when the requested result was established (exit 0). |
+| `outcome` | `ready`, `already-running`, `already-running-foreground`, `shutdown-in-progress`, `startup-not-confirmed`, `stop-requested`, `stopped`, `already-stopped`, `still-draining`, `completion-unknown`, `busy`, `conflict` or `failed`. Success outcomes: `ready`, `already-running`, `already-running-foreground`, `stop-requested`, `stopped`, `already-stopped`. |
+| `message` | One-line summary for people. Do not parse it. |
+| `target` | `{ configFile, origin, stateDirectory, endpoint, manager, label }`, or `null` when no target resolved. `origin` is `flag`, `env` or `implicit-default`; `manager` is `launchd`, `systemd` or `null`. |
+| `instance` | `{ instanceId, pid, mode }` of the instance that answered a validated lifecycle request (`mode` is `managed` or `foreground`), otherwise `null`. |
+| `error` | `null` when `ok`, otherwise `{ code, message }`. |
+| `logs` | Where to read logs when the operation did not complete, otherwise `null`. |
+
+Error codes by group:
+
+- Input and environment: `invalid-arguments`, `invalid-configuration`,
+  `invalid-credentials`, `invalid-launch-context`, `unsupported-platform`,
+  `manager-unavailable` (no usable launchd domain or systemd user manager and bus;
+  there is no detached-process fallback).
+- Launch and waiting: `launch-failed`, `startup-timeout`, `service-exited`,
+  `deadline-exceeded`, `interrupted`, `busy`, `superseded-by-stop`.
+- Conflicts: `context-conflict`, `credential-conflict`, `data-directory-conflict`,
+  `running-context-changed`, `target-mismatch`, `foreign-registration`,
+  `foreign-definition`, `registered-elsewhere`, `inactive-registration-stale`,
+  `foreground-coordinator`, `instance-mismatch`, `not-managed`.
+- Endpoint and state: `endpoint-unreachable`, `endpoint-refused`,
+  `endpoint-transitioning`, `endpoint-invalid`, `endpoint-not-ready`,
+  `unsupported-lifecycle-protocol`, `state-unknown`.
+- Shutdown: `shutdown-in-progress`, `drain-failed`, `completion-unknown`,
+  `crashed-after-acknowledgement`, `shutdown-failed`.
+- Other: `internal`. `not-implemented` is reserved and not produced.
+
+Consumers should accept new codes and treat unknown ones as failures.
+
+### Logs
+
+`logs` prints the most recent lines (default 100, at most 10000) as plain text
+without a pager, and works while the coordinator is stopped or after a failed
+start if logs exist; otherwise it says they are unavailable. Memory use is
+bounded: only the tail of a file is read. There is no JSON log output.
+`--follow` keeps printing new lines until Ctrl-C, which ends only the reader
+(exit 130).
+
+- **macOS:** the coordinator's standard output and error go to two private
+  regular files, `coordinator.out.log` and `coordinator.err.log`, in the `logs`
+  directory of the state directory (files 0600, directory 0700). Destinations that
+  are symbolic links, not regular files or not private are rejected without
+  repair. `--lines` applies to each file; they are printed one after the other
+  under a header naming the file, because the two streams have no common
+  timestamps. Files are appended to across stops and starts. Heimdall does not
+  rotate or truncate them; they grow until you remove them while the service is
+  stopped.
+- **Linux:** the unit's journal output, read with
+  `journalctl --user -u <unit>`, filtered to the owned unit. Retention and
+  permissions follow the host's journal policy.
+
+Output is sanitized by the coordinator before it is written, not only when read.
+Process logs are separate from persisted run events, task results and proof that a
+run succeeded.
+
+### Supported service contexts
+
+- **macOS:** the logged-in user's GUI launchd domain (`gui/<uid>`). The owned
+  LaunchAgent plist is stored under the state directory (`service/`, file 0600,
+  directory 0700), outside the directories launchd scans at login, with `RunAtLoad`
+  and `KeepAlive` set to `false` and no other automatic trigger. `start` loads it
+  if needed and uses `kickstart` without the kill-existing option.
+- **Linux:** a systemd user manager with a user bus, as the ordinary user and
+  without sudo. The unit has `Type=exec`, `Restart=no`, journal output and no
+  `[Install]` section; it is linked into the user's unit directory, never enabled,
+  and linger is not changed. If the manager is unavailable, `start` fails with
+  `manager-unavailable` and guidance.
+
+Other platforms report `unsupported-platform`; Windows is not supported by these
+commands. The service runs the installed package's `dist/cli.js` with an absolute
+Node.js executable, not npm, a shell or a profile. Closing the terminal that ran
+`start` does not stop the service.
+
+### Foreground operation and troubleshooting
+
+`heimdall coordinator serve` is unchanged: it runs in the terminal, and
+SIGINT/SIGTERM (Ctrl-C) stop admission and drain as described in
+[Lifecycle and recovery](#lifecycle-and-recovery). Use it to see output directly
+when `start` does not become ready. `stop` does not manage a foreground
+coordinator, and `start` reports one as `already-running-foreground`.
+Other troubleshooting:
+
+- Read `heimdall coordinator logs` first; it works after a failed start.
+- A refusal naming another coordinator, or "endpoint already exists", means
+  another process owns the state directory or a stale socket is left from a crash.
+  Inspect the owner before acting; Heimdall does not remove it.
+- Removing a stale socket or clearing reservations after a crash is a manual
+  decision; no lifecycle command does it.
 
 ## Status
 
@@ -166,7 +500,8 @@ fields; any other shape is rejected as an invalid response:
 ```
 
 - `status` is `running` or `draining`. `draining` means the coordinator received
-  SIGINT/SIGTERM, stopped admission and is waiting for reservations to resolve;
+  a stop request or SIGINT/SIGTERM, stopped admission and is waiting for
+  reservations to resolve;
   it is reported exactly when `acceptingNewRuns` is `false`.
 - `queuedRuns` counts runs waiting for admission.
 - `reservedRuns` counts runs holding capacity. It includes runs with uncertain
@@ -359,6 +694,14 @@ forces a full re-run. Verification record:
 - `coordinator status` is covered by automated tests with temporary fixtures on
   macOS only; Linux and Windows behavior and a live installed coordinator are
   unverified.
+- Lifecycle commands were checked against a real launchd domain and a real systemd
+  user manager with an empty coordinator state; a delayed drain with a held run was
+  checked only with a synthetic executor and a fake service manager, and the
+  hosted CI native job has not run. See
+  [coordinator-lifecycle.md](validation/coordinator-lifecycle.md).
+- Windows has no service adapter. There is no automatic startup, crash restart,
+  stale-endpoint repair or force-stop mode, and drain can stay open while
+  execution is unresolved.
 - SQLite uses Node's built-in `node:sqlite`, still experimental on Node 22.
 - Usage is unlimited by default. Existing optional caps cover cumulative child
   session/run tokens; parent orchestration tokens are outside those caps. Active
