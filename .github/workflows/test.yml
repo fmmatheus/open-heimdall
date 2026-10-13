@@ -51,3 +51,65 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run test:package
       - run: node --test --test-concurrency=1 test/setup-*.test.mjs test/doctor*.test.mjs test/runtime-identity*.test.mjs
+  # Real launchd / systemd user-manager lifecycle checks. The suite itself reports every case as skipped unless
+  # HEIMDALL_NATIVE_LIFECYCLE=1, and a skip is not a pass, so the variable is exported only after the provisioning
+  # step below has proven that the runner provides a usable user manager. If it does not, the job fails: native
+  # verification for that platform stays pending rather than passing silently. Neither step enables linger,
+  # creates users or changes persistent host settings.
+  native-lifecycle:
+    name: native-lifecycle (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Prove a usable launchd user domain
+        if: runner.os == 'macOS'
+        run: |
+          set -eu
+          uid="$(id -u)"
+          sw_vers
+          if ! launchctl print "gui/${uid}" > /dev/null 2>&1; then
+            echo "::error::No launchd GUI domain is available for uid ${uid}; native launchd verification is pending on this runner."
+            exit 1
+          fi
+          echo "launchd domain gui/${uid} is available"
+          echo "HEIMDALL_NATIVE_LIFECYCLE=1" >> "$GITHUB_ENV"
+      - name: Prove a usable systemd user manager and bus
+        if: runner.os == 'Linux'
+        run: |
+          set -eu
+          uid="$(id -u)"
+          usable() {
+            [ -n "${XDG_RUNTIME_DIR:-}" ] || return 1
+            [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] || [ -S "${XDG_RUNTIME_DIR}/bus" ] || return 1
+            systemctl --user show-environment > /dev/null 2>&1
+          }
+          if ! usable; then
+            # Start the per-user manager for this uid for the lifetime of the job. This does not enable linger,
+            # create users or change any persistent setting; a runner that cannot do this fails below.
+            export XDG_RUNTIME_DIR="/run/user/${uid}"
+            sudo -n systemctl start "user@${uid}.service" || true
+            if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"; fi
+          fi
+          if ! usable; then
+            echo "::error::No systemd user manager and user bus are usable for uid ${uid} (XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-unset}); native systemd verification is pending on this runner."
+            exit 1
+          fi
+          systemctl --version | head -n 1
+          systemctl --user show-environment | grep -c '=' | sed 's/^/user manager answered; environment entries: /'
+          echo "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS}" >> "$GITHUB_ENV"
+          echo "HEIMDALL_NATIVE_LIFECYCLE=1" >> "$GITHUB_ENV"
+      - name: Native lifecycle integration suite
+        run: |
+          test "${HEIMDALL_NATIVE_LIFECYCLE:-}" = "1" || { echo "::error::Native provisioning did not complete; the suite is not run"; exit 1; }
+          npm run test:native
