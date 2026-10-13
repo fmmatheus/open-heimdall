@@ -103,6 +103,11 @@ export type RememberedContext =
   | { kind: 'owned'; credentialFile: string | null; openchamberDataDirectory: string | null }
   | { kind: 'foreign'; reason: string };
 
+/** Whether the registration the manager reports resolves to the definition Heimdall owns. */
+export type RegistrationOwnership =
+  | { kind: 'owned' }
+  | { kind: 'refused'; code: 'registered-elsewhere' | 'foreign-definition' | 'state-unknown'; reason: string };
+
 /**
  * Native service manager adapter. Methods only ever start the service on `start`; nothing here sends a stop,
  * kill or restart request, and a loaded running definition is never replaced.
@@ -117,6 +122,12 @@ export interface NativeServiceAdapter {
   logLocation(): string;
   /** Read manager state without starting, stopping or changing anything. */
   inspect(): Promise<ServiceInspection>;
+  /**
+   * Positive ownership evidence for the registration an inspection reports as loaded: the reported definition path
+   * resolves (canonical path and link handling) to the owned definition and that definition is a valid Heimdall
+   * definition for this state directory. A missing, different or unreadable definition is refused. Changes nothing.
+   */
+  registrationOwnership(inspection: ServiceInspection): Promise<RegistrationOwnership>;
   /** Write the owned definition when needed and register it when it is not loaded. */
   install(): Promise<InstallResult>;
   /** Explicitly start a registered definition that is not running. */
@@ -128,6 +139,43 @@ export interface NativeServiceAdapter {
   unloadInactive(): Promise<CleanupResult>;
   /** Fixture and test cleanup only: unloads and deletes the owned definition when the service is proven stopped. */
   cleanupFixture(): Promise<CleanupResult>;
+}
+
+/** One manager inspection together with what it proves about the registration's ownership. */
+export type NativeOwnership =
+  | { kind: 'owned'; inspection: ServiceInspection }
+  | { kind: 'not-loaded'; inspection: ServiceInspection }
+  | { kind: 'refused'; code: 'registered-elsewhere' | 'foreign-definition' | 'state-unknown'; reason: string; inspection: ServiceInspection };
+
+/** Inspect the service and decide whether a loaded registration is the one Heimdall owns. Starts, stops and changes nothing. */
+export async function inspectOwnership(adapter: NativeServiceAdapter): Promise<NativeOwnership> {
+  const inspection = await adapter.inspect();
+  if (inspection.registration === 'unknown') return { kind: 'refused', code: 'state-unknown', reason: inspection.detail, inspection };
+  if (inspection.registration === 'not-loaded') return { kind: 'not-loaded', inspection };
+  const registration = await adapter.registrationOwnership(inspection);
+  return registration.kind === 'owned' ? { kind: 'owned', inspection } : { ...registration, inspection };
+}
+
+export type OwnedProcess =
+  | { kind: 'process'; pid: number; inspection: ServiceInspection }
+  | { kind: 'refused'; code: 'registered-elsewhere' | 'foreign-definition' | 'state-unknown'; reason: string; inspection: ServiceInspection };
+
+/**
+ * A process is the owned service's only with all of: an owned loaded registration, a recognized running main process,
+ * and a positive process id equal to the authenticated coordinator instance's. An absent, unknown or different
+ * value is never ownership.
+ */
+export function confirmOwnedProcess(ownership: NativeOwnership, expectedPid: number, label: string): OwnedProcess {
+  const { inspection } = ownership;
+  if (ownership.kind === 'refused') return ownership;
+  if (ownership.kind === 'not-loaded') return { kind: 'refused', code: 'registered-elsewhere', reason: `${label} is not registered with the service manager`, inspection };
+  if (inspection.running === 'unknown') return { kind: 'refused', code: 'state-unknown', reason: `whether ${label} is running could not be determined (${inspection.detail})`, inspection };
+  if (inspection.running === false) return { kind: 'refused', code: 'registered-elsewhere', reason: `${label} is not running`, inspection };
+  if (inspection.pid === null || !Number.isInteger(inspection.pid) || inspection.pid <= 0) {
+    return { kind: 'refused', code: 'state-unknown', reason: `${label} is running but the service manager reports no main process id`, inspection };
+  }
+  if (inspection.pid !== expectedPid) return { kind: 'refused', code: 'registered-elsewhere', reason: `${label} is running process ${inspection.pid}, not ${expectedPid}`, inspection };
+  return { kind: 'process', pid: inspection.pid, inspection };
 }
 
 export interface LaunchResult {

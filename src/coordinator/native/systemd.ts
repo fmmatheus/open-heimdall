@@ -4,7 +4,7 @@ import { MANAGER_LABEL_VARIABLE } from '../launch-context.js';
 import type { LaunchContext } from '../launch-context.js';
 import { ensurePrivateDirectory, readPrivateText, validatePrivateDirectory, writePrivateFile } from './private-files.js';
 import { createExecFileRunner, nativeServiceNames } from './types.js';
-import type { CleanupResult, CommandRunner, InstallResult, NativeServiceAdapter, RememberedContext, ServiceConflict, ServiceIdentity, ServiceInspection, StartResult } from './types.js';
+import type { CleanupResult, CommandRunner, InstallResult, NativeServiceAdapter, RegistrationOwnership, RememberedContext, ServiceConflict, ServiceIdentity, ServiceInspection, StartResult } from './types.js';
 
 const SYSTEMCTL_CANDIDATES = ['/usr/bin/systemctl', '/bin/systemctl', '/usr/local/bin/systemctl'];
 const DEFINITION_DIRECTORY = 'service';
@@ -344,6 +344,17 @@ export function createSystemdAdapter(options: SystemdAdapterOptions): NativeServ
     `A service definition exists at ${paths.definition} but ${reason}.`,
     'Inspect or move that file yourself; Heimdall will not overwrite or load it.');
 
+  async function registrationOwnership(inspection: ServiceInspection): Promise<RegistrationOwnership> {
+    if (inspection.registration !== 'loaded') return { kind: 'refused', code: 'state-unknown', reason: `${unit} is not a loaded registration (${inspection.detail})` };
+    if (!await ownsFragment(inspection.registeredPath)) {
+      return { kind: 'refused', code: 'registered-elsewhere', reason: `${unit} is loaded from ${inspection.registeredPath ?? 'an unreported path'}, not from ${paths.definition}` };
+    }
+    const existing = await existingDefinition();
+    if (existing.kind === 'foreign') return { kind: 'refused', code: 'foreign-definition', reason: `its definition ${paths.definition} ${existing.reason}` };
+    if (existing.kind === 'absent') return { kind: 'refused', code: 'registered-elsewhere', reason: `${unit} is loaded but its definition file ${paths.definition} is missing` };
+    return { kind: 'owned' };
+  }
+
   const failed = (detail: string, conflicts: ServiceConflict[] = []): InstallResult => ({ outcome: 'failed', registered: false, conflicts, detail });
   const conflicted = (conflicts: ServiceConflict[]): InstallResult => ({ outcome: 'conflict', registered: false, conflicts, detail: conflicts[0]!.message });
 
@@ -474,5 +485,5 @@ export function createSystemdAdapter(options: SystemdAdapterOptions): NativeServ
 
   const logLocation = () => `systemd journal of the user unit ${unit} (journalctl --user -u ${unit})`;
 
-  return { identity, render: () => desiredText, remembered, logLocation, inspect, install, start, unloadInactive, cleanupFixture };
+  return { identity, render: () => desiredText, remembered, logLocation, inspect, registrationOwnership, install, start, unloadInactive, cleanupFixture };
 }

@@ -251,7 +251,12 @@ A managed service does not inherit the credentials of the terminal that ran
 `start` reports ready only after the instance it launched answers an authenticated
 lifecycle identity request (`GET /lifecycle`, a separate versioned contract; the
 `/status` schema is unchanged) and `/status` shows it `running` and accepting
-runs. A successful call to the service manager is only a launch result. One
+runs, and the service manager shows the expected registration loaded from the owned
+definition with a running main process whose process id is the answering
+instance's. Missing, unknown or conflicting manager evidence is never readiness:
+an unconfirmed answer ends as `startup-not-confirmed` and a registration from
+another definition as a `conflict`. A successful call to the service manager is
+only a launch result. One
 deadline (`--timeout`, default 30 seconds) covers the manager calls and every
 retry. If readiness is not confirmed, the result is `startup-not-confirmed` or a
 failure with the observed state and where to read logs; Heimdall does not claim to
@@ -281,8 +286,14 @@ Other starts:
 
 ### Stopping
 
-`stop` verifies that the answering coordinator is the owned managed instance, then
-sends one authenticated shutdown request naming that instance. Only the
+`stop` verifies that the answering coordinator is the owned managed instance: the
+service's loaded registration resolves to the owned definition and its running main
+process has the answering instance's process id. An authenticated answer, a
+definition on disk or a process id alone is not enough; unknown, missing or
+conflicting evidence is a `conflict` and nothing is requested. Ownership is checked
+again immediately before the request, which then names that instance. The service
+that started the process is what is verified, so an owned service that was started
+with an earlier launch context stays stoppable. Only the
 coordinator key authorizes it; run-owner capabilities, wrong credentials, an
 instance mismatch and an older coordinator without the lifecycle protocol are
 refused, and there is no signal fallback. The coordinator disables admission
