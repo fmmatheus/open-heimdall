@@ -123,7 +123,7 @@ corrected code, and nothing in this work addresses them:
 
 | Failing case | Observed |
 | --- | --- |
-| `test/package/install.test.mjs`: `resolves one supported @opencode/plugin and no quota package dependency` | `npm ls` (npm 10.9.3) in the consumer reports `@msgpackr-extract/msgpackr-extract-linux-arm64@3.0.4 extraneous`, which the test rejects. Cause not investigated further. |
+| `test/package/install.test.mjs`: `resolves one supported @opencode/plugin and no quota package dependency` | `npm ls` (npm 10.9.3) in the consumer reports `@msgpackr-extract/msgpackr-extract-linux-arm64@3.0.4 extraneous`, which the test rejects. Cause not investigated further at the time; diagnosed and resolved in "Linux installed package: the extraneous `msgpackr-extract` platform package" below. |
 | `test/package/lifecycle.test.mjs`: `consumer install:` and `global install: setup registers nothing; ...` | The final `coordinator logs` on an unused state directory exits 0 and prints `-- No entries --` from `journalctl`; the test expects exit 1 and a "no logs" message, which is what the macOS file-log path produces. |
 
 The package tests also need git metadata, because `scripts/pack.mjs` lists files with `git ls-files`: the first run on
@@ -400,6 +400,119 @@ Checks on the corrected code (macOS arm64, Node v22.22.3, npm 10.9.8): `node --t
 `test/coordinator-stop-logs.test.mjs` and `test/coordinator-lifecycle-cli.test.mjs`: 61 of 61; `npm run check`,
 `npm run build:extension` exit 0; `npm test`: 1387 of 1387; `npm run test:package`: 22 of 22.
 
+### Linux installed package: the extraneous `msgpackr-extract` platform package
+
+Evidence label: **real Linux, installed tarball** (Lima VM `heimdall-lc-d7432164`, ordinary `npm install <tarball>` and
+`npm install --global --prefix`, no overrides, links or flags), plus a macOS comparison. The 22 new tree controls use
+synthetic `node_modules` trees checked with the real `npm ls`.
+
+| Item | Linux VM | macOS host |
+| --- | --- | --- |
+| OS | Ubuntu 24.04.5 LTS, Linux 6.8.0-142-generic aarch64 (glibc) | macOS 27.0.1, arm64 |
+| Hypervisor | Lima 2.2.1, `vz`, template `ubuntu-24.04`, `--mount-none`, 2 CPUs, 3 GiB, 12 GiB; instance `heimdall-lc-d7432164` (left running for the native checks) | not applicable |
+| Service manager | systemd 255 (255.4-1ubuntu8.17); `systemctl --user show-environment` works (`XDG_RUNTIME_DIR=/run/user/501`, user bus); `is-system-running`: `running` | not exercised here |
+| Linger | the template enabled it; `Linger=no` set inside the VM, still `no` after the runs | not applicable |
+| Node.js / npm | v22.19.0 / 10.9.3 and v24.21.0 / 11.19.0 (official linux-arm64 tarballs, SHA-256 checked, under the VM user's home) | v22.22.3 / 10.9.8 |
+| C compiler | none (`gcc` not installed) | Xcode toolchain |
+| Source | `git archive 1277c23` plus the three package test files of the fix, in a throwaway git repository with a fixture identity and signing disabled | the managed checkout |
+
+**Symptom.** On Linux, `npm install <tarball>` exits 0 (283 packages) and `npm ls --all` exits 0, but the tree starts
+with `├── @msgpackr-extract/msgpackr-extract-linux-arm64@3.0.4 extraneous`. `npm ls --all --json` has
+`problems: ["extraneous: @msgpackr-extract/msgpackr-extract-linux-arm64@3.0.4 …/node_modules/@msgpackr-extract/msgpackr-extract-linux-arm64"]`
+and `npm explain` reports the package as `extraneous`. The test rejected it through its text match, not through npm's
+exit status. The global install on npm 10.9.3 is not flagged; the platform package sits under the package's own
+`node_modules`.
+
+**Captured evidence (Node v22.19.0, npm 10.9.3, consumer install).**
+
+- The installed manifests: `msgpackr@2.1.0` declares `optionalDependencies: {"msgpackr-extract": "^3.0.4"}`; the platform
+  package is `@msgpackr-extract/msgpackr-extract-linux-arm64@3.0.4` with `os: ["linux"]`, `cpu: ["arm64"]` and no scripts.
+  `msgpackr-extract`, `node-gyp-build-optional-packages` and `detect-libc` are **not installed**; `npm explain
+  msgpackr-extract` finds nothing, and `npm ls` shows `UNMET OPTIONAL DEPENDENCY msgpackr-extract@^3.0.4` under
+  `msgpackr`.
+- `node_modules/.package-lock.json` has an entry for the platform package (`"optional": true`, same `os`/`cpu`) and none
+  for `msgpackr-extract`. Ancestry in the shipped graph: `@opencode/plugin` → `effect` → `msgpackr` (dependency) →
+  `msgpackr-extract` (optional) → `@msgpackr-extract/msgpackr-extract-<os>-<cpu>` (optional, platform restricted).
+- The npm debug log of the same install: `placeDep` places `msgpackr-extract@3.0.4` and all six platform packages; the
+  five platform packages for other platforms are marked `reify failed optional dependency` and deleted; then
+  `info run msgpackr-extract@3.0.4 install … { code: 1 }` is followed by `reify mark deleted` for `msgpackr-extract`,
+  `node-gyp-build-optional-packages` and `detect-libc`. The linux-arm64 package is **not** among the deleted paths.
+- Running the install script in the foreground (`--foreground-scripts`, diagnosis only): the prebuild test
+  (`node-gyp-build-optional-packages`) cannot load a native build and throws, then the fallback `node-gyp rebuild`
+  stops with `/bin/sh: 1: gcc: not found`, so the script exits 1. The reason no prebuild is usable: the registry tarball `@msgpackr-extract/msgpackr-extract-linux-arm64@3.0.4` contains only
+  `node.abi115.musl.node` and `node.napi.musl.node` (like `…-linux-arm`), while `…-linux-x64@3.0.4` also ships the
+  `glibc` builds. `msgpackr-extract@3.0.4` is the latest version of the package.
+- Runtime: `import('@open-heimdall/core')` and `import('effect')` load; `require('msgpackr-extract')` from `msgpackr` is
+  `MODULE_NOT_FOUND`; `msgpackr` packs and unpacks (`{"a":1,"b":[1,2,3]}` and 50 records) in its JavaScript path, which
+  `node_modules/msgpackr/node-index.js` takes when the optional `require('msgpackr-extract')` throws.
+
+**Comparison.**
+
+| Run | Install script of `msgpackr-extract` | Result in the consumer tree |
+| --- | --- | --- |
+| Linux, Node 22.19.0, npm 10.9.3 | exit 1 (no glibc prebuild for arm64, no compiler) | `msgpackr-extract` removed, platform package kept; `npm ls` marks it `extraneous` |
+| Linux, Node 24.21.0, npm 11.19.0 | exit 1, same cause | `msgpackr-extract` **and** the platform package removed; `npm ls` clean, no `@msgpackr-extract` directory |
+| macOS, Node 22.22.3, npm 10.9.8 | succeeds (darwin-arm64 prebuild) | `msgpackr-extract` installed, native accelerator loaded, `npm ls` clean |
+
+**Root cause: an npm installation artifact, not a packaging graph defect.** The package's graph is the upstream one
+(`msgpackr` lists `msgpackr-extract` as optional); nothing in `@open-heimdall/core`'s manifest or lockfile is
+mis-declared, and an unbuildable optional native module is a supported outcome for npm. The leftover comes from how npm
+10 cleans up after the failed optional install. `@npmcli/arborist` 8.0.1 (bundled with npm 10.9.3),
+`lib/optional-set.js`, ends with `return gatherDepSet(set, edge => !edge.optional)`: the set of nodes removed with a
+failed optional package follows only non-optional edges, so the package's own optional dependencies (the platform
+packages that survived the platform filter) stay on disk without a parent. `@npmcli/arborist` 9.9.1 (npm 11.19.0)
+ends with `gatherDepSet(set, edge => !set.has(edge.to) && !edge.from?.inert)` and removes them. The change is upstream
+[npm/cli#8537](https://github.com/npm/cli/pull/8537) "fix: optional set calculation" (commit `13d8df64e`, merged
+2025-09-29, first contained in npm v11.6.2 / arborist v9.1.6; found with `git tag --contains` on a clone of
+`npm/cli`). npm's report is accurate for the disk state: the package really has no parent. The host-dependent part
+is the failed install script: hosts with a glibc arm64 runtime and no compiler hit it; x64 glibc (platform package
+ships glibc builds) and macOS do not, which is why only this environment failed.
+
+**Not changed:** `package.json`, `package-lock.json` and the published dependency graph. A dependency or lockfile change
+cannot make `msgpackr-extract` installable on glibc arm64 without a compiler, and the consumer must stay an ordinary
+`npm install <tarball>`.
+
+**Rule change** (`test/package/helpers.mjs` `verifyDependencyTree`, used by
+`resolves one supported @opencode/plugin and no quota package dependency` for the consumer and global installs). The
+rule still requires `npm ls --all` to exit 0 with no `invalid`, `extraneous` or `UNMET DEPENDENCY` line, exactly the
+supported `@opencode/plugin` version in every copy and no `@slkiser/opencode-quota` copy. It makes one exception: an
+`extraneous` line is accepted only when every condition holds for that package: (1) the checkout's `package-lock.json`
+marks it optional and lists it in `optionalDependencies` of a package that is itself optional; (2) that optional parent
+is declared in `optionalDependencies` of an installed package and is not installed; (3) the leftover's manifest has `os`
+and `cpu` lists that include this host. A new case, `msgpackr loads and round-trips with or without its optional native
+accelerator`, runs the installed `msgpackr` (consumer and global) and checks that a missing accelerator is
+`MODULE_NOT_FOUND`, not a broken load, and that pack/unpack round-trips.
+
+**Negative controls** (`test/package/tree-validation.test.mjs`, 22 cases; synthetic trees, real `npm ls`, so the same
+on every platform): a complete tree is accepted; the host platform package left without its failed parent is reported
+`extraneous` by npm and accepted; and each of these is rejected: the leftover next to an unrelated extraneous package; no
+installed package declaring the optional parent; the lockfile not declaring the leftover, its declaring package not
+optional or the leftover not optional; a missing, foreign-host or absent `os`/`cpu` restriction; a look-alike package in
+the same scope; a platform package that does not satisfy its installed parent (`invalid`); an unrelated extraneous
+package; a missing required dependency; an invalid required dependency version; a missing required peer; an invalid
+required peer version; an unsupported `@opencode/plugin` version both when npm accepts the range and when it reports it
+invalid; a missing `@opencode/plugin`; a nested second `@opencode/plugin` copy at another version; a declared runtime
+dependency on the quota package; and an undeclared installed quota package. Mutation checks on the rule (restored
+afterwards): accepting any `extraneous` line fails 9 controls; ignoring the exit status fails 2; dropping the plugin
+version check fails 3; dropping the quota check fails 2; dropping the `os` check fails 1.
+
+**Results.**
+
+| Where | Command | Result |
+| --- | --- | --- |
+| Linux VM, Node 22.19.0 / npm 10.9.3, before the fix | `npm run test:package` | 22 tests, 21 pass, 1 fail (the consumer `npm ls` case, `extraneous`); the two unused-state `coordinator logs` cases pass with the journal fix |
+| Linux VM, Node 22.19.0 / npm 10.9.3 | `npm run test:package` | 46 tests, 46 pass, 0 fail, 0 skipped (22 original, 2 new `msgpackr` cases, 22 controls) |
+| Linux VM, Node 24.21.0 / npm 11.19.0 | `npm run test:package` | 46 tests, 46 pass, 0 fail, 0 skipped |
+| Linux VM, Node 22.19.0 | `node --test --test-concurrency=1 test/setup-*.test.mjs test/doctor*.test.mjs test/runtime-identity*.test.mjs` | 253 tests, 253 pass, 0 fail, 0 skipped |
+| Linux VM, Node 24.21.0 | same command | 253 tests, 253 pass, 0 fail, 0 skipped |
+| macOS host, Node 22.22.3 / npm 10.9.8 | `npm run test:package` | 46 tests, 46 pass, 0 fail, 0 skipped |
+
+The two lifecycle cases that expect an unused state directory to produce no logs (`coordinator logs` exit 1, empty
+stdout, stderr `/no logs/i`, inside the consumer and global lifecycle tests) pass on both Node versions with their
+assertions unchanged. One earlier run of the Node 24 setup/doctor set in the VM exceeded its time budget while the host
+was suspended and reported timing assertions as failures; it was repeated unchanged afterwards and passed (253 of 253).
+Not run here: the GitHub-hosted jobs, and the real-systemd lifecycle checks (**pending**).
+
 ## Historical evidence at `3bfdc76`
 
 The remaining sections record the earlier run. They describe code at `3bfdc76` and are not repeated for the
@@ -645,14 +758,16 @@ entry existed in the user's domain. All commands ran with an isolated `HOME` and
   delays a shutdown stage in a fixture entry point and is not a held-reservation test.
 - On Linux there is no native check of the stopped-definition refresh, the overall deadline or the stop ordering;
   those are covered by mocked-manager tests, and the native refresh and delayed-drain cases run on macOS only.
-- The Linux installed-package tests fail 3 of 22 on the corrected code and on `e5c6fbc` alike (npm reports an
-  optional dependency as extraneous; `coordinator logs` on an unused state directory exits 0 on Linux). They are
-  unresolved. The package tests were not run on Linux with Node.js 24.
+- At `61847fe` the Linux installed-package tests failed 3 of 22 (npm reports an optional dependency as extraneous;
+  `coordinator logs` on an unused state directory exits 0 on Linux). Both causes are corrected after `0651d81`; the
+  package suite passes on Linux with Node.js 22.19.0 and 24 (see "Linux installed package: the extraneous
+  `msgpackr-extract` platform package"). The hosted `installed-package` job has not run.
 - The GitHub-hosted jobs in `.github/workflows/test.yml` (`baseline`, `macos-harness`, `installed-package`,
   `native-lifecycle`) were not run for the corrected code, and whether a hosted Linux runner provides a usable user
   manager is unverified.
-- Node.js 22.19.0 ran on Linux only. Node.js 24 ran the package tests on macOS only, and Node.js 26 ran only the
-  credential test file on macOS. Native service-manager checks used Node.js 22.
+- Node.js 22.19.0 and 24.21.0 ran the package tests on Linux after the extraneous-package fix; macOS ran them on
+  Node.js 22.22.3 only. Node.js 26 ran only the credential test file on macOS. Native service-manager checks used
+  Node.js 22.
 - The Node.js 26 diagnosis is established for the failure mode (handlers installed after the readiness line). A
   flush or `process.exit` problem was not demonstrated and is not claimed.
 - A start whose native call was already issued survives the death of its process only through the private launch
