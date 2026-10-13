@@ -257,8 +257,10 @@ A managed service does not inherit the credentials of the terminal that ran
   the nonsecret `OPENCHAMBER_DATA_DIR` selection.
 - **Masking.** Known credential values, the coordinator key, run capabilities,
   authorization headers and URL credentials are masked before coordinator output is
-  written to a log or printed by a lifecycle command. Values that were never
-  available to Heimdall cannot be masked.
+  written to a log or printed by a lifecycle command, and before a shutdown
+  diagnostic is stored. A known credential value is masked at any length, including a
+  single character, and the longest value is masked whole when values overlap.
+  Values that were never available to Heimdall cannot be masked.
 
 ### Readiness and its limits
 
@@ -272,9 +274,14 @@ an unconfirmed answer ends as `startup-not-confirmed` and a registration from
 another definition as a `conflict`. A successful call to the service manager is
 only a launch result. One
 deadline (`--timeout`, default 30 seconds) covers the manager calls and every
-retry. If readiness is not confirmed, the result is `startup-not-confirmed` or a
-failure with the observed state and where to read logs; Heimdall does not claim to
-have stopped an instance that may still start.
+retry, and each coordinator request is limited to what remains of it, so a command
+does not outlast its timeout by more than a small margin. Ctrl-C ends a request
+that is in flight. An answer that arrives after the deadline is never reported as
+success. When the deadline passes before the command changed anything, the result
+is a `conflict` (`deadline-exceeded`) that says nothing was started or changed. If
+readiness is not confirmed after a launch was requested, the result is
+`startup-not-confirmed` or a failure with the observed state and where to read
+logs; Heimdall does not claim to have stopped an instance that may still start.
 
 Ready means coordinator IPC is available. It does not show that OpenCode is
 reachable, that a Basic password is present or accepted, or that provider login,
@@ -332,6 +339,11 @@ By default `stop` then waits up to 60 seconds for all of: the clean completion
 record of that instance, a clean exit of the service's main process, and release
 of the ownership lock. A vanished socket, a failed status request or a zero
 reserved count is not proof. `stop --no-wait` returns after the acknowledgement.
+The wait is bounded by one deadline that also covers the status request used to
+describe a drain in progress: no request starts after it has passed, and a clean
+exit established only after it is reported as `completion-unknown`
+(`deadline-exceeded`), not as `stopped`. The coordinator keeps draining, and a later
+`stop` reports its own result.
 
 Before it sends the drain request (also with `--no-wait`), and before it reports
 `already-stopped`, `stop` records an ordering boundary in the private `lifecycle`
