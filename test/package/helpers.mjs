@@ -142,9 +142,13 @@ export async function installGlobal(tarball, { env, prefix, cwd }) {
   };
 }
 
+// Runs `npm ls --all` and reports its exit status instead of throwing, so that the caller decides what
+// a nonzero status or a problem line means.
 export async function listTree(install, { env, cwd }) {
   const argv = install.layout === 'global' ? ['ls', '--global', '--prefix', install.directory, '--all'] : ['ls', '--all'];
-  return await npm(argv, { cwd: install.layout === 'global' ? cwd : install.directory, env });
+  assertOrdinaryInstall(argv);
+  const result = await runProcess('npm', argv, { cwd: install.layout === 'global' ? cwd : install.directory, env });
+  return { argv, ...result };
 }
 
 export function runProcess(file, args, { cwd, env, input } = {}) {
@@ -163,8 +167,8 @@ export function runProcess(file, args, { cwd, env, input } = {}) {
 export const runBinary = (install, args, options) => runProcess(install.bin, args, options);
 export const runModule = (code, options) => runProcess(process.execPath, ['--input-type=module', '--eval', code], options);
 
-// Finds every installed copy of a package below a node_modules tree.
-export async function findPackages(modules, name) {
+// Every package installed below a node_modules tree, with its manifest.
+export async function listPackages(modules) {
   const found = [];
   const visit = async directory => {
     const entries = await fs.readdir(directory, { withFileTypes: true }).catch(() => []);
@@ -174,10 +178,91 @@ export async function findPackages(modules, name) {
       if (entry.name.startsWith('@')) { await visit(location); continue; }
       const manifest = await fs.readFile(path.join(location, 'package.json'), 'utf8').then(JSON.parse, () => undefined);
       if (!manifest) continue;
-      if (manifest.name === name) found.push({ location, version: manifest.version });
+      found.push({ name: manifest.name, location, version: manifest.version, manifest });
       await visit(path.join(location, 'node_modules'));
     }
   };
   await visit(modules);
   return found;
+}
+
+// Finds every installed copy of a package below a node_modules tree.
+export async function findPackages(modules, name) {
+  return (await listPackages(modules)).filter(entry => entry.name === name).map(({ location, version }) => ({ location, version }));
+}
+
+export const supportedPluginVersion = '2.0.22';
+export const quotaPackageName = '@slkiser/opencode-quota';
+
+// The dependency graph the package is published against (the checkout's lockfile). It supplies which
+// packages are declared optional dependencies of which, so the tree check can tell an optional native
+// package left behind by a failed optional install from an arbitrary stray package.
+export async function readDependencyLock() {
+  return JSON.parse(await fs.readFile(path.join(checkout, 'package-lock.json'), 'utf8'));
+}
+
+function lockedOptionalChildren(lock) {
+  const byName = new Map();
+  for (const [location, entry] of Object.entries(lock.packages ?? {})) {
+    if (!location.includes('node_modules/')) continue;
+    byName.set(location.slice(location.lastIndexOf('node_modules/') + 'node_modules/'.length), entry);
+  }
+  const parents = new Map();
+  for (const [name, entry] of byName) {
+    if (entry.optional !== true) continue;
+    for (const child of Object.keys(entry.optionalDependencies ?? {})) {
+      if (byName.get(child)?.optional === true) parents.set(child, [...(parents.get(child) ?? []), name]);
+    }
+  }
+  return parents;
+}
+
+// npm 10 does not drop an optional package's own optional dependencies when the package's install script fails
+// and npm removes it (arborist `optional-set.js`: only non-optional edges were followed; fixed in npm 11.6.2,
+// npm/cli#8537). For msgpackr-extract that leaves its platform package installed without its parent, and `npm ls`
+// reports it `extraneous`. The leftover is accepted only when every condition below holds:
+//  - the lockfile declares it as an optional dependency of a package that is itself optional,
+//  - that optional parent is an optional dependency of an installed package and is not installed,
+//  - the leftover's own manifest restricts os and cpu and matches this host.
+// Anything else npm reports stays a problem.
+export async function leftoverOptionalPackages({ packages, lock }) {
+  const parents = lockedOptionalChildren(lock);
+  const installedNames = new Set(packages.map(entry => entry.name));
+  const leftovers = new Set();
+  for (const entry of packages) {
+    const optionalParents = parents.get(entry.name);
+    if (!optionalParents) continue;
+    const { os: systems, cpu: architectures } = entry.manifest;
+    if (!Array.isArray(systems) || !systems.includes(process.platform)) continue;
+    if (!Array.isArray(architectures) || !architectures.includes(process.arch)) continue;
+    const orphaned = optionalParents.some(parent => !installedNames.has(parent)
+      && packages.some(owner => owner.manifest.optionalDependencies?.[parent] !== undefined));
+    if (orphaned) leftovers.add(`${entry.name}@${entry.version}`);
+  }
+  return leftovers;
+}
+
+// The installed-tree rules: `npm ls --all` exits zero with no invalid, missing or extraneous package, exactly
+// one supported @opencode/plugin version is installed, and no runtime dependency on the quota package exists.
+// Returns the list of violations (empty when the tree is acceptable).
+export async function verifyDependencyTree({ modules, listing, lock }) {
+  const problems = [];
+  if (listing.status !== 0) problems.push(`npm ls --all exited ${listing.status}`);
+  const packages = await listPackages(modules);
+  const plugins = packages.filter(entry => entry.name === '@opencode/plugin');
+  if (plugins.length === 0) problems.push('@opencode/plugin is not installed');
+  for (const plugin of plugins) {
+    if (plugin.version !== supportedPluginVersion) problems.push(`unsupported @opencode/plugin ${plugin.version} at ${plugin.location}`);
+  }
+  for (const entry of packages.filter(candidate => candidate.name === quotaPackageName)) {
+    problems.push(`${quotaPackageName} is installed at ${entry.location}`);
+  }
+  const leftovers = await leftoverOptionalPackages({ packages, lock });
+  for (const line of listing.stdout.split('\n')) {
+    if (!/\binvalid\b|extraneous|UNMET DEPENDENCY/.test(line)) continue;
+    const leftover = /(\S+@\S+) extraneous\s*$/.exec(line);
+    if (leftover && leftovers.has(leftover[1])) continue;
+    problems.push(`npm ls --all reports: ${line.trim()}`);
+  }
+  return problems;
 }
