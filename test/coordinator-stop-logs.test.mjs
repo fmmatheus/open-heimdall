@@ -676,7 +676,7 @@ test('on Linux logs reads only the owned unit through journalctl with an argumen
   const [{ file, args, options, child }] = journal.calls;
   const unit = nativeServiceNames(f.stateDirectory).systemdUnit;
   assert.equal(file, '/usr/bin/journalctl');
-  assert.deepEqual(args, ['--user', '-u', unit, '-n', '7', '--no-pager', '-o', 'short-iso']);
+  assert.deepEqual(args, ['--user', '-u', unit, '-n', '7', '--no-pager', '--quiet', '-o', 'short-iso']);
   assert.ok(!options.shell && options.stdio[0] === 'ignore');
   child.stdout.write('2026-01-01T00:00:00+0000 host unit[1]: first\n2026-01-01T00:00:01+0000 host unit[1]: sec\u001b[31mond\n2026-01-01 partial');
   child.stdout.end();
