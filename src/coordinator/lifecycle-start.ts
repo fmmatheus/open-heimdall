@@ -14,7 +14,7 @@ import type { LaunchAttempt } from './lifecycle-launch.js';
 import type { ParsedLifecycleArguments } from './lifecycle-arguments.js';
 import { createLifecycleResult, sanitizeResultText } from './lifecycle-result.js';
 import type { LifecycleErrorCode, LifecycleResult, LifecycleResultInput, LifecycleTarget, ObservedInstance } from './lifecycle-result.js';
-import { abandonLaunch, confirmOwnedProcess, createLaunchProgress, inspectOwnership, launchNativeService, nativeServiceNames } from './native/types.js';
+import { abandonLaunch, confirmOwnedProcess, createLaunchProgress, inspectOwnership, launchNativeService, nativeServiceNames, withCommandBudget } from './native/types.js';
 import type { LaunchRecord, LaunchResult, NativeOwnership, NativeServiceAdapter, ServiceConflict } from './native/types.js';
 import { selectNativeAdapter, selectNativeManager } from './native/platform.js';
 import type { NativeAdapterSelection } from './native/platform.js';
@@ -207,8 +207,13 @@ export const errorText = (error: unknown) => error instanceof Error ? error.mess
  * It never throws; every outcome is a result. It does not write coordinator or project configuration, remove
  * endpoints, signal processes or stop services.
  */
-export async function runCoordinatorStart(args: ParsedLifecycleArguments, deps: LifecycleDependencies): Promise<LifecycleResult> {
+export function runCoordinatorStart(args: ParsedLifecycleArguments, deps: LifecycleDependencies): Promise<LifecycleResult> {
   const deadlineAt = deps.now() + args.timeoutSeconds * 1000;
+  // Every native tool call of this command, including work it gives up on, is bound by the same deadline and Ctrl-C.
+  return withCommandBudget({ deadlineAt, now: deps.now, signal: deps.signal }, () => startBefore(args, deps, deadlineAt));
+}
+
+async function startBefore(args: ParsedLifecycleArguments, deps: LifecycleDependencies, deadlineAt: number): Promise<LifecycleResult> {
   const secrets = new Set<string>();
   let target: LifecycleTarget | null = null;
   const finish = (input: Omit<LifecycleResultInput, 'command'>) => createLifecycleResult({ command: 'start', target, ...input }, secrets);

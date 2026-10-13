@@ -1,4 +1,6 @@
-import { execFile } from 'node:child_process';
+import { spawn } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 
 /** Names derived from the canonical state directory, so an isolated state directory gets its own service. */
@@ -20,24 +22,124 @@ export interface CommandResult {
   timedOut?: boolean;
 }
 
+export interface CommandRunOptions {
+  /** How long the tool may run before it is ended. Defaults to 15 seconds. */
+  timeoutMs?: number;
+  /**
+   * The tool carries a request the manager may act on after this command gives up on it (a start request). When the
+   * command's deadline passes or it is interrupted, the tool client is then left running instead of being ended: ending
+   * it could drop a request the manager has not received yet, and the durable launch attempt record, not this process,
+   * is what keeps that request from being forgotten. Every other tool is ended with the command.
+   */
+  outlivesCommand?: boolean;
+}
+
 /** Runs a native tool with an argument array. Implementations never use a shell and never throw for a nonzero exit. */
 export interface CommandRunner {
-  run(file: string, args: readonly string[], options?: { timeoutMs?: number }): Promise<CommandResult>;
+  run(file: string, args: readonly string[], options?: CommandRunOptions): Promise<CommandResult>;
+}
+
+/**
+ * The overall allowance of one lifecycle command: the instant its deadline passes and the signal that interrupts it. A
+ * runner created by `createExecFileRunner` takes it from the asynchronous context of the command that calls it, so
+ * every tool call of the command (and of work the command abandoned) ends with the command rather than with the tool's
+ * own, unrelated timeout, and no tool is started once the command's allowance is spent.
+ */
+export interface CommandBudget {
+  deadlineAt: number;
+  now(): number;
+  signal?: AbortSignal;
+}
+
+const commandBudgets = new AsyncLocalStorage<CommandBudget>();
+
+/** Run `work` so that every native tool call it makes, however late, is bound by `budget`. */
+export function withCommandBudget<T>(budget: CommandBudget, work: () => T): T {
+  return commandBudgets.run(budget, work);
 }
 
 const DEFAULT_TOOL_TIMEOUT_MS = 15000;
 const OUTPUT_BOUND = 1024 * 1024;
+/** After SIGTERM, how long a tool client may take to exit before it is killed, and when the runner stops waiting for it. */
+const TERMINATE_GRACE_MS = 250;
+const GIVE_UP_AFTER_MS = 500;
 
+/** Stop holding the event loop for a child that is not waited for any more. */
+function release(child: ChildProcess): void {
+  child.unref();
+  child.stdout?.destroy();
+  child.stderr?.destroy();
+}
+
+/**
+ * The production runner: `spawn` with an argument array and no shell. Inside `withCommandBudget` the call is also bound
+ * by the command: nothing starts after the deadline or an interruption, and a tool still running when either happens
+ * is ended (SIGTERM, then SIGKILL) so the command can finish on time. Only the tool client this call started is ever
+ * signalled, never a process it asked the manager to start. A tool marked `outlivesCommand` is released instead.
+ */
 export function createExecFileRunner(): CommandRunner {
   return {
     run(file, args, options = {}) {
       return new Promise(resolve => {
-        execFile(file, [...args], { encoding: 'utf8', timeout: options.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS, maxBuffer: OUTPUT_BOUND, windowsHide: true }, (error, stdout, stderr) => {
-          if (!error) { resolve({ exitCode: 0, stdout, stderr }); return; }
-          const failure = error as NodeJS.ErrnoException & { killed?: boolean; signal?: string | null };
-          if (typeof failure.code === 'number') { resolve({ exitCode: failure.code, stdout: stdout ?? '', stderr: stderr ?? '' }); return; }
-          resolve({ exitCode: null, stdout: stdout ?? '', stderr: stderr ?? '', error: failure.killed ? `${file} did not finish in time` : `${file} could not run: ${failure.code ?? failure.message}`, ...(failure.killed ? { timedOut: true } : {}) });
+        const budget = commandBudgets.getStore();
+        if (budget?.signal?.aborted) { resolve({ exitCode: null, stdout: '', stderr: '', error: `${file} was not run: the command was interrupted` }); return; }
+        const allowance = budget ? budget.deadlineAt - budget.now() : Infinity;
+        if (allowance <= 0) { resolve({ exitCode: null, stdout: '', stderr: '', error: `${file} was not run: the command's deadline had passed` }); return; }
+
+        let child: ChildProcess;
+        try {
+          // A released tool leaves the command's process group, so a terminal Ctrl-C meant for the command cannot reach it.
+          child = spawn(file, [...args], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, detached: options.outlivesCommand === true });
+        } catch (error) {
+          resolve({ exitCode: null, stdout: '', stderr: '', error: `${file} could not run: ${(error as NodeJS.ErrnoException).code ?? (error as Error).message}` });
+          return;
+        }
+        let stdout = '';
+        let stderr = '';
+        let settled = false;
+        let endReason: string | null = null;
+        const timers: NodeJS.Timeout[] = [];
+        const later = (milliseconds: number, action: () => void) => { timers.push(setTimeout(action, milliseconds)); };
+        const abort = () => end('the command was interrupted');
+        const finish = (result: CommandResult) => {
+          if (settled) return;
+          settled = true;
+          for (const timer of timers) clearTimeout(timer);
+          budget?.signal?.removeEventListener('abort', abort);
+          resolve(result);
+        };
+        const unfinished = (reason: string): CommandResult => ({ exitCode: null, stdout, stderr, error: `${file} did not finish in time: ${reason}`, timedOut: true });
+        /** End the tool because its time ran out or the command did. A tool that may carry a request is left running. */
+        function end(reason: string, command = true): void {
+          if (settled || endReason !== null) return;
+          endReason = reason;
+          if (command && options.outlivesCommand) { release(child); finish(unfinished(reason)); return; }
+          child.kill('SIGTERM');
+          later(TERMINATE_GRACE_MS, () => { child.kill('SIGKILL'); });
+          later(GIVE_UP_AFTER_MS, () => { release(child); finish(unfinished(reason)); });
+        }
+
+        const collect = (which: 'stdout' | 'stderr') => (chunk: string) => {
+          if (which === 'stdout') stdout += chunk; else stderr += chunk;
+          if (stdout.length > OUTPUT_BOUND || stderr.length > OUTPUT_BOUND) {
+            child.kill('SIGKILL');
+            release(child);
+            finish({ exitCode: null, stdout: stdout.slice(0, OUTPUT_BOUND), stderr: stderr.slice(0, OUTPUT_BOUND), error: `${file} could not run: ERR_CHILD_PROCESS_STDIO_MAXBUFFER` });
+          }
+        };
+        child.stdout!.setEncoding('utf8'); child.stderr!.setEncoding('utf8');
+        child.stdout!.on('data', collect('stdout')); child.stderr!.on('data', collect('stderr'));
+        child.once('error', error => finish({ exitCode: null, stdout, stderr, error: `${file} could not run: ${(error as NodeJS.ErrnoException).code ?? error.message}` }));
+        child.once('close', (code, signal) => {
+          if (code !== null) finish({ exitCode: code, stdout, stderr });
+          else finish(unfinished(endReason ?? `it was terminated by ${signal ?? 'a signal'}`));
         });
+
+        later(Math.min(options.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS, 2 ** 31 - 1), () => end('the tool timeout passed', false));
+        if (budget) {
+          if (Number.isFinite(allowance)) later(Math.min(allowance, 2 ** 31 - 1), () => end("the command's deadline passed"));
+          budget.signal?.addEventListener('abort', abort, { once: true });
+        }
       });
     },
   };

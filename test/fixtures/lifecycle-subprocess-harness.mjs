@@ -91,10 +91,10 @@ export async function createSubprocessNative(t, manager) {
   /** Start a lifecycle command in its own process. `exit` resolves with the status once the process has ended. */
   function cli(command, args = []) {
     const child = spawn(process.execPath, [ENTRY, fixturePath, command, ...args], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, HOME: home } });
-    const handle = { child, pid: child.pid, stdout: '', stderr: '', exitStatus: null };
+    const handle = { child, pid: child.pid, startedAt: Date.now(), elapsedMs: null, stdout: '', stderr: '', exitStatus: null };
     child.stdout.on('data', chunk => { handle.stdout += chunk; });
     child.stderr.on('data', chunk => { handle.stderr += chunk; });
-    handle.exit = new Promise(resolve => child.once('close', (code, signal) => { handle.exitStatus = { code, signal }; resolve(handle.exitStatus); }));
+    handle.exit = new Promise(resolve => child.once('close', (code, signal) => { handle.elapsedMs = Date.now() - handle.startedAt; handle.exitStatus = { code, signal }; resolve(handle.exitStatus); }));
     spawned.push(handle);
     return handle;
   }
@@ -105,7 +105,7 @@ export async function createSubprocessNative(t, manager) {
     const status = await handle.exit;
     let document = null;
     try { document = parseLifecycleResult(JSON.parse(handle.stdout)); } catch { /* the caller's assertion reports the output */ }
-    return { status, stdout: handle.stdout, stderr: handle.stderr, document };
+    return { status, stdout: handle.stdout, stderr: handle.stderr, document, elapsedMs: handle.elapsedMs };
   }
 
   const harness = {
@@ -123,6 +123,8 @@ export async function createSubprocessNative(t, manager) {
     // --- gates and evidence of the synthetic tool ---
     gate: verb => fsp.writeFile(path.join(managerDirectory, 'gates', verb), ''),
     ungate: verb => fsp.rm(path.join(managerDirectory, 'gates', verb), { force: true }),
+    /** Every call of `verb` sleeps this long before it takes effect, so a tool call outlasts the command's budget. */
+    delay: (verb, milliseconds) => fsp.writeFile(path.join(managerDirectory, 'delay', verb), String(milliseconds)),
     failWith: (verb, status) => fsp.writeFile(path.join(managerDirectory, 'fail', verb), String(status)),
     /** Resolves with the pid of a tool call that is waiting on the gate of `verb`. */
     async reached(verb) {
