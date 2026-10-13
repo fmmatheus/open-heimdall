@@ -292,8 +292,15 @@ Other starts:
   `already-running-foreground`; nothing is registered and it is not taken over.
 - A draining coordinator is reported as `shutdown-in-progress`; it is not
   restarted and admission is not re-enabled.
-- A `start` that was waiting on another lifecycle command while a stop completed
-  does not run afterwards (`conflict`, `superseded-by-stop`); run `start` again.
+- A `start` that was waiting on another lifecycle command while a stop was
+  accepted or an `already-stopped` result was confirmed does not run afterwards
+  (`conflict`, `superseded-by-stop`); run `start` again.
+- A `start` whose deadline ends or that is interrupted while the service definition
+  is still being installed requests no start afterwards; the installation under way
+  finishes while the command keeps the per-target lock, so no other lifecycle command
+  overlaps it. A start that was already requested from the service manager stays
+  `startup-not-confirmed`: Heimdall does not undo it, and `stop` does not report
+  `stopped` or `already-stopped` for the target until that call has settled.
 - A foreign service registration, a mismatched target, a changed credential or data
   directory selection, or an endpoint that cannot be verified is a `conflict`.
   Heimdall does not remove a socket, take over a registration or signal a process.
@@ -325,6 +332,13 @@ By default `stop` then waits up to 60 seconds for all of: the clean completion
 record of that instance, a clean exit of the service's main process, and release
 of the ownership lock. A vanished socket, a failed status request or a zero
 reserved count is not proof. `stop --no-wait` returns after the acknowledgement.
+
+Before it sends the drain request (also with `--no-wait`), and before it reports
+`already-stopped`, `stop` records an ordering boundary in the private `lifecycle`
+state directory, so a `start` that began waiting earlier cannot launch the
+coordinator again. If that record cannot be written, `stop` is a `failed`
+result (`state-unknown`) that says no drain was requested, or that the coordinator
+is not reported as already stopped; it never claims that admission was disabled.
 
 | Outcome | Exit | Meaning |
 | --- | --- | --- |

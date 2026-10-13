@@ -148,6 +148,10 @@ export async function runCoordinatorStop(args: ParsedLifecycleArguments, deps: L
       // Ownership can change between the inspection above and the action: look again immediately before the request.
       const rechecked = await verifyOwned(lifecycle, instance);
       if (rechecked) return rechecked;
+      // A start that began waiting before this stop must not launch after it: the ordering boundary is recorded
+      // durably before anything is requested, and a stop that cannot record it requests nothing.
+      const boundary = await recordBoundary('drain', instance);
+      if (boundary) return boundary;
       // The request is created only while the deadline has not passed and nothing interrupted the stop.
       const budget = requestBudget(configuration.endpoint, key!, deps, deadlineAt);
       if (budget.kind === 'aborted') return failed('interrupted', 'Interrupted before any drain was requested. Nothing was changed.', { instance });
@@ -172,6 +176,29 @@ export async function runCoordinatorStop(args: ParsedLifecycleArguments, deps: L
         return await awaitCompletion(lifecycle, instance, 'The coordinator was already closing when the drain was requested.');
       }
       return await acknowledged(lifecycle, sent.value);
+    }
+
+    /**
+     * Records that a stop is being accepted or confirmed (the stop generation), so a start that was already waiting
+     * does not launch afterwards. Failing or running out of time here is a non-success that claims nothing: before a
+     * drain no request has been sent, and before `already-stopped` the state was not declared stopped.
+     */
+    async function recordBoundary(purpose: 'drain' | 'already-stopped', instance?: ObservedInstance): Promise<LifecycleResult | undefined> {
+      const recorded = await bounded(() => advanceStopGeneration(configuration.stateDirectory), deps, deadlineAt).catch((error: unknown) => ({ kind: 'error' as const, error }));
+      if (recorded.kind === 'value') return undefined;
+      const extra = { ...(instance ? { instance } : {}), logs: logsHint() };
+      if (purpose === 'drain') {
+        if (recorded.kind === 'aborted') return failed('interrupted', 'Interrupted before any drain was requested. Nothing was changed.', extra);
+        if (recorded.kind === 'timeout') return deadlineBeforeRequest(instance!);
+        return failed('state-unknown', `The stop ordering record in ${configuration.stateDirectory} could not be updated (${errorText(recorded.error)}), so no drain was requested and admission was not disabled. The coordinator was left running. Fix the lifecycle state directory and run \`heimdall coordinator stop\` again.`, extra);
+      }
+      if (recorded.kind === 'aborted') return failed('interrupted', 'Interrupted before the stopped state was recorded. Nothing was changed.', extra);
+      const message = recorded.kind === 'timeout'
+        ? 'The stop deadline passed before the stopped state was fully established. Nothing was changed. Run `heimdall coordinator stop` again.'
+        : `No coordinator answers and its last instance ended cleanly, but the stop ordering record in ${configuration.stateDirectory} could not be updated (${errorText(recorded.error)}), so a start that is still waiting could not be fenced and this is not reported as already stopped. Nothing was changed. Fix the lifecycle state directory and run \`heimdall coordinator stop\` again.`;
+      return recorded.kind === 'timeout'
+        ? finish({ outcome: 'completion-unknown', message, error: { code: 'deadline-exceeded', message }, logs: logsHint() })
+        : failed('state-unknown', message, extra);
     }
 
     /** The deadline passed while the stop was still verifying the coordinator: no request was sent and nothing changed. */
@@ -284,7 +311,7 @@ export async function runCoordinatorStop(args: ParsedLifecycleArguments, deps: L
           observation = answer.kind === 'problem' ? answer.message : 'The coordinator endpoint no longer exists.';
           const exit = await assessExit(expected);
           if (exit.kind === 'clean') {
-            if (remaining() > 0) return await stopped(expected, instance);
+            if (remaining() > 0) return stopped(expected, instance);
             // A success is never reported after the deadline; the next stop reports the already-stopped coordinator.
             observation = `Instance ${expected.instanceId} completed a clean shutdown, but that was established only after the stop deadline.`;
             break;
@@ -377,9 +404,7 @@ export async function runCoordinatorStop(args: ParsedLifecycleArguments, deps: L
       return { kind: 'clean' };
     }
 
-    async function stopped(expected: CoordinatorLifecycle, instance: ObservedInstance): Promise<LifecycleResult> {
-      try { await advanceStopGeneration(configuration.stateDirectory); }
-      catch (error) { progress(`Warning: the stop was confirmed but a start that was already waiting could not be fenced: ${errorText(error)}`); }
+    function stopped(expected: CoordinatorLifecycle, instance: ObservedInstance): LifecycleResult {
       return finish({
         outcome: 'stopped',
         message: `Coordinator instance ${expected.instanceId} stopped cleanly: its shutdown completed, its process exited with status 0 and the state ownership lock is free. The service definition is kept inactive; run \`heimdall coordinator start\` to start it again.`,
@@ -427,6 +452,10 @@ export async function runCoordinatorStop(args: ParsedLifecycleArguments, deps: L
       if (exit.kind === 'final') return exit.result;
       if (exit.kind === 'pending') return unknown(exit.observation);
       // A success is never reported after the deadline.
+      if (remaining() <= 0) return unknown('The stop deadline passed before the stopped state was fully established. Nothing was changed. Run `heimdall coordinator stop` again.', 'deadline-exceeded');
+      // Already-stopped is a stop confirmation too: a start that began waiting before it must not launch afterwards.
+      const boundary = await recordBoundary('already-stopped');
+      if (boundary) return boundary;
       if (remaining() <= 0) return unknown('The stop deadline passed before the stopped state was fully established. Nothing was changed. Run `heimdall coordinator stop` again.', 'deadline-exceeded');
       return finish({ outcome: 'already-stopped', message: `The coordinator is already stopped: its last instance ${record.instanceId} completed a clean shutdown, its process is absent and the ownership lock is free. Nothing was changed.` });
     }
