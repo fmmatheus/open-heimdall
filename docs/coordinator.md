@@ -506,7 +506,10 @@ run succeeded.
 - **Linux:** a systemd user manager with a user bus, as the ordinary user and
   without sudo. The unit has `Type=exec`, `Restart=no`, journal output and no
   `[Install]` section; it is linked into the user's unit directory, never enabled,
-  and linger is not changed. If the manager is unavailable, `start` fails with
+  and linger is not changed. The loaded fragment the manager reports, including
+  that user-directory link, counts as owned only when it resolves through every
+  link to the private definition; a link that is missing, dangling, unreadable or
+  points at another unit is a `conflict`. If the manager is unavailable, `start` fails with
   `manager-unavailable` and guidance.
 
 Other platforms report `unsupported-platform`; Windows is not supported by these

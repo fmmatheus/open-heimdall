@@ -11,6 +11,7 @@ const DEFINITION_DIRECTORY = 'service';
 const MAXIMUM_DEFINITION_BYTES = 256 * 1024;
 const START_TIMEOUT_MS = 30000;
 const SHOW_PROPERTIES = 'LoadState,ActiveState,SubState,MainPID,ExecMainStatus,ExecMainCode,FragmentPath';
+const CHANGED_ACTION = 'The unit registration changed while Heimdall was acting on it. Nothing further was requested; retry the command once the registration is stable.';
 const DEFINITION_MARKER = '# Managed by OpenHeimdall: loaded without being enabled; started only by an explicit start.';
 
 // eslint-disable-next-line no-control-regex
@@ -320,10 +321,14 @@ export function createSystemdAdapter(options: SystemdAdapterOptions): NativeServ
     return showUnit();
   }
 
-  /** The reported fragment is ours when it is the owned definition, its user-config link, or resolves to the definition. */
+  /**
+   * The reported fragment is ours only when it resolves, through every link hop, to the owned definition file. A
+   * pathname is never enough: the expected user-config link and the definition path itself are resolved like any
+   * other reported path, so a missing, unreadable, dangling or foreign link is not ownership. A symlinked definition
+   * resolves to its target and is rejected by `existingDefinition`, which opens the file without following links.
+   */
   async function ownsFragment(registered: string | null): Promise<boolean> {
-    if (!registered) return false;
-    if (registered === paths.definition || registered === linkPath) return true;
+    if (!registered || !path.isAbsolute(registered)) return false;
     const [real, owned] = await Promise.all([fs.realpath(registered).catch(() => undefined), fs.realpath(paths.definition).catch(() => undefined)]);
     return real !== undefined && real === owned;
   }
@@ -347,13 +352,16 @@ export function createSystemdAdapter(options: SystemdAdapterOptions): NativeServ
   async function registrationOwnership(inspection: ServiceInspection): Promise<RegistrationOwnership> {
     if (inspection.registration !== 'loaded') return { kind: 'refused', code: 'state-unknown', reason: `${unit} is not a loaded registration (${inspection.detail})` };
     if (!await ownsFragment(inspection.registeredPath)) {
-      return { kind: 'refused', code: 'registered-elsewhere', reason: `${unit} is loaded from ${inspection.registeredPath ?? 'an unreported path'}, not from ${paths.definition}` };
+      return { kind: 'refused', code: 'registered-elsewhere', reason: `${unit} is loaded from ${inspection.registeredPath ?? 'an unreported path'}, which does not resolve to ${paths.definition}` };
     }
     const existing = await existingDefinition();
     if (existing.kind === 'foreign') return { kind: 'refused', code: 'foreign-definition', reason: `its definition ${paths.definition} ${existing.reason}` };
     if (existing.kind === 'absent') return { kind: 'refused', code: 'registered-elsewhere', reason: `${unit} is loaded but its definition file ${paths.definition} is missing` };
     return { kind: 'owned' };
   }
+
+  const elsewhere = (registered: string | null, action: string): ServiceConflict => conflict('registered-elsewhere',
+    `${unit} is loaded from ${registered ?? 'an unreported path'}, which does not resolve to ${paths.definition}.`, action);
 
   const failed = (detail: string, conflicts: ServiceConflict[] = []): InstallResult => ({ outcome: 'failed', registered: false, conflicts, detail });
   const conflicted = (conflicts: ServiceConflict[]): InstallResult => ({ outcome: 'conflict', registered: false, conflicts, detail: conflicts[0]!.message });
@@ -389,9 +397,7 @@ export function createSystemdAdapter(options: SystemdAdapterOptions): NativeServ
 
     if (inspection.registration === 'loaded') {
       if (!await ownsFragment(inspection.registeredPath)) {
-        return conflicted([conflict('registered-elsewhere',
-          `${unit} is loaded from ${inspection.registeredPath ?? 'an unreported path'}, not from ${paths.definition}.`,
-          'Remove or rename that unit yourself; Heimdall will not replace a unit it does not own.')]);
+        return conflicted([elsewhere(inspection.registeredPath, 'Remove or rename that unit yourself; Heimdall will not replace a unit it does not own.')]);
       }
       if (existing.kind === 'absent') {
         return conflicted([conflict('registered-elsewhere', `${unit} is loaded but its definition file ${paths.definition} is missing.`,
@@ -408,9 +414,12 @@ export function createSystemdAdapter(options: SystemdAdapterOptions): NativeServ
         return conflicted([conflict('state-unknown', `The definition changed (${changes.join(', ') || 'text'}) but whether ${unit} is running could not be determined.`,
           `Confirm with \`heimdall coordinator status\` and \`systemctl --user show ${unit}\`, then retry.`, changes)]);
       }
-      // Inactive with the main process proven absent: the owned definition may be refreshed in place.
+      // Inactive with the main process proven absent: the owned definition may be refreshed in place. The link is
+      // resolved again immediately before the rewrite and before the reload, since either acts on whatever it names.
+      if (!await ownsFragment(inspection.registeredPath)) return conflicted([elsewhere(inspection.registeredPath, CHANGED_ACTION)]);
       const writeFailure = await writeDefinition(existing);
       if (writeFailure) return failed(writeFailure);
+      if (!await ownsFragment(inspection.registeredPath)) return conflicted([elsewhere(inspection.registeredPath, CHANGED_ACTION)]);
       const reloadFailure = await reload();
       if (reloadFailure) return failed(reloadFailure);
       return { outcome: 'refreshed', registered: false, conflicts: [], detail: `${unit} definition refreshed while inactive` };
@@ -418,6 +427,10 @@ export function createSystemdAdapter(options: SystemdAdapterOptions): NativeServ
 
     const writeFailure = await writeDefinition(existing);
     if (writeFailure) return failed(writeFailure);
+    // Not loaded: a link already at the expected path must be the owned definition's before `systemctl link` acts.
+    if (await fs.lstat(linkPath).then(() => true, () => false) && !await ownsFragment(linkPath)) {
+      return conflicted([elsewhere(linkPath, 'Remove or rename that link yourself; Heimdall will not link over or load a unit it does not own.')]);
+    }
     const link = await run(['link', paths.definition]);
     if (link.error || link.exitCode !== 0) return failed(`systemctl link failed: ${clip(link.error ?? `${link.stderr} ${link.stdout}`)}`);
     const reloadFailure = await reload();
@@ -434,12 +447,22 @@ export function createSystemdAdapter(options: SystemdAdapterOptions): NativeServ
         `The systemd state of ${unit} could not be determined: ${inspection.detail}.`, `Run \`systemctl --user show ${unit}\` yourself and retry once the state is clear.`)] };
     }
     if (inspection.registration === 'not-loaded') return { outcome: 'failed', conflicts: [], detail: `${unit} is not registered; install it before starting` };
-    if (!await ownsFragment(inspection.registeredPath)) {
-      const conflicts = [conflict('registered-elsewhere', `${unit} is loaded from ${inspection.registeredPath ?? 'an unreported path'}, not from ${paths.definition}.`,
-        'Remove or rename that unit yourself; Heimdall will not start a unit it does not own.')];
+    const refusal = async (): Promise<StartResult | undefined> => {
+      if (await ownsFragment(inspection.registeredPath)) {
+        const existing = await existingDefinition();
+        if (existing.kind === 'owned') return undefined;
+        const conflicts = [existing.kind === 'foreign' ? foreign(existing.reason) : conflict('registered-elsewhere', `${unit} is loaded but its definition file ${paths.definition} is missing.`, CHANGED_ACTION)];
+        return { outcome: 'conflict', conflicts, detail: conflicts[0]!.message };
+      }
+      const conflicts = [elsewhere(inspection.registeredPath, 'Remove or rename that unit yourself; Heimdall will not start a unit it does not own.')];
       return { outcome: 'conflict', conflicts, detail: conflicts[0]!.message };
-    }
+    };
+    const refused = await refusal();
+    if (refused) return refused;
     if (inspection.running === true) return { outcome: 'already-running', conflicts: [], detail: `${unit} is already running; no start was requested` };
+    // The fragment is resolved again immediately before the start request, which acts on whatever the link names.
+    const rechecked = await refusal();
+    if (rechecked) return rechecked;
     const started = await run(['start', unit], START_TIMEOUT_MS);
     if (started.error || started.exitCode !== 0) return { outcome: 'failed', conflicts: [], detail: `systemctl start failed: ${clip(started.error ?? `${started.stderr} ${started.stdout}`)}` };
     return { outcome: 'started', conflicts: [], detail: `${unit} start requested; readiness is not yet confirmed` };
@@ -453,8 +476,9 @@ export function createSystemdAdapter(options: SystemdAdapterOptions): NativeServ
     if (!await ownsFragment(inspection.registeredPath)) return { outcome: 'refused', detail: `Not unlinking ${unit}: it is loaded from ${inspection.registeredPath ?? 'an unreported path'}, not from the owned definition` };
     const existing = await existingDefinition();
     if (existing.kind !== 'owned') return { outcome: 'refused', detail: `Not unlinking ${unit}: its definition file is not an owned Heimdall definition` };
+    // Resolved immediately before the unlink, which removes whatever occupies the link path.
     const link = await fs.lstat(linkPath).catch(() => undefined);
-    if (!link?.isSymbolicLink() || await fs.realpath(linkPath).catch(() => undefined) !== await fs.realpath(paths.definition).catch(() => null)) {
+    if (!link?.isSymbolicLink() || !await ownsFragment(linkPath)) {
       return { outcome: 'refused', detail: `Not unlinking ${unit}: ${linkPath} is not a link to the owned definition` };
     }
     await fs.unlink(linkPath);
