@@ -72,27 +72,54 @@ export function defaultLifecycleDependencies(overrides: Partial<LifecycleDepende
   };
 }
 
-export type Bounded<T> = { kind: 'value'; value: T } | { kind: 'timeout' } | { kind: 'aborted' };
+/** `dispatched` is false when the deadline or interruption was seen before the action was started, so it never ran. */
+export type Bounded<T> = { kind: 'value'; value: T } | { kind: 'timeout'; dispatched: boolean } | { kind: 'aborted'; dispatched: boolean };
 
-/** Waits for `promise` until the overall deadline or an interruption. A late rejection of an abandoned call is ignored. */
-export function bounded<T>(promise: Promise<T>, deps: LifecycleDependencies, deadlineAt: number): Promise<Bounded<T>> {
+/**
+ * Starts `action` and waits for it until the overall deadline or an interruption. The deadline and the interruption
+ * are checked before the action is created, so an expired or interrupted operation never starts a new action. A late
+ * rejection of an abandoned action is ignored.
+ */
+export function bounded<T>(action: () => Promise<T>, deps: LifecycleDependencies, deadlineAt: number): Promise<Bounded<T>> {
   const remaining = deadlineAt - deps.now();
-  if (remaining <= 0) { promise.catch(() => {}); return Promise.resolve({ kind: 'timeout' }); }
-  if (deps.signal?.aborted) { promise.catch(() => {}); return Promise.resolve({ kind: 'aborted' }); }
+  if (remaining <= 0) return Promise.resolve({ kind: 'timeout', dispatched: false });
+  if (deps.signal?.aborted) return Promise.resolve({ kind: 'aborted', dispatched: false });
   return new Promise((resolve, reject) => {
     let settled = false;
-    const finish = (action: () => void) => { if (settled) return; settled = true; clearTimeout(timer); deps.signal?.removeEventListener('abort', onAbort); action(); };
-    const onAbort = () => finish(() => resolve({ kind: 'aborted' }));
-    const timer = setTimeout(() => finish(() => resolve({ kind: 'timeout' })), remaining);
+    const finish = (settle: () => void) => { if (settled) return; settled = true; clearTimeout(timer); deps.signal?.removeEventListener('abort', onAbort); settle(); };
+    const onAbort = () => finish(() => resolve({ kind: 'aborted', dispatched: true }));
+    const timer = setTimeout(() => finish(() => resolve({ kind: 'timeout', dispatched: true })), remaining);
     deps.signal?.addEventListener('abort', onAbort, { once: true });
+    let promise: Promise<T>;
+    try { promise = action(); } catch (error) { finish(() => reject(error)); return; }
     promise.then(value => finish(() => resolve({ kind: 'value', value })), error => finish(() => reject(error)));
   });
+}
+
+/** What remains of the overall deadline for one more request, or why none may be started. */
+export type RequestBudget = { kind: 'budget'; client: ReturnType<typeof createCoordinatorClient>; cappedByDeadline: boolean } | { kind: 'expired' } | { kind: 'aborted' };
+
+/**
+ * A coordinator client for the next request of an operation with one overall deadline: its allowance is what remains of
+ * that deadline (never more than `requestTimeoutMs`), computed now rather than shared with an earlier request. Nothing
+ * is created once the deadline has passed or the operation was interrupted, and Ctrl-C ends the request in flight.
+ */
+export function requestBudget(endpoint: string, key: string, deps: LifecycleDependencies, deadlineAt: number, limitMs = deps.requestTimeoutMs): RequestBudget {
+  if (deps.signal?.aborted) return { kind: 'aborted' };
+  const remaining = deadlineAt - deps.now();
+  if (remaining <= 0) return { kind: 'expired' };
+  const milliseconds = Math.max(1, Math.floor(Math.min(remaining, limitMs)));
+  return { kind: 'budget', cappedByDeadline: remaining <= limitMs, client: createCoordinatorClient(endpoint, key, { timeoutMs: milliseconds, deadlineMs: milliseconds, signal: deps.signal }) };
 }
 
 export type Probe =
   | { kind: 'absent' }
   | { kind: 'answered'; lifecycle: CoordinatorLifecycle; status: CoordinatorStatus | null }
-  | { kind: 'problem'; code: LifecycleErrorCode; message: string; transient: boolean };
+  | { kind: 'problem'; code: LifecycleErrorCode; message: string; transient: boolean }
+  /** The overall deadline passed before the probe finished; no further request was started. */
+  | { kind: 'expired' }
+  /** The operation was interrupted; the request in flight was ended. */
+  | { kind: 'aborted' };
 
 export const problem = (code: LifecycleErrorCode, message: string, transient = false): Probe => ({ kind: 'problem', code, message, transient });
 
@@ -112,8 +139,13 @@ async function endpointExists(endpoint: string): Promise<boolean> {
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false; throw error; }
 }
 
-/** One authenticated lifecycle (and, for a running coordinator, status) request. Creates and changes nothing. */
-export async function probeEndpoint(configuration: CoordinatorConfiguration, deps: LifecycleDependencies, deadlineAt: number, learned: (secret: string) => void): Promise<Probe> {
+/**
+ * One authenticated lifecycle request and, for a running coordinator, a status request. Every request takes its
+ * allowance from what remains of the overall deadline when it starts, so the pair never outlasts it. With
+ * `statusWhenClosing`, a coordinator that is not running is also asked for its status (a failure of that request
+ * leaves `status` null). Creates and changes nothing.
+ */
+export async function probeEndpoint(configuration: CoordinatorConfiguration, deps: LifecycleDependencies, deadlineAt: number, learned: (secret: string) => void, options: { statusWhenClosing?: boolean } = {}): Promise<Probe> {
   let key: string;
   try { key = await readCoordinatorToken(configuration.stateDirectory); }
   catch (error) {
@@ -126,17 +158,31 @@ export async function probeEndpoint(configuration: CoordinatorConfiguration, dep
   }
   learned(key);
   if (!await endpointExists(configuration.endpoint)) return { kind: 'absent' };
-  const milliseconds = Math.max(1, Math.floor(Math.min(deadlineAt - deps.now(), deps.requestTimeoutMs)));
-  const client = createCoordinatorClient(configuration.endpoint, key, { timeoutMs: milliseconds, deadlineMs: milliseconds });
+  /** A request that failed because the shared deadline (not its own limit) ran out, or because of Ctrl-C, ends the probe. */
+  const ended = (error: unknown, cappedByDeadline: boolean): Probe | null => {
+    if (deps.signal?.aborted) return { kind: 'aborted' };
+    const message = error instanceof Error ? error.message : '';
+    if (cappedByDeadline && /^Coordinator request (timed out|exceeded)/.test(message)) return { kind: 'expired' };
+    return null;
+  };
+  const first = requestBudget(configuration.endpoint, key, deps, deadlineAt);
+  if (first.kind !== 'budget') return first;
   let lifecycle: CoordinatorLifecycle;
-  try { lifecycle = await fetchCoordinatorLifecycle(client); }
-  catch (error) { return classifyRequestFailure(error, configuration.endpoint); }
+  try { lifecycle = await fetchCoordinatorLifecycle(first.client); }
+  catch (error) { return ended(error, first.cappedByDeadline) ?? classifyRequestFailure(error, configuration.endpoint); }
   if (lifecycle.stateDirectory !== configuration.stateDirectory || lifecycle.endpoint !== configuration.endpoint) {
     return problem('target-mismatch', `The coordinator at ${configuration.endpoint} reports state ${lifecycle.stateDirectory} and endpoint ${lifecycle.endpoint}, which do not match the selected target.`);
   }
-  if (lifecycle.phase !== 'running') return { kind: 'answered', lifecycle, status: null };
-  try { return { kind: 'answered', lifecycle, status: parseCoordinatorStatus(await client.request('GET', '/status')) }; }
-  catch (error) { return classifyRequestFailure(error, configuration.endpoint); }
+  const closing = lifecycle.phase !== 'running';
+  if (closing && !options.statusWhenClosing) return { kind: 'answered', lifecycle, status: null };
+  const second = requestBudget(configuration.endpoint, key, deps, deadlineAt);
+  if (second.kind !== 'budget') return closing && second.kind === 'expired' ? { kind: 'answered', lifecycle, status: null } : second;
+  try { return { kind: 'answered', lifecycle, status: parseCoordinatorStatus(await second.client.request('GET', '/status')) }; }
+  catch (error) {
+    const stopped = ended(error, second.cappedByDeadline);
+    if (stopped) return closing && stopped.kind === 'expired' ? { kind: 'answered', lifecycle, status: null } : stopped;
+    return closing ? { kind: 'answered', lifecycle, status: null } : classifyRequestFailure(error, configuration.endpoint);
+  }
 }
 
 export const observed = (lifecycle: CoordinatorLifecycle): ObservedInstance => ({ instanceId: lifecycle.instanceId, pid: lifecycle.pid, mode: lifecycle.mode });
@@ -227,14 +273,18 @@ export async function runCoordinatorStart(args: ParsedLifecycleArguments, deps: 
       };
 
       const first = await settleProbe();
-      if (first.kind === 'timeout') return finish({ outcome: 'conflict', message: first.message, error: { code: 'endpoint-transitioning', message: first.message } });
+      if (first.kind === 'timeout') return finish({ outcome: 'conflict', message: first.message, error: { code: first.code, message: first.message } });
       if (first.kind === 'aborted') return failed('interrupted', 'Interrupted before the coordinator was started. Nothing was started.');
       const probe = first.probe;
       if (probe.kind === 'problem') {
         const message = `${probe.message} Nothing was started or changed.`;
         return finish({ outcome: 'conflict', message, error: { code: probe.code, message } });
       }
-      if (probe.kind === 'answered') return await handleAnswered(probe.lifecycle, probe.status);
+      if (probe.kind === 'answered') {
+        const recognized = await handleAnswered(probe.lifecycle, probe.status);
+        // Recognition that finished only after the deadline is not reported as a success.
+        return recognized.ok && deadlineAt - deps.now() <= 0 ? deadlineBeforeAction('verified the running coordinator') : recognized;
+      }
 
       // No coordinator answers: an explicit start. A remembered credential reference is reused when none is given.
       const unprepared = await prepare(null);
@@ -260,8 +310,11 @@ export async function runCoordinatorStart(args: ParsedLifecycleArguments, deps: 
       }
 
       progress(`Starting the coordinator through ${target!.manager} (${target!.label}).`);
-      const launched = await bounded(launchNativeService(adapter!), deps, deadlineAt).catch((error: unknown) => ({ kind: 'error' as const, error }));
+      const launched = await bounded(() => launchNativeService(adapter!), deps, deadlineAt).catch((error: unknown) => ({ kind: 'error' as const, error }));
       if (launched.kind === 'error') return failed('launch-failed', `The service manager call failed: ${errorText(launched.error)}`, { logs: logsHint() });
+      // Seen before the launch was started: nothing was requested, so nothing may have started either.
+      if (launched.kind === 'aborted' && !launched.dispatched) return failed('interrupted', 'Interrupted before the coordinator was started. Nothing was started.');
+      if (launched.kind === 'timeout' && !launched.dispatched) return deadlineBeforeAction('started the service');
       if (launched.kind === 'aborted') return finish({ outcome: 'startup-not-confirmed', message: 'Interrupted while starting the service. The launch may already have been requested; check with `heimdall coordinator status`.', error: { code: 'interrupted', message: 'Interrupted while starting the service' }, logs: logsHint() });
       if (launched.kind === 'timeout') {
         const message = 'The service manager did not finish within the startup deadline. The coordinator may still start.';
@@ -291,13 +344,11 @@ export async function runCoordinatorStart(args: ParsedLifecycleArguments, deps: 
         let absentChecks = 0;
         let ownership: NativeOwnership | null = null;
         while (true) {
-          if (deps.signal?.aborted) {
-            return finish({ outcome: 'startup-not-confirmed', message: `Interrupted while waiting. The service was started and keeps running or starting; it was not stopped. ${observation}`, error: { code: 'interrupted', message: 'Interrupted while waiting for readiness' }, logs: logsHint() });
-          }
+          if (deps.signal?.aborted) return interruptedWaiting();
           if (deadlineAt - deps.now() <= 0) break;
           // Each pass starts without evidence: an unreadable manager state never carries over as ownership.
           ownership = null;
-          const inspected = await bounded(inspectOwnership(adapter!), deps, deadlineAt).catch(() => ({ kind: 'timeout' as const }));
+          const inspected = await bounded(() => inspectOwnership(adapter!), deps, deadlineAt).catch(() => ({ kind: 'timeout' as const }));
           if (inspected.kind === 'value') {
             ownership = inspected.value;
             const inspection = ownership.inspection;
@@ -309,6 +360,8 @@ export async function runCoordinatorStart(args: ParsedLifecycleArguments, deps: 
             }
           }
           const answer = await probeEndpoint(configuration, deps, deadlineAt, secret => secrets.add(secret)).catch((error: unknown) => problem('state-unknown', `The endpoint could not be checked: ${errorText(error)}`, true));
+          if (answer.kind === 'aborted') return interruptedWaiting();
+          if (answer.kind === 'expired') break;
           if (answer.kind === 'absent') observation = 'The coordinator endpoint does not exist yet.';
           else if (answer.kind === 'problem') {
             if (!answer.transient) return finish({ outcome: 'conflict', message: `${answer.message} The launch was requested and may still start.`, error: { code: answer.code, message: answer.message }, logs: logsHint() });
@@ -330,6 +383,7 @@ export async function runCoordinatorStart(args: ParsedLifecycleArguments, deps: 
             } else {
               const confirmed = confirmOwnedProcess(ownership, lifecycle.pid, label!);
               if (confirmed.kind === 'refused') observation = `The coordinator answered with process ${lifecycle.pid}, but it is not confirmed as the started service: ${confirmed.reason}.`;
+              else if (deadlineAt - deps.now() <= 0) observation = 'The coordinator answered only after the startup deadline.';
               else if (answer.status?.status === 'running' && answer.status.acceptingNewRuns) {
                 return finish({ outcome: 'ready', message: 'Coordinator started and ready. Readiness confirms coordinator IPC only; it does not check OpenCode connectivity, credentials or quota.', instance: observed(lifecycle) });
               } else observation = 'The coordinator answered but is not yet running and accepting runs.';
@@ -339,21 +393,33 @@ export async function runCoordinatorStart(args: ParsedLifecycleArguments, deps: 
         }
         const message = `Readiness was not confirmed within ${args.timeoutSeconds} seconds. ${observation} The service was started and may still become ready; Heimdall did not stop it.`;
         return finish({ outcome: 'startup-not-confirmed', message, error: { code: 'startup-timeout', message }, logs: logsHint() });
+
+        function interruptedWaiting(): LifecycleResult {
+          return finish({ outcome: 'startup-not-confirmed', message: `Interrupted while waiting. The service was started and keeps running or starting; it was not stopped. ${observation}`, error: { code: 'interrupted', message: 'Interrupted while waiting for readiness' }, logs: logsHint() });
+        }
       }
     }
 
-    async function settleProbe(): Promise<{ kind: 'probe'; probe: Probe } | { kind: 'timeout'; message: string } | { kind: 'aborted' }> {
+    async function settleProbe(): Promise<{ kind: 'probe'; probe: Probe } | { kind: 'timeout'; message: string; code: LifecycleErrorCode } | { kind: 'aborted' }> {
       while (true) {
         if (deps.signal?.aborted) return { kind: 'aborted' };
         let probe: Probe;
         try { probe = await probeEndpoint(configuration, deps, deadlineAt, secret => secrets.add(secret)); }
         catch (error) { probe = problem('state-unknown', `The endpoint could not be checked: ${errorText(error)}`); }
+        if (probe.kind === 'aborted') return { kind: 'aborted' };
+        if (probe.kind === 'expired') return { kind: 'timeout', code: 'deadline-exceeded', message: 'The coordinator did not answer within the startup deadline. Nothing was started or changed.' };
         // An unreachable endpoint that still exists is stale or unknown; only a coordinator that is starting or closing may settle.
         if (probe.kind === 'problem' && probe.code === 'endpoint-unreachable') probe = { ...probe, transient: false };
         if (probe.kind !== 'problem' || !probe.transient) return { kind: 'probe', probe };
-        if (deadlineAt - deps.now() <= 0) return { kind: 'timeout', message: `${probe.message} It did not settle before the startup deadline. Nothing was started or changed.` };
+        if (deadlineAt - deps.now() <= 0) return { kind: 'timeout', code: 'endpoint-transitioning', message: `${probe.message} It did not settle before the startup deadline. Nothing was started or changed.` };
         await deps.sleep(Math.max(1, Math.min(deps.pollIntervalMs, deadlineAt - deps.now())), deps.signal);
       }
+    }
+
+    /** The overall deadline passed before `step` finished; nothing was changed by this command, so this is not a pending startup. */
+    function deadlineBeforeAction(step: string, instance?: ObservedInstance): LifecycleResult {
+      const message = `The startup deadline passed before this command ${step}. Nothing was started or changed; retry the command.`;
+      return finish({ outcome: 'conflict', message, error: { code: 'deadline-exceeded', message }, ...(instance ? { instance } : {}) });
     }
 
     function shutdownInProgress(lifecycle: CoordinatorLifecycle): LifecycleResult {
@@ -385,9 +451,11 @@ export async function runCoordinatorStart(args: ParsedLifecycleArguments, deps: 
       const instance = observed(lifecycle);
       // An answering endpoint, a disk definition or a process id alone never establishes ownership: the loaded
       // registration must resolve to the owned definition and run exactly this instance's process.
-      const inspected = await bounded(inspectOwnership(adapter), deps, deadlineAt).catch((error: unknown) => ({ kind: 'error' as const, error }));
+      const inspected = await bounded(() => inspectOwnership(adapter), deps, deadlineAt).catch((error: unknown) => ({ kind: 'error' as const, error }));
+      if (inspected.kind === 'aborted') return failed('interrupted', 'Interrupted while verifying the running coordinator. Nothing was started or changed.', { instance });
+      if (inspected.kind === 'timeout') return deadlineBeforeAction('verified the running coordinator', instance);
       if (inspected.kind !== 'value') {
-        const message = `The service manager could not confirm the running coordinator: ${inspected.kind === 'error' ? errorText(inspected.error) : inspected.kind}. It was left unchanged.`;
+        const message = `The service manager could not confirm the running coordinator: ${errorText(inspected.error)}. It was left unchanged.`;
         return finish({ outcome: 'conflict', message, error: { code: 'state-unknown', message }, instance });
       }
       const confirmed = confirmOwnedProcess(inspected.value, lifecycle.pid, label!);
