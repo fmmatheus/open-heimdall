@@ -313,6 +313,77 @@ export function createLaunchdAdapter(options: LaunchdAdapterOptions): NativeServ
     return { outcome, registered: true, conflicts: [], detail: `${label} registered from ${paths.definition}` };
   }
 
+  type Unload =
+    | { kind: 'done'; outcome: 'removed' | 'nothing-to-remove'; detail: string }
+    | { kind: 'refused'; reason: 'running' | 'unknown' | 'elsewhere' | 'definition' | 'bootout-failed'; detail: string; inspection: ServiceInspection };
+
+  /**
+   * Unload the registration only while it is proven inactive and owned: loaded from the owned definition, a
+   * recognized stopped state with no process, and (when given) the definition file unchanged since the caller
+   * read it. The state is read again here, immediately before `bootout`, and nothing is signalled.
+   */
+  async function unload(expectedText?: string): Promise<Unload> {
+    const inspection = await inspect();
+    if (inspection.registration === 'not-loaded') return { kind: 'done', outcome: 'nothing-to-remove', detail: `${label} is not loaded` };
+    if (inspection.registration !== 'loaded' || inspection.running === 'unknown') {
+      return { kind: 'refused', reason: 'unknown', inspection, detail: `Not unloading ${label}: absence of its process is not proven (${inspection.detail})` };
+    }
+    if (inspection.running !== false) return { kind: 'refused', reason: 'running', inspection, detail: `Not unloading ${label}: it is running` };
+    if (!await ownsRegistration(inspection.registeredPath)) {
+      return { kind: 'refused', reason: 'elsewhere', inspection, detail: `Not unloading ${label}: it is loaded from ${inspection.registeredPath ?? 'an unreported path'}, not from the owned definition` };
+    }
+    const existing = await existingDefinition();
+    if (existing.kind !== 'owned') return { kind: 'refused', reason: 'definition', inspection, detail: `Not unloading ${label}: its definition file is not an owned Heimdall definition` };
+    if (expectedText !== undefined && existing.text !== expectedText) {
+      return { kind: 'refused', reason: 'definition', inspection, detail: `Not unloading ${label}: its definition file changed while the refresh was under way` };
+    }
+    const bootout = await runner.run(launchctl, ['bootout', target]);
+    if (bootout.error || bootout.exitCode !== 0) {
+      return { kind: 'refused', reason: 'bootout-failed', inspection, detail: `launchctl bootout failed: ${clip(bootout.error ?? `${bootout.stderr} ${bootout.stdout}`)}` };
+    }
+    return { kind: 'done', outcome: 'removed', detail: `${label} unloaded; the definition file is retained` };
+  }
+
+  const stateUnknownConflict = (detail: string, changes: string[]) => conflict('state-unknown',
+    `The launchd state of ${label} could not be confirmed while its definition (${changes.join(', ')}) was being refreshed: ${detail}.`,
+    'Confirm with `heimdall coordinator status` and `launchctl print ' + target + '`, then retry.', changes);
+
+  /**
+   * Replace the owned definition of a loaded, proven-inactive registration. launchd keeps the definition it
+   * loaded, so the stale registration is unloaded first, the state is read once more, and only a registration
+   * that is gone is replaced by the new definition. A change at any step stops the refresh without further
+   * mutation; start then registers and kickstarts the new definition, never with a kill option.
+   */
+  async function refreshInactive(existing: Extract<Existing, { kind: 'owned' }>, changes: string[]): Promise<InstallResult> {
+    const conflicted = (refusal: ServiceConflict): InstallResult => ({ outcome: 'conflict', registered: false, detail: refusal.message, conflicts: [refusal] });
+    const unloaded = await unload(existing.text);
+    if (unloaded.kind === 'refused') {
+      if (unloaded.reason === 'bootout-failed') return { outcome: 'failed', registered: false, conflicts: [], detail: unloaded.detail };
+      if (unloaded.reason === 'running') {
+        return conflicted(conflict('running-context-changed', `${label} started running while its definition (${changes.join(', ')}) was being refreshed; a loaded running definition is never replaced.`,
+          'Stop the coordinator with `heimdall coordinator stop`, wait for a clean shutdown, then start it again.', changes));
+      }
+      if (unloaded.reason === 'elsewhere') {
+        return conflicted(conflict('registered-elsewhere', `${label} is loaded in ${domain} from ${unloaded.inspection.registeredPath ?? 'an unreported path'}, not from ${paths.definition}.`,
+          'Remove that registration yourself (launchctl bootout), or stop using the conflicting label; Heimdall will not replace it.'));
+      }
+      return conflicted(stateUnknownConflict(unloaded.detail, changes));
+    }
+    const fresh = await inspect();
+    if (fresh.registration !== 'not-loaded') {
+      if (fresh.registration === 'loaded' && fresh.running === true) {
+        return conflicted(conflict('running-context-changed', `${label} is running again after its stale registration was unloaded; a loaded running definition is never replaced.`,
+          'Stop the coordinator with `heimdall coordinator stop`, wait for a clean shutdown, then start it again.', changes));
+      }
+      if (fresh.registration === 'loaded' && fresh.running === false) {
+        return conflicted(conflict('registered-elsewhere', `${label} was registered again from ${fresh.registeredPath ?? 'an unreported path'} while its definition was being refreshed.`,
+          'Remove that registration yourself (launchctl bootout), or stop using the conflicting label; Heimdall will not replace it.'));
+      }
+      return conflicted(stateUnknownConflict(fresh.detail, changes));
+    }
+    return writeAndRegister(existing, fresh);
+  }
+
   async function install(): Promise<InstallResult> {
     const inspection = await inspect();
     if (inspection.registration === 'unknown') {
@@ -322,7 +393,7 @@ export function createLaunchdAdapter(options: LaunchdAdapterOptions): NativeServ
     const existing = await existingDefinition();
     if (existing.kind === 'foreign') return { outcome: 'conflict', registered: false, detail: existing.reason, conflicts: [foreign(existing.reason)] };
     if (inspection.registration === 'loaded') {
-      if (inspection.registeredPath !== paths.definition) {
+      if (!await ownsRegistration(inspection.registeredPath)) {
         const conflicts = [conflict('registered-elsewhere',
           `${label} is loaded in ${domain} from ${inspection.registeredPath ?? 'an unreported path'}, not from ${paths.definition}.`,
           'Remove that registration yourself (launchctl bootout), or stop using the conflicting label; Heimdall will not replace it.')];
@@ -346,10 +417,9 @@ export function createLaunchdAdapter(options: LaunchdAdapterOptions): NativeServ
             'Confirm with `heimdall coordinator status` and `launchctl print ' + target + '`, then retry.', changes)];
           return { outcome: 'conflict', registered: false, detail: conflicts[0]!.message, conflicts };
         }
-        const conflicts = [conflict('inactive-registration-stale',
-          `${label} is loaded but not running, and its definition differs in ${changes.join(', ')}.`,
-          'Unload the inactive registration (the adapter\'s unloadInactive), then start again.', changes)];
-        return { outcome: 'conflict', registered: false, detail: conflicts[0]!.message, conflicts };
+        // Loaded from the owned definition with the previous process proven absent: the registration is stale and
+        // may be replaced by the new definition. Anything the recheck cannot prove leaves launchd untouched.
+        return refreshInactive(existing, changes);
       }
       return { outcome: 'unchanged', registered: false, conflicts: [], detail: `${label} is already registered with the current definition` };
     }
@@ -364,7 +434,7 @@ export function createLaunchdAdapter(options: LaunchdAdapterOptions): NativeServ
         `The launchd state of ${label} could not be determined: ${inspection.detail}.`, 'Run `launchctl print ' + target + '` yourself and retry once the state is clear.')] };
     }
     if (inspection.registration === 'not-loaded') return { outcome: 'failed', conflicts: [], detail: `${label} is not registered; install it before starting` };
-    if (inspection.registeredPath !== paths.definition) {
+    if (!await ownsRegistration(inspection.registeredPath)) {
       const conflicts = [conflict('registered-elsewhere', `${label} is loaded from ${inspection.registeredPath ?? 'an unreported path'}, not from ${paths.definition}.`,
         'Remove that registration yourself; Heimdall will not start a definition it does not own.')];
       return { outcome: 'conflict', conflicts, detail: conflicts[0]!.message };
@@ -377,15 +447,8 @@ export function createLaunchdAdapter(options: LaunchdAdapterOptions): NativeServ
   }
 
   async function unloadInactive(): Promise<CleanupResult> {
-    const inspection = await inspect();
-    if (inspection.registration === 'not-loaded') return { outcome: 'nothing-to-remove', detail: `${label} is not loaded` };
-    if (inspection.registration !== 'loaded' || inspection.running !== false) return { outcome: 'refused', detail: `Not unloading ${label}: absence of its process is not proven (${inspection.detail})` };
-    if (inspection.registeredPath !== paths.definition) return { outcome: 'refused', detail: `Not unloading ${label}: it is loaded from ${inspection.registeredPath ?? 'an unreported path'}, not from the owned definition` };
-    const existing = await existingDefinition();
-    if (existing.kind !== 'owned') return { outcome: 'refused', detail: `Not unloading ${label}: its definition file is not an owned Heimdall definition` };
-    const bootout = await runner.run(launchctl, ['bootout', target]);
-    if (bootout.error || bootout.exitCode !== 0) return { outcome: 'refused', detail: `launchctl bootout failed: ${clip(bootout.error ?? `${bootout.stderr} ${bootout.stdout}`)}` };
-    return { outcome: 'removed', detail: `${label} unloaded; the definition file is retained` };
+    const unloaded = await unload();
+    return unloaded.kind === 'done' ? { outcome: unloaded.outcome, detail: unloaded.detail } : { outcome: 'refused', detail: unloaded.detail };
   }
 
   async function cleanupFixture(): Promise<CleanupResult> {

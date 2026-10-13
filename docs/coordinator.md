@@ -337,7 +337,16 @@ restarts the service and never deletes state. After a clean stop the owned
 definition is kept, inactive, for the next explicit `start`. A changed executable,
 configuration or credential source is applied to an inactive definition only after
 its previous process is proven absent; a live definition is never replaced and the
-conflict is reported.
+conflict is reported. `start` applies the change itself, with no manual
+service-manager step: systemd rewrites the unit in place and reloads the manager.
+launchd keeps the definition it loaded, so `start` first unloads the registration
+(`launchctl bootout`) only when it is loaded from the owned definition and
+the manager reports it not running with no process, then reads the state again,
+registers the new definition and starts it with `launchctl kickstart` (never with
+`-k` or any kill option). A registration that is running, in an unknown state,
+loaded from another definition, or that changes while the refresh is under way is
+left untouched and reported as a conflict (`running-context-changed`,
+`state-unknown` or `registered-elsewhere`).
 
 Ctrl-C (or SIGTERM) during `start`'s or `stop`'s wait, or during `logs --follow`,
 ends only that command. It does not reverse a requested drain, stop the
@@ -406,6 +415,8 @@ Error codes by group:
   `running-context-changed`, `target-mismatch`, `foreign-registration`,
   `foreign-definition`, `registered-elsewhere`, `inactive-registration-stale`,
   `foreground-coordinator`, `instance-mismatch`, `not-managed`.
+  `inactive-registration-stale` stays in the result schema for compatibility;
+  `start` now refreshes such a registration itself instead of reporting it.
 - Endpoint and state: `endpoint-unreachable`, `endpoint-refused`,
   `endpoint-transitioning`, `endpoint-invalid`, `endpoint-not-ready`,
   `unsupported-lifecycle-protocol`, `state-unknown`.
