@@ -14,7 +14,6 @@ import { privateFile, readCoordinatorToken } from './token.js';
 import { acquireCoordinatorOwnership } from './ownership.js';
 import type { CoordinatorOwnership } from './ownership.js';
 import type { CredentialContext } from './credentials.js';
-import { maskSecrets } from '../redaction.js';
 import {
   buildCoordinatorLifecycle, COORDINATOR_LIFECYCLE_PROTOCOL, CoordinatorShutdownError, createCoordinatorInstance,
   privateLifecycleDirectory, sanitizeShutdownError, writeInstanceRecord, writeShutdownRecord,
@@ -275,12 +274,9 @@ async function startOwnedService(options: ServiceOptions, root: string, ownershi
 
   const hook = async (stage: ShutdownStage | 'publish-failure') => { await options.testHooks?.shutdownStage?.(stage); };
   const describe = (error: unknown) => {
-    const secrets = [accessToken];
+    const secrets = [accessToken, ...(options.credentials?.values() ?? [])];
     try { for (const candidate of store.listRuns()) if (candidate.ownerToken) secrets.push(candidate.ownerToken); } catch { /* The store may be the failing part. */ }
-    // Credential values may be shorter than the generic sanitizer's threshold, so mask them first.
-    const credentialValues = options.credentials?.values() ?? [];
-    const raw = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
-    return sanitizeShutdownError(credentialValues.length ? maskSecrets(raw, credentialValues.filter(value => value.length >= 4)) : error, secrets);
+    return sanitizeShutdownError(error, secrets);
   };
   const persist = (status: ShutdownStatus, extra: { stage?: ShutdownStage; error?: string; completedAt?: number } = {}): Promise<string> => {
     const record: ShutdownRecord = {

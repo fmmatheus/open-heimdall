@@ -84,10 +84,9 @@ export const isSuccessOutcome = (outcome: LifecycleOutcome): boolean => SUCCESS_
 
 const MAXIMUM_TEXT_LENGTH = 2000;
 
-/** Masks known secrets and credential-shaped values, removes control characters and bounds the length. */
+/** Masks known secrets of any length and credential-shaped values, removes control characters and bounds the length. */
 export function sanitizeResultText(text: string, secrets: Iterable<string> = []): string {
-  const known = [...secrets].filter(secret => secret.length >= 4);
-  const clean = maskSecrets(text, known)
+  const clean = maskSecrets(text, secrets)
     // eslint-disable-next-line no-control-regex
     .replace(/[\u0000-\u001f\u007f]+/g, ' ')
     .replace(/\b[0-9a-f]{64}\b/gi, '[redacted]')
