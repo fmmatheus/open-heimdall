@@ -2,9 +2,14 @@
 
 Evidence for `heimdall coordinator start`, `stop` and `logs` and the native user-service adapters.
 
-**Status: this page holds two separate bodies of evidence.**
+**Status: this page holds three separate bodies of evidence.**
 
-1. **Corrected code, `61847fe`** (next section). Local checks and the native lifecycle suite on a real launchd
+0. **Final acceptance, `01b073f`** (next section). The full local matrix on macOS, the Linux installed-package and
+   native suites, and the corrections made after `0651d81` pass at that commit, with one host-load instability of
+   `npm test` on macOS that is recorded rather than resolved. PENDING: the GitHub-hosted CI jobs, a held-reservation
+   drain under a native manager, native systemd checks of the stopped-definition refresh and of the stop ordering,
+   and Windows (unsupported).
+1. **Corrected code, `61847fe`** (the section after it). Local checks and the native lifecycle suite on a real launchd
    user domain (macOS) pass. The native suite on a real systemd user manager (Ubuntu 24.04 VM) passes with 10
    passing and 3 skipped cases (none of them native Linux checks of the corrected behavior). On Linux, the
    installed-package tests fail 3 of 22 (the same 3 as at the base commit `e5c6fbc`, so not caused by the corrected
@@ -16,6 +21,127 @@ Evidence for `heimdall coordinator start`, `stop` and `logs` and the native user
 
 Nothing in this record shows that a run can execute under a native service. A user's real OpenCode or
 OpenChamber installation, provider accounts and quota were not involved.
+
+## Final acceptance: verified commit `01b073f`
+
+The source verified in this section is `01b073f` (`fix(coordinator): publish the access key only once it holds a
+complete token`), the last commit that changed source. Its ancestry includes the base `0651d81`. Every later commit
+on the branch changes this page only. The source changed after the earlier Linux and native runs, so the Linux
+installed-package suite and the native suites were run again at `01b073f` in a new VM instead of being cited.
+
+### Environments
+
+| Item | macOS host | Linux VM |
+| --- | --- | --- |
+| OS | macOS 27.0.1 (Darwin 27.0.0, arm64) | Ubuntu 24.04.5 LTS, Linux 6.8.0-142-generic aarch64, systemd 255 |
+| Node.js / npm | v22.22.3 / 10.9.8 (default); v24.21.0 / 11.19.0 (mise); v22.19.0 / 10.9.3 (official `darwin-arm64` tarball, SHA-256 checked against `SHASUMS256.txt`, extracted in a disposable directory); v26.11.1 (credentials regression only) | v22.19.0 / 10.9.3 and v24.21.0 / 11.19.0 (official `linux-arm64` tarballs, SHA-256 checked) |
+| Execution context | ordinary logged-in user | ordinary non-root user, `Linger=no` before and after the suites |
+| Source | managed checkout at `01b073f` | `git archive HEAD` of `01b073f` committed into a scratch repository, `npm ci --ignore-scripts`, `npm run build` |
+
+The VM was a Lima 2.2.1 `vz` guest (stock `ubuntu-24.04` template, no host mounts, 2 CPUs, 3 GiB), created for this
+run and deleted afterwards.
+
+### Commands and results at `01b073f`
+
+| Command | Environment | Result |
+| --- | --- | --- |
+| `npm run check` | macOS, Node 22.22.3 | exit 0 |
+| `npm run build:extension` | macOS, Node 22.22.3 | exit 0 |
+| `npm test` | macOS, Node 22.22.3 | passes, with intermittent failures under host load (see below): 1390 tests, 1390 pass in 2 of the 3 clean re-runs (83 s each); 10 further consecutive full runs 1390 of 1390 |
+| `npm run test:package` | macOS, Node 22.22.3 | 46 of 46 pass (140 s) |
+| `npm run test:package` | macOS, Node 24.21.0 | 46 of 46 pass (155 s) |
+| `npm run test:package` | macOS, Node 22.19.0 | 46 of 46 pass (123 s) |
+| `node --test --test-concurrency=1 test/setup-*.test.mjs test/doctor*.test.mjs test/runtime-identity*.test.mjs` | macOS | 253 of 253 pass (89 s) |
+| Regression set: the access-key, redaction, systemd link ownership, launch uncertainty, process exit, journal, ownership, refresh, private paths, managed and short credentials, deadline, ordering, credentials, adapters, CLI, stop and logs, drain, native adapter, executor, service and lifecycle files, run serially | macOS | 452 of 452 pass (188 s) |
+| `node@26 --test test/coordinator-credentials.test.mjs` | macOS, Node 26.11.1 | 12 of 12 pass |
+| `HEIMDALL_NATIVE_LIFECYCLE=1 npm run test:native` | macOS, launchd user domain | 16 tests: 12 pass, 4 expected skips (23 s) |
+| `npm run test:package` | Linux, Node 22.19.0 | 46 of 46 pass (221 s) |
+| `npm run test:package` | Linux, Node 24.21.0 | 46 of 46 pass (228 s) |
+| setup, doctor and runtime-identity set | Linux, Node 22.19.0 and 24.21.0 | 253 of 253 pass on each (37 s and 48 s) |
+| `HEIMDALL_NATIVE_LIFECYCLE=1 node --test --test-concurrency=1 test/native/*.test.mjs` | Linux, real systemd user manager, Node 22.19.0 | 16 tests: 14 pass, 2 expected skips (14 s) |
+
+The Linux native skips are the launchd-only refresh case and the case that needs the production executor (a
+restarted managed service always runs the real executor). After the native suite on Linux no
+`heimdall-coordinator-*` unit, unit file, `~/.config/systemd/user` entry, `/tmp/hn-*` root or coordinator process
+remained, and `Linger` was still `no`.
+
+### Baseline versus fixed: the access key could be read empty
+
+Defect (found while diagnosing `npm test` failures; present at `0651d81` and before): `startCoordinatorService`
+created `coordinator.key` empty and wrote it in a second step. `coordinator start`, `status`, `stop` and the
+OpenChamber service read that key without the ownership lock, so a probe racing a starting coordinator could read an
+empty file and fail with `Invalid coordinator access key`. A lifecycle `start` that hit this reported an unresolved
+state instead of waiting.
+
+Correction: `src/coordinator/service.ts` writes the key to `coordinator.key.pending` and renames it into place under
+the state-directory ownership. An existing key is kept, and a leftover pending file is replaced.
+
+Regression: `test/coordinator-key-creation.test.mjs` (3 tests) starts a real service process on a fresh state
+directory 12 times while another loop reads the key as fast as it can. Baseline (the same test against the previous
+two-step creation in a disposable copy of the built output), three runs: 1 of 3 tests passing each time; the
+reader saw an unusable key in 2 to 4 of the 12 starts, and the pending-file test failed. Fixed, three runs: 3 of 3
+pass. A separate tight-poll loop over 150 fresh starts of the previous code saw an empty key in 120 of them.
+
+### `npm test` on the macOS host: recorded instability
+
+`npm test` ran as one `node --test test/*.test.mjs` process with default parallelism. On this host the result
+depends on load from unrelated processes (load averages between 10 and 99 were observed while an unrelated test
+run was active on the same machine).
+
+- At `473e6ca` (before the access-key fix), under load: 1381 of 1387 (5 failures and 1 cancelled file), then 1387 of
+  1387, then 1383 of 1387 (4 failures). The failing tests differed from run to run (drain, launchd and systemd
+  readiness, snapshot launch, link-ownership and configuration tests). One of them (`start does not adopt a running
+  managed coordinator whose expected link is a missing target`) failed with the empty-key read described above and
+  is fixed by `01b073f`.
+- At `01b073f`: one full run (519 s, while a VM was being prepared) ended with one test file,
+  `coordinator-service.test.mjs`, alive at 0% CPU about seven minutes after its last reported test; the process was
+  ended by hand and counted as one failure (1389 of 1390). The file passes alone (6 of 6 runs) and showed no hang in
+  96 further runs at 8-way concurrency. Three clean re-runs then gave 1389 of 1390 (one failure, `systemd: after an
+  already-issued start, a timeout ends the command without ending the request, and stop claims nothing until it
+  resolves`, which returned `failed` instead of `startup-not-confirmed`), 1390 of 1390 and 1390 of 1390. Ten more
+  consecutive runs, with a message-only change to one assertion that was reverted afterwards, were all 1390 of 1390.
+- The 96 concurrent runs of `coordinator-service.test.mjs` also showed that its fixture repositories inherit the
+  host's `commit.gpgsign=true`: 11 runs failed with `gpg failed to sign the data` when several commits competed for
+  the signing agent. The full-suite failures above contained no such error.
+
+Not resolved: the single hang and the single process-exit failure did not reproduce, and no cause is claimed for
+them. The access-key read is the only failure with a demonstrated mechanism and a fix. **PENDING**: the cause of the
+two non-reproduced failures, and a fixture-level `commit.gpgsign=false` for hosts that sign commits globally.
+
+### Areas of the work and where they are established
+
+| Area | Tests | Where the evidence is |
+| --- | --- | --- |
+| Redaction of known values that collide with credential syntax | `test/coordinator-redaction-collisions.test.mjs` | "Redaction: known values that collide with credential syntax" |
+| systemd link ownership | `test/coordinator-systemd-link-ownership.test.mjs`, `test/native/` foreign-link case | "systemd ownership" and "Real-native checks" |
+| Launch attempts surviving the invoking process | `test/coordinator-lifecycle-launch-uncertainty.test.mjs` | "Launch attempts survive the invoking process" |
+| Command lifetime bound to its deadline and Ctrl-C | `test/coordinator-lifecycle-process-exit.test.mjs`, native delayed-shutdown case | "The command's lifetime is bound by its deadline and Ctrl-C" and "Real-native checks" |
+| Empty Linux journals | `test/coordinator-journal-logs.test.mjs`, `test/package/` | "Empty Linux journals" |
+| Linux installed package (extraneous `msgpackr-extract` platform package) | `test/package/` | "Linux installed package: the extraneous `msgpackr-extract` platform package" |
+| Access key published only when complete | `test/coordinator-key-creation.test.mjs` | this section |
+
+The dependency diagnosis (npm 10 reports the leftover optional `@msgpackr-extract/*` platform package as extraneous)
+is unchanged; the package suite passes on Linux with Node 22.19.0 and 24.21.0 in the new VM.
+
+### Cleanup
+
+- Both Lima instances created for this work were stopped and deleted; `limactl list` reports no instance.
+- On the host: no fixture launchd label (`launchctl list` shows none), no `~/Library/LaunchAgents` entry, no `/tmp/hn-*`
+  root and no fixture process remains. Fixture processes and a temporary root left by an aborted diagnostic copy of
+  the tests were ended and removed, as were the extracted Node 22.19.0 tarball and the temporary installed-package
+  roots from interrupted package runs.
+- **Cleanup pending**: 19 directories `/private/tmp/hl-*` and older `heimdall-baseline-*` and `heimdall-native-*`
+  roots under the user temporary directory predate this verification pass and could not be attributed to it, so
+  they were not removed. Check that nothing uses them (`lsof +D <dir>`) before deleting.
+
+### Pending in this record
+
+- The GitHub-hosted jobs in `.github/workflows/test.yml` (`baseline`, `macos-harness`, `installed-package`,
+  `native-lifecycle`) were not run; whether a hosted Linux runner provides a usable user manager is unverified.
+- A held-reservation drain under a real launchd or systemd manager; a native systemd check of the stopped-definition
+  refresh and of the stop ordering.
+- The non-reproduced `npm test` hang and process-exit failure, and the fixture signing sensitivity (see above).
+- Windows is unsupported and was not exercised. One macOS and one Ubuntu release on arm64 only.
 
 ## Corrected code: verified commit `61847fe`
 
@@ -866,9 +992,9 @@ entry existed in the user's domain. All commands ran with an isolated `HOME` and
 - The GitHub-hosted jobs in `.github/workflows/test.yml` (`baseline`, `macos-harness`, `installed-package`,
   `native-lifecycle`) were not run for the corrected code, and whether a hosted Linux runner provides a usable user
   manager is unverified.
-- Node.js 22.19.0 and 24.21.0 ran the package tests on Linux after the extraneous-package fix; macOS ran them on
-  Node.js 22.22.3 only. Node.js 26 ran only the credential test file on macOS. Native service-manager checks used
-  Node.js 22.
+- At `01b073f`, Node.js 22.19.0 and 24.21.0 ran the package tests on Linux, and Node.js 22.19.0, 22.22.3 and
+  24.21.0 on macOS (see "Final acceptance"). Node.js 26 ran only the credential test file on macOS. Native
+  service-manager checks used Node.js 22.
 - The Node.js 26 diagnosis is established for the failure mode (handlers installed after the readiness line). A
   flush or `process.exit` problem was not demonstrated and is not claimed.
 - A start whose native call was already issued survives the death of its process only through the private launch
