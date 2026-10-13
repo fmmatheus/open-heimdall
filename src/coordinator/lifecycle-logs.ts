@@ -241,7 +241,11 @@ export async function runCoordinatorLogs(args: ParsedLifecycleArguments, deps: L
   async function journalLogs(unit: string): Promise<number> {
     const journalctl = deps.journalctl ?? await resolveJournalctl();
     if (!journalctl) return unavailable(`journalctl was not found, so the journal of ${unit} cannot be read.`);
-    const argv = ['--user', '-u', unit, '-n', String(args.lines), '--no-pager', ...(args.follow ? ['-f'] : []), '-o', 'short-iso'];
+    // A finite read adds --quiet (systemd v255, journalctl.c: `if (n_shown == 0 && !arg_quiet) printf("-- No entries --\n")`),
+    // so the reader prints nothing but entries and an empty result is zero output bytes on exit 0, whatever the locale.
+    // Real access failures stay errors with --quiet: "No journal files were opened due to insufficient permissions."
+    // is logged unconditionally and exits nonzero. `--follow` keeps waiting for future entries and is left unchanged.
+    const argv = ['--user', '-u', unit, '-n', String(args.lines), '--no-pager', ...(args.follow ? ['-f'] : ['--quiet']), '-o', 'short-iso'];
     const start = deps.spawnProcess ?? spawn;
     let child;
     try { child = start(journalctl, argv, { stdio: ['ignore', 'pipe', 'pipe'], env: deps.environment, windowsHide: true }); }
@@ -251,7 +255,8 @@ export async function runCoordinatorLogs(args: ParsedLifecycleArguments, deps: L
     const diagnostics: Buffer[] = [];
     let diagnosticBytes = 0;
     let spawnError: Error | null = null;
-    child.stdout?.on('data', (data: Buffer) => lines.push(Buffer.from(data)));
+    let outputBytes = 0;
+    child.stdout?.on('data', (data: Buffer) => { outputBytes += data.length; lines.push(Buffer.from(data)); });
     child.stderr?.on('data', (data: Buffer) => { if (diagnosticBytes < 8192) { diagnostics.push(Buffer.from(data)); diagnosticBytes += data.length; } });
 
     const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(resolve => {
@@ -276,6 +281,9 @@ export async function runCoordinatorLogs(args: ParsedLifecycleArguments, deps: L
     if (result.code !== 0) {
       const detail = cleanLogLine(Buffer.concat(diagnostics).toString('utf8').replace(/\s+/g, ' ').trim());
       return unavailable(`journalctl ${result.code === null ? `ended by ${result.signal ?? 'a signal'}` : `exited with status ${result.code}`}${detail ? `: ${detail}` : ''}`);
+    }
+    if (!args.follow && outputBytes === 0) {
+      return unavailable(`There are no logs for ${unit}: its journal has no entries, because the service was never started for this state directory or the host's journal retention removed them.`);
     }
     return 0;
   }
