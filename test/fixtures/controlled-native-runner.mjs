@@ -66,6 +66,9 @@ class ControlledRunner {
   /** The verb of each call, in order. */
   get verbs() { return this.calls.map(call => call.verb); }
 
+  /** Called as the manager begins to process a call, after any `before` barrier. Managers record what the call acts on. */
+  async observe() {}
+
   service(name) {
     let service = this.services.get(name);
     if (!service) {
@@ -123,6 +126,7 @@ class ControlledRunner {
     this.calls.push(call);
     this.checkPolicy(file, call);
     await this.fire('before', call);
+    await this.observe(call);
     const response = this.responses.find(candidate => candidate.verb === call.verb && candidate.times > 0);
     let result;
     if (response) {
@@ -316,6 +320,18 @@ export class ControlledSystemctl extends ControlledRunner {
     if (args.includes('--system') || args.includes('--global') || args.includes('--now') || args.includes('--force')) this.violation(`unexpected option in ${args.join(' ')}`);
     if (SYSTEMCTL_FORBIDDEN.includes(verb)) this.violation(`systemctl ${verb} could stop, kill, restart or enable a service`);
     if (!['show-environment', 'show', 'link', 'daemon-reload', 'start'].includes(verb)) this.violation(`unhandled systemctl verb ${verb}`);
+  }
+
+  /**
+   * Records, on every call that acts on the unit (`start`, `link`, `daemon-reload`), where the unit's user-config link
+   * resolved when the manager began to process it: `call.linkTarget` is the canonical target, or null when the link is
+   * missing or dangling. A test can then prove that no native action ran while the link named another definition.
+   */
+  async observe(call) {
+    if (!['start', 'link', 'daemon-reload'].includes(call.verb)) return;
+    const units = call.verb === 'daemon-reload' ? [...this.services.keys()] : [path.basename(call.args[2])];
+    call.linkTargets = {};
+    for (const unit of units) call.linkTargets[unit] = await fsp.realpath(this.linkPathOf(unit)).catch(() => null);
   }
 
   /** Re-read the unit from its user-config link. A missing link unloads an inactive unit. */
