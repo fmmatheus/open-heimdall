@@ -192,8 +192,11 @@ export async function coordinatorMain(args: string[], internals: CoordinatorMain
       const credentialSource = credentialSourceFor({ credentials, managed: lifecycle !== undefined });
       service = await startCoordinatorService({ ...internals.serviceOptions, configuration, credentials, credentialSource, ...(lifecycle ? { lifecycle } : {}) });
       coordinatorKey = await readCoordinatorToken(configuration.stateDirectory).catch(() => undefined);
+      // Signal handlers come first: a supervisor may signal as soon as it reads the readiness line, and an
+      // unhandled SIGTERM would end the process without a drain.
+      const supervised = superviseForeground(service);
       process.stdout.write(`Coordinator listening at ${configuration.endpoint}\n`);
-      if (!await superviseForeground(service)) {
+      if (!await supervised) {
         // A failed close stage may leave resources open; end the process instead of waiting on them.
         process.exitCode = 1;
         await new Promise<void>(resolve => process.stderr.write('', () => resolve()));
