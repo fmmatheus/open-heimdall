@@ -360,6 +360,46 @@ with the new test and the harness fixtures copied in unchanged; the same cases m
 
 Baseline run of the first five rows: 10 tests, 0 pass, 10 fail. Fixed code: 22 of 22 pass.
 
+### Empty Linux journals: `logs` reports unavailable logs
+
+Evidence label: **unit level, synthetic `journalctl`** (a scripted child process through the spawn seam, and a real
+executable that mimics `journalctl`) run on a macOS host. Not a real journal. **Linux installed-package evidence:
+pending** until the installed suite runs on a Linux host; the consumer and global lifecycle cases that expect an unused
+state directory to produce no logs are the ones to watch.
+
+Defect: a finite `coordinator logs` read on Linux forwarded the `-- No entries --` line that `journalctl` prints for an
+empty selection and exited 0, while the unavailable-log contract (also used on macOS) is exit 1, empty stdout and a
+"no logs" message on stderr.
+
+Correction (`src/coordinator/lifecycle-logs.ts`): a finite read adds `--quiet`, and a successful exit that produced zero
+output bytes is an empty read. It does not match localized text, so an entry containing the old status text is an
+ordinary entry. `--follow` is unchanged (no `--quiet`, no empty rule). Source for the option: systemd v255,
+`man/journalctl.xml` documents `-q`/`--quiet` as suppressing informational messages, and `src/journal/journalctl.c`
+prints the status line only under `if (n_shown == 0 && !arg_quiet)`. The same source (`src/shared/journal-util.c`,
+`journal_access_check_and_warn`) logs "No journal files were opened due to insufficient permissions." without
+consulting `quiet` and returns an error, so denied access remains a nonzero exit with a diagnostic rather than an empty
+read. Both were read from the v255 tag upstream; a real `journalctl --quiet` run is part of the pending Linux evidence.
+
+Regression file: `test/coordinator-journal-logs.test.mjs` (15 cases) runs the production `lifecycleCommandMain('logs')`
+with `platform: 'linux'`: empty read (exit 1, empty stdout, stderr names the unit and contains "no logs", argv recorded,
+no state created); empty chunks only; nonempty read; an entry containing `-- No entries --`, and a line that is exactly
+that text; output split mid-word, inside a two-byte character and before the last byte; one byte without a line break;
+output after an initial empty chunk; nonzero exit, nonzero exit after partial output and death by signal; denied access;
+missing and unrunnable `journalctl`; unit filtering for two state directories without consulting the service manager;
+`--follow` waiting with no entries, printing a later entry, then Ctrl-C exiting 130 with `SIGTERM` sent only to the one
+reader and no second reader; Ctrl-C before any entry; and two cases with a real executable that prints the status line
+unless given `--quiet`. `test/coordinator-stop-logs.test.mjs` had one argument assertion updated for `--quiet`.
+
+Baseline: a disposable `git archive 0651d81` build (`npm ci --ignore-scripts`, `npm run build`) given the new file
+unchanged: 15 tests, 11 pass, 4 fail. The empty-result cases fail on the unchanged assertion (`0 !== 1`: exit 0 instead
+of 1), as does the real-executable empty case; the fourth failure is the argument check that expects `--quiet`.
+The cases for nonempty output, the old status text inside an entry, chunk boundaries, reader failures, missing and denied
+access and `--follow` pass on both builds, so they guard against regressions. Corrected code: 15 of 15 pass.
+
+Checks on the corrected code (macOS arm64, Node v22.22.3, npm 10.9.8): `node --test` on the new file,
+`test/coordinator-stop-logs.test.mjs` and `test/coordinator-lifecycle-cli.test.mjs`: 61 of 61; `npm run check`,
+`npm run build:extension` exit 0; `npm test`: 1387 of 1387; `npm run test:package`: 22 of 22.
+
 ## Historical evidence at `3bfdc76`
 
 The remaining sections record the earlier run. They describe code at `3bfdc76` and are not repeated for the
