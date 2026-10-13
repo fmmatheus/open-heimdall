@@ -438,8 +438,12 @@ bounded: only the tail of a file is read. There is no JSON log output.
 - **macOS:** the coordinator's standard output and error go to two private
   regular files, `coordinator.out.log` and `coordinator.err.log`, in the `logs`
   directory of the state directory (files 0600, directory 0700). Destinations that
-  are symbolic links, not regular files or not private are rejected without
-  repair. `--lines` applies to each file; they are printed one after the other
+  are symbolic links, not regular files (including a named pipe, which is refused
+  without waiting for a reader) or not private are rejected without repair, and `start`
+  reports the failure before registering or starting anything. An existing
+  state directory that is not private is likewise rejected by `start` and `stop`
+  without changing its mode; only directories Heimdall creates receive mode 0700.
+  `--lines` applies to each file; they are printed one after the other
   under a header naming the file, because the two streams have no common
   timestamps. Files are appended to across stops and starts. Heimdall does not
   rotate or truncate them; they grow until you remove them while the service is
