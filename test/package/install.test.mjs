@@ -6,7 +6,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
   assertOrdinaryInstall, buildTarball, checkout, findPackages, installConsumer, installGlobal, isolatedEnvironment,
-  listTree, removeTarballBuild, runBinary, runModule, toolVersions,
+  listPackages, listTree, readDependencyLock, removeTarballBuild, runBinary, runModule, toolVersions, verifyDependencyTree,
 } from './helpers.mjs';
 
 const requiredFiles = [
@@ -171,15 +171,46 @@ describe('installed package', () => {
         }
       });
 
-      test('resolves one supported @opencode/plugin and no quota package dependency', async () => {
+      test('resolves one supported @opencode/plugin and no quota package dependency', async t => {
         const { modules } = install();
         const plugins = await findPackages(modules, '@opencode/plugin');
         assert.ok(plugins.length >= 1);
         for (const plugin of plugins) assert.equal(plugin.version, '2.0.22', plugin.location);
         assert.deepEqual(await findPackages(modules, '@slkiser/opencode-quota'), []);
-        const tree = await listTree(install(), { env: environment.env, cwd: elsewhere });
-        // npm ls exits nonzero for invalid or missing required dependencies and peers.
-        assert.doesNotMatch(tree.stdout, /\binvalid\b|extraneous|UNMET DEPENDENCY/);
+        const listing = await listTree(install(), { env: environment.env, cwd: elsewhere });
+        t.diagnostic(`${layout}: npm ${listing.argv.join(' ').replace(install().directory, '<prefix>')} exited ${listing.status}`);
+        // npm ls exits nonzero for invalid or missing required dependencies and peers. An optional native
+        // package that npm 10 leaves behind after removing its failed optional parent is the one extraneous
+        // report the rule accepts (see leftoverOptionalPackages); test/package/tree-validation.test.mjs
+        // holds the controls that every other problem is still rejected.
+        const lock = await readDependencyLock();
+        assert.deepEqual(await verifyDependencyTree({ modules, listing, lock }), []);
+        const extraneous = listing.stdout.split('\n').filter(line => /extraneous/.test(line)).map(line => line.trim());
+        for (const line of extraneous) t.diagnostic(`${layout}: accepted leftover optional package: ${line}`);
+      });
+
+      test('msgpackr loads and round-trips with or without its optional native accelerator', async t => {
+        const { modules, directory } = install();
+        const copies = await findPackages(modules, 'msgpackr');
+        assert.ok(copies.length >= 1, 'msgpackr is installed');
+        const installed = new Set((await listPackages(modules)).map(entry => entry.name));
+        for (const { location } of copies) {
+          const result = await runModule(`
+            import { createRequire } from 'node:module';
+            const require = createRequire(${JSON.stringify(path.join(location, 'package.json'))});
+            let native;
+            try { require('msgpackr-extract'); native = 'loaded'; } catch (error) { native = error.code; }
+            const { pack, unpack } = require(${JSON.stringify(location)});
+            const sample = { text: 'x'.repeat(64), list: [1, 2, 3], nested: { flag: true } };
+            console.log(JSON.stringify({ native, same: JSON.stringify(unpack(pack(sample))) === JSON.stringify(sample) }));
+          `, { cwd: layout === 'consumer' ? directory : elsewhere, env: environment.env });
+          assert.equal(result.status, 0, result.stderr);
+          const report = JSON.parse(result.stdout);
+          t.diagnostic(`${layout}: msgpackr at ${path.relative(modules, location)}; native accelerator ${report.native}`);
+          assert.equal(report.same, true);
+          // An accelerator that is not installed must be reported as missing, never as a broken load.
+          if (!installed.has('msgpackr-extract')) assert.equal(report.native, 'MODULE_NOT_FOUND');
+        }
       });
 
       test('installed heimdall runs from outside the checkout without configuration', async t => {
