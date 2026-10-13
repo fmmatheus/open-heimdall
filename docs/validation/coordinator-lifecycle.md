@@ -201,9 +201,10 @@ Evidence label: **controlled-runner** (mocked manager). The production systemd a
 public lifecycle commands, the coordinator process and the state files are real; `systemctl --user` is a stateful
 stand-in. Upstream behavior is cited from the systemd v255 sources (link handling in `unit-file.c`, fragment storage
 in `load-fragment.c`, the exported property in `dbus-unit.c`): a unit linked from outside the search paths keeps the
-link source as its `FragmentPath`. The reported fragment can therefore be the expected link. **Real-manager check:
-pending.** The foreign-link refusal has not been run under a real systemd user manager; that check belongs to the
-later real-native task, and the actual `FragmentPath` is not recorded here.
+link source as its `FragmentPath`. The reported fragment can therefore be the expected link. The real-manager
+check, with the `FragmentPath` systemd actually reported, is recorded in "Real-native checks: delayed shutdown on
+launchd and systemd, and the foreign unit link under systemd" below; the evidence in this subsection is the
+controlled-runner part only.
 
 Defect: `ownsFragment` accepted a reported fragment equal to the expected link path (`$XDG_CONFIG_HOME/systemd/user/<unit>`)
 without resolving it. With a valid owned definition kept under the state directory, the expected link pointing at a
@@ -511,7 +512,105 @@ The two lifecycle cases that expect an unused state directory to produce no logs
 stdout, stderr `/no logs/i`, inside the consumer and global lifecycle tests) pass on both Node versions with their
 assertions unchanged. One earlier run of the Node 24 setup/doctor set in the VM exceeded its time budget while the host
 was suspended and reported timing assertions as failures; it was repeated unchanged afterwards and passed (253 of 253).
-Not run here: the GitHub-hosted jobs, and the real-systemd lifecycle checks (**pending**).
+Not run here: the GitHub-hosted jobs. The real-systemd lifecycle checks are recorded in the next subsection.
+
+### Real-native checks: delayed shutdown on launchd and systemd, and the foreign unit link under systemd
+
+Evidence label: **real-native**. Everything below ran against the real launchd (`gui/<uid>`) of the macOS host and the
+real systemd user manager of the Linux VM; no stand-in manager is involved. It is kept apart from the
+**controlled-runner** evidence (mocked `launchctl`/`systemctl`, subsections above) and from the **upstream-source**
+citations (systemd v255 sources, quoted only where a subsection says so).
+
+| Item | Value |
+| --- | --- |
+| Code | `bcd1296` on top of `0651d81` (test code only; no product change) |
+| macOS host | Darwin arm64, Node v22.22.3, npm 10.9.8, real launchd |
+| Linux VM | Lima `heimdall-lc-d7432164`, Ubuntu 24.04.5 aarch64, systemd 255.4-1ubuntu8.17, Node 22.19.0 / npm 10.9.3, `Linger=no` before and after |
+| Isolation | HOME, XDG state/data/cache, credentials and the OpenChamber directory private to each fixture; on Linux the real `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` stay visible (the user manager reads and writes its own link directory), and only the uniquely derived fixture unit is ever placed there |
+
+Changes to the native suite (`test/native/lifecycle.native.test.mjs`):
+
+- The delayed-shutdown fixture no longer skips on Linux. It runs on both platforms with the shared isolated
+  environment. It is a **delayed-shutdown protocol fixture** (`test/fixtures/delayed-drain-entry.mjs` delays one
+  shutdown stage by 6 s), not a held-run idle proof.
+- Its `stop --timeout 1` runs as the invoking client **process** (`test/fixtures/native-lifecycle-entry.mjs`: the
+  production `lifecycleCommandMain`, adapters and native tool, with only the environment and the service entry point
+  injected), so the measured time includes process start-up and exit. Limit: 1000 ms budget plus 1500 ms tolerance
+  (2500 ms), as in the process-exit tests.
+- The manager is queried directly before and after the hurried stop: `systemctl --user show` (`ActiveState`,
+  `SubState`, `MainPID`, `InvocationID`, `StateChangeTimestampMonotonic`, `NRestarts`, `FragmentPath`) and
+  `launchctl print` (`state`, `pid`, `runs`). Real managers keep no call log, so the absence of a native stop, kill,
+  restart or removal is established by identical manager state (same invocation, main PID, state-change time and run
+  count), the live process, held ownership, the retained registration and the same instance reported by `/lifecycle`.
+- A new Linux-only suite loads the expected user-unit link naming a complete synthetic foreign unit that lives outside
+  every unit search path, next to a valid separate owned definition in the fixture state directory, and runs the
+  public `start` and `stop` as client processes.
+
+Delayed-shutdown results (macOS launchd; Linux systemd):
+
+| Step | macOS launchd | Linux systemd |
+| --- | --- | --- |
+| Start | `ready`, owned registration, positive main PID, authenticated `/lifecycle` `running` | same |
+| `stop --timeout 1` client process | 1055 ms and 1078 ms in two runs; exit 1, one JSON document, `completion-unknown` (not a success) | 1041 ms and 1043 ms in two runs; same outcome |
+| Manager before / after | `state=running pid runs=1` unchanged | `ActiveState=active`, `MainPID`, `InvocationID`, `StateChangeTimestampMonotonic` unchanged, `NRestarts=0` |
+| Service during the drain | same PID alive, ownership held | same |
+| Self-completed shutdown | record `completed`, `last exit code = 0`, process absent, ownership free | record `completed`, `ExecMainStatus=0`, `Result=success`, `ActiveState=inactive`, process absent, ownership free |
+| Later `stop` | `already-stopped`, exit 0 | same |
+
+Foreign-link refusal (Linux, real systemd 255.4):
+
+- The unit was linked with `systemctl --user link <foreign file>` (file name equal to the derived unit name, under the
+  fixture directory), then `daemon-reload`. systemd loaded it (`LoadState=loaded`, `ActiveState=inactive`,
+  `UnitFileState=linked`).
+- **Actual `FragmentPath`:** the expected link, `$XDG_CONFIG_HOME/systemd/user/<unit>`
+  (`/home/<user>/.config/systemd/user/heimdall-coordinator-<24 hex>.service`), not the foreign file and not the owned
+  definition. This matches the upstream-source statement above that a linked unit keeps the link source as its
+  fragment. The link resolves to the foreign file, which differs from the owned definition; the adapter's
+  `registrationOwnership` answered `refused` / `registered-elsewhere`.
+- Public `start`: exit 1, outcome `conflict`, error `registered-elsewhere` ("... loaded from <link>, which does not
+  resolve to <owned definition>").
+- Public `stop`: exit 1, outcome `conflict`, error `registered-elsewhere`, "Nothing was requested".
+- After each command: identical manager properties, identical link target, foreign and owned file text, the foreign
+  unit never started (its marker file was never written), no coordinator endpoint, and no `shutdown-*.json`,
+  `instance.json` or `launch-attempt.json` in the state directory. The coordinator was never running in this
+  fixture, so "zero shutdown requests" is established by the absent endpoint and records, not by a counter.
+- Not run: the same case against the pre-fix code (`0651d81`) under real systemd. The pre-fix behavior is shown only by
+  the controlled-runner baseline above.
+
+Full native suite counts (`HEIMDALL_NATIVE_LIFECYCLE=1`):
+
+| Platform | Command | Tests | Pass | Fail | Skipped |
+| --- | --- | --- | --- | --- | --- |
+| macOS launchd | `npm run test:native` | 16 | 12 | 0 | 4 |
+| Linux systemd, Node 22.19.0 | `node --test --test-concurrency=1 test/native/*.test.mjs` | 16 | 14 | 0 | 2 |
+
+Skips (never counted as passes): on macOS the queued-work case (covered by `test/coordinator-service.test.mjs`) and
+the three Linux-only foreign-link cases; on Linux the queued-work case and the launchd stopped-definition refresh
+(macOS only by design). Both platforms ran the suite twice on code that differed only in the final cleanup step;
+counts and timings above are from the final code, the first runs gave the same counts.
+
+Actual-coordinator evidence, separate label (macOS host, fake or controlled manager, synthetic executor holding a run
+reservation): `node --test test/coordinator-drain.test.mjs test/coordinator-stop-logs.test.mjs` gave 31 tests, 31
+pass, 0 fail, 0 skipped. This is not native-manager evidence.
+
+Cleanup (fixture names only):
+
+| Item | macOS | Linux VM |
+| --- | --- | --- |
+| Registered label / unit | `launchctl list` shows no `openheimdall` label | `list-units` and `list-unit-files` for `heimdall-coordinator-*`: none |
+| Link / definition | no fixture file | no `heimdall` link in `~/.config/systemd/user`; foreign unit, link and owned definition removed |
+| Fixture directories, processes | no `/tmp/hn-*`; no fixture process | no `/tmp/hn-*`; no coordinator, `delayed-drain`, `foreign-service` or `sleep 300` process |
+| Linger | not applicable | `Linger=no` |
+
+The first Linux run left the manager remembering the crash-test unit as `not-found failed` in memory (nothing loaded,
+no file). That record was cleared once by hand with `systemctl --user reset-failed <that unit>`, and the suite's
+cleanup now does the same for its own derived unit; the second run left none. The macOS host also runs an unrelated
+coordinator from an installed engine directory; it is not a fixture and was not touched. No cleanup is pending.
+The VM `heimdall-lc-d7432164` is still running and holds no fixture state.
+
+Hosted CI: `native-lifecycle` already runs `npm run test:native` on `ubuntu-latest` after proving a user manager and
+exports the real `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`, so the workflow needed no change; the hosted job has not
+run for this code.
 
 ## Historical evidence at `3bfdc76`
 
@@ -603,7 +702,7 @@ HEIMDALL_NATIVE_LIFECYCLE=1 node --test --test-concurrency=1 test/native/*.test.
 
 Without `HEIMDALL_NATIVE_LIFECYCLE=1` every case is reported as skipped, which is not a pass. With it, a host
 without a usable user manager fails the suite, and the cases that are specific to another platform (the launchd
-refresh and the delayed-drain fixture on Linux) are still reported as skipped.
+refresh on Linux, the systemd foreign-link cases on macOS) are still reported as skipped.
 
 ### Reproduce: Linux VM
 
@@ -754,10 +853,12 @@ entry existed in the user's domain. All commands ran with an isolated `HOME` and
 
 - The native suites use an empty state. The delayed drain with a held run reservation is established by the
   actual-coordinator tests with a synthetic executor and checked against a fake or controlled service manager. It
-  was not run under launchd or systemd with a real held run: **PENDING**. The native delayed-drain case on macOS
-  delays a shutdown stage in a fixture entry point and is not a held-reservation test.
-- On Linux there is no native check of the stopped-definition refresh, the overall deadline or the stop ordering;
-  those are covered by mocked-manager tests, and the native refresh and delayed-drain cases run on macOS only.
+  was not run under launchd or systemd with a real held run: **PENDING**. The native delayed-shutdown case (macOS
+  and Linux) delays a shutdown stage in a fixture entry point and is not a held-reservation test.
+- On Linux there is no native check of the stopped-definition refresh or the stop ordering; those are covered by
+  mocked-manager tests, and the native launchd refresh case runs on macOS only. The overall deadline is checked
+  natively on both platforms by the delayed-shutdown case (client process time), the foreign-link refusal only under
+  systemd.
 - At `61847fe` the Linux installed-package tests failed 3 of 22 (npm reports an optional dependency as extraneous;
   `coordinator logs` on an unused state directory exits 0 on Linux). Both causes are corrected after `0651d81`; the
   package suite passes on Linux with Node.js 22.19.0 and 24 (see "Linux installed package: the extraneous
