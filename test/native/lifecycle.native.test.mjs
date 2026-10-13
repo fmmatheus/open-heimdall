@@ -310,6 +310,53 @@ describe('native coordinator lifecycle (launchd or systemd user manager)', () =>
     if (fixture.manager === 'launchd') assert.match(result.stdout, /Coordinator listening at/, 'the service output was captured in the private log file');
   });
 
+  // launchd keeps the definition it loaded, so applying a changed credential file to a stopped service needs the
+  // stale registration replaced; `start` does that itself, without any manual launchctl step.
+  test('launchd: start after a clean stop applies a changed credential file path to the stopped definition', {
+    skip: skip || (process.platform === 'darwin' ? false : 'launchd refresh is checked on macOS only'),
+  }, async t => {
+    const identity = fixture.adapter.identity();
+    const target = `gui/${process.getuid()}/${identity.label}`;
+    const next = path.join(fixture.root, 'credentials-next.env');
+    await fs.writeFile(next, 'OPENCODE_PASSWORD=hn-native-synthetic-next-credential\n', { mode: 0o600 });
+    await fs.chmod(next, 0o600);
+    const withFile = file => json(['start', '--json', '--timeout', '90', '--coordinator-config', fixture.configuration, '--env-file', file]);
+
+    // Start, then a confirmed clean stop: the owned definition stays registered with the old credential path.
+    const first = await withFile(fixture.credentials);
+    assert.equal(first.document.outcome, 'ready', `${first.stdout}\n${first.stderr}`);
+    const halted = await stop(['--timeout', '90']);
+    assert.equal(halted.document.outcome, 'stopped', `${halted.stdout}\n${halted.stderr}`);
+    await waitFor('the manager to report the service stopped', async () => (await fixture.adapter.inspect()).running === false);
+    const before = await run('/bin/launchctl', ['print', target]);
+    assert.equal(before.status, 0, before.stderr);
+    assert.ok(before.stdout.includes(fixture.credentials), 'the loaded registration still names the previous credential file');
+
+    // A changed credential path is applied by start itself.
+    const refreshed = await withFile(next);
+    assert.equal(refreshed.status, 0, `${refreshed.stdout}\n${refreshed.stderr}`);
+    assert.equal(refreshed.document.outcome, 'ready');
+    assert.notEqual(refreshed.document.instance.instanceId, first.document.instance.instanceId);
+    const definition = await fs.readFile(identity.definitionPath, 'utf8');
+    assert.ok(definition.includes(next) && !definition.includes(fixture.credentials), 'the definition on disk carries the new credential path');
+    assert.equal((await fixture.adapter.remembered()).credentialFile, next);
+    const after = await run('/bin/launchctl', ['print', target]);
+    assert.equal(after.status, 0, after.stderr);
+    assert.ok(after.stdout.includes(next) && !after.stdout.includes(fixture.credentials), 'the loaded registration names only the new credential file');
+    const inspection = await fixture.adapter.inspect();
+    assert.deepEqual([inspection.registration, inspection.running, inspection.pid], ['loaded', true, refreshed.document.instance.pid]);
+    const lifecycle = await (await client()).request('GET', '/lifecycle');
+    assert.equal(lifecycle.instanceId, refreshed.document.instance.instanceId);
+    assert.equal(lifecycle.phase, 'running');
+    assert.ok(!(refreshed.stdout + refreshed.stderr).includes('hn-native-synthetic-next-credential'));
+
+    // Graceful stop; only the proven-inactive fixture registration remains for the suite's cleanup.
+    const final = await stop(['--timeout', '90']);
+    assert.equal(final.document.outcome, 'stopped', `${final.stdout}\n${final.stderr}`);
+    await waitFor('the manager to report the service stopped', async () => (await fixture.adapter.inspect()).running === false);
+    t.diagnostic(`launchd refresh: ${first.document.instance.instanceId} -> ${refreshed.document.instance.instanceId} with a changed credential file path`);
+  });
+
   native('a later explicit start brings up a new instance', async () => {
     const result = await start();
     assert.equal(result.status, 0, result.stdout);
