@@ -141,6 +141,60 @@ Whether to change the tests or the Linux behavior is an open decision and was no
 
 Nothing was escalated; no cleanup is pending on the host.
 
+## Corrections after `0651d81`
+
+Further corrections made on top of `0651d81`. Each subsection names the defect, the regression file, the commands and
+the baseline versus fixed results. Environment of the runs below: macOS (arm64), Node v22.22.3, npm 10.9.8. The
+"baseline" is a disposable copy of `0651d81` outside the repository (`git archive 0651d81`, `npm ci --ignore-scripts`,
+`npm run build`) into which the new test file was copied unchanged.
+
+### Redaction: known values that collide with credential syntax
+
+Defect: known-value masking ran before the Authorization, URL user information and capability masks, in `maskSecrets`
+and in `sanitizeShutdownError`. An accepted credential value `B` turned `Bearer`/`Basic` into `[redacted]earer` and
+`[redacted]asic`, and a value `:` destroyed `://`, so the pattern masks no longer matched and the payload stayed
+visible. A value `e` did the same to `Bearer`.
+
+Correction: `src/redaction.ts` locates the known values and the pattern spans on the original text and replaces the
+union of the spans in one pass. Overlapping spans are replaced as one, by the stable marker of the first pattern among
+them (`Bearer [redacted]`, `scheme://[redacted]@`, `[redacted]`), otherwise by `[redacted]`. A marker is never
+scanned again. Known values of every nonempty length remain masked, longest first, with regular expression
+metacharacters escaped. `sanitizeShutdownError` and `sanitizeResultText` use the same helper with their previous rule
+sets. Only diagnostic strings are sanitized; serialized JSON structure, protocol identifiers, outcomes, error codes
+and numeric fields are untouched. The minimum password length and the setup and doctor credential policy are unchanged.
+
+Regression file: `test/coordinator-redaction-collisions.test.mjs` (52 cases). Credential values `B` and `:` come from
+a private (mode 0600) credential file with opaque references. Collision cases cover `B` with Bearer and Basic payloads,
+`:` with `scheme://user:password@host`, both together, `e` with the Bearer marker, partially overlapping values and
+capability digits, on the helpers (`maskSecrets`, the output sanitizer, `sanitizeResultText`,
+`sanitizeShutdownError`), the producer writers (strings and buffers), parsed and rendered lifecycle results (JSON
+fields and human text) and, per manager with the controlled native runner (mocked manager, real coordinator process
+and files), a start failure, a drain failure (`/lifecycle` response, stored shutdown record read and raw, raw process
+log) and a close failure, where the original failure code stays observable. Controls: no known value, a one- to
+three-character value accepted from the file and authenticating unchanged, longer and contained values,
+metacharacters, `e` alone, and the same end-to-end cases with an unrelated credential.
+
+| Run | Command | Result |
+| --- | --- | --- |
+| Baseline `0651d81` | `node --test test/coordinator-redaction-collisions.test.mjs` | 52 tests, 19 pass, 33 fail (all collision cases and the colliding end-to-end cases; every control passes) |
+| Fixed code | same command | 52 tests, 52 pass |
+
+Decisive baseline assertion: `maskSecrets` returned `first [redacted]earer syntheticbearer123 second [redacted]asic
+c3ludGhldGljOnNlY3JldA== third`, and the stored shutdown error read `... [redacted]earer syntheticbearer123 ...
+scheme[redacted]//syntheticuser[redacted]syntheticpassword@example.test/path ...`.
+
+Other checks on the fixed code:
+
+| Command | Result |
+| --- | --- |
+| `node --test` on the new file, `test/coordinator-short-credentials.test.mjs`, `test/coordinator-credentials.test.mjs`, `test/setup-*.test.mjs`, `test/doctor*.test.mjs` | 197 tests, 197 pass, 0 fail, 0 skipped; the existing files are unchanged |
+| `npm run check` | exit 0 |
+| `npm test` | exit 0; 1297 tests, 1297 pass, 0 fail, 0 skipped |
+| `npm run build:extension` | exit 0 |
+
+Scope of the evidence: automated tests against the controlled native runner on a macOS host. No real launchd or
+systemd service was involved.
+
 ## Historical evidence at `3bfdc76`
 
 The remaining sections record the earlier run. They describe code at `3bfdc76` and are not repeated for the
