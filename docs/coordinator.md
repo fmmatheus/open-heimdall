@@ -506,7 +506,15 @@ bounded: only the tail of a file is read. There is no JSON log output.
   stopped.
 - **Linux:** the unit's journal output, read with
   `journalctl --user -u <unit>`, filtered to the owned unit. Retention and
-  permissions follow the host's journal policy.
+  permissions follow the host's journal policy. A finite read passes
+  `--quiet`, so the reader prints entries only; when it exits successfully
+  without printing anything, the unit has no journal entries and `logs` exits 1
+  with no output and a message that there are no logs for the unit, as it does
+  on macOS for an unused state directory. This does not depend on the reader's
+  status text, so an entry whose text resembles it is still printed. A missing
+  `journalctl`, denied access to the journal and other reader failures are
+  reported with their own diagnostics. `--follow` does not apply this rule: it
+  waits for future entries.
 
 Output is sanitized by the coordinator before it is written, not only when read.
 Process logs are separate from persisted run events, task results and proof that a
