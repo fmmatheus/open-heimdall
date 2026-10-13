@@ -196,6 +196,9 @@ describe('native coordinator lifecycle (launchd or systemd user manager)', () =>
       process.stderr.write(`native lifecycle cleanup pending: ${pending}; fixture preserved in ${fixture.root}\n`);
       throw new Error(`Cleanup pending: ${pending}. The fixture in ${fixture.root} was preserved and nothing was escalated.`);
     }
+    // The controlled crash leaves the unit remembered as failed by the manager although nothing is loaded; forget
+    // only that record, for the fixture's own derived unit.
+    if (fixture.manager === 'systemd') await systemctl('reset-failed', fixture.adapter.identity().label);
     await fs.rm(fixture.root, { recursive: true, force: true });
   });
 
