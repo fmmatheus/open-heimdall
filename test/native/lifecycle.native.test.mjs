@@ -38,10 +38,15 @@ import { readCoordinatorToken } from '../../dist/coordinator/token.js';
  * delayed-drain behavior with a held run is established by coordinator tests with a synthetic executor
  * (test/coordinator-stop-logs.test.mjs) and the fake service manager there is adapter/CLI evidence only.
  *
- * The second suite, "native delayed drain", is protocol-fixture evidence: the real launchd runs the production
- * coordinator through test/fixtures/delayed-drain-entry.mjs, which injects a delay into the shutdown. It shows that
- * the production `stop --timeout` command ends within its deadline without a success while the real service keeps
- * draining, and that a later stop reports the clean stop. It does not involve a native run.
+ * The second suite, "native delayed shutdown", is protocol-fixture evidence on both platforms: the real launchd or
+ * systemd user manager runs the production coordinator through test/fixtures/delayed-drain-entry.mjs, which injects
+ * a delay into the shutdown. The production `stop --timeout` command runs as its own client process
+ * (test/fixtures/native-lifecycle-entry.mjs) and ends within its deadline without a success while the real service
+ * keeps running; the accepted shutdown then finishes on its own with a clean exit and a later stop reports
+ * `already-stopped`. It is not a held-run idle proof and does not involve a native run.
+ *
+ * The third suite, "native systemd foreign unit link", is Linux only: real systemd loads the expected user-unit link
+ * naming a synthetic foreign unit outside its search paths, and the public start and stop commands must refuse it.
  */
 
 const enabled = process.env.HEIMDALL_NATIVE_LIFECYCLE === '1';
@@ -81,6 +86,32 @@ function run(file, args, { cwd, env, timeoutMs = 120 * SECONDS } = {}) {
 }
 
 const processAlive = pid => { try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } };
+
+/**
+ * The environment of every fixture command. HOME, XDG state/data/cache, the OpenChamber directory and the credential
+ * file are private to the fixture. On Linux the real XDG_CONFIG_HOME, XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS
+ * stay visible: `systemctl --user link` is carried out by the user manager, which reads and writes its own
+ * configuration home, and the adapter looks for its link there. Only the derived fixture unit is ever placed in it.
+ */
+function isolatedEnvironment(root, home) {
+  const env = {
+    PATH: process.env.PATH ?? '',
+    HOME: home,
+    TMPDIR: process.env.TMPDIR ?? os.tmpdir(),
+    LANG: process.env.LANG ?? 'C.UTF-8',
+    XDG_STATE_HOME: path.join(home, '.local', 'state'),
+    XDG_DATA_HOME: path.join(home, '.local', 'share'),
+    XDG_CACHE_HOME: path.join(home, '.cache'),
+    OPENCHAMBER_DATA_DIR: path.join(root, 'openchamber'),
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_CONFIG_NOSYSTEM: '1',
+  };
+  if (process.platform === 'linux') {
+    env.XDG_CONFIG_HOME = process.env.XDG_CONFIG_HOME ?? path.join(os.userInfo().homedir, '.config');
+    for (const name of ['XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS']) if (process.env[name]) env[name] = process.env[name];
+  } else env.XDG_CONFIG_HOME = path.join(home, '.config');
+  return env;
+}
 
 // One skipped test per case keeps the skip visible in the report; hooks do nothing unless the suite is enabled.
 const native = (name, body) => test(name, { skip }, body);
@@ -133,25 +164,7 @@ describe('native coordinator lifecycle (launchd or systemd user manager)', () =>
     await fs.writeFile(fixture.credentials, `OPENCODE_PASSWORD=${SENTINEL}\n`, { mode: 0o600 });
     await fs.chmod(fixture.credentials, 0o600);
 
-    const env = {
-      PATH: process.env.PATH ?? '',
-      HOME: fixture.home,
-      TMPDIR: process.env.TMPDIR ?? os.tmpdir(),
-      LANG: process.env.LANG ?? 'C.UTF-8',
-      XDG_STATE_HOME: path.join(fixture.home, '.local', 'state'),
-      XDG_DATA_HOME: path.join(fixture.home, '.local', 'share'),
-      XDG_CACHE_HOME: path.join(fixture.home, '.cache'),
-      OPENCHAMBER_DATA_DIR: path.join(root, 'openchamber'),
-      GIT_CONFIG_GLOBAL: '/dev/null',
-      GIT_CONFIG_NOSYSTEM: '1',
-    };
-    if (process.platform === 'linux') {
-      // `systemctl --user link` is carried out by the user manager, which reads and writes its own configuration
-      // home. The adapter looks for its link there, so the real XDG_CONFIG_HOME must stay visible. Only the derived
-      // fixture unit is ever placed in it.
-      env.XDG_CONFIG_HOME = process.env.XDG_CONFIG_HOME ?? path.join(os.userInfo().homedir, '.config');
-      for (const name of ['XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS']) if (process.env[name]) env[name] = process.env[name];
-    } else env.XDG_CONFIG_HOME = path.join(fixture.home, '.config');
+    const env = isolatedEnvironment(root, fixture.home);
     fixture.env = env;
 
     fixture.context = await resolveLaunchContext({ coordinatorConfig: fixture.configuration, envFile: fixture.credentials }, env);
@@ -396,53 +409,67 @@ describe('native coordinator lifecycle (launchd or systemd user manager)', () =>
   test('previously queued work follows normal admission after startup', { skip: 'the managed service always runs the production executor; admission after a restart with a synthetic executor is covered by test/coordinator-service.test.mjs ("a run queued before the coordinator started ...")' }, () => {});
 });
 
-describe('native delayed drain (protocol fixture; launchd on macOS)', () => {
+/** Manager-reported state of one fixture service, read straight from the real launchd or systemd user manager. */
+async function managerState(manager, label, env) {
+  if (manager === 'launchd') {
+    const print = await run('/bin/launchctl', ['print', `gui/${process.getuid()}/${label}`], { env });
+    const field = name => new RegExp(`^\\s*${name} = (.+)$`, 'm').exec(print.stdout)?.[1]?.trim() ?? null;
+    return { raw: print, status: print.status, state: field('state'), pid: field('pid'), runs: field('runs'), lastExit: field('last exit code') };
+  }
+  const properties = ['LoadState', 'ActiveState', 'SubState', 'MainPID', 'ExecMainStatus', 'Result', 'NRestarts', 'InvocationID', 'StateChangeTimestampMonotonic', 'FragmentPath', 'UnitFileState'];
+  const shown = await run('/usr/bin/systemctl', ['--user', 'show', label, '--property', properties.join(',')], { env });
+  assert.equal(shown.status, 0, shown.stderr);
+  return { raw: shown, ...Object.fromEntries(shown.stdout.trim().split('\n').map(line => line.split(/=(.*)/s).slice(0, 2))) };
+}
+
+describe('native delayed shutdown (protocol fixture; real launchd or systemd user manager)', () => {
   const fixture = {};
   let cleaned = false;
-  const darwinOnly = skip || (process.platform === 'darwin' ? false : 'the delayed-drain fixture is checked against launchd on macOS only');
-  const delayed = (name, body) => test(name, { skip: darwinOnly, timeout: 180 * SECONDS }, body);
+  const delayed = (name, body) => test(name, { skip, timeout: 180 * SECONDS }, body);
+  const serviceEntry = path.join(checkout, 'test', 'fixtures', 'delayed-drain-entry.mjs');
+  const clientEntry = path.join(checkout, 'test', 'fixtures', 'native-lifecycle-entry.mjs');
+  // The budget of the hurried stop (1000 ms) plus the documented tolerance for process start-up and the final
+  // manager inspection, the same tolerance test/coordinator-lifecycle-process-exit.test.mjs applies (2500 ms total).
+  const HURRIED_BUDGET_MS = 1000;
+  const CLIENT_TOLERANCE_MS = 1500;
 
-  /** The production lifecycle command in this process, against the real launchd, with the delayed-drain service entry. */
+  /** The production lifecycle command as its own client PROCESS against the real manager, with the delayed-shutdown service entry. */
   async function lifecycle(command, args) {
-    let stdout = '';
     const startedAt = Date.now();
-    const status = await lifecycleCommandMain(command, ['--json', '--coordinator-config', fixture.configuration, ...args], {
-      streams: { stdout: { write: text => { stdout += text; } }, stderr: { write: () => {} } },
-      dependencies: { environment: fixture.env, launchOverrides: { nodeExecutable: process.execPath, entryPoint: path.join(checkout, 'test', 'fixtures', 'delayed-drain-entry.mjs') } },
-    });
-    const document = JSON.parse(stdout);
-    assert.ok(!stdout.includes(SENTINEL), `${command} leaked the credential value`);
-    return { status, document, elapsed: Date.now() - startedAt };
+    const result = await run(process.execPath, ['--no-warnings', clientEntry, serviceEntry, command, '--json', '--coordinator-config', fixture.configuration, ...args], { cwd: fixture.cwd, env: fixture.env });
+    const elapsed = Date.now() - startedAt;
+    assert.ok(!(result.stdout + result.stderr).includes(SENTINEL), `${command} leaked the credential value`);
+    let document;
+    try { document = JSON.parse(result.stdout); }
+    catch { throw new Error(`Expected exactly one JSON document from "${command}" (exit ${result.status}):\n${result.stdout}\n${result.stderr}`); }
+    return { status: result.status, document, elapsed, stdout: result.stdout, stderr: result.stderr };
   }
 
   before(async () => {
-    if (darwinOnly) return;
+    if (!enabled) return;
     const root = await fs.realpath(await fs.mkdtemp(path.join(await fs.access('/tmp').then(() => '/tmp', () => os.tmpdir()), 'hn-')));
-    Object.assign(fixture, { root, home: path.join(root, 'home'), state: path.join(root, 'state'), configuration: path.join(root, 'coordinator.toml'), credentials: path.join(root, 'credentials.env') });
-    await Promise.all([fixture.home, path.join(root, 'openchamber')].map(directory => fs.mkdir(directory, { recursive: true, mode: 0o700 })));
+    Object.assign(fixture, { root, home: path.join(root, 'home'), state: path.join(root, 'state'), cwd: path.join(root, 'cwd'), configuration: path.join(root, 'coordinator.toml'), credentials: path.join(root, 'credentials.env') });
+    await Promise.all([fixture.home, fixture.cwd, path.join(root, 'openchamber')].map(directory => fs.mkdir(directory, { recursive: true, mode: 0o700 })));
     await fs.writeFile(fixture.configuration, `[coordinator]\nstateDirectory = ${JSON.stringify(fixture.state)}\nglobalConcurrency = 1\nprojectConcurrency = 1\n`);
     await fs.writeFile(fixture.credentials, `OPENCODE_PASSWORD=${SENTINEL}\n`, { mode: 0o600 });
     await fs.chmod(fixture.credentials, 0o600);
-    fixture.env = {
-      PATH: process.env.PATH ?? '', HOME: fixture.home, TMPDIR: process.env.TMPDIR ?? os.tmpdir(), LANG: process.env.LANG ?? 'C.UTF-8',
-      XDG_STATE_HOME: path.join(fixture.home, '.local', 'state'), XDG_DATA_HOME: path.join(fixture.home, '.local', 'share'),
-      XDG_CACHE_HOME: path.join(fixture.home, '.cache'), XDG_CONFIG_HOME: path.join(fixture.home, '.config'),
-      OPENCHAMBER_DATA_DIR: path.join(root, 'openchamber'), GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1',
-    };
+    fixture.env = isolatedEnvironment(root, fixture.home);
     fixture.context = await resolveLaunchContext({ coordinatorConfig: fixture.configuration, envFile: fixture.credentials }, fixture.env);
     const selection = selectNativeAdapter({ context: fixture.context, environment: fixture.env });
     assert.ok(selection.supported, `no native manager for ${process.platform}: ${selection.message}`);
     fixture.adapter = selection.adapter;
+    fixture.manager = selection.manager;
     const inspection = await fixture.adapter.inspect();
     assert.equal(inspection.registration, 'not-loaded', `${fixture.adapter.identity().label} is already registered: ${inspection.detail}`);
   });
 
   after(async () => {
-    if (darwinOnly || cleaned || !fixture.adapter) return;
+    if (!enabled || cleaned || !fixture.adapter) return;
     cleaned = true;
     let pending;
     let inspection = await fixture.adapter.inspect();
     if (inspection.running === true) {
+      // Graceful shutdown through the production command only; nothing is signaled or force-removed.
       await lifecycle('stop', ['--timeout', '90']).catch(() => undefined);
       inspection = await fixture.adapter.inspect();
     }
@@ -453,49 +480,235 @@ describe('native delayed drain (protocol fixture; launchd on macOS)', () => {
       else if ((await fixture.adapter.inspect()).registration === 'loaded') pending = `${fixture.adapter.identity().label} is still registered after cleanup`;
     } else pending = `${fixture.adapter.identity().label} is not proven stopped (${inspection.detail})`;
     if (pending) {
-      process.stderr.write(`native delayed-drain cleanup pending: ${pending}; fixture preserved in ${fixture.root}\n`);
+      process.stderr.write(`native delayed-shutdown cleanup pending: ${pending}; fixture preserved in ${fixture.root}\n`);
       throw new Error(`Cleanup pending: ${pending}. The fixture in ${fixture.root} was preserved and nothing was escalated.`);
     }
     await fs.rm(fixture.root, { recursive: true, force: true });
   });
 
-  delayed('a stop whose drain outlasts its deadline reports no success, leaves the service draining, and a later stop completes', async t => {
-    const started = await lifecycle('start', ['--timeout', '90', '--env-file', fixture.credentials]);
-    assert.equal(started.document.outcome, 'ready', JSON.stringify(started.document));
-    const instance = started.document.instance;
+  delayed('a stop whose shutdown outlasts its deadline reports no success, leaves the service running, and the accepted shutdown completes on its own', async t => {
+    const identity = fixture.adapter.identity();
+    t.diagnostic(`delayed-shutdown protocol fixture on ${fixture.manager}: ${identity.label} (not a held-run idle proof)`);
 
+    // 1. Explicit start reaches authenticated readiness with an owned registration and a positive main PID.
+    const started = await lifecycle('start', ['--timeout', '90', '--env-file', fixture.credentials]);
+    assert.equal(started.status, 0, started.stdout);
+    assert.equal(started.document.outcome, 'ready', started.stdout);
+    const instance = started.document.instance;
+    assert.ok(Number.isInteger(instance.pid) && instance.pid > 0, `instance pid ${instance.pid}`);
+    const running = await fixture.adapter.inspect();
+    assert.deepEqual([running.registration, running.running, running.pid], ['loaded', true, instance.pid]);
+    assert.deepEqual(await fixture.adapter.registrationOwnership(running), { kind: 'owned' });
+    assert.equal((await fixture.adapter.remembered()).kind, 'owned');
+    assert.equal(await probeCoordinatorOwnership(fixture.state), 'held');
+    const ipc = createCoordinatorClient(fixture.context.configuration.endpoint, await readCoordinatorToken(fixture.state), { timeoutMs: 3000, deadlineMs: 5000 });
+    const ready = await ipc.request('GET', '/lifecycle');
+    assert.equal(ready.instanceId, instance.instanceId);
+    assert.equal(ready.phase, 'running');
+    const before = await managerState(fixture.manager, identity.label, fixture.env);
+    if (fixture.manager === 'systemd') {
+      assert.equal(before.ActiveState, 'active');
+      assert.equal(Number(before.MainPID), instance.pid);
+    } else {
+      assert.equal(before.state, 'running');
+      assert.equal(Number(before.pid), instance.pid);
+    }
+
+    // 2. The hurried stop is measured as the invoking client process: it ends within the budget plus the tolerance,
+    //    with exactly one JSON document that is not a success.
     const hurried = await lifecycle('stop', ['--timeout', '1']);
-    t.diagnostic(`stop --timeout 1 ended after ${hurried.elapsed} ms with ${hurried.document.outcome} (exit ${hurried.status})`);
-    assert.ok(hurried.elapsed <= 1000 + 1500, `stop took ${hurried.elapsed} ms for a 1000 ms deadline`);
+    t.diagnostic(`stop --timeout 1 client process ended after ${hurried.elapsed} ms (limit ${HURRIED_BUDGET_MS + CLIENT_TOLERANCE_MS} ms) with ${hurried.document.outcome} (exit ${hurried.status}); message: ${hurried.document.message}`);
+    assert.ok(hurried.elapsed <= HURRIED_BUDGET_MS + CLIENT_TOLERANCE_MS, `stop took ${hurried.elapsed} ms for a ${HURRIED_BUDGET_MS} ms deadline`);
     assert.notEqual(hurried.status, 0);
     assert.equal(hurried.document.ok, false);
     assert.notEqual(hurried.document.outcome, 'stopped');
     assert.ok(['still-draining', 'completion-unknown'].includes(hurried.document.outcome), hurried.document.outcome);
     assert.ok(['deadline-exceeded', 'completion-unknown'].includes(hurried.document.error.code), hurried.document.error.code);
-    t.diagnostic(`message: ${hurried.document.message}`);
 
-    // The deadline ended the command, not the service: the real manager still runs the same process, which keeps draining.
-    const inspection = await fixture.adapter.inspect();
-    assert.equal(inspection.running, true);
-    assert.equal(inspection.pid, instance.pid);
+    // 3. The deadline ended the command, not the service: the same process is alive, ownership is held, and the manager
+    //    shows no stop, kill, restart or removal (same invocation, same main PID, same state-change time, one run).
+    const during = await fixture.adapter.inspect();
+    assert.deepEqual([during.registration, during.running, during.pid], ['loaded', true, instance.pid]);
     assert.ok(processAlive(instance.pid));
     assert.equal(await probeCoordinatorOwnership(fixture.state), 'held');
-    const reported = await createCoordinatorClient(fixture.context.configuration.endpoint, await readCoordinatorToken(fixture.state), { timeoutMs: 3000, deadlineMs: 5000 }).request('GET', '/lifecycle').catch(() => null);
-    if (reported) {
-      assert.equal(reported.instanceId, instance.instanceId);
-      assert.notEqual(reported.phase, 'running', 'the accepted drain stays in effect');
+    const stopped = await managerState(fixture.manager, identity.label, fixture.env);
+    if (fixture.manager === 'systemd') {
+      for (const property of ['ActiveState', 'SubState', 'MainPID', 'InvocationID', 'StateChangeTimestampMonotonic', 'NRestarts', 'FragmentPath']) assert.equal(stopped[property], before[property], `${property} changed during the hurried stop`);
+      assert.equal(stopped.NRestarts, '0');
+    } else {
+      for (const property of ['state', 'pid', 'runs']) assert.equal(stopped[property], before[property], `${property} changed during the hurried stop`);
     }
+    assert.equal((await exists(identity.definitionPath)), true, 'the registration was not removed');
+    const reported = await ipc.request('GET', '/lifecycle').catch(() => null);
+    if (reported) {
+      assert.equal(reported.instanceId, instance.instanceId, 'the session was not replaced');
+      assert.notEqual(reported.phase, 'running', 'the accepted shutdown stays in effect');
+    }
+    t.diagnostic(`manager state before/after the hurried stop (${fixture.manager}): ${JSON.stringify(fixture.manager === 'systemd' ? { before: { ActiveState: before.ActiveState, MainPID: before.MainPID, InvocationID: before.InvocationID, StateChangeTimestampMonotonic: before.StateChangeTimestampMonotonic }, after: { ActiveState: stopped.ActiveState, MainPID: stopped.MainPID, InvocationID: stopped.InvocationID, StateChangeTimestampMonotonic: stopped.StateChangeTimestampMonotonic } } : { before: { state: before.state, pid: before.pid, runs: before.runs }, after: { state: stopped.state, pid: stopped.pid, runs: stopped.runs } })}`);
 
-    // The accepted drain finishes on its own; the service manager then reports the process gone with a clean exit.
+    // 4. The accepted shutdown finishes on its own; the manager then reports a clean exit.
     await waitFor('the delayed shutdown to finish', async () => (await fixture.adapter.inspect()).running === false, { timeoutMs: 60 * SECONDS });
     const record = JSON.parse(await fs.readFile(path.join(fixture.state, 'lifecycle', `shutdown-${instance.instanceId}.json`), 'utf8'));
     assert.equal(record.status, 'completed');
-    assert.equal((await fixture.adapter.inspect()).lastExitStatus, 0);
-    // A later stop reports the completed clean shutdown; it does not claim to have stopped anything itself.
-    const finished = await lifecycle('stop', ['--timeout', '90']);
-    assert.equal(finished.status, 0, JSON.stringify(finished.document));
-    assert.equal(finished.document.outcome, 'already-stopped');
+    const finishedState = await managerState(fixture.manager, identity.label, fixture.env);
+    if (fixture.manager === 'systemd') {
+      assert.equal(finishedState.ExecMainStatus, '0', 'the main process exited with status 0');
+      assert.equal(finishedState.Result, 'success');
+      assert.equal(finishedState.NRestarts, '0');
+      assert.equal(finishedState.ActiveState, 'inactive');
+    } else {
+      assert.equal(finishedState.lastExit, '0', `launchd last exit code: ${finishedState.lastExit}`);
+      assert.equal((await fixture.adapter.inspect()).lastExitStatus, 0);
+    }
     await waitFor('the service process to be gone', () => !processAlive(instance.pid));
     assert.equal(await probeCoordinatorOwnership(fixture.state), 'free');
+    const later = await lifecycle('stop', ['--timeout', '90']);
+    assert.equal(later.status, 0, later.stdout);
+    assert.equal(later.document.outcome, 'already-stopped');
+    t.diagnostic(`self-completed shutdown: record ${record.status}; ${fixture.manager === 'systemd' ? `ExecMainStatus=${finishedState.ExecMainStatus} Result=${finishedState.Result}` : `last exit code = ${finishedState.lastExit}`}; later stop ${later.document.outcome}`);
+  });
+});
+
+/*
+ * Real-systemd foreign-link refusal. The expected user-unit link names a complete synthetic foreign unit that lives
+ * outside every unit search path, while a valid, separate, owned definition exists in the fixture state directory.
+ * Real systemd loads the unit through the link; the public commands must refuse to start or stop it. Only uniquely
+ * derived synthetic identities are used, and the foreign unit is removed afterwards. Evidence class: real-native
+ * (systemd user manager), not a controlled runner.
+ */
+describe('native systemd foreign unit link (real systemd user manager)', () => {
+  const fixture = {};
+  let cleaned = false;
+  const linuxOnly = skip || (process.platform === 'linux' ? false : 'the foreign-link refusal is checked against the systemd user manager on Linux only');
+  const foreign = (name, body) => test(name, { skip: linuxOnly, timeout: 120 * SECONDS }, body);
+  const clientEntry = path.join(checkout, 'test', 'fixtures', 'native-lifecycle-entry.mjs');
+
+  async function lifecycle(command, args) {
+    const result = await run(process.execPath, ['--no-warnings', clientEntry, cli, command, '--json', '--coordinator-config', fixture.configuration, ...args], { cwd: fixture.cwd, env: fixture.env });
+    let document;
+    try { document = JSON.parse(result.stdout); }
+    catch { throw new Error(`Expected exactly one JSON document from "${command}" (exit ${result.status}):\n${result.stdout}\n${result.stderr}`); }
+    assert.ok(!(result.stdout + result.stderr).includes(SENTINEL), `${command} leaked the credential value`);
+    return { status: result.status, document, stdout: result.stdout, stderr: result.stderr };
+  }
+
+  const systemctlUser = (...args) => run('/usr/bin/systemctl', ['--user', ...args], { env: fixture.env });
+  async function observe() {
+    const shown = await managerState('systemd', fixture.unit, fixture.env);
+    const { raw: _raw, ...properties } = shown;
+    return {
+      properties,
+      link: await fs.readlink(fixture.linkPath).catch(() => null),
+      foreignText: await fs.readFile(fixture.foreignUnit, 'utf8'),
+      ownedText: await fs.readFile(fixture.ownedDefinition, 'utf8'),
+      started: await exists(path.join(fixture.foreignDirectory, 'started')),
+      lifecycleFiles: await fs.readdir(path.join(fixture.state, 'lifecycle')).catch(() => []),
+      endpoint: await exists(fixture.context.configuration.endpoint),
+    };
+  }
+  function assertRefusedUntouched(label, current) {
+    assert.deepEqual(current.properties, fixture.initial.properties, `${label}: the unit's manager state changed`);
+    assert.equal(current.link, fixture.initial.link, `${label}: the link changed`);
+    assert.equal(current.foreignText, fixture.initial.foreignText);
+    assert.equal(current.ownedText, fixture.initial.ownedText);
+    assert.equal(current.started, false, `${label}: the foreign unit was started`);
+    assert.equal(current.endpoint, false, `${label}: no coordinator endpoint exists, so no shutdown request could have been sent`);
+    assert.deepEqual(current.lifecycleFiles.filter(name => name.startsWith('shutdown-') || name === 'instance.json' || name === 'launch-attempt.json'), [], `${label}: a shutdown request, instance or launch record was written`);
+  }
+
+  before(async () => {
+    if (linuxOnly) return;
+    const root = await fs.realpath(await fs.mkdtemp(path.join(await fs.access('/tmp').then(() => '/tmp', () => os.tmpdir()), 'hn-')));
+    Object.assign(fixture, { root, home: path.join(root, 'home'), state: path.join(root, 'state'), cwd: path.join(root, 'cwd'), foreignDirectory: path.join(root, 'foreign'), configuration: path.join(root, 'coordinator.toml'), credentials: path.join(root, 'credentials.env') });
+    await Promise.all([fixture.home, fixture.cwd, fixture.foreignDirectory, path.join(root, 'openchamber')].map(directory => fs.mkdir(directory, { recursive: true, mode: 0o700 })));
+    await fs.writeFile(fixture.configuration, `[coordinator]\nstateDirectory = ${JSON.stringify(fixture.state)}\nglobalConcurrency = 1\nprojectConcurrency = 1\n`);
+    await fs.writeFile(fixture.credentials, `OPENCODE_PASSWORD=${SENTINEL}\n`, { mode: 0o600 });
+    await fs.chmod(fixture.credentials, 0o600);
+    fixture.env = isolatedEnvironment(root, fixture.home);
+    fixture.context = await resolveLaunchContext({ coordinatorConfig: fixture.configuration, envFile: fixture.credentials }, fixture.env);
+    const selection = selectNativeAdapter({ context: fixture.context, environment: fixture.env });
+    assert.ok(selection.supported && selection.manager === 'systemd', `no systemd user manager: ${selection.message}`);
+    fixture.adapter = selection.adapter;
+    fixture.unit = fixture.adapter.identity().label;
+    fixture.ownedDefinition = fixture.adapter.identity().definitionPath;
+    fixture.linkPath = path.join(fixture.env.XDG_CONFIG_HOME, 'systemd', 'user', fixture.unit);
+    fixture.foreignUnit = path.join(fixture.foreignDirectory, fixture.unit);
+    const inspection = await fixture.adapter.inspect();
+    assert.equal(inspection.registration, 'not-loaded', `${fixture.unit} is already registered: ${inspection.detail}`);
+    assert.equal(await exists(fixture.linkPath), false, `${fixture.linkPath} already exists`);
+  });
+
+  after(async () => {
+    if (linuxOnly || cleaned || !fixture.adapter) return;
+    cleaned = true;
+    let pending;
+    const shown = await managerState('systemd', fixture.unit, fixture.env).catch(error => ({ LoadState: 'unknown', detail: error.message }));
+    if (shown.LoadState === 'not-found' && !await exists(fixture.linkPath)) pending = undefined;
+    else if (shown.LoadState === 'loaded' && shown.ActiveState !== 'active' && shown.ActiveState !== 'activating' && shown.MainPID === '0'
+      && await fs.readlink(fixture.linkPath).catch(() => null) === fixture.foreignUnit) {
+      // Only the synthetic foreign unit's own link, proven inactive, is removed.
+      await fs.unlink(fixture.linkPath);
+      const reloaded = await systemctlUser('daemon-reload');
+      const reshown = await managerState('systemd', fixture.unit, fixture.env);
+      if (reloaded.status !== 0 || reshown.LoadState !== 'not-found') pending = `${fixture.unit} is still loaded after removing its link`;
+    } else pending = `${fixture.unit} is not proven inactive or its link is not the fixture's (LoadState=${shown.LoadState}, ActiveState=${shown.ActiveState}, MainPID=${shown.MainPID})`;
+    if (pending) {
+      process.stderr.write(`native foreign-link cleanup pending: ${pending}; fixture preserved in ${fixture.root}\n`);
+      throw new Error(`Cleanup pending: ${pending}. The fixture in ${fixture.root} was preserved and nothing was escalated.`);
+    }
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  });
+
+  foreign('real systemd loads the expected link to a foreign unit outside its search paths and reports its FragmentPath', async t => {
+    // A valid, separate, owned definition exists but is not the one the link names.
+    await fs.mkdir(fixture.state, { recursive: true, mode: 0o700 });
+    await fs.mkdir(path.dirname(fixture.ownedDefinition), { recursive: true, mode: 0o700 });
+    await fs.writeFile(fixture.ownedDefinition, fixture.adapter.render(), { mode: 0o600 });
+    assert.equal((await fixture.adapter.remembered()).kind, 'owned');
+
+    // A complete synthetic foreign unit; if anything starts it, it leaves a marker.
+    const script = path.join(fixture.foreignDirectory, 'foreign-service.sh');
+    await fs.writeFile(script, `#!/bin/sh\necho started > ${path.join(fixture.foreignDirectory, 'started')}\nexec sleep 300\n`, { mode: 0o755 });
+    await fs.writeFile(fixture.foreignUnit, `[Unit]\nDescription=Synthetic foreign unit (OpenHeimdall native test fixture)\n\n[Service]\nType=simple\nExecStart=/bin/sh ${script}\n`);
+    const linked = await systemctlUser('link', fixture.foreignUnit);
+    assert.equal(linked.status, 0, `${linked.stdout}\n${linked.stderr}`);
+    const reloaded = await systemctlUser('daemon-reload');
+    assert.equal(reloaded.status, 0, reloaded.stderr);
+
+    assert.equal(await fs.readlink(fixture.linkPath), fixture.foreignUnit, 'the expected link names the foreign unit');
+    fixture.initial = await observe();
+    const properties = fixture.initial.properties;
+    t.diagnostic(`real-native systemd: FragmentPath=${properties.FragmentPath} (expected link ${fixture.linkPath}, foreign unit ${fixture.foreignUnit}, owned definition ${fixture.ownedDefinition}); LoadState=${properties.LoadState} ActiveState=${properties.ActiveState} UnitFileState=${properties.UnitFileState}`);
+    assert.equal(properties.LoadState, 'loaded');
+    assert.equal(properties.ActiveState, 'inactive');
+    assert.ok([fixture.linkPath, fixture.foreignUnit].includes(properties.FragmentPath), `unexpected FragmentPath ${properties.FragmentPath}`);
+    assert.notEqual(properties.FragmentPath, fixture.ownedDefinition);
+    assert.notEqual(await fs.realpath(properties.FragmentPath), await fs.realpath(fixture.ownedDefinition));
+    const inspection = await fixture.adapter.inspect();
+    assert.equal(inspection.registeredPath, properties.FragmentPath);
+    const ownership = await fixture.adapter.registrationOwnership(inspection);
+    assert.equal(ownership.kind, 'refused', JSON.stringify(ownership));
+    assert.equal(ownership.code, 'registered-elsewhere');
+  });
+
+  foreign('public start refuses the foreign unit and mutates nothing', async t => {
+    assert.ok(fixture.initial, 'the link case must run first');
+    const result = await lifecycle('start', ['--timeout', '30', '--env-file', fixture.credentials]);
+    t.diagnostic(`start: exit ${result.status}, outcome ${result.document.outcome}, error ${result.document.error?.code}: ${result.document.message}`);
+    assert.notEqual(result.status, 0);
+    assert.equal(result.document.ok, false);
+    assert.ok(!['ready', 'already-running', 'stopped', 'already-stopped'].includes(result.document.outcome), result.document.outcome);
+    assert.equal(result.document.outcome, 'conflict');
+    assertRefusedUntouched('start', await observe());
+  });
+
+  foreign('public stop refuses the foreign unit, sends no shutdown request and mutates nothing', async t => {
+    assert.ok(fixture.initial, 'the link case must run first');
+    const result = await lifecycle('stop', ['--timeout', '30']);
+    t.diagnostic(`stop: exit ${result.status}, outcome ${result.document.outcome}, error ${result.document.error?.code}: ${result.document.message}`);
+    assert.notEqual(result.status, 0);
+    assert.equal(result.document.ok, false);
+    assert.ok(!['stopped', 'already-stopped'].includes(result.document.outcome), result.document.outcome);
+    assertRefusedUntouched('stop', await observe());
   });
 });
