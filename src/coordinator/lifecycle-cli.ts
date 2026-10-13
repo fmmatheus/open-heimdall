@@ -18,7 +18,8 @@ Nothing starts automatically at install, login or boot; start is always an expli
   --env-file FILE            private file of NAME=value Basic authentication credentials, read by the
                              coordinator at every launch. Remembered by the owned service definition by
                              path; omit it to reuse the remembered file. Changing it needs a stop first.
-  --timeout SECONDS          overall startup wait, 1 to 3600 (default 30)
+  --timeout SECONDS          overall startup wait, 1 to 3600 (default 30); one deadline covers every
+                             service-manager call and coordinator request
   --json                     print one versioned result document on stdout; progress goes to stderr
 
 The environment variable OPENCHAMBER_DATA_DIR, when set, is recorded as a path (never read for tokens)
@@ -40,7 +41,8 @@ Ask the managed coordinator to drain and close, and wait for confirmed clean shu
 immediately; active runs keep their reserved capacity until native execution is idle.
 
   --coordinator-config FILE  coordinator configuration, as for start
-  --timeout SECONDS          overall shutdown wait, 1 to 3600 (default 60)
+  --timeout SECONDS          overall shutdown wait, 1 to 3600 (default 60); one deadline covers every
+                             coordinator request, and no success is reported after it has passed
   --no-wait                  return after the drain request is acknowledged; cannot be combined with
                              --timeout. Exit 0 means only that the drain was accepted.
   --json                     print one versioned result document on stdout; progress goes to stderr
