@@ -2,10 +2,11 @@
 
 Evidence for `heimdall coordinator start`, `stop` and `logs` and the native user-service adapters.
 
-**Status (draft): the native lifecycle suite and an installed-tarball lifecycle flow PASSED against a real
-launchd user domain (macOS) and a real systemd user manager (Ubuntu VM). Not yet recorded here: the
-GitHub-hosted `native-lifecycle` CI job (configured, not run), Node.js 24, Windows, and any native run with a
-held run (delayed drain). Native checks used an empty coordinator state, no project, no OpenCode server and no agent.**
+**Status: the local checks passed, and the native lifecycle suite and an installed-tarball lifecycle flow passed
+against a real launchd user domain (macOS) and a real systemd user manager (Ubuntu VM). PENDING: the
+GitHub-hosted `native-lifecycle` CI job and the installed-package CI matrix (configured, not run), Node.js 24
+natively, Windows (unsupported), and any native run with a held run (delayed drain). Native checks used an empty
+coordinator state, no project, no OpenCode server and no agent.**
 
 Nothing in this record shows that a run can execute under a native service. A user's real OpenCode or
 OpenChamber installation, provider accounts and quota were not involved.
@@ -29,6 +30,43 @@ mounts, 2 CPUs, 3 GiB memory and a 12 GiB disk; Node.js 22.19.0 from the officia
 provisions the VM user with linger enabled; it was turned off inside the VM (`loginctl disable-linger`) before any
 check so that the linger assertions were meaningful. The user manager stayed available because the
 SSH session that drove the checks remained open. The VM was deleted afterwards.
+
+Configured CI coverage, which is **not** a measured result (no hosted run happened): the `installed-package` job
+runs `npm run test:package` on `ubuntu-latest` and `macos-latest` with Node.js 22.19.0 and 24, and the
+`native-lifecycle` job runs the native suite on `ubuntu-latest` and `macos-latest` with Node.js 22 after checking
+that a user manager is usable.
+
+## Local checks on the final code
+
+Run on the macOS host above (Node v22.22.3, npm 10.9.8) in the managed checkout, with source identical to the
+code the native checks verified (`3bfdc76`); the only later changes are documentation. Each command exited 0.
+
+| Command | Result |
+| --- | --- |
+| `npm run check` | `tsc --noEmit` clean |
+| `npm test` | 1098 tests, 1098 pass, 0 fail, 0 cancelled, 0 skipped |
+| `npm run build:extension` | build and quota vendoring succeeded |
+| `npm run test:package` | 22 tests, 22 pass, 0 fail, 0 skipped (includes `test/package/lifecycle.test.mjs`) |
+| `git diff --check <base>..HEAD` | clean |
+
+The diff against the supplied base touches coordinator lifecycle code, the two native adapters, credential and
+output handling, tests, `package.json`, `.github/workflows/test.yml`, `README.md` and the three documentation
+pages. It does not touch `AGENTS.md`, any `.heimdall` file or `src/coordinator/status.ts` (the `/status` schema 1
+validator), and the existing status tests are unchanged.
+
+## Acceptance criteria and evidence
+
+| # | Criterion | Evidence | Status |
+| --- | --- | --- | --- |
+| 1 | Installed startup: tarball in an isolated consumer, lifecycle commands outside the checkout, intended authenticated instance, terminal close, duplicate and simultaneous start, configuration precedence and failure cases, empty-state no-op, queued-work admission | Installed-package tests (`test/package/lifecycle.test.mjs`, within 22/22 package tests); real installed-tarball flow 41/41 on both platforms (readiness, duplicate and simultaneous start, terminal hang-up, no project, OpenCode or provider activity with an empty state); configuration precedence, working-directory independence, paths with metacharacters, absent implicit versus explicit configuration, invalid configuration, startup timeout and exited service in `test/coordinator-lifecycle-cli.test.mjs` (fake service manager, real coordinators); queued-work admission in `test/coordinator-service.test.mjs` | Met, with limits. A missing Node.js executable is covered only by launch-context resolution in `test/coordinator-native-launchd.test.mjs`, not by a native start. The terminal check hung up a pseudo-terminal, not a Terminal.app window. |
+| 2 | Explicit-only service policy: no registration by install or setup, no login or boot trigger, no linger or restart, inactive definition after stop, later start works, crash not relaunched | Package test asserts install and setup create no definition; generated and loaded launchd and systemd definitions inspected on real managers (`RunAtLoad` and `KeepAlive` false, no triggers; `Type=exec`, `Restart=no`, no `[Install]`, `UnitFileState=linked`, `Linger=no`); clean stop, repeated stop, later start; `SIGKILL` not relaunched through an 8 s window | Met on macOS and on Ubuntu 24.04. No stale-endpoint repair is claimed. |
+| 3 | Held-run drain: status draining, admission off, owner persistence usable, capacity held, completed checkpoint is not idle proof, bounded wait without manager stop or kill, shared operation, idle proof then clean exit and completion | `test/coordinator-drain.test.mjs` and `test/coordinator-stop-logs.test.mjs` (actual coordinator with a synthetic reserved run; fake service manager recording calls) | Met by actual-coordinator and fake-adapter tests only. Not run under a real launchd or systemd manager: **PENDING**. |
+| 4 | Failure and races: unauthorized and run-owner stop, instance mismatch, drain and close-stage errors, crash after acknowledgement, old protocol, malformed replies, foreground, foreign registration, stale endpoint, start during drain and racing stop, `/status` unchanged | `test/coordinator-lifecycle.test.mjs`, `test/coordinator-drain.test.mjs`, `test/coordinator-stop-logs.test.mjs`, `test/coordinator-lifecycle-cli.test.mjs`, unchanged `test/coordinator-status.test.mjs`; adapter conflicts in the two native adapter test files | Met by automated tests. |
+| 5 | CLI and credentials: human, JSON, non-TTY and interrupted paths, exactly one JSON document, no prompts, remembered credential file, rejected files and keys, no sentinel in output, definitions, records or logs, files unchanged | `test/coordinator-lifecycle-cli.test.mjs`, `test/coordinator-credentials.test.mjs`, `test/coordinator-executor.test.mjs`; a pseudo-terminal run confirms no prompt; sentinel scans in the real flows | Met. Authentication against a live OpenCode or OpenChamber was not exercised. |
+| 6 | Logs: tail, bounded read, no-log failure, access after stop, follow interruption, private macOS destinations, Linux unit filtering, producer-side sanitizing | `test/coordinator-stop-logs.test.mjs`, `test/coordinator-credentials.test.mjs`; real `logs` after stop on both platforms (macOS private files, Linux journal filtered to the unit) | Met. A real journal `--follow` and large real journals were not exercised. |
+| 7 | Real platform evidence on one macOS and one Linux | Sections below: launchd on macOS 27.0.1 and systemd 255 on Ubuntu 24.04.5; registration, readiness, duplicate start, clean stop, later start | Met with an empty state. Delayed drain under a native manager is **PENDING**. |
+| 8 | Isolation and cleanup | Cleanup section below; fixture names derived from isolated state; live coordinator untouched | Met. No cleanup is pending. |
+| 9 | CI and checks: existing checks and matrix preserved, lifecycle regressions, explicit native route, Linux user manager provisioning | `.github/workflows/test.yml` keeps `baseline`, `macos-harness` and the `installed-package` matrix unchanged and adds the `native-lifecycle` job, which fails rather than skips when no user manager is usable; local checks above | Local checks met. Hosted CI **PENDING**: it was not run, nothing was pushed, and whether `ubuntu-latest` provides a usable user manager is unverified. |
 
 ## How the checks were run
 

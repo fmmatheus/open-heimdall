@@ -41,16 +41,24 @@ check proves model availability, provider login, quota or run readiness. For
 Claude Code models, use `claude-code` as the quota provider. For OpenChamber
 Desktop, use its local HTTP port as the URL and `openchamber` authentication;
 Heimdall uses Desktop's existing client token. For password authentication,
-supply the existing server password as `OPENCODE_PASSWORD` in the terminal that
-starts the coordinator. See the [installation and setup guide](docs/installation.md)
+supply the existing server password in a private credential file passed to
+`heimdall coordinator start --env-file`, or as `OPENCODE_PASSWORD` in the terminal
+that runs a foreground `serve`. See the [installation and setup guide](docs/installation.md)
 for the global install without `sudo`, every flag, JSON output and exit codes.
 
 ```sh
-heimdall coordinator serve
+heimdall coordinator start
+heimdall coordinator status
 ```
 
-In another terminal, write your feature request in a Markdown file, then register
-the project and submit it:
+`start` runs the coordinator in the background through your user service manager
+and returns once it answers local requests; it does not start at login or boot.
+Afterwards, `heimdall coordinator logs` shows its process output and
+`heimdall coordinator stop` drains it safely. To run it in a terminal instead, use
+`heimdall coordinator serve`. See [coordinator operation](docs/coordinator.md#background-service-start-stop-and-logs).
+
+Write your feature request in a Markdown file, then register the project and
+submit it:
 
 ```sh
 heimdall coordinator project add /path/to/your/project
