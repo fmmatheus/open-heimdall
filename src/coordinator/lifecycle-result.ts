@@ -1,4 +1,4 @@
-import { maskSecrets } from '../redaction.js';
+import { AUTHORIZATION_RULES, CAPABILITY_RULE, maskSecrets } from '../redaction.js';
 import type { ConfigurationOrigin } from './launch-context.js';
 import type { CoordinatorMode } from './lifecycle.js';
 
@@ -86,10 +86,9 @@ const MAXIMUM_TEXT_LENGTH = 2000;
 
 /** Masks known secrets of any length and credential-shaped values, removes control characters and bounds the length. */
 export function sanitizeResultText(text: string, secrets: Iterable<string> = []): string {
-  const clean = maskSecrets(text, secrets)
+  const clean = maskSecrets(text, secrets, [...AUTHORIZATION_RULES, CAPABILITY_RULE])
     // eslint-disable-next-line no-control-regex
     .replace(/[\u0000-\u001f\u007f]+/g, ' ')
-    .replace(/\b[0-9a-f]{64}\b/gi, '[redacted]')
     .replace(/\s+/g, ' ')
     .trim();
   return clean.length > MAXIMUM_TEXT_LENGTH ? `${clean.slice(0, MAXIMUM_TEXT_LENGTH - 3)}...` : clean;

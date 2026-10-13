@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { COORDINATOR_SERVICE_ID } from './status.js';
 import { privateFile } from './token.js';
 import type { createCoordinatorClient } from './client.js';
-import { maskKnownSecrets } from '../redaction.js';
+import { DIAGNOSTIC_RULES, maskSecrets } from '../redaction.js';
 
 /** Version of the lifecycle contract. It is independent of the `/status` schema version. */
 export const COORDINATOR_LIFECYCLE_PROTOCOL = 1;
@@ -304,11 +304,8 @@ export class CoordinatorShutdownError extends Error {
 /** Reduce a failure to bounded single-line text without the credentials the service knows about, whatever their length. */
 export function sanitizeShutdownError(error: unknown, secrets: readonly string[] = []): string {
   let message = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
-  message = maskKnownSecrets(message, secrets);
+  message = maskSecrets(message, secrets, DIAGNOSTIC_RULES);
   message = message
-    .replace(/\b(Bearer|Basic)\s+[^\s'"]+/gi, '$1 [redacted]')
-    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi, '$1[redacted]@')
-    .replace(/\b[0-9a-f]{64}\b/gi, '[redacted]')
     // eslint-disable-next-line no-control-regex
     .replace(/[\u0000-\u001f\u007f]+/g, ' ')
     .replace(/\s+/g, ' ')
