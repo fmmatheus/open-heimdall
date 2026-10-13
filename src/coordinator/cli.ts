@@ -185,9 +185,12 @@ export async function coordinatorMain(args: string[], internals: CoordinatorMain
     const restoreOutput = sanitizeProcessOutput(sanitize);
     try {
       const { startCoordinatorService } = await import('./service.js');
+      const { credentialSourceFor } = await import('./executor.js');
       const managerLabel = managerLabelFromEnvironment(configuration.stateDirectory);
       const lifecycle = managerLabel ? { mode: 'managed' as const, label: managerLabel } : undefined;
-      service = await startCoordinatorService({ ...internals.serviceOptions, configuration, credentials, ...(lifecycle ? { lifecycle } : {}) });
+      // A managed service takes Basic passwords only from a selected file; the manager's environment is never a source.
+      const credentialSource = credentialSourceFor({ credentials, managed: lifecycle !== undefined });
+      service = await startCoordinatorService({ ...internals.serviceOptions, configuration, credentials, credentialSource, ...(lifecycle ? { lifecycle } : {}) });
       coordinatorKey = await readCoordinatorToken(configuration.stateDirectory).catch(() => undefined);
       process.stdout.write(`Coordinator listening at ${configuration.endpoint}\n`);
       if (!await superviseForeground(service)) {

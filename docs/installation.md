@@ -287,7 +287,12 @@ the mode with `--opencode-auth` (the `authentication` key in `[opencode]`):
   started with `heimdall coordinator start` runs under your service manager and
   does not inherit that terminal's environment: select a private, owner-only
   credential file with `--env-file` instead (see
-  [Credential context](coordinator.md#credential-context)).
+  [Credential context](coordinator.md#credential-context)). A managed
+  coordinator never reads the Basic password from its own environment, even when
+  the service manager provides `OPENCODE_PASSWORD`; without a file, or with a file
+  that lacks the configured name, connections fail before any request while the
+  coordinator itself still starts. A foreground `serve` without `--env-file`
+  keeps using its environment.
 - **`none`**: no authorization header is sent. Use it only for an explicitly
   passwordless loopback server.
 - **`openchamber`**: for OpenChamber Desktop. Use Desktop's local HTTP port in

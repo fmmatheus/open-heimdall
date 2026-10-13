@@ -3,6 +3,7 @@ import { connect, snapshot } from '../opencode/observer.js';
 import type { ConnectionOptions } from '../opencode/observer.js';
 import type { SessionAPI, SessionSnapshot } from '../opencode/types.js';
 import { verifyRuntimeSnapshot } from './runtime-snapshot.js';
+import { selectionEnvironment } from './credentials.js';
 import type { CredentialContext } from './credentials.js';
 import type { ExecutorInspection, ManagedExecutor, RunRecord } from './types.js';
 
@@ -24,14 +25,36 @@ export function managedPrompt(run: RunRecord): string {
   return 'Heimdall managed run: ' + run.id + '\nCall the native adr_workflow tool exactly once with these arguments:\n' + JSON.stringify(args) + '\nReport its result and wait. Do not implement, delegate directly, or retry a paused run.';
 }
 
-export function createManagedExecutor({ getRun, connection = {}, credentials, preflightTimeoutMs = 10000, pause = ms => new Promise<void>(resolve => setTimeout(resolve, ms)), now = Date.now }: {
+/**
+ * Where Basic authentication may read its password from.
+ * - `file`: only the configured reference inside the selected credential file; a missing reference never falls back.
+ * - `none`: no source at all. A managed service (started by a native service manager) uses this without a selected
+ *   file, so an ambient `OPENCODE_PASSWORD` or custom reference inherited from the manager is never used.
+ * - `ambient`: the connection environment, as a foreground coordinator without a file has always done.
+ * OpenChamber authentication and passwordless mode do not read a password, and every policy keeps passing the
+ * nonsecret `OPENCHAMBER_DATA_DIR` selection through.
+ */
+export type CredentialSource =
+  | { kind: 'file'; context: CredentialContext }
+  | { kind: 'none' }
+  | { kind: 'ambient' };
+
+/** The policy for a coordinator: a selected file wins, otherwise a managed service has no source and a foreground one is ambient. */
+export function credentialSourceFor({ credentials, managed }: { credentials?: CredentialContext; managed: boolean }): CredentialSource {
+  if (credentials) return { kind: 'file', context: credentials };
+  return managed ? { kind: 'none' } : { kind: 'ambient' };
+}
+
+export function createManagedExecutor({ getRun, connection = {}, credentials, credentialSource, preflightTimeoutMs = 10000, pause = ms => new Promise<void>(resolve => setTimeout(resolve, ms)), now = Date.now }: {
   getRun: (id: string) => RunRecord | Promise<RunRecord>;
   connection?: ConnectionOptions;
   /**
-   * An explicitly selected credential file. Basic authentication then reads its password only from this context and
-   * never falls back to the process environment; without it the connection environment is used unchanged.
+   * An explicitly selected credential file; equivalent to `credentialSource: { kind: 'file', context }`.
+   * Without either option the connection environment is used unchanged.
    */
   credentials?: CredentialContext;
+  /** The explicit credential-source policy. Takes precedence over `credentials`. */
+  credentialSource?: CredentialSource;
   preflightTimeoutMs?: number;
   pause?: (ms: number) => Promise<void>;
   now?: () => number;
@@ -43,10 +66,17 @@ export function createManagedExecutor({ getRun, connection = {}, credentials, pr
     if (run.ownerToken !== expected.ownerToken || run.version !== expected.version || (launching && (!run.ownerToken || !run.capacityReserved))) throw new Error('Managed executor ownership or version changed');
     return run;
   };
-  const apiFor = (run: RunRecord) => {
+  const source: CredentialSource = credentialSource ?? (credentials ? { kind: 'file', context: credentials } : { kind: 'ambient' });
+  const apiFor = async (run: RunRecord) => {
     const options = { ...connection, ...run.specification.opencode, authentication: run.specification.opencode.authentication ?? 'basic' };
-    // The selected file resolves only the configured password reference; the ambient password is never consulted.
-    if (credentials) options.environment = credentials.environmentFor(options.passwordEnvironmentVariable ?? 'OPENCODE_PASSWORD', connection.environment ?? process.env);
+    const reference = options.passwordEnvironmentVariable ?? 'OPENCODE_PASSWORD';
+    const base = connection.environment ?? process.env;
+    // Always hand `connect` an explicit environment under a file or none policy; its default would be `process.env`.
+    if (source.kind === 'file') options.environment = source.context.environmentFor(reference, base);
+    else if (source.kind === 'none') {
+      if (options.authentication === 'basic') throw new Error('Managed Basic authentication needs a credential file selected with --env-file; none is configured for this service');
+      options.environment = selectionEnvironment(base);
+    }
     return connect(run.worktreePath, undefined, options);
   };
   const verifySession = (value: SessionSnapshot, run: RunRecord, parent?: string) => {
