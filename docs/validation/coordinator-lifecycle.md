@@ -2,16 +2,151 @@
 
 Evidence for `heimdall coordinator start`, `stop` and `logs` and the native user-service adapters.
 
-**Status: the local checks passed, and the native lifecycle suite and an installed-tarball lifecycle flow passed
-against a real launchd user domain (macOS) and a real systemd user manager (Ubuntu VM). PENDING: the
-GitHub-hosted `native-lifecycle` CI job and the installed-package CI matrix (configured, not run), Node.js 24
-natively, Windows (unsupported), and any native run with a held run (delayed drain). Native checks used an empty
-coordinator state, no project, no OpenCode server and no agent.**
+**Status: this page holds two separate bodies of evidence.**
+
+1. **Corrected code, `61847fe`** (next section). Local checks and the native lifecycle suite on a real launchd
+   user domain (macOS) pass. The native suite on a real systemd user manager (Ubuntu 24.04 VM) passes with 10
+   passing and 3 skipped cases (none of them native Linux checks of the corrected behavior). On Linux, the
+   installed-package tests fail 3 of 22 (the same 3 as at the base commit `e5c6fbc`, so not caused by the corrected
+   code), and nothing in this work makes them pass. PENDING: the GitHub-hosted CI jobs (configured, not run), a
+   held-reservation drain under a native manager, a native systemd check of the stopped-definition refresh and of
+   the deadline cases, and Windows (unsupported).
+2. **Earlier evidence, `3bfdc76`** (sections headed "Historical"). Kept as recorded, attributed to the code it was
+   gathered on. It is not evidence for the corrected code.
 
 Nothing in this record shows that a run can execute under a native service. A user's real OpenCode or
 OpenChamber installation, provider accounts and quota were not involved.
 
-## Environment
+## Corrected code: verified commit `61847fe`
+
+The code verified below is `61847fe` (`docs(coordinator): align lifecycle documentation with corrected behavior`),
+the last commit that changed source. The base it corrects is `e5c6fbc`. Every later commit on the branch changes
+this page only. Evidence labels: **mocked-manager** means the production launchd/systemd adapters and a real
+coordinator process driven through `test/fixtures/controlled-native-runner.mjs`, with a stateful stand-in for
+`launchctl`/`systemctl`; it is not native evidence. **Protocol fixture** means a synthetic authenticated socket
+peer. **Native** means a real user service manager.
+
+### Environments
+
+| Item | macOS host | Linux VM |
+| --- | --- | --- |
+| OS | macOS 27.0.1 (Darwin 27.0.0, arm64) | Ubuntu 24.04.5 LTS, Linux 6.8.0-142-generic aarch64 |
+| Service manager | launchd (Darwin Bootstrapper 7.0.0), per-user domain `gui/<uid>` | systemd 255 (255.4-1ubuntu8.17), `systemctl --user`, user bus at `/run/user/<uid>/bus` |
+| Node.js / npm | v22.22.3 / 10.9.8 (default); v24.21.0 / 11.19.0; v26.11.1 | v22.19.0 (the minimum supported, official tarball) / 10.9.3 |
+| Execution context | ordinary logged-in user, existing GUI login session | ordinary non-root VM user in an SSH login session |
+| Linger | not applicable | `Linger=no` before the suite, after the suite and after the package tests (the template enabled it; it was disabled inside the VM only) |
+| Source | the managed checkout at `61847fe` | `git archive 61847fe` copied into the VM |
+
+Linux VM: Lima 2.2.1, `vz` driver, stock `ubuntu-24.04` template (cloud image release 20260926), no host mounts,
+2 CPUs, 3 GiB memory, 12 GiB disk. Dependencies were installed with `npm ci --ignore-scripts` and the project was
+built with `npm run build` inside the VM. The VM was stopped and deleted afterwards; `limactl list` then showed no
+instance.
+
+### Local checks (macOS, Node 22.22.3, npm 10.9.8)
+
+| Command | Result |
+| --- | --- |
+| `npm run check` | `tsc --noEmit` clean |
+| `npm test` | 1245 tests, 1245 pass, 0 fail, 0 skipped (run twice, before and after the last documentation commit) |
+| `npm run build:extension` | exit 0 |
+| `npm run test:package` | 22 tests, 22 pass, 0 fail, 0 skipped |
+| `node --test --test-concurrency=1 test/setup-*.test.mjs test/doctor*.test.mjs test/runtime-identity*.test.mjs` | 253 tests, 253 pass, 0 fail, 0 skipped |
+| `npm run test:package` on Node 24.21.0 / npm 11.19.0 | 22 tests, 22 pass, 0 fail, 0 skipped |
+| `node --test test/coordinator-credentials.test.mjs` on Node 26.11.1 | 12 tests, 12 pass, 0 fail, 0 skipped |
+| `git diff --check e5c6fbc..61847fe` | clean |
+
+Node.js 22.19.0 was not run on macOS; it was run on Linux (below). Node.js 24 and 26 were not run on Linux.
+
+### Defect regressions: baseline versus corrected
+
+**Baseline** means a disposable copy of `e5c6fbc` (`git archive e5c6fbc`, `npm ci --ignore-scripts`,
+`npm run build`) into which the new test file and `test/fixtures/controlled-native-runner.mjs` were copied, then:
+
+```sh
+cd <baseline> && node --test test/<file>.test.mjs
+```
+
+**Corrected** is the same command in the branch checkout at `61847fe` (after `npm run build`). All results are
+mocked-manager or protocol-fixture evidence unless a native result is named.
+
+| Defect | Regression file (cases) | Baseline `e5c6fbc` | Corrected |
+| --- | --- | --- | --- |
+| 1. Public `start` could not refresh an owned, stopped launchd definition after the credential file or entry point changed; the diagnostic named an internal adapter method | `test/coordinator-lifecycle-refresh.test.mjs` (16): changed credential path and changed entry point end `ready` with a new instance and one `bootout`; refusal and state-change-during-refresh cases; systemd in-place refresh | 16 tests, 8 pass, 8 fail (both launchd refresh cases returned conflict `inactive-registration-stale`; the six state-change tests failed). Unchanged-context, running, foreign and systemd cases pass at the base and keep passing | 16 of 16 pass. Native launchd: see below |
+| 2. Ownership was accepted from a disk definition, a pid or an authenticated endpoint alone | `test/coordinator-lifecycle-ownership.test.mjs` (51; both adapters): foreign registration with a matching pid, missing loaded path and null manager pid for start, stop and new start; unrecognized state; ownership change between inspection and the shutdown request; controls (owned graceful stop, alias link, previous credential context, linked systemd fragment) | 51 tests, 21 pass, 30 fail: foreign, missing-path and null-pid registrations were reported `already-running` or `ready`, and the shutdown request was sent anyway; the change-between-inspection case sent the request. Mismatched pid and unknown-state cases for start and stop already passed at the base | 51 of 51 pass |
+| 3/4. An existing group- or world-accessible state directory was chmodded and accepted; a FIFO at a log destination blocked the open | `test/coordinator-private-paths.test.mjs` (21): insecure 0755 state directory for public start and stop, creation of missing directories, create races, symlink substitution, FIFO / directory / symlink / insecure-file log destinations | 21 tests, 9 pass, 12 fail: start and stop returned status 0 on a 0755 directory and changed it to 0700; a symlink target was chmodded; the FIFO start child stayed alive 15 s past its result and was killed by the harness | 21 of 21 pass; the FIFO child exits 1 in under 100 ms with one JSON document and no native call |
+| 5. A managed `serve` without a credential file used the manager-inherited OpenCode password | `test/coordinator-managed-credentials.test.mjs` (12) and two executor cases in `test/coordinator-executor.test.mjs` | 12 tests, 10 pass, 2 fail: the default and the opaque custom reference authenticated with the inherited value (a request with an `Authorization` header reached the stand-in) | 12 of 12 pass; managed without a file fails before any OpenCode request |
+| 6. Short known credential values (under 4 or 8 characters) were not masked | `test/coordinator-short-credentials.test.mjs` (12); the old "values under four characters are not masked" assertion in `test/coordinator-credentials.test.mjs` is replaced by a masking requirement | 12 tests, 1 pass (the authentication control), 11 fail: values leaked in producer logs, lifecycle result text, `/lifecycle` responses and shutdown records | 12 of 12 pass across streams, result fields, `/lifecycle`, shutdown records and log files |
+| 7/8. Start and stop shared no overall deadline; `stop` published its ordering boundary only after the drain; an abandoned start could still launch | `test/coordinator-lifecycle-deadline.test.mjs` (7, protocol fixture) and `test/coordinator-lifecycle-ordering.test.mjs` (21, both adapters) | Deadline: 0 pass, 7 fail (start readiness reported success after the deadline; a stop with a 1000 ms budget took 2004 ms; Ctrl-C took 2992 ms). Ordering: 21 tests, 2 pass, 19 fail (a queued start relaunched after `--no-wait` and after `already-stopped`; a publication failure still reported success; an abandoned install launched, giving 2 starts instead of 1). The abandoned-install-failure scenario and the post-deadline shutdown request did not reproduce as runtime failures; they are covered only by an invariant unit test | Deadline 7 of 7 and ordering 21 of 21 pass; elapsed times stay within the budget plus a 600 ms tolerance |
+| 9. `serve output never contains credential values, even in shutdown failure diagnostics` failed on Node 26 | `test/coordinator-credentials.test.mjs`: the original test (unchanged) and `serve handles SIGINT and SIGTERM before it announces readiness` | The new test fails. Cause demonstrated: `serve` printed `Coordinator listening` before installing its SIGINT/SIGTERM handlers, so an early SIGTERM ended the child by default action with empty stderr (about 60% of serial diagnostic runs on Node 26.11.1 and on 22.22.3). The original test failed 1 of 80 under 8-way load on Node 26.11.1 and 0 of 80 on Node 22.22.3 | The new test passes. The original test passed 12 of 12 on Node 26.11.1, 20 of 20 singly and 80 of 80 under 8-way load on both versions; 300 diagnostic runs per version all ended `code:1` with the diagnostic flushed |
+
+Additional behavior covered by existing passing tests: foreground recognition, expected-instance validation and
+run-owner refusal (`test/coordinator-stop-logs.test.mjs`, `test/coordinator-lifecycle-cli.test.mjs`,
+`test/coordinator-drain.test.mjs`).
+
+Two existing assertions were replaced because they endorsed the defects: the `--no-wait` and timeout generation
+expectations in `test/coordinator-stop-logs.test.mjs` (a stop request now advances the stop generation once), and
+the short-value assertion named above.
+
+### Native results on the corrected code
+
+**macOS, real launchd** (host above, Node 22.22.3):
+`HEIMDALL_NATIVE_LIFECYCLE=1 npm run test:native` gave 13 tests, 12 pass, 0 fail, 1 skipped. The skip is the
+documented queued-work case (covered by a coordinator test); it is not counted as a pass. The passing cases
+include `launchd: start after a clean stop applies a changed credential file path to the stopped definition`
+(defect 1, native) and `native delayed drain (protocol fixture; launchd on macOS)`: a `stop --timeout 1` against
+a coordinator whose shutdown is delayed by a fixture entry point ended in about 1.0 s with `completion-unknown`
+and exit 1 while the service stayed registered and running; after the service finished on its own the shutdown
+record was `completed` and a later `stop` reported `already-stopped`. This is a delayed shutdown stage, not a held
+run reservation.
+
+**Linux, real systemd user manager** (VM above, Node 22.19.0, `61847fe` snapshot):
+
+```sh
+HEIMDALL_NATIVE_LIFECYCLE=1 node --test --test-concurrency=1 test/native/*.test.mjs
+```
+
+13 tests, 10 pass, 0 fail, 0 cancelled, 3 skipped. The 10 passing cases are the same registration, readiness,
+duplicate and simultaneous start, terminal independence, explicit-only policy, clean and repeated stop, logs,
+later start and crash cases as in the historical run, now on the corrected code. The 3 skips are not passes:
+
+- the documented queued-work case;
+- the launchd stopped-definition refresh (macOS only by design);
+- the delayed-drain fixture (macOS only by design).
+
+So there is **no native Linux check** of the stopped-definition refresh or of the deadline and delayed-drain
+behavior. The systemd in-place refresh is covered by a mocked-manager case in
+`test/coordinator-lifecycle-refresh.test.mjs` only.
+
+**Linux installed-package tests** (`npm run test:package`, same VM): 22 tests, 19 pass, 3 fail. The same three
+fail on the `e5c6fbc` base built in the same VM (22 tests, 19 pass, 3 fail), so they are not caused by the
+corrected code, and nothing in this work addresses them:
+
+| Failing case | Observed |
+| --- | --- |
+| `test/package/install.test.mjs`: `resolves one supported @opencode/plugin and no quota package dependency` | `npm ls` (npm 10.9.3) in the consumer reports `@msgpackr-extract/msgpackr-extract-linux-arm64@3.0.4 extraneous`, which the test rejects. Cause not investigated further. |
+| `test/package/lifecycle.test.mjs`: `consumer install:` and `global install: setup registers nothing; ...` | The final `coordinator logs` on an unused state directory exits 0 and prints `-- No entries --` from `journalctl`; the test expects exit 1 and a "no logs" message, which is what the macOS file-log path produces. |
+
+The package tests also need git metadata, because `scripts/pack.mjs` lists files with `git ls-files`: the first run on
+the bare `git archive` copy was cancelled by that hook (22 cancelled) until a throwaway repository was created in the
+VM copy. The installed-package CI matrix includes `ubuntu-latest`, so these failures would be expected there too.
+Whether to change the tests or the Linux behavior is an open decision and was not made here.
+
+### Cleanup
+
+| Item | Outcome |
+| --- | --- |
+| macOS native run | `launchctl print gui/<uid>` before and after contained no Heimdall label; no new temporary fixture directory; no Heimdall file in `LaunchAgents`. |
+| Linux native run | No fixture service left loaded, no `heimdall` link or unit file under the user manager's configuration directory, no `hl-*` or `hn-*` fixture directory, no coordinator process, `Linger=no`. The user manager still held an in-memory `not-found failed` record for the fixture unit (see the historical observation below); it is cleared with the VM. The package tests left four `heimdall-tarball-*` directories under the VM's temporary directory. |
+| Linux VM | Stopped and deleted; `limactl list` showed no instance. The downloaded image remains in the host's Lima cache. |
+
+Nothing was escalated; no cleanup is pending on the host.
+
+## Historical evidence at `3bfdc76`
+
+The remaining sections record the earlier run. They describe code at `3bfdc76` and are not repeated for the
+corrected code, except where the sections above say so. Their status words (Met, PENDING) are as recorded then.
+
+## Historical environment (`3bfdc76`)
 
 Values are measured on the machines that ran the checks, not CI matrix settings.
 
@@ -36,7 +171,7 @@ runs `npm run test:package` on `ubuntu-latest` and `macos-latest` with Node.js 2
 `native-lifecycle` job runs the native suite on `ubuntu-latest` and `macos-latest` with Node.js 22 after checking
 that a user manager is usable.
 
-## Local checks on the final code
+## Historical local checks (`3bfdc76`)
 
 Run on the macOS host above (Node v22.22.3, npm 10.9.8) in the managed checkout, with source identical to the
 code the native checks verified (`3bfdc76`); the only later changes are documentation. Each command exited 0.
@@ -54,7 +189,7 @@ output handling, tests, `package.json`, `.github/workflows/test.yml`, `README.md
 pages. It does not touch `AGENTS.md`, any `.heimdall` file or `src/coordinator/status.ts` (the `/status` schema 1
 validator), and the existing status tests are unchanged.
 
-## Acceptance criteria and evidence
+## Historical acceptance criteria and evidence (`3bfdc76`)
 
 | # | Criterion | Evidence | Status |
 | --- | --- | --- | --- |
@@ -68,7 +203,7 @@ validator), and the existing status tests are unchanged.
 | 8 | Isolation and cleanup | Cleanup section below; fixture names derived from isolated state; live coordinator untouched | Met. No cleanup is pending. |
 | 9 | CI and checks: existing checks and matrix preserved, lifecycle regressions, explicit native route, Linux user manager provisioning | `.github/workflows/test.yml` keeps `baseline`, `macos-harness` and the `installed-package` matrix unchanged and adds the `native-lifecycle` job, which fails rather than skips when no user manager is usable; local checks above | Local checks met. Hosted CI **PENDING**: it was not run, nothing was pushed, and whether `ubuntu-latest` provides a usable user manager is unverified. |
 
-## How the checks were run
+## How the checks are run
 
 Every fixture used its own temporary root: state directory, `HOME`, XDG state/data/cache directories, OpenChamber
 data directory, npm cache and prefix. The coordinator configuration declared only `stateDirectory` and
@@ -83,7 +218,8 @@ fixture names was used for inspection.
 | Actual coordinator tests | Instance ownership, authenticated shutdown, held-run drain, close-stage failures and queued-work admission with real coordinators and a synthetic executor | `test/coordinator-drain.test.mjs`, `test/coordinator-lifecycle.test.mjs`, `test/coordinator-service.test.mjs`, `test/coordinator-stop-logs.test.mjs` |
 | Mocked adapter tests | Rendered definitions, command sequences, conflict and failure handling with a mock `launchctl`/`systemctl` runner or a fake service manager | `test/coordinator-native-launchd.test.mjs`, `test/coordinator-native-systemd.test.mjs`, `test/coordinator-lifecycle-cli.test.mjs`, `test/coordinator-stop-logs.test.mjs` |
 | Installed-package tests | Tarball install, no service registered by install or setup, failures before side effects, rendered definition of the installed entry point | `test/package/lifecycle.test.mjs` |
-| Real native checks | Everything below on this page | `test/native/lifecycle.native.test.mjs` and the installed-tarball flow |
+| Real native checks | The native result sections of this page | `test/native/lifecycle.native.test.mjs` and, for the historical run, the installed-tarball flow |
+| Controlled-manager tests | The production adapters and a real coordinator process against a stateful stand-in for `launchctl`/`systemctl`; mocked-manager evidence, not native | `test/fixtures/controlled-native-runner.mjs` with the defect regression files named above |
 
 ### Reproduce: native suite
 
@@ -93,8 +229,9 @@ npm run build
 HEIMDALL_NATIVE_LIFECYCLE=1 node --test --test-concurrency=1 test/native/*.test.mjs
 ```
 
-Without `HEIMDALL_NATIVE_LIFECYCLE=1` all 11 cases are reported as skipped, which is not a pass. With it, a host
-without a usable user manager fails the suite.
+Without `HEIMDALL_NATIVE_LIFECYCLE=1` every case is reported as skipped, which is not a pass. With it, a host
+without a usable user manager fails the suite, and the cases that are specific to another platform (the launchd
+refresh and the delayed-drain fixture on Linux) are still reported as skipped.
 
 ### Reproduce: Linux VM
 
@@ -105,9 +242,12 @@ limactl shell heimdall-native-check
 # inside the VM, as the ordinary user
 loginctl show-user "$(id -u)" --property=Linger          # expect Linger=no; sudo loginctl disable-linger "$(id -u)" for the VM only
 systemctl --user show-environment >/dev/null && echo "user manager ok"
-# install Node.js >= 22.19 (official tarball under $HOME), then in a source copy:
+# install Node.js >= 22.19 (official tarball under $HOME), then in a source copy
+# (a `git archive HEAD` tarball copied with `limactl copy`; run `git init && git add -A && git commit` in it,
+# because `npm run test:package` lists files with `git ls-files`):
 npm ci --ignore-scripts && npm run build
 HEIMDALL_NATIVE_LIFECYCLE=1 node --test --test-concurrency=1 test/native/*.test.mjs
+npm run test:package
 # afterwards, from the host
 limactl stop heimdall-native-check && limactl delete heimdall-native-check
 ```
@@ -133,7 +273,7 @@ $H coordinator stop --json $C
 On Linux keep the real `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS` and `XDG_CONFIG_HOME` visible, because
 `systemctl --user link` is performed by the user manager.
 
-## macOS: real launchd
+## Historical macOS: real launchd (`3bfdc76`)
 
 Native suite: `HEIMDALL_NATIVE_LIFECYCLE=1 node --test test/native/*.test.mjs` gave 11 tests, 10 pass, 0 fail,
 1 skipped. The skip is the documented queued-work case, covered by a coordinator test (see above). Installed flow:
@@ -169,7 +309,7 @@ Generated definition (sanitized):
 <key>StandardErrorPath</key><string><fixture>/state/logs/coordinator.err.log</string>
 ```
 
-## Linux: real systemd user manager
+## Historical Linux: real systemd user manager (`3bfdc76`)
 
 Native suite: 11 tests, 10 pass, 0 fail, 1 skipped (same documented case). Installed flow: 41 checks, 41 pass,
 Node.js 22.19.0, as an ordinary VM user with a real `systemctl --user` session and bus.
@@ -201,7 +341,7 @@ StandardOutput=journal
 StandardError=journal
 ```
 
-## Installed-tarball flow and empty state
+## Historical installed-tarball flow and empty state (`3bfdc76`)
 
 On both platforms the tarball built by `scripts/pack.mjs` was installed into an isolated global prefix and driven
 through its installed `bin` from a working directory outside the checkout; the installed entry point resolved
@@ -217,7 +357,7 @@ inside the installation.
 - Output of `start`, `stop`, `status` and `logs` and the service definitions contained none of the synthetic
   credential value.
 
-## Cleanup
+## Historical cleanup (`3bfdc76`)
 
 | Fixture | Outcome |
 | --- | --- |
@@ -240,12 +380,28 @@ entry existed in the user's domain. All commands ran with an isolated `HOME` and
 
 ## Limits
 
-- The native suite and the flow use an empty state. The delayed drain with a held run is established by the
-  actual-coordinator tests with a synthetic executor and checked against a fake service manager; it was not run
-  under launchd or systemd.
-- The GitHub-hosted `native-lifecycle` job in `.github/workflows/test.yml` was not run, and whether a hosted
-  Linux runner provides a usable user manager is unverified.
-- macOS ran Node.js 22.22.3 and Linux ran 22.19.0; Node.js 24 was not exercised natively.
+- The native suites use an empty state. The delayed drain with a held run reservation is established by the
+  actual-coordinator tests with a synthetic executor and checked against a fake or controlled service manager. It
+  was not run under launchd or systemd with a real held run: **PENDING**. The native delayed-drain case on macOS
+  delays a shutdown stage in a fixture entry point and is not a held-reservation test.
+- On Linux there is no native check of the stopped-definition refresh, the overall deadline or the stop ordering;
+  those are covered by mocked-manager tests, and the native refresh and delayed-drain cases run on macOS only.
+- The Linux installed-package tests fail 3 of 22 on the corrected code and on `e5c6fbc` alike (npm reports an
+  optional dependency as extraneous; `coordinator logs` on an unused state directory exits 0 on Linux). They are
+  unresolved. The package tests were not run on Linux with Node.js 24.
+- The GitHub-hosted jobs in `.github/workflows/test.yml` (`baseline`, `macos-harness`, `installed-package`,
+  `native-lifecycle`) were not run for the corrected code, and whether a hosted Linux runner provides a usable user
+  manager is unverified.
+- Node.js 22.19.0 ran on Linux only. Node.js 24 ran the package tests on macOS only, and Node.js 26 ran only the
+  credential test file on macOS. Native service-manager checks used Node.js 22.
+- The Node.js 26 diagnosis is established for the failure mode (handlers installed after the readiness line). A
+  flush or `process.exit` problem was not demonstrated and is not claimed.
+- Stop-ordering protection for a start whose native call was already issued in another process relies on the
+  operation lock held by that process; no durable cross-process launch record exists. Real launchd and systemd
+  behavior for these races was not exercised.
+- The post-deadline shutdown-request defect and the failing-install variant of the abandoned-start defect did not
+  reproduce as runtime failures; they are covered by invariant tests only.
+- Windows is unsupported and was not exercised.
 - Closing the terminal was exercised by hanging up a pseudo-terminal, with another login session active; a
   logout of the last login session on Linux with linger disabled was not tested.
 - One macOS and one Ubuntu release on arm64 only.
