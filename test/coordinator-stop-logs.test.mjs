@@ -151,7 +151,7 @@ test('stop --no-wait sends one authenticated drain request and reports only that
   const again = await stop(f, manager, ['--no-wait']);
   assert.equal(again.document.outcome, 'stop-requested');
   assert.equal((await readShutdownRecord(f.stateDirectory, held.instanceId)).attempts, 1);
-  assert.equal(await readStopGeneration(f.stateDirectory), 0, 'a drain request alone does not fence a waiting start');
+  assert.equal(await readStopGeneration(f.stateDirectory), 2, 'each accepted drain request fences a start that was already waiting, before the request is sent');
 });
 
 test('stop waits for native idle, the end of the service process and a free ownership lock before it reports stopped', { skip: !posix, timeout: 30000 }, async t => {
@@ -211,7 +211,7 @@ test('a wait that times out reports still-draining and leaves the coordinator dr
   assert.equal(held.service.lifecycle().phase, 'draining');
   assert.equal((await held.admin.request('GET', '/status')).reservedRuns, 1);
   assertReadOnly(manager);
-  assert.equal(await readStopGeneration(f.stateDirectory), 0);
+  assert.equal(await readStopGeneration(f.stateDirectory), 1, 'the accepted drain request fenced a start that was already waiting');
   // The drain continues and a later stop finishes the job.
   held.acknowledge();
   held.control.proof = true;

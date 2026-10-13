@@ -179,16 +179,45 @@ export function confirmOwnedProcess(ownership: NativeOwnership, expectedPid: num
 }
 
 export interface LaunchResult {
-  outcome: StartResult['outcome'] | 'install-conflict' | 'install-failed';
+  outcome: StartResult['outcome'] | 'install-conflict' | 'install-failed' | 'abandoned';
   install: InstallResult;
   start: StartResult | null;
 }
 
-/** Explicit start: install (register when unloaded), then start without any kill-existing option. */
-export async function launchNativeService(adapter: NativeServiceAdapter): Promise<LaunchResult> {
+/**
+ * Where a launch stands, shared with whoever may give up waiting for it. `abandoned` is only honoured while the launch
+ * is still installing: once `start()` was called the request is issued and cannot be taken back.
+ */
+export interface LaunchProgress {
+  phase: 'installing' | 'starting' | 'done';
+  abandoned: boolean;
+}
+
+export const createLaunchProgress = (): LaunchProgress => ({ phase: 'installing', abandoned: false });
+
+/**
+ * Give up on a launch that has not yet requested the start. Returns true when it will now never request one, false
+ * when the start was already issued (or the launch finished) and stays unconfirmed.
+ */
+export function abandonLaunch(progress: LaunchProgress): boolean {
+  if (progress.phase !== 'installing') return false;
+  progress.abandoned = true;
+  return true;
+}
+
+/**
+ * Explicit start: install (register when unloaded), then start without any kill-existing option. With `progress`, the
+ * start is requested only if the launch was not abandoned while the install was under way. The check and the phase
+ * change are one synchronous step, so a launch is either abandoned before its start request or issued before it.
+ */
+export async function launchNativeService(adapter: NativeServiceAdapter, progress?: LaunchProgress): Promise<LaunchResult> {
   const install = await adapter.install();
-  if (install.outcome === 'conflict') return { outcome: 'install-conflict', install, start: null };
-  if (install.outcome === 'failed') return { outcome: 'install-failed', install, start: null };
-  const start = await adapter.start();
-  return { outcome: start.outcome, install, start };
+  if (install.outcome === 'conflict') { if (progress) progress.phase = 'done'; return { outcome: 'install-conflict', install, start: null }; }
+  if (install.outcome === 'failed') { if (progress) progress.phase = 'done'; return { outcome: 'install-failed', install, start: null }; }
+  if (progress?.abandoned) { progress.phase = 'done'; return { outcome: 'abandoned', install, start: null }; }
+  if (progress) progress.phase = 'starting';
+  try {
+    const start = await adapter.start();
+    return { outcome: start.outcome, install, start };
+  } finally { if (progress) progress.phase = 'done'; }
 }

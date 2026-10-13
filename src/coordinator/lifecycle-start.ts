@@ -12,8 +12,8 @@ import { acquireOperationLock, readStopGeneration } from './lifecycle-lock.js';
 import type { ParsedLifecycleArguments } from './lifecycle-arguments.js';
 import { createLifecycleResult, sanitizeResultText } from './lifecycle-result.js';
 import type { LifecycleErrorCode, LifecycleResult, LifecycleResultInput, LifecycleTarget, ObservedInstance } from './lifecycle-result.js';
-import { confirmOwnedProcess, inspectOwnership, launchNativeService, nativeServiceNames } from './native/types.js';
-import type { NativeOwnership, NativeServiceAdapter, ServiceConflict } from './native/types.js';
+import { abandonLaunch, confirmOwnedProcess, createLaunchProgress, inspectOwnership, launchNativeService, nativeServiceNames } from './native/types.js';
+import type { LaunchResult, NativeOwnership, NativeServiceAdapter, ServiceConflict } from './native/types.js';
 import { selectNativeAdapter, selectNativeManager } from './native/platform.js';
 import type { NativeAdapterSelection } from './native/platform.js';
 import { parseCoordinatorStatus } from './status.js';
@@ -248,13 +248,24 @@ export async function runCoordinatorStart(args: ParsedLifecycleArguments, deps: 
       if (lock.reason === 'aborted') return failed('interrupted', 'Interrupted while waiting for another lifecycle operation. Nothing was started.');
       return finish({ outcome: 'busy', message: 'Another lifecycle operation for this coordinator did not finish before the startup deadline. Nothing was started; retry the command.', error: { code: 'busy', message: 'Another lifecycle operation holds the lock for this coordinator' } });
     }
+    /**
+     * The native call this start left running after giving up on it (deadline or interruption). The operation lock is
+     * kept until it settles, so no other lifecycle operation overlaps a late definition change or an issued launch.
+     */
+    const pendingNativeCall: { settled: Promise<unknown> | null } = { settled: null };
     try {
-      const current = await readStopGeneration(configuration.stateDirectory);
+      let current: number;
+      try { current = await readStopGeneration(configuration.stateDirectory); }
+      catch (error) { return failed('state-unknown', `The lifecycle state in ${configuration.stateDirectory} cannot be used: ${errorText(error)}. Nothing was started.`); }
       if (current !== generation) {
-        return finish({ outcome: 'conflict', message: 'A stop completed while this start was waiting, so it did not start the coordinator. Run start again to start it explicitly.', error: { code: 'superseded-by-stop', message: 'A stop completed while this start was waiting' } });
+        return finish({ outcome: 'conflict', message: 'A stop was requested or confirmed while this start was waiting, so it did not start the coordinator. Run start again to start it explicitly.', error: { code: 'superseded-by-stop', message: 'A stop was requested while this start was waiting' } });
       }
       return await startLocked();
-    } finally { lock.lock.release(); }
+    } finally {
+      const release = () => lock.lock.release();
+      if (pendingNativeCall.settled) void pendingNativeCall.settled.then(release, release);
+      else release();
+    }
 
     async function startLocked(): Promise<LifecycleResult> {
       let context: LaunchContext | undefined;
@@ -310,17 +321,28 @@ export async function runCoordinatorStart(args: ParsedLifecycleArguments, deps: 
       }
 
       progress(`Starting the coordinator through ${target!.manager} (${target!.label}).`);
-      const launched = await bounded(() => launchNativeService(adapter!), deps, deadlineAt).catch((error: unknown) => ({ kind: 'error' as const, error }));
+      const launchProgress = createLaunchProgress();
+      let call: Promise<LaunchResult> | undefined;
+      const launched = await bounded(() => (call = launchNativeService(adapter!, launchProgress)), deps, deadlineAt).catch((error: unknown) => ({ kind: 'error' as const, error }));
       if (launched.kind === 'error') return failed('launch-failed', `The service manager call failed: ${errorText(launched.error)}`, { logs: logsHint() });
       // Seen before the launch was started: nothing was requested, so nothing may have started either.
       if (launched.kind === 'aborted' && !launched.dispatched) return failed('interrupted', 'Interrupted before the coordinator was started. Nothing was started.');
       if (launched.kind === 'timeout' && !launched.dispatched) return deadlineBeforeAction('started the service');
-      if (launched.kind === 'aborted') return finish({ outcome: 'startup-not-confirmed', message: 'Interrupted while starting the service. The launch may already have been requested; check with `heimdall coordinator status`.', error: { code: 'interrupted', message: 'Interrupted while starting the service' }, logs: logsHint() });
-      if (launched.kind === 'timeout') {
+      if (launched.kind === 'aborted' || launched.kind === 'timeout') {
+        // The native call keeps running. The lock stays held until it settles, and a call that is still installing
+        // is told never to request the start; one that already requested it stays unconfirmed and is not undone.
+        pendingNativeCall.settled = call!.catch(() => undefined);
+        if (abandonLaunch(launchProgress)) {
+          if (launched.kind === 'aborted') return failed('interrupted', 'Interrupted while the service definition was being installed. No start was requested and none will be; the installation under way finishes without launching the coordinator. Run start again to start it.', { logs: logsHint() });
+          const message = 'The startup deadline passed while the service definition was being installed. No start was requested and none will be; the installation under way finishes without launching the coordinator. Retry the command.';
+          return finish({ outcome: 'conflict', message, error: { code: 'deadline-exceeded', message }, logs: logsHint() });
+        }
+        if (launched.kind === 'aborted') return finish({ outcome: 'startup-not-confirmed', message: 'Interrupted while starting the service. The launch may already have been requested; check with `heimdall coordinator status`.', error: { code: 'interrupted', message: 'Interrupted while starting the service' }, logs: logsHint() });
         const message = 'The service manager did not finish within the startup deadline. The coordinator may still start.';
         return finish({ outcome: 'startup-not-confirmed', message, error: { code: 'startup-timeout', message }, logs: logsHint() });
       }
       const launch = launched.value;
+      if (launch.outcome === 'abandoned') return failed('internal', 'The launch was abandoned without a request to give up on it');
       if (launch.outcome === 'install-conflict' || launch.outcome === 'conflict') {
         const mapped = fromConflicts(launch.outcome === 'conflict' ? launch.start?.conflicts ?? [] : launch.install.conflicts, launch.start?.detail ?? launch.install.detail);
         return finish({ outcome: mapped.outcome, message: mapped.message, error: { code: mapped.code, message: mapped.message }, logs: mapped.outcome === 'failed' ? undefined : logsHint() });
