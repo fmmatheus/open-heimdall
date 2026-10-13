@@ -9,11 +9,13 @@ import type { CoordinatorLifecycle } from './lifecycle.js';
 import { resolveLaunchContext, selectConfigurationFile } from './launch-context.js';
 import type { ConfigurationSelection, LaunchContext, LaunchContextOptions } from './launch-context.js';
 import { acquireOperationLock, readStopGeneration } from './lifecycle-lock.js';
+import { afterStart, clearLaunchAttempt, markLaunchRequested, readLaunchAttempt, writeLaunchAttempt } from './lifecycle-launch.js';
+import type { LaunchAttempt } from './lifecycle-launch.js';
 import type { ParsedLifecycleArguments } from './lifecycle-arguments.js';
 import { createLifecycleResult, sanitizeResultText } from './lifecycle-result.js';
 import type { LifecycleErrorCode, LifecycleResult, LifecycleResultInput, LifecycleTarget, ObservedInstance } from './lifecycle-result.js';
 import { abandonLaunch, confirmOwnedProcess, createLaunchProgress, inspectOwnership, launchNativeService, nativeServiceNames } from './native/types.js';
-import type { LaunchResult, NativeOwnership, NativeServiceAdapter, ServiceConflict } from './native/types.js';
+import type { LaunchRecord, LaunchResult, NativeOwnership, NativeServiceAdapter, ServiceConflict } from './native/types.js';
 import { selectNativeAdapter, selectNativeManager } from './native/platform.js';
 import type { NativeAdapterSelection } from './native/platform.js';
 import { parseCoordinatorStatus } from './status.js';
@@ -320,8 +322,22 @@ export async function runCoordinatorStart(args: ParsedLifecycleArguments, deps: 
         }
       }
 
+      const earlier = await readLaunchAttempt(configuration.stateDirectory).catch(() => undefined);
+      if (earlier !== null) progress('An earlier start request for this coordinator was never confirmed; this explicit start replaces its record.');
       progress(`Starting the coordinator through ${target!.manager} (${target!.label}).`);
-      const launchProgress = createLaunchProgress();
+      // Durable evidence for every other process, written under the operation lock right before the request is issued.
+      let attempt: LaunchAttempt | undefined;
+      const record: LaunchRecord = {
+        async write() { attempt = await writeLaunchAttempt(configuration.stateDirectory, { manager: target!.manager!, label: target!.label!, now: deps.now() }); },
+        async discard() { if (attempt) await clearLaunchAttempt(configuration.stateDirectory, attempt.attemptId); },
+        async finished(start) {
+          if (!attempt) return;
+          const next = afterStart(start);
+          if (next === 'clear') await clearLaunchAttempt(configuration.stateDirectory, attempt.attemptId);
+          else if (next === 'requested') await markLaunchRequested(configuration.stateDirectory, attempt);
+        },
+      };
+      const launchProgress = createLaunchProgress(record);
       let call: Promise<LaunchResult> | undefined;
       const launched = await bounded(() => (call = launchNativeService(adapter!, launchProgress)), deps, deadlineAt).catch((error: unknown) => ({ kind: 'error' as const, error }));
       if (launched.kind === 'error') return failed('launch-failed', `The service manager call failed: ${errorText(launched.error)}`, { logs: logsHint() });
@@ -343,6 +359,9 @@ export async function runCoordinatorStart(args: ParsedLifecycleArguments, deps: 
       }
       const launch = launched.value;
       if (launch.outcome === 'abandoned') return failed('internal', 'The launch was abandoned without a request to give up on it');
+      if (launch.outcome === 'unrecorded') {
+        return failed('state-unknown', `The launch attempt could not be recorded in ${configuration.stateDirectory} (${launch.recordFailure ?? 'unknown error'}), so no start was requested and nothing was started. Fix the lifecycle state directory and run start again.`);
+      }
       if (launch.outcome === 'install-conflict' || launch.outcome === 'conflict') {
         const mapped = fromConflicts(launch.outcome === 'conflict' ? launch.start?.conflicts ?? [] : launch.install.conflicts, launch.start?.detail ?? launch.install.detail);
         return finish({ outcome: mapped.outcome, message: mapped.message, error: { code: mapped.code, message: mapped.message }, logs: mapped.outcome === 'failed' ? undefined : logsHint() });
@@ -407,6 +426,8 @@ export async function runCoordinatorStart(args: ParsedLifecycleArguments, deps: 
               if (confirmed.kind === 'refused') observation = `The coordinator answered with process ${lifecycle.pid}, but it is not confirmed as the started service: ${confirmed.reason}.`;
               else if (deadlineAt - deps.now() <= 0) observation = 'The coordinator answered only after the startup deadline.';
               else if (answer.status?.status === 'running' && answer.status.acceptingNewRuns) {
+                // The authenticated instance is the owned service's own main process: the attempt has landed.
+                await clearLaunchAttempt(configuration.stateDirectory).catch(() => undefined);
                 return finish({ outcome: 'ready', message: 'Coordinator started and ready. Readiness confirms coordinator IPC only; it does not check OpenCode connectivity, credentials or quota.', instance: observed(lifecycle) });
               } else observation = 'The coordinator answered but is not yet running and accepting runs.';
             }
@@ -487,6 +508,8 @@ export async function runCoordinatorStart(args: ParsedLifecycleArguments, deps: 
           : `A coordinator answered as a managed instance, but ${confirmed.reason}. It was left unchanged.`;
         return finish({ outcome: 'conflict', message, error: { code: confirmed.code, message }, instance });
       }
+      // Owned registration and the authenticated instance's own process: any earlier start attempt has landed.
+      await clearLaunchAttempt(configuration.stateDirectory).catch(() => undefined);
       const remembered = await adapter.remembered().catch((error: unknown) => ({ kind: 'foreign' as const, reason: errorText(error) }));
       if (remembered.kind !== 'owned') {
         const message = `The running managed coordinator has no definition owned by Heimdall${remembered.kind === 'foreign' ? ` (${remembered.reason})` : ''}. It was left unchanged.`;

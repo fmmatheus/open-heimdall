@@ -16,6 +16,8 @@ export interface CommandResult {
   stderr: string;
   /** Present when the tool could not be started, timed out, or exceeded its output bound. */
   error?: string;
+  /** True when the tool started but was ended before it finished, so the request it carried may still take effect. */
+  timedOut?: boolean;
 }
 
 /** Runs a native tool with an argument array. Implementations never use a shell and never throw for a nonzero exit. */
@@ -34,7 +36,7 @@ export function createExecFileRunner(): CommandRunner {
           if (!error) { resolve({ exitCode: 0, stdout, stderr }); return; }
           const failure = error as NodeJS.ErrnoException & { killed?: boolean; signal?: string | null };
           if (typeof failure.code === 'number') { resolve({ exitCode: failure.code, stdout: stdout ?? '', stderr: stderr ?? '' }); return; }
-          resolve({ exitCode: null, stdout: stdout ?? '', stderr: stderr ?? '', error: failure.killed ? `${file} did not finish in time` : `${file} could not run: ${failure.code ?? failure.message}` });
+          resolve({ exitCode: null, stdout: stdout ?? '', stderr: stderr ?? '', error: failure.killed ? `${file} did not finish in time` : `${file} could not run: ${failure.code ?? failure.message}`, ...(failure.killed ? { timedOut: true } : {}) });
         });
       });
     },
@@ -90,6 +92,8 @@ export interface StartResult {
   outcome: 'started' | 'already-running' | 'conflict' | 'failed';
   conflicts: ServiceConflict[];
   detail: string;
+  /** On `failed`: the start tool did not finish, so the manager may still act on a request it already received. */
+  unresolved?: boolean;
 }
 
 export interface CleanupResult {
@@ -122,6 +126,11 @@ export interface NativeServiceAdapter {
   logLocation(): string;
   /** Read manager state without starting, stopping or changing anything. */
   inspect(): Promise<ServiceInspection>;
+  /**
+   * Whether the manager still has a start request of the owned service queued. Absent for a manager that cannot
+   * report queued requests; `unknown` when the answer was not recognized. Changes nothing.
+   */
+  startJobPending?(): Promise<boolean | 'unknown'>;
   /**
    * Positive ownership evidence for the registration an inspection reports as loaded: the reported definition path
    * resolves (canonical path and link handling) to the owned definition and that definition is a valid Heimdall
@@ -179,9 +188,23 @@ export function confirmOwnedProcess(ownership: NativeOwnership, expectedPid: num
 }
 
 export interface LaunchResult {
-  outcome: StartResult['outcome'] | 'install-conflict' | 'install-failed' | 'abandoned';
+  outcome: StartResult['outcome'] | 'install-conflict' | 'install-failed' | 'abandoned' | 'unrecorded';
   install: InstallResult;
   start: StartResult | null;
+  /** On `unrecorded`: why the launch attempt could not be recorded. No start was requested. */
+  recordFailure?: string;
+}
+
+/**
+ * Durable evidence of a launch attempt, supplied by the caller. `write` runs after the last chance to abandon the
+ * launch and before the start can be requested; a start is never requested when it fails. `finished` receives the
+ * outcome of a request that was made, before the launch reports it.
+ */
+export interface LaunchRecord {
+  write(): Promise<void>;
+  /** Called when the launch was abandoned after `write`, so the record of a request that never happened is removed. */
+  discard(): Promise<void>;
+  finished(start: StartResult): Promise<void>;
 }
 
 /**
@@ -191,9 +214,10 @@ export interface LaunchResult {
 export interface LaunchProgress {
   phase: 'installing' | 'starting' | 'done';
   abandoned: boolean;
+  record?: LaunchRecord;
 }
 
-export const createLaunchProgress = (): LaunchProgress => ({ phase: 'installing', abandoned: false });
+export const createLaunchProgress = (record?: LaunchRecord): LaunchProgress => ({ phase: 'installing', abandoned: false, ...(record ? { record } : {}) });
 
 /**
  * Give up on a launch that has not yet requested the start. Returns true when it will now never request one, false
@@ -215,9 +239,23 @@ export async function launchNativeService(adapter: NativeServiceAdapter, progres
   if (install.outcome === 'conflict') { if (progress) progress.phase = 'done'; return { outcome: 'install-conflict', install, start: null }; }
   if (install.outcome === 'failed') { if (progress) progress.phase = 'done'; return { outcome: 'install-failed', install, start: null }; }
   if (progress?.abandoned) { progress.phase = 'done'; return { outcome: 'abandoned', install, start: null }; }
+  if (progress?.record) {
+    // Still `installing`: the caller can abandon the launch while the record is being written.
+    try { await progress.record.write(); }
+    catch (error) {
+      progress.phase = 'done';
+      return { outcome: 'unrecorded', install, start: null, recordFailure: error instanceof Error ? error.message : 'unknown error' };
+    }
+    if (progress.abandoned) {
+      progress.phase = 'done';
+      await progress.record.discard().catch(() => undefined);
+      return { outcome: 'abandoned', install, start: null };
+    }
+  }
   if (progress) progress.phase = 'starting';
   try {
     const start = await adapter.start();
+    await progress?.record?.finished(start).catch(() => undefined);
     return { outcome: start.outcome, install, start };
   } finally { if (progress) progress.phase = 'done'; }
 }
