@@ -273,3 +273,22 @@ test('a submitted run is admitted with its runtime identity and launched from an
   assert.equal(run.specification.runtime.modules, await fs.realpath(path.join(sourcePackageRoot(), 'node_modules')));
   assert.equal(git(f.project, ['status', '--porcelain']), before, 'the source checkout is untouched');
 });
+
+test('a run queued before the coordinator started is admitted by the new instance under the normal admission rules', async t => {
+  const f = await fixture(t);
+  const project = await f.client.request('POST', '/projects', { directory: f.project });
+  const queued = await f.client.request('POST', '/runs', { projectId: project.id, feature: 'Feature' });
+  assert.equal(f.service().store.getRun(queued.id).status, 'queued');
+  assert.equal(f.launches.length, 0, 'submission alone does not admit');
+  await f.restart();
+  const waiting = f.service().store.getRun(queued.id);
+  assert.equal(waiting.status, 'queued', 'starting the coordinator does not admit by itself');
+  assert.equal(waiting.capacityReserved, false);
+  assert.equal(f.launches.length, 0);
+  await f.service().scheduler.tick();
+  const run = await settled(f.service().store, queued.id);
+  assert.equal(run.status, 'running', run.reason ?? '');
+  await f.waitForLaunch(1);
+  assert.equal(f.launches.length, 1);
+  assert.equal(f.launches[0].id, queued.id);
+});
