@@ -199,3 +199,27 @@ test('serve output never contains credential values, even in shutdown failure di
   assert.ok(!combined.includes(secret), combined);
   assert.ok(!/syntheticbearer123|user:pass/.test(combined), combined);
 });
+
+// A supervisor treats the readiness line as permission to signal the process, so SIGINT and SIGTERM must already be
+// handled when it is written; before that a signal ends the process by its default action, with no drain and no diagnostic.
+const readinessProbe = `import { coordinatorMain } from ${JSON.stringify(cliUrl)};
+const write = process.stdout.write.bind(process.stdout);
+process.stdout.write = (chunk, ...rest) => {
+  if (String(chunk).includes('Coordinator listening')) write('SIGNAL-HANDLERS SIGINT=' + process.listenerCount('SIGINT') + ' SIGTERM=' + process.listenerCount('SIGTERM') + '\\n');
+  return write(chunk, ...rest);
+};
+await coordinatorMain(['serve', '--coordinator-config', process.env.CONFIG]);`;
+
+test('serve handles SIGINT and SIGTERM before it announces readiness', { skip: !posix, timeout: 30000 }, async t => {
+  for (const signal of ['SIGTERM', 'SIGINT']) {
+    const f = await serve(t, { script: readinessProbe });
+    for (let index = 0; index < 1000 && !/Coordinator listening/.test(f.output.stdout); index++) {
+      if (f.child.exitCode !== null) assert.fail('child exited: ' + f.output.stderr);
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.match(f.output.stdout, /^SIGNAL-HANDLERS SIGINT=1 SIGTERM=1\nCoordinator listening at /, 'both handlers exist when the readiness line is written');
+    f.child.kill(signal);
+    assert.deepEqual(await f.exited, { code: 0, signal: null }, `${signal} drains and exits cleanly: ${f.output.stderr}`);
+    assert.match(f.output.stdout, /Stopping admission and draining/);
+  }
+});
