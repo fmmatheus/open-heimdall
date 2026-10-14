@@ -184,7 +184,7 @@ start or a `requested` outcome replaces. An explicit `start` still replaces an e
 instance still clears a record in the start paths, and recovery of attempts, are not changed here (the next
 subsection changes all three). The Linux VM and the native suites were not run for this change.
 
-### Explicit start and the authenticated instance no longer settle an unresolved attempt
+### Earlier attempts, landing and recovery
 
 **Defect.** At `97552f9` (source identical at `6850805`), an explicit `start` that found an earlier launch attempt
 logged "this explicit start replaces its record", wrote a new record, refreshed the service definition and issued a
@@ -211,8 +211,11 @@ finished could still deliver a request that launches the coordinator again after
 ```
 node --test test/coordinator-lifecycle-pre-delivery.test.mjs test/coordinator-lifecycle-launch-uncertainty.test.mjs test/coordinator-lifecycle-ordering.test.mjs
 node --test test/coordinator-lifecycle-*.test.mjs test/coordinator-lifecycle.test.mjs test/coordinator-native-systemd.test.mjs test/coordinator-native-launchd.test.mjs
+node --test test/coordinator-stop-logs.test.mjs test/coordinator-systemd-link-ownership.test.mjs test/coordinator-managed-credentials.test.mjs test/coordinator-redaction-collisions.test.mjs test/coordinator-key-creation.test.mjs test/coordinator-private-paths.test.mjs
 npm run check
 ```
+
+The six files of the third command pass together with the pre-delivery file (169 of 169).
 
 **Baseline versus fixed.** The new cases in `coordinator-lifecycle-pre-delivery.test.mjs` (per manager: an explicit
 start while a client is held before delivery; recovery after the client finished; a malformed record; plus one
@@ -635,7 +638,7 @@ request accepted (`requested`) or, for systemd, `systemctl --user show -p Job` r
 tool that was ended by its timeout keeps the record `dispatching`. `stop` with no answering coordinator reads the
 record after inspecting ownership and, while it is unresolved, returns `completion-unknown` (`completion-unknown`)
 without a stopped claim and without any native stop, kill or removal. An unreadable record is `state-unknown`. An
-explicit `start` replaced an unresolved record (superseded by "Explicit start and the authenticated instance no longer settle an unresolved attempt"). No flag, result field or error code was added.
+explicit `start` replaced an unresolved record (superseded by "Earlier attempts, landing and recovery"). No flag, result field or error code was added.
 
 Regression file: `test/coordinator-lifecycle-launch-uncertainty.test.mjs` (10 cases, both managers). With the start
 held on the gate: the invoking CLI is killed with `SIGKILL`; a separate-process `stop` (twice) does not report
