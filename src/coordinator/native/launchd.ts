@@ -443,7 +443,7 @@ export function createLaunchdAdapter(options: LaunchdAdapterOptions): NativeServ
     // Never `-k`: a start request must not terminate an existing instance.
     // The tool client of a start request outlives the command that gave up on it; see CommandRunOptions.outlivesCommand.
     const kickstart = await runner.run(launchctl, ['kickstart', target], { outlivesCommand: true });
-    if (kickstart.error || kickstart.exitCode !== 0) return { outcome: 'failed', conflicts: [], detail: `launchctl kickstart failed: ${clip(kickstart.error ?? `${kickstart.stderr} ${kickstart.stdout}`)}`, ...(kickstart.timedOut ? { unresolved: true } : {}) };
+    if (kickstart.error || kickstart.exitCode !== 0) return { outcome: 'failed', conflicts: [], detail: `launchctl kickstart failed: ${clip(kickstart.error ?? `${kickstart.stderr} ${kickstart.stdout}`)}`, ...(kickstart.unresolved ? { unresolved: true } : {}) };
     return { outcome: 'started', conflicts: [], detail: `${label} start requested; readiness is not yet confirmed` };
   }
 
