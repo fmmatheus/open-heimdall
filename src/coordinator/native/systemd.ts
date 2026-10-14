@@ -465,7 +465,7 @@ export function createSystemdAdapter(options: SystemdAdapterOptions): NativeServ
     if (rechecked) return rechecked;
     // The tool client of a start request outlives the command that gave up on it; see CommandRunOptions.outlivesCommand.
     const started = await run(['start', unit], { timeoutMs: START_TIMEOUT_MS, outlivesCommand: true });
-    if (started.error || started.exitCode !== 0) return { outcome: 'failed', conflicts: [], detail: `systemctl start failed: ${clip(started.error ?? `${started.stderr} ${started.stdout}`)}`, ...(started.timedOut ? { unresolved: true } : {}) };
+    if (started.error || started.exitCode !== 0) return { outcome: 'failed', conflicts: [], detail: `systemctl start failed: ${clip(started.error ?? `${started.stderr} ${started.stdout}`)}`, ...(started.unresolved ? { unresolved: true } : {}) };
     return { outcome: 'started', conflicts: [], detail: `${unit} start requested; readiness is not yet confirmed` };
   }
 

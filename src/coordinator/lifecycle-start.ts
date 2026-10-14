@@ -9,13 +9,15 @@ import type { CoordinatorLifecycle } from './lifecycle.js';
 import { resolveLaunchContext, selectConfigurationFile } from './launch-context.js';
 import type { ConfigurationSelection, LaunchContext, LaunchContextOptions } from './launch-context.js';
 import { acquireOperationLock, readStopGeneration } from './lifecycle-lock.js';
-import { afterStart, assessLaunchAttempt, clearLandedAttempt, clearLaunchAttempt, launchRecordFile, markLaunchRequested, readLaunchAttempt, recordLaunchClient, unresolvedStartMessage, writeLaunchAttempt } from './lifecycle-launch.js';
+import { assessLaunchAttempt, clearLandedAttempt, launchRecordFile, readLaunchAttempt, unresolvedStartMessage } from './lifecycle-launch.js';
+import { createLaunchAttemptOwner } from './launch-owner.js';
+import type { LaunchAttemptOwner } from './launch-owner.js';
 import type { LaunchAttempt } from './lifecycle-launch.js';
 import type { ParsedLifecycleArguments } from './lifecycle-arguments.js';
 import { createLifecycleResult, sanitizeResultText } from './lifecycle-result.js';
 import type { LifecycleErrorCode, LifecycleResult, LifecycleResultInput, LifecycleTarget, ObservedInstance } from './lifecycle-result.js';
 import { abandonLaunch, confirmOwnedProcess, createLaunchProgress, inspectOwnership, launchNativeService, nativeServiceNames, withClientWitness, withCommandBudget } from './native/types.js';
-import type { ClientWitness, LaunchRecord, LaunchResult, NativeOwnership, NativeServiceAdapter, ServiceConflict } from './native/types.js';
+import type { LaunchResult, NativeOwnership, NativeServiceAdapter, ServiceConflict } from './native/types.js';
 import { selectNativeAdapter, selectNativeManager } from './native/platform.js';
 import type { NativeAdapterSelection } from './native/platform.js';
 import { parseCoordinatorStatus } from './status.js';
@@ -260,6 +262,8 @@ async function startBefore(args: ParsedLifecycleArguments, deps: LifecycleDepend
      * kept until it settles, so no other lifecycle operation overlaps a late definition change or an issued launch.
      */
     const pendingNativeCall: { settled: Promise<unknown> | null } = { settled: null };
+    /** The writer of this start's launch attempt record; the lock is released only after it has closed. */
+    const attemptOwner: { current: LaunchAttemptOwner | null } = { current: null };
     try {
       let current: number;
       try { current = await readStopGeneration(configuration.stateDirectory); }
@@ -269,8 +273,12 @@ async function startBefore(args: ParsedLifecycleArguments, deps: LifecycleDepend
       }
       return await startLocked();
     } finally {
+      // Serialization ends only when nothing this start began can still finish: the native call it abandoned (which
+      // includes the publication of its client) and every record change its owner accepted.
       const release = () => lock.lock.release();
-      if (pendingNativeCall.settled) void pendingNativeCall.settled.then(release, release);
+      const quiet = () => (attemptOwner.current?.close() ?? Promise.resolve()).then(undefined, () => undefined);
+      if (pendingNativeCall.settled) void pendingNativeCall.settled.then(quiet).then(release, release);
+      else if (attemptOwner.current) await quiet().then(release, release);
       else release();
     }
 
@@ -331,27 +339,12 @@ async function startBefore(args: ParsedLifecycleArguments, deps: LifecycleDepend
       if (unsettled) return unsettled;
       progress(`Starting the coordinator through ${target!.manager} (${target!.label}).`);
       // Durable evidence for every other process, written under the operation lock right before the request is issued.
-      let attempt: LaunchAttempt | undefined;
-      const record: LaunchRecord = {
-        async write() { attempt = await writeLaunchAttempt(configuration.stateDirectory, { manager: target!.manager!, label: target!.label!, now: deps.now() }); },
-        async discard() { if (attempt) await clearLaunchAttempt(configuration.stateDirectory, attempt.attemptId); },
-        async finished(start) {
-          if (!attempt) return;
-          const next = afterStart(start);
-          if (next === 'clear') await clearLaunchAttempt(configuration.stateDirectory, attempt.attemptId);
-          else if (next === 'requested') await markLaunchRequested(configuration.stateDirectory, attempt);
-        },
-      };
-      const launchProgress = createLaunchProgress(record);
-      // A start client the command may have to give up on is recorded before it can deliver the request.
-      const witness: ClientWitness = {
-        async spawned(client) {
-          if (!attempt) throw new Error('no launch attempt is recorded');
-          await recordLaunchClient(configuration.stateDirectory, attempt, { pid: client.pid, now: deps.now() });
-        },
-      };
+      // One owner writes it: the attempt, the client a command may have to give up on, and the attempt's settlement.
+      const owner = createLaunchAttemptOwner(configuration.stateDirectory, { manager: target!.manager!, label: target!.label!, now: deps.now });
+      attemptOwner.current = owner;
+      const launchProgress = createLaunchProgress(owner.record);
       let call: Promise<LaunchResult> | undefined;
-      const launched = await bounded(() => (call = withClientWitness(witness, () => launchNativeService(adapter!, launchProgress))), deps, deadlineAt).catch((error: unknown) => ({ kind: 'error' as const, error }));
+      const launched = await bounded(() => (call = withClientWitness(owner.witness, () => launchNativeService(adapter!, launchProgress))), deps, deadlineAt).catch((error: unknown) => ({ kind: 'error' as const, error }));
       if (launched.kind === 'error') return failed('launch-failed', `The service manager call failed: ${errorText(launched.error)}`, { logs: logsHint() });
       // Seen before the launch was started: nothing was requested, so nothing may have started either.
       if (launched.kind === 'aborted' && !launched.dispatched) return failed('interrupted', 'Interrupted before the coordinator was started. Nothing was started.');
@@ -383,6 +376,12 @@ async function startBefore(args: ParsedLifecycleArguments, deps: LifecycleDepend
         if (conflicts[0]?.code === 'manager-unavailable') {
           const mapped = fromConflicts(conflicts, 'The service manager is unavailable');
           return failed('manager-unavailable', `${mapped.message} No service was started.`);
+        }
+        if (launch.start?.unresolved) {
+          // The start tool was told to run and its outcome is not known (it was left running), so the request it carried
+          // may still reach the manager: a definitive failure would be false, and the record of the attempt stays.
+          const message = `The start tool did not finish: ${launch.start.detail}. The request it carried may still reach the service manager, so the coordinator may still start; Heimdall did not stop or undo it. Run \`heimdall coordinator status\` before starting again.`;
+          return finish({ outcome: 'startup-not-confirmed', message, error: { code: 'launch-failed', message }, logs: logsHint() });
         }
         const message = `The service manager could not start the coordinator: ${launch.start?.detail ?? launch.install.detail}`;
         return failed('launch-failed', message, { logs: logsHint() });

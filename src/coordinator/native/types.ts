@@ -18,8 +18,12 @@ export interface CommandResult {
   stderr: string;
   /** Present when the tool could not be started, timed out, or exceeded its output bound. */
   error?: string;
-  /** True when the tool started but was ended before it finished, so the request it carried may still take effect. */
-  timedOut?: boolean;
+  /**
+   * True when the tool was told to run but its outcome is not known: it was ended or left running before it finished
+   * (a deadline, an interruption, its output bound), so the request it carried may still take effect. Absent means the
+   * tool was never run, could not run, or its exit was observed.
+   */
+  unresolved?: boolean;
 }
 
 export interface CommandRunOptions {
@@ -65,6 +69,10 @@ export function withCommandBudget<T>(budget: CommandBudget, work: () => T): T {
  * Durable evidence of a released tool client, supplied by the command that may have to give up on it. `spawned` runs
  * once the client exists and before it has been told to run its tool: the client waits for the answer, so the
  * evidence is on disk before the request can reach the manager. When it fails, the client is never told to run.
+ *
+ * The runner owns the call it makes: it reports no result, so the command's native call (and the lock the command
+ * holds for it) does not settle, until `spawned` has settled. Whatever `spawned` writes is therefore finished before
+ * the serialization it ran under ends, however the call ended.
  */
 export interface ClientWitness {
   spawned(client: { pid: number }): Promise<void>;
@@ -101,6 +109,8 @@ const OUTPUT_BOUND = 1024 * 1024;
 /** After SIGTERM, how long a tool client may take to exit before it is killed, and when the runner stops waiting for it. */
 const TERMINATE_GRACE_MS = 250;
 const GIVE_UP_AFTER_MS = 500;
+/** After a witnessed client exits, how long its output may take to drain before the exit alone is taken as its answer. */
+const EXIT_DRAIN_MS = 250;
 
 /** Stop holding the event loop for a child that is not waited for any more. */
 function release(child: ChildProcess): void {
@@ -111,10 +121,39 @@ function release(child: ChildProcess): void {
 }
 
 /**
+ * How a call to a tool ended, which is also what it proves about delivery. Only `left-running` leaves the request the
+ * tool carried unresolved; it is never inferred from a generic failure or from the passing of time.
+ *   exited         The tool's exit was observed; its status is the result.
+ *   not-run        A witnessed client was never told to run its tool (its input closed first), so nothing reached the
+ *                  manager and nothing is left behind.
+ *   could-not-run  The tool or its client could not be started.
+ *   left-running   The tool was told to run and was ended or abandoned before its exit was seen (deadline, interruption,
+ *                  output bound, an unexplained death of its client): it may still deliver.
+ */
+type Ending =
+  | { kind: 'exited'; code: number }
+  | { kind: 'not-run'; reason: string }
+  | { kind: 'could-not-run'; reason: string }
+  | { kind: 'left-running'; reason: string };
+
+function resultOf(file: string, ending: Ending, output: { stdout: string; stderr: string }): CommandResult {
+  switch (ending.kind) {
+    case 'exited': return { exitCode: ending.code, ...output };
+    case 'not-run': return { exitCode: null, ...output, error: `${file} was not run: ${ending.reason}` };
+    case 'could-not-run': return { exitCode: null, ...output, error: `${file} could not run: ${ending.reason}` };
+    case 'left-running': return { exitCode: null, ...output, error: `${file} did not finish: ${ending.reason}`, unresolved: true };
+  }
+}
+
+/**
  * The production runner: `spawn` with an argument array and no shell. Inside `withCommandBudget` the call is also bound
  * by the command: nothing starts after the deadline or an interruption, and a tool still running when either happens
  * is ended (SIGTERM, then SIGKILL) so the command can finish on time. Only the tool client this call started is ever
  * signalled, never a process it asked the manager to start. A tool marked `outlivesCommand` is released instead.
+ *
+ * A witnessed client has one owner, this call: it publishes the client through the witness, gives the go-ahead only
+ * once the publication succeeded and the call is still open, and ends in exactly one place (`conclude`), after the
+ * publication has settled.
  */
 export function createExecFileRunner(): CommandRunner {
   return {
@@ -140,71 +179,98 @@ export function createExecFileRunner(): CommandRunner {
         }
         let stdout = '';
         let stderr = '';
-        let settled = false;
-        let endReason: string | null = null;
-        /** False while a witnessed client still waits to be told to run its tool. */
+        /** False while a witnessed client waits for its go-ahead; true once it was told (a tool that runs at once is told from the start). */
         let told = witness === undefined;
+        /** Why the tool is being ended. Once set, the go-ahead is never given. */
+        let endReason: string | null = null;
+        let concluded = false;
+        /** The witness's publication of this client, once started. No result is reported before it has settled. */
+        let publication: Promise<void> | null = null;
         const timers: NodeJS.Timeout[] = [];
         const later = (milliseconds: number, action: () => void) => { timers.push(setTimeout(action, milliseconds)); };
         const abort = () => end('the command was interrupted');
-        const finish = (result: CommandResult) => {
-          if (settled) return;
-          settled = true;
+
+        /**
+         * The one place a call ends, and the evidence disposition of every way it can: see `Ending`. The go-ahead is
+         * closed first, the client's input is released (a client that was not told then exits without running its
+         * tool), and the result is reported only after the witness's publication has settled, so nothing this call
+         * started can finish after the command that owns it has released its serialization.
+         */
+        function conclude(ending: Ending): void {
+          if (concluded) return;
+          concluded = true;
           for (const timer of timers) clearTimeout(timer);
           budget?.signal?.removeEventListener('abort', abort);
-          resolve(result);
-        };
-        const unfinished = (reason: string): CommandResult => ({ exitCode: null, stdout, stderr, error: `${file} did not finish in time: ${reason}`, timedOut: true });
+          release(child);
+          const output = { stdout, stderr };
+          const report = () => resolve(resultOf(file, ending, output));
+          if (publication) publication.then(report, report); else report();
+        }
         /** End the tool because its time ran out or the command did. A tool that may carry a request is left running. */
         function end(reason: string, command = true): void {
-          if (settled || endReason !== null) return;
+          if (concluded || endReason !== null) return;
           endReason = reason;
-          if (!told) {
-            // The client was never told to run its tool, so nothing reached the manager and nothing is left behind: closing
-            // its input makes it exit without running anything.
-            release(child);
-            finish({ exitCode: null, stdout, stderr, error: `${file} was not run: ${reason}` });
-            return;
-          }
-          if (command && options.outlivesCommand) { release(child); finish(unfinished(reason)); return; }
+          // Never told: nothing reached the manager and nothing is left behind.
+          if (!told) { conclude({ kind: 'not-run', reason }); return; }
+          if (command && options.outlivesCommand) { conclude({ kind: 'left-running', reason }); return; }
           signalClient('SIGTERM');
           later(TERMINATE_GRACE_MS, () => { signalClient('SIGKILL'); });
-          later(GIVE_UP_AFTER_MS, () => { release(child); finish(unfinished(reason)); });
+          later(GIVE_UP_AFTER_MS, () => { conclude({ kind: 'left-running', reason }); });
         }
         /** A witnessed client is a process group (its launcher and the tool); signalling it signals only the client this call started. */
         function signalClient(signal: NodeJS.Signals): void {
           if (witness && child.pid !== undefined) { try { process.kill(-child.pid, signal); return; } catch { /* the group is gone; address the launcher itself */ } }
           child.kill(signal);
         }
+        /**
+         * The output passed its bound: stop collecting. A tool that carries a request is not signalled and is not
+         * reported as failed, since the bound says nothing about whether it will deliver; it is left running. A client
+         * that was never told to run cannot have run anything.
+         */
+        function overflow(): void {
+          stdout = stdout.slice(0, OUTPUT_BOUND);
+          stderr = stderr.slice(0, OUTPUT_BOUND);
+          if (!told) { endReason ??= 'its output passed the bound'; conclude({ kind: 'not-run', reason: 'its output passed the bound before it was told to run' }); return; }
+          if (options.outlivesCommand) { endReason ??= 'its output passed the bound'; conclude({ kind: 'left-running', reason: 'its output passed the bound' }); return; }
+          child.kill('SIGKILL');
+          conclude({ kind: 'could-not-run', reason: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' });
+        }
 
         const collect = (which: 'stdout' | 'stderr') => (chunk: string) => {
+          if (concluded) return;
           if (which === 'stdout') stdout += chunk; else stderr += chunk;
-          if (stdout.length > OUTPUT_BOUND || stderr.length > OUTPUT_BOUND) {
-            child.kill('SIGKILL');
-            release(child);
-            finish({ exitCode: null, stdout: stdout.slice(0, OUTPUT_BOUND), stderr: stderr.slice(0, OUTPUT_BOUND), error: `${file} could not run: ERR_CHILD_PROCESS_STDIO_MAXBUFFER` });
-          }
+          if (stdout.length > OUTPUT_BOUND || stderr.length > OUTPUT_BOUND) overflow();
         };
         child.stdout!.setEncoding('utf8'); child.stderr!.setEncoding('utf8');
         child.stdout!.on('data', collect('stdout')); child.stderr!.on('data', collect('stderr'));
-        child.once('error', error => finish({ exitCode: null, stdout, stderr, error: `${file} could not run: ${(error as NodeJS.ErrnoException).code ?? error.message}` }));
-        child.once('close', (code, signal) => {
-          if (code !== null) finish({ exitCode: code, stdout, stderr });
-          else finish(unfinished(endReason ?? `it was terminated by ${signal ?? 'a signal'}`));
+        child.once('error', error => {
+          const reason = (error as NodeJS.ErrnoException).code ?? error.message;
+          if (child.pid === undefined) conclude({ kind: 'could-not-run', reason });
+          else if (!told) conclude({ kind: 'not-run', reason: `the client failed before it was told to run (${reason})` });
+          else conclude({ kind: 'left-running', reason: `the client failed (${reason})` });
         });
+        const ended = (code: number | null, signal: NodeJS.Signals | null) => {
+          if (!told) conclude({ kind: 'not-run', reason: 'the client ended before it was told to run its tool' });
+          else if (code !== null) conclude({ kind: 'exited', code });
+          else conclude({ kind: 'left-running', reason: endReason ?? `it was terminated by ${signal ?? 'a signal'}` });
+        };
+        child.once('close', ended);
+        // The client's own exit is its answer even when a process it left behind keeps its output open, which would hold
+        // back `close` until the tool timeout; the output gets a short grace to drain first.
+        if (witness) child.once('exit', (code, signal) => later(EXIT_DRAIN_MS, () => ended(code, signal)));
 
         if (witness && child.pid !== undefined) {
           const client = child.pid;
           child.stdin!.on('error', () => undefined);
-          witness.spawned({ pid: client }).then(() => {
-            if (settled || endReason !== null) return;
+          publication = (async () => witness.spawned({ pid: client }))().then(() => {
+            // The go-ahead needs the evidence on disk and a call that is still open; a late publication releases nothing.
+            if (concluded || endReason !== null) return;
             told = true;
             child.stdin!.end('go\n');
           }, (error: unknown) => {
-            if (settled || endReason !== null) return;
+            if (concluded || endReason !== null) return;
             endReason = 'the client could not be recorded';
-            release(child);
-            finish({ exitCode: null, stdout, stderr, error: `${file} was not run: the client could not be recorded (${error instanceof Error ? error.message : 'unknown error'})` });
+            conclude({ kind: 'not-run', reason: `the client could not be recorded (${error instanceof Error ? error.message : 'unknown error'})` });
           });
         }
         later(Math.min(options.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS, 2 ** 31 - 1), () => end('the tool timeout passed', false));
