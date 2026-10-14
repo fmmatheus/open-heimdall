@@ -247,6 +247,75 @@ kill are not exercised. A record whose client is a process id reused by an unrel
 group ends; the owner can then remove the record as the message states. The Linux VM, the native suites, the package
 tests and the full suite were not run for this change.
 
+### Package exception: supported identity
+
+Code: `test/package/helpers.mjs` (`leftoverOptionalPackages`) and `test/package/tree-validation.test.mjs`, gathered on
+the macOS host (Node 22.22.3, npm 10.9.8). Only the test helper and its controls changed; `package.json`,
+`package-lock.json`, dependencies, overrides, links and platform handling are untouched.
+
+**Defect.** The earlier exception for the optional platform package that npm 10 leaves behind (see "Linux installed
+package: the extraneous `msgpackr-extract` platform package") indexed the lockfile by bare package name, so a
+same-name record anywhere replaced another, and it never compared the installed version with the locked one. With the
+optional parent absent, any installed version of the platform package was accepted: an installed `99.0.0` passed.
+
+**Rule now.** An `extraneous` line is accepted only for a package for which all of these hold. Each lockfile record is
+chosen by the installed location (the leftover's path below the consumer's `node_modules`, or below the installed
+package's own `node_modules` for the global layout, mapped to a lockfile path) and by Node's lookup chain, not by name.
+
+1. The lockfile has a record at that path. The directory name equals the manifest name, the manifest `version` is a
+   valid version, and it equals the record's `version` exactly (a range or a newer version is not accepted).
+2. The record is `optional` and restricts `os` and `cpu` to this host, and so does the installed manifest.
+3. Exactly one optional lockfile record lists the leftover in `optionalDependencies` and resolves the leftover's name,
+   through its own lookup chain, to that record. The edge's range (exact, `^` or `~`; other syntax grants nothing) is
+   satisfied by the installed version, and the locked parent version is a valid version.
+4. The parent is not installed anywhere. An installed package whose lookup chain finds that same parent record declares
+   it in `optionalDependencies` with a range the locked parent version satisfies.
+5. All lockfile records for the leftover's name agree on version and optionality, and so do all records for the
+   parent's name.
+
+Missing, malformed, incompatible or ambiguous evidence grants nothing. Valid trees are not restricted further: a tree
+npm reports clean is accepted as before, and the check only applies to lines npm reports `extraneous`.
+
+**Controls** (`tree-validation.test.mjs`, synthetic trees, real `npm ls --all`). The file grew from 22 to 40 tests; the
+22 earlier tests are unchanged (the diff only adds lines). New cases: the supported `3.0.4` leftover is accepted; an
+installed `99.0.0` with the parent absent is rejected; neighbouring versions (`3.0.3`, `3.0.5`, `3.1.0`, `2.9.9`,
+`3.0.4-rc.1`) are rejected; a missing, empty, malformed, numeric, null or array `version` is rejected; a manifest name
+that differs from the directory or is missing is rejected; a leftover at a location the lockfile has no record for is
+rejected; a locked child at another version is rejected, also when the parent edge is a range; a lockfile record
+without this host in `os` or `cpu` is rejected; a parent edge the installed version does not satisfy is rejected
+(`4.0.0`, `3.0.5`, `^4.0.0`, `~3.1.0`, `latest`, empty) and satisfied edges (`3.0.4`, `^3.0.4`, `^3.0.0`, `~3.0.1`) are
+accepted; an absent owner, an owner that declares the parent as a required dependency, a missing parent or child
+lockfile record, an owner range the locked parent version does not satisfy and a malformed locked parent version are
+rejected; an owner whose lookup finds a different parent record is rejected; conflicting same-name lockfile records
+(another child version, another parent version with and without the child edge, a non-optional copy) are rejected; two
+optional parents resolving to the leftover are rejected; and an unrelated extraneous package next to the supported
+leftover is rejected. The existing required and peer, plugin-version, quota, nonzero-exit and parent-present controls
+pass unchanged.
+
+**Baseline versus fixed.** The new test file ran against the helper at `97552f9` (a disposable copy outside the
+repository, since removed) and against the fixed helper, with the same assertions:
+
+| Helper | `node --test test/package/tree-validation.test.mjs` |
+| --- | --- |
+| `97552f9` | 40 tests, 28 pass, 12 fail; `a different version is rejected while the optional parent is absent` fails with `ERR_ASSERTION` (`expected: true`, `actual: false`) because the problem list is empty: the `99.0.0` package was accepted |
+| fixed | 40 tests, 40 pass, 0 fail |
+
+The other baseline failures are the neighbouring-version, malformed-version, no-lockfile-record, locked-version,
+host-restriction, parent-edge, owner-range, malformed-parent-version, conflicting-record and two-parent cases. The
+cases that pass on both are the earlier controls, the supported `3.0.4` leftover, the manifest-name case, the absent
+owner or lookup cases (the old rule already rejected them) and the unrelated extraneous package.
+
+**Mutation checks** on the fixed helper (restored afterwards), each failing the named control: dropping the exact locked
+version comparison; the parent edge range check; the single-parent rule; agreement of same-name child records;
+agreement of same-name parent records; the owner range check; the owner lookup; and the lockfile host restriction.
+Three checks are redundant with others and no control isolates them: the manifest-name comparison, the version
+syntax check and the locked parent version syntax check (a malformed value is also rejected by the edge comparisons).
+
+**Real installs.** On this host `node --test --test-concurrency=1 --test-name-pattern='resolves one supported'
+test/package/install.test.mjs` passes for the consumer and global layouts (2 tests, 0 fail); `msgpackr-extract` installs
+here, so the leftover path is not exercised by that run. The full installed-package matrix and the Linux VM, where npm
+10 leaves the package behind, were not run for this change.
+
 ## Final acceptance: verified commit `01b073f`
 
 The source verified in this section is `01b073f` (`fix(coordinator): publish the access key only once it holds a
