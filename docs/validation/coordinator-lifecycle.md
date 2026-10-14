@@ -2,34 +2,217 @@
 
 Evidence for `heimdall coordinator start`, `stop` and `logs` and the native user-service adapters.
 
-**Status: this page holds three separate bodies of evidence.**
+**Status: this page holds four separate bodies of evidence.**
 
-0. **Final acceptance, `01b073f`** (next section). The full local matrix on macOS, the Linux installed-package and
-   native suites, and the corrections made after `0651d81` pass at that commit, with one host-load instability of
-   `npm test` on macOS that is recorded rather than resolved. PENDING: the GitHub-hosted CI jobs, a held-reservation
-   drain under a native manager, native systemd checks of the stopped-definition refresh and of the stop ordering,
-   and Windows (unsupported).
-1. **Corrected code, `61847fe`** (the section after it). Local checks and the native lifecycle suite on a real launchd
+0. **Final acceptance of the pending-start and package-identity corrections, source `65bd4c9`** (the first section
+   below; the macOS suite ran at `254b436` and the Linux suites at `686de72`, both with `src/` identical to
+   `65bd4c9`). The pre-delivery and earlier-attempt corrections to `heimdall coordinator start` and `stop` and the
+   exact-identity rule for the leftover optional platform package pass on macOS (including the real launchd native
+   suite) and on Linux (including the real systemd native suite). The pre-delivery window itself is reproduced and
+   corrected only against the synthetic native tool, not against real launchd or systemd. PENDING: the GitHub-hosted CI
+   jobs, the full `npm test` on Linux, the cause of the `npm test` instabilities recorded for `01b073f` (neither
+   reproduced nor shown fixed), 18 `/private/tmp/hl-*` roots of unknown origin, and Windows (unsupported).
+1. **Earlier final acceptance, `01b073f`** (the section after it). The full local matrix on macOS, the Linux
+   installed-package and native suites, and the corrections made after `0651d81` pass at that commit, with one
+   host-load instability of `npm test` on macOS that is recorded rather than resolved. Historical for the lifecycle
+   commands and the package tree rule, which changed afterwards; PENDING at that commit: the GitHub-hosted CI jobs, a
+   held-reservation drain under a native manager, native systemd checks of the stopped-definition refresh and of the
+   stop ordering, and Windows (unsupported).
+2. **Corrected code, `61847fe`** (a later section). Local checks and the native lifecycle suite on a real launchd
    user domain (macOS) pass. The native suite on a real systemd user manager (Ubuntu 24.04 VM) passes with 10
    passing and 3 skipped cases (none of them native Linux checks of the corrected behavior). On Linux, the
    installed-package tests fail 3 of 22 (the same 3 as at the base commit `e5c6fbc`, so not caused by the corrected
    code), and nothing in this work makes them pass. PENDING: the GitHub-hosted CI jobs (configured, not run), a
    held-reservation drain under a native manager, a native systemd check of the stopped-definition refresh and of
    the deadline cases, and Windows (unsupported).
-2. **Earlier evidence, `3bfdc76`** (sections headed "Historical"). Kept as recorded, attributed to the code it was
+3. **Earlier evidence, `3bfdc76`** (sections headed "Historical"). Kept as recorded, attributed to the code it was
    gathered on. It is not evidence for the corrected code.
 
-- **Follow-up corrections (in progress)**, the first section below. It records the evidence gathered for the start
-  and stop corrections made after `97552f9`, starting with a baseline that reproduces a defect and the correction that
-  makes it pass. It is not acceptance evidence for any commit.
+Statements in older sections that a later correction changed are kept as recorded and marked as historical where
+they appear.
 
 Nothing in this record shows that a run can execute under a native service. A user's real OpenCode or
 OpenChamber installation, provider accounts and quota were not involved.
 
-## Follow-up corrections (in progress)
+## Final acceptance: verified source commit `65bd4c9`
 
-This section is written as the corrections land. Each subsection names the code it was gathered on. Until a later
-subsection says otherwise, nothing here shows a correction works.
+Three corrections were made after the base commit `97552f9`:
+
+1. A start request that has not yet reached the service manager (a "pre-delivery" request) was invisible to `stop`, so
+   `stop` could answer `already-stopped` and the coordinator could then launch.
+2. An explicit `start` replaced an unresolved launch attempt, and a running instance cleared one whose request could
+   still deliver.
+3. The installed-package tree check accepted the leftover optional platform package at any version once its parent was
+   absent.
+
+The source verified here is `65bd4c9` (`fix(coordinator): never replace an unresolved launch attempt on an explicit
+start`), the last commit that changed `src/`; the other source commit of the series is `0122eb9`. Every later commit
+changes tests, fixtures or this page only. `97552f9` is an ancestor of the branch head. The commits after `97552f9`, in
+order:
+
+| Commit | Subject |
+| --- | --- |
+| `6850805` | `test(coordinator): reproduce stop success while a released start client can still deliver` |
+| `0122eb9` | `fix(coordinator): keep a released start client unresolved until its completion is proven` |
+| `65bd4c9` | `fix(coordinator): never replace an unresolved launch attempt on an explicit start` |
+| `babf740` | `test(coordinator): cover explicit start and landed-attempt clearing around an unresolved launch` |
+| `60d0732` | `docs(validation): record explicit start and landed-attempt corrections against 6850805` |
+| `3564b4f` | `test(coordinator): end the held-start recovery case with a later explicit start` |
+| `145ef84` | `test(package): accept the leftover optional package only at its locked identity` |
+| `254b436` | `docs(validation): record the inherited fixture cleanup` |
+| `686de72` | `docs(validation): record the macOS matrix and real launchd suite at 254b436` |
+| `282cb66` | `docs(validation): record the Linux package matrix and real systemd suite at 686de72` |
+
+The macOS suites ran at `254b436`, the first commit that contains all the source and test changes; the Linux suites ran
+at `686de72`, whose `src/` is identical to `254b436`. `git diff 254b436 686de72` and the commit after it touch this
+page only. The commit that records this section changes this page only.
+
+### Environments
+
+| Item | macOS host | Linux VM |
+| --- | --- | --- |
+| OS | macOS 27.0.1 (Darwin 27.0.0, arm64), ordinary logged-in user | Ubuntu 24.04.5 LTS, Linux 6.8.0-142-generic aarch64, ordinary non-root user, `Linger=no` before and after |
+| Service manager | real launchd user domain | systemd 255 (255.4-1ubuntu8.17) user manager |
+| Node.js / npm | v22.22.3 / 10.9.8; v24.21.0 / 11.19.0; v22.19.0 / 10.9.3 (official tarball, SHA-256 checked, disposable directory) | v22.19.0 / 10.9.3; v24.21.0 / 11.19.0 (official tarballs, SHA-256 checked) |
+| Source | managed checkout at `254b436` | `git archive` of `686de72` committed into a scratch repository |
+| Created for this run | nothing persistent; disposable baseline copies and a Node tarball directory, removed | a new Lima 2.2.1 `vz` instance (2 CPUs, 3 GiB, 12 GiB, `--mount-none`), deleted afterwards |
+
+Test processes ran with `commit.gpgsign=false` and `core.hooksPath=/dev/null` set through the environment only; no
+global Git configuration was changed. The details are in "macOS results at `254b436`" and "Linux results at
+`686de72`".
+
+### Commands and results
+
+| Command | Environment | Result |
+| --- | --- | --- |
+| `npm run check` | macOS, Node 22.22.3 | exit 0 |
+| `npm run build:extension` | macOS, Node 22.22.3 | exit 0 |
+| `npm test` | macOS, Node 22.22.3 | 1414 tests, 1414 pass, 0 fail, 0 cancelled, 0 skipped (one run) |
+| `npm run test:package` | macOS, Node 22.22.3 / 24.21.0 / 22.19.0 | 64 of 64 pass on each |
+| `npm run test:package` | Linux, Node 22.19.0 / 24.21.0 | 64 of 64 pass on each |
+| setup, doctor and runtime-identity set | macOS, Node 22.22.3 | 253 of 253 pass |
+| same set | Linux, Node 22.19.0 and 24.21.0 | 253 of 253 pass on each |
+| serial lifecycle regression set (25 files) | macOS, Node 22.22.3 | 476 of 476 pass |
+| pre-delivery, launch-uncertainty, process-exit and ordering files | Linux, Node 22.19.0 | 68 of 68 pass |
+| `coordinator-lifecycle-released-client.test.mjs` | Linux, Node 22.19.0 | 9 of 9 pass |
+| `HEIMDALL_NATIVE_LIFECYCLE=1 npm run test:native` | macOS, real launchd | 16 tests: 12 pass, 4 skipped, 0 fail |
+| `HEIMDALL_NATIVE_LIFECYCLE=1 node --test --test-concurrency=1 test/native/*.test.mjs` | Linux, real systemd user manager | 16 tests: 14 pass, 2 skipped, 0 fail |
+
+Against `01b073f`: `npm test` 1390 to 1414; `npm run test:package` 46 to 64; setup, doctor and runtime-identity 253
+to 253; native 16 tests on both hosts with the same skips. The skips are the ones the suite reports itself (the case
+that needs a synthetic executor after a restart, the three systemd foreign-link cases on macOS, and the launchd
+refresh case on Linux). Not run: the GitHub-hosted jobs, and the full `npm test` on Linux.
+
+### Baseline versus fixed
+
+Both start and stop defects were reproduced against `97552f9` (source identical at `6850805`) with the synthetic native
+tool, `test/coordinator-lifecycle-pre-delivery.test.mjs`, the production adapters and `createExecFileRunner`, in
+separate CLI subprocesses. Evidence is mocked-manager evidence.
+
+| Defect | Baseline `97552f9` / `6850805` | Fixed |
+| --- | --- | --- |
+| A start client ends its command (deadline, Ctrl-C, kill of only the command) before it delivers; the manager reports no queued job | systemd: 8 cases, 5 pass, 3 fail; `stop`, repeated `stop` and `stop --no-wait` all answered `already-stopped` (`ok: true`, exit 0) while the client was alive; the record was removed by the first `stop`; the client then delivered and the coordinator launched. launchd: passes only because it has no probe, so its attempt stays unresolved | 8 of 8 pass with unchanged assertions; the three stops answer `completion-unknown` (`ok: false`, exit 1) while the client is alive; the invoking command ends at its deadline or signal (1055 to 1058 ms for a 1000 ms budget, 241 to 414 ms after Ctrl-C); one delivery, one launch, then `stopped` |
+| A second explicit `start` during the same window | replaced the record ("this explicit start replaces its record"), refreshed the definition and issued another request | `conflict` / `state-unknown`; record, definition and native calls unchanged; after release one delivery, one launch |
+| A malformed record | launchd: replaced and went on; systemd: failed the same expectation | `conflict` / `state-unknown`, record bytes unchanged, no native call |
+| An authenticated instance clearing a record | cleared it unconditionally on `start` and on `stop` | clears only when no recorded client that is not proven finished can deliver |
+
+**Why a queued job is not enough.** The earlier resolution rule treated an empty `Job=` as "no request in flight". A
+released client that has not delivered yet shows an empty `Job=` too, so the absence of a queued job proves nothing
+about a client that may still deliver. The corrected rule resolves a `dispatching` attempt only when the client's own
+process group is proven gone (`kill(-pid, 0)` answers `ESRCH`) and, on systemd, the manager has no queued job. The
+client is recorded (`{ pid, spawnedAt }`, an additive optional field of the `schemaVersion: 1` record) before the tool
+runs; a record without a client, from an earlier version, stays unresolved.
+
+**Normal recovery.** After release the held client delivers once, the coordinator launches, `stop` returns `stopped`,
+the record is removed and a later `start` reaches `ready` (both managers). With a finished client and nothing queued,
+systemd resolves by absence and the next explicit `start` runs; launchd stays `conflict` until the owner removes the
+record named in the message, then reaches `ready`, because launchd cannot report a queued request. A command that
+died before releasing a client leaves a record that this version marks (`recordsClients: true`) as resolvable without
+a manager probe.
+
+**Limits of the real-native coverage.** The real launchd and systemd suites passed on the corrected source, but they
+do not hold a real `launchctl kickstart` or `systemctl --user start` before delivery. They are not a pre-delivery
+reproduction. The window, the baseline failure and the correction are established only against the synthetic native
+tool, which stands in for both managers. How a real client behaves under a deadline, Ctrl-C or kill is not shown. A
+process id reused by an unrelated group keeps an attempt unresolved until that group ends (a deliberate fail-safe).
+
+**Package defect** (`test/package/helpers.mjs`). Against the `97552f9` helper, `tree-validation.test.mjs` gives 40
+tests, 28 pass, 12 fail; the control `a different version is rejected while the optional parent is absent` fails with
+`ERR_ASSERTION` because an installed `99.0.0` was accepted. With the fix: 40 of 40 pass. The 22 earlier controls are
+unchanged (additions only).
+
+### Package exception: identity, ancestry and negative controls
+
+An `extraneous` line from `npm ls --all` is accepted only for a package that satisfies every rule below; anything
+missing, malformed or ambiguous grants nothing. The full text is in "Package exception: supported identity".
+
+- Identity: the lockfile record is chosen by the installed location and Node's lookup chain, not by name; the
+  directory name equals the manifest name, and the installed `version` equals the locked version exactly (`3.0.4` for
+  `@msgpackr-extract/msgpackr-extract-<platform>-<arch>`; a range, a prerelease or any neighbouring version is not
+  accepted). The record and the installed manifest are `optional` and restricted to this host's `os` and `cpu`.
+- Ancestry: exactly one optional lockfile record lists the leftover in `optionalDependencies`, with an edge range the
+  installed version satisfies; that parent is not installed anywhere; an installed owner whose lookup chain finds the
+  same parent record declares it in `optionalDependencies` with a range the locked parent version satisfies; same-name
+  lockfile records agree.
+- Negative controls (40 tests in total, real `npm ls --all` on synthetic trees): other versions (`99.0.0`, `3.0.3`,
+  `3.0.5`, `3.1.0`, `2.9.9`, `3.0.4-rc.1`), missing or malformed versions, name mismatch, no lockfile record, locked
+  child at another version, missing host restriction, unsatisfied or malformed edges, absent or required-only owner,
+  owner range not satisfied, a different parent record, conflicting same-name records, two optional parents, and an
+  unrelated extraneous package. Eight checks were each shown by mutation to fail a named control; three are redundant
+  with other checks and no control isolates them (manifest-name comparison, version syntax, locked parent version
+  syntax).
+- Real installs: on Linux with Node 22.19.0 / npm 10.9.3 a consumer install of the tarball leaves exactly
+  `@msgpackr-extract/msgpackr-extract-linux-arm64@3.0.4`, at the lockfile version, with its parent not installed; the
+  repository's helpers accepted exactly that name and version and returned no problems. On Node 24.21.0 / npm 11.19.0
+  npm removes the orphan and the exception is not exercised. On macOS the package installs normally.
+- Compatibility consequence: a future `msgpackr-extract` release installed by a consumer, leaving an orphan at a version
+  other than the locked one, is rejected by design until the lockfile moves.
+- `package.json`, `package-lock.json` and dependencies are unchanged.
+
+### Fixture and virtual machine cleanup
+
+Four groups are kept separate.
+
+- **Inherited fixture, attributed and removed.** `/private/tmp/hl-Y4lOxB` was a synthetic launchd fixture root of the
+  preceding verification pass, identified by its own manifest. After read-only checks of processes, open files and
+  launchd registrations it was removed by exact path. See "Inherited fixture cleanup".
+- **Fixtures created by this run.** The test commands' own fixture roots were removed by the harness; the disposable
+  baseline and mutation copies and the Node 22.19.0 tarball directory were removed by exact name; the run's Lima
+  instance was stopped and deleted after an in-VM audit (`Linger=no`, no `heimdall-coordinator-*` unit, no
+  `/tmp/hn-*`, `/tmp/hl-*` or `/tmp/heimdall-*` directory, no coordinator or synthetic-tool process). The downloaded
+  Ubuntu image remains in the host's Lima cache.
+- **Old virtual machines.** The instances of earlier verification passes had already been deleted; none was recreated or
+  touched.
+- **Remaining roots of unknown origin.** The listing taken at acceptance (2026-10-14) is the planning-time list of 19
+  roots minus `hl-Y4lOxB`: `hl-0tBV1a`, `hl-81swzc`, `hl-9vABcS`, `hl-ElTQBL`, `hl-FIbAam`, `hl-Gr8VBa`, `hl-LetFoa`,
+  `hl-PZwGe8`, `hl-SNclP0`, `hl-SoF5Lo`, `hl-UxXPDx`, `hl-cdRXFC`, `hl-g4HvzG`, `hl-iqetjF`, `hl-lqScTv`, `hl-pNuK9X`,
+  `hl-q9cgZj`, `hl-wYa5VJ` under `/private/tmp`. They are unchanged, unattributed and untouched: nothing here shows
+  what created them or that they are safe to delete. No `/private/tmp/hn-*` root exists, `limactl list` reports no
+  instance, no `synthetic-native-tool` or coordinator process runs, and the macOS audit found no
+  `dev.openheimdall.coordinator` launchd label and no Heimdall entry in `~/Library/LaunchAgents`.
+
+### Unresolved
+
+- **PENDING: the GitHub-hosted jobs** in `.github/workflows/test.yml` (`baseline`, `macos-harness`,
+  `installed-package`, `native-lifecycle`) were not run: the branch was not pushed. Whether a hosted Linux runner
+  provides a usable user manager is unverified.
+- **PENDING: real-manager pre-delivery coverage.** No real launchd or systemd run holds a start client before
+  delivery (see "Limits of the real-native coverage" above).
+- **Unexplained `npm test` instabilities** recorded for `01b073f` (a hang and a process-exit failure that did not
+  reproduce) remain unexplained. `npm test` at `254b436` passed once (1414 of 1414); that neither reproduces nor fixes
+  them. The full `npm test` was not run on Linux.
+- **PENDING: 18 unattributed `/private/tmp/hl-*` roots** (above). Before removing any, check each for a manifest and
+  for open files (`lsof +D <dir>`).
+- Held-reservation drain under a real native manager, and native systemd checks of the stopped-definition refresh and
+  the stop ordering, remain as listed under "Limits".
+- Windows is unsupported and was not exercised. One macOS and one Ubuntu release on arm64 only.
+- Not changed by this work and still open: `launchd` cannot report a queued start request, so a `dispatching` launchd
+  attempt stays unresolved until the coordinator appears or the owner removes the record.
+
+### Records gathered as the work landed
+
+The subsections below were written as each correction landed and each names the code it was gathered on. Where a
+later subsection changed a statement, the earlier one is kept and marked historical.
 
 ### Pre-delivery start request: baseline
 
@@ -318,8 +501,8 @@ here, so the leftover path is not exercised by that run. The full installed-pack
 
 ### Inherited fixture cleanup
 
-"Cleanup" under "Final acceptance" lists 19 `/private/tmp/hl-*` roots that could not be attributed to that
-verification pass and were left in place. One of them has since been attributed and removed. This subsection is
+"Cleanup" under "Final acceptance: verified commit `01b073f`" lists 19 `/private/tmp/hl-*` roots that could not be
+attributed to that verification pass and were left in place. One of them has since been attributed and removed. This subsection is
 separate from the Lima virtual machines of earlier passes, which were deleted at the time, and from the remaining
 roots, whose origin is still unknown.
 
@@ -426,7 +609,7 @@ for this source; the table below replaces them for Linux.
 
 | Item | Value |
 | --- | --- |
-| Hypervisor | Lima 2.2.1, `vz` driver, stock `ubuntu-24.04` template (cloud image release 20260926), `--mount-none`, 2 CPUs, 3 GiB memory, 12 GiB disk; instance `heimdall-vf-37c515f3`, created for this run and deleted afterwards |
+| Hypervisor | Lima 2.2.1, `vz` driver, stock `ubuntu-24.04` template (cloud image release 20260926), `--mount-none`, 2 CPUs, 3 GiB memory, 12 GiB disk; a single instance created for this verification pass and deleted afterwards |
 | OS | Ubuntu 24.04.5 LTS, Linux 6.8.0-142-generic aarch64 |
 | Service manager | systemd 255 (255.4-1ubuntu8.17), user manager reachable (`XDG_RUNTIME_DIR=/run/user/501`, user bus), `is-system-running`: `running` |
 | Execution context | ordinary non-root VM user in an SSH login session |
@@ -496,6 +679,11 @@ pass: the GitHub-hosted jobs.
 Reproduce: the "Reproduce: Linux VM" steps below, with the commands in the table above.
 
 ## Final acceptance: verified commit `01b073f`
+
+**Historical.** This section is kept as recorded. For the lifecycle commands, the launch-attempt handling and the
+package tree rule it is superseded by "Final acceptance: verified source commit `65bd4c9`" above, whose code changed
+`src/coordinator/lifecycle-launch.ts`, `lifecycle-start.ts`, `lifecycle-stop.ts`, `native/types.ts` and the package
+test helpers. Statements below that name those behaviors describe `01b073f`.
 
 The source verified in this section is `01b073f` (`fix(coordinator): publish the access key only once it holds a
 complete token`), the last commit that changed source. Its ancestry includes the base `0651d81`. Every later commit
@@ -605,9 +793,13 @@ is unchanged; the package suite passes on Linux with Node 22.19.0 and 24.21.0 in
   roots from interrupted package runs.
 - **Cleanup pending**: 19 directories `/private/tmp/hl-*` and older `heimdall-baseline-*` and `heimdall-native-*`
   roots under the user temporary directory predate this verification pass and could not be attributed to it, so
-  they were not removed. Check that nothing uses them (`lsof +D <dir>`) before deleting.
+  they were not removed. Check that nothing uses them (`lsof +D <dir>`) before deleting. *Historical, at `01b073f`:
+  one of the 19 roots, `hl-Y4lOxB`, has since been attributed and removed; 18 remain unattributed (see "Inherited
+  fixture cleanup" and the final acceptance above).*
 
 ### Pending in this record
+
+*Historical, at `01b073f`; the open items now are listed under "Unresolved" in the final acceptance above.*
 
 - The GitHub-hosted jobs in `.github/workflows/test.yml` (`baseline`, `macos-harness`, `installed-package`,
   `native-lifecycle`) were not run; whether a hosted Linux runner provides a usable user manager is unverified.
@@ -1072,7 +1264,8 @@ ships glibc builds) and macOS do not, which is why only this environment failed.
 cannot make `msgpackr-extract` installable on glibc arm64 without a compiler, and the consumer must stay an ordinary
 `npm install <tarball>`.
 
-**Rule change** (`test/package/helpers.mjs` `verifyDependencyTree`, used by
+**Rule change** *(historical, at `01b073f`: the exception below matched the leftover by name and did not compare
+versions; "Package exception: supported identity" replaces it)* (`test/package/helpers.mjs` `verifyDependencyTree`, used by
 `resolves one supported @opencode/plugin and no quota package dependency` for the consumer and global installs). The
 rule still requires `npm ls --all` to exit 0 with no `invalid`, `extraneous` or `UNMET DEPENDENCY` line, exactly the
 supported `@opencode/plugin` version in every copy and no `@slkiser/opencode-quota` copy. It makes one exception: an
@@ -1466,14 +1659,16 @@ entry existed in the user's domain. All commands ran with an isolated `HOME` and
   `native-lifecycle`) were not run for the corrected code, and whether a hosted Linux runner provides a usable user
   manager is unverified.
 - At `01b073f`, Node.js 22.19.0 and 24.21.0 ran the package tests on Linux, and Node.js 22.19.0, 22.22.3 and
-  24.21.0 on macOS (see "Final acceptance"). Node.js 26 ran only the credential test file on macOS. Native
+  24.21.0 on macOS (see "Final acceptance: verified commit `01b073f`"). Node.js 26 ran only the credential test file on macOS. Native
   service-manager checks used Node.js 22.
 - The Node.js 26 diagnosis is established for the failure mode (handlers installed after the readiness line). A
   flush or `process.exit` problem was not demonstrated and is not claimed.
 - A start whose native call was already issued survives the death of its process only through the private launch
   attempt record (see "Launch attempts survive the invoking process"). Real launchd and systemd behavior for these
   races was not exercised, and launchd cannot report a queued start request, so an issued `kickstart` that never
-  produced the coordinator stays unresolved until the coordinator appears or the owner removes the record.
+  produced the coordinator stays unresolved until the coordinator appears or the owner removes the record. (The
+  record now also names the released start client and an explicit `start` no longer replaces it; see the final
+  acceptance at the top of this page. The real-native gap is unchanged.)
 - The post-deadline shutdown-request defect and the failing-install variant of the abandoned-start defect did not
   reproduce as runtime failures; they are covered by invariant tests only.
 - Windows is unsupported and was not exercised.
