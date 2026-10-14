@@ -17,6 +17,20 @@ const MAXIMUM_RECORD_BYTES = 4096;
 export type LaunchAttemptPhase = 'dispatching' | 'requested';
 
 /**
+ * The tool client that carries the start request to the manager. The command that issued it may end first (deadline,
+ * Ctrl-C, being killed) while the client, which was released, is still on its way to the manager.
+ */
+export interface LaunchClient {
+  /**
+   * Process id of the client. It was spawned detached, so it leads its own process group and the id also names the
+   * group: the group exists exactly while the client (or anything it started) still runs.
+   */
+  pid: number;
+  /** Milliseconds since the epoch when the client was spawned. */
+  spawnedAt: number;
+}
+
+/**
  * Durable evidence that a native start was (or may have been) requested for this target. It lives next to the
  * operation lock, which disappears with the process that held it, and is cleared only once an observation correlates
  * the attempt with the service state: the authenticated instance runs as the owned service's main process, or the
@@ -32,6 +46,12 @@ export interface LaunchAttempt {
   phase: LaunchAttemptPhase;
   /** Process id of the command that issued the request; informational, never trusted as liveness evidence. */
   ownerPid: number;
+  /**
+   * The released start client, recorded before it was allowed to run its tool. Absent on records written before clients
+   * were recorded and on attempts whose command ended before it spawned a client; either way nothing proves that no
+   * client can still deliver, so a `dispatching` record without it is never resolved.
+   */
+  client?: LaunchClient;
 }
 
 const recordPath = (stateDirectory: string) => path.join(stateDirectory, LIFECYCLE_DIRECTORY, RECORD_FILE);
@@ -45,6 +65,13 @@ function parseAttempt(text: string): LaunchAttempt {
     || (record.manager !== 'launchd' && record.manager !== 'systemd') || typeof record.label !== 'string' || !record.label
     || !integer(record.dispatchedAt) || (record.phase !== 'dispatching' && record.phase !== 'requested') || !integer(record.ownerPid)) {
     throw new Error('The launch attempt record is malformed');
+  }
+  if (record.client !== undefined) {
+    const client = record.client && typeof record.client === 'object' ? record.client as Record<string, unknown> : {};
+    // A process group id below 2 would address every process (-1) or the caller's own group (0, 1), never one client.
+    if (typeof client.pid !== 'number' || !Number.isSafeInteger(client.pid) || client.pid < 2 || !integer(client.spawnedAt)) {
+      throw new Error('The launch attempt record names a malformed start client');
+    }
   }
   return record as unknown as LaunchAttempt;
 }
@@ -66,6 +93,51 @@ export async function writeLaunchAttempt(stateDirectory: string, details: { mana
   };
   await writePrivateFile(recordPath(stateDirectory), JSON.stringify(attempt));
   return attempt;
+}
+
+/**
+ * Record the released client of `attempt`. Runs while the client waits to be told to run its tool, so the evidence is
+ * on disk before the request can reach the manager; when it fails the client is never told to run.
+ */
+export async function recordLaunchClient(stateDirectory: string, attempt: LaunchAttempt, client: { pid: number; now: number }): Promise<void> {
+  const current = await readLaunchAttempt(stateDirectory);
+  if (current?.attemptId !== attempt.attemptId) throw new Error('the launch attempt record is no longer this attempt\'s');
+  await writePrivateFile(recordPath(stateDirectory), JSON.stringify({ ...current, client: { pid: client.pid, spawnedAt: client.now } }));
+}
+
+/**
+ * Whether the client's process group still exists. Only a group that is positively absent counts as gone: a group
+ * that exists, a refused probe, and a process id the system has since given to something else are all "running", so
+ * the answer errs towards an unresolved attempt and never towards a premature "nothing can deliver".
+ */
+export function launchClientRunning(client: LaunchClient): boolean {
+  try { process.kill(-client.pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
+}
+
+/**
+ * Why the request of this attempt may still reach the manager after the command that issued it is gone, or null when
+ * the client that carried it is proven finished. A request the manager answered (`requested`) has no client left.
+ * Elapsed time, the exit of the issuing command and its process id are not evidence.
+ */
+export function launchMayStillDeliver(attempt: LaunchAttempt): string | null {
+  if (attempt.phase === 'requested') return null;
+  if (attempt.client === undefined) {
+    return 'no record of the start client exists (the attempt was recorded without one, or its command ended before it started one), so it cannot be ruled out that the request is still on its way to the manager';
+  }
+  if (launchClientRunning(attempt.client)) return `its start client (process group ${attempt.client.pid}) is still running and may deliver the request`;
+  return null;
+}
+
+/**
+ * Clear the record because the authenticated instance runs as the owned service, unless a client that is not proven
+ * finished could still deliver a request: that request would launch the coordinator again after it stops. An
+ * unreadable record is kept.
+ */
+export async function clearLandedAttempt(stateDirectory: string): Promise<void> {
+  const attempt = await readLaunchAttempt(stateDirectory).catch(() => undefined);
+  if (attempt === undefined || attempt === null || launchMayStillDeliver(attempt) !== null) return;
+  await clearLaunchAttempt(stateDirectory, attempt.attemptId);
 }
 
 /** Mark that the manager accepted the request, so nothing of this attempt is still in flight. */
@@ -105,8 +177,9 @@ export type LaunchAssessment =
 /**
  * Decide, from one ownership inspection, whether a recorded attempt is still unresolved. Absence of the service is
  * evidence only when nothing of the attempt can still be in flight: the request completed (`requested`), or the
- * manager reports no queued start job. A manager that cannot report queued jobs never resolves a `dispatching`
- * attempt by absence. A running service resolves it only through the authenticated instance, which callers that
+ * client that carried it is proven finished and the manager reports no queued start job. A client that may still run,
+ * or that was never recorded, keeps the attempt unresolved whatever the manager reports; a manager that cannot report
+ * queued jobs never resolves a `dispatching` attempt by absence. A running service resolves it only through the authenticated instance, which callers that
  * reached one record with `clearLaunchAttempt` themselves.
  *
  * Reads and clears the record on resolution. Starts, stops and changes nothing in the service manager.
@@ -126,6 +199,9 @@ export async function assessLaunchAttempt(stateDirectory: string, adapter: Nativ
   if (inspection.running === 'unknown') return unresolved(`whether ${label} is running could not be determined (${inspection.detail})`);
   if (inspection.running === true) return unresolved(`${label} runs, but no authenticated coordinator instance confirms it as the started service`);
   if (attempt.phase === 'requested') return resolve(`the service manager accepted the start request and ${label} is not running`);
+  // The manager can only report what it has received. A client that may not have delivered yet is invisible to it.
+  const delivery = launchMayStillDeliver(attempt);
+  if (delivery !== null) return unresolved(delivery);
   if (adapter.startJobPending === undefined) {
     return unresolved(`${attempt.manager} does not report queued start requests, so the request may still be in flight`);
   }
