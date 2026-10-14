@@ -48,13 +48,22 @@ export interface LaunchAttempt {
   ownerPid: number;
   /**
    * The released start client, recorded before it was allowed to run its tool. Absent on records written before clients
-   * were recorded and on attempts whose command ended before it spawned a client; either way nothing proves that no
-   * client can still deliver, so a `dispatching` record without it is never resolved.
+   * were recorded, where nothing proves that no client can still deliver, and on attempts whose command ended before it
+   * spawned one (see `recordsClients`).
    */
   client?: LaunchClient;
+  /**
+   * Set by versions that record a released client before it can run its tool. With it, a record that names no client
+   * belongs to a command that ended before it released one, so no request left that command; without it the record may
+   * predate client recording and a client that was never recorded cannot be ruled out.
+   */
+  recordsClients?: true;
 }
 
 const recordPath = (stateDirectory: string) => path.join(stateDirectory, LIFECYCLE_DIRECTORY, RECORD_FILE);
+
+/** Where the launch attempt record lives, for messages that tell the owner what remains on disk. */
+export const launchRecordFile = recordPath;
 
 function parseAttempt(text: string): LaunchAttempt {
   let value: unknown;
@@ -66,6 +75,7 @@ function parseAttempt(text: string): LaunchAttempt {
     || !integer(record.dispatchedAt) || (record.phase !== 'dispatching' && record.phase !== 'requested') || !integer(record.ownerPid)) {
     throw new Error('The launch attempt record is malformed');
   }
+  if (record.recordsClients !== undefined && record.recordsClients !== true) throw new Error('The launch attempt record is malformed');
   if (record.client !== undefined) {
     const client = record.client && typeof record.client === 'object' ? record.client as Record<string, unknown> : {};
     // A process group id below 2 would address every process (-1) or the caller's own group (0, 1), never one client.
@@ -83,13 +93,17 @@ export async function readLaunchAttempt(stateDirectory: string): Promise<LaunchA
 }
 
 /**
- * Record a new attempt (replacing any earlier one) atomically with mode 0600. The caller holds the operation lock and
- * calls this before the native start request can be issued, so a request in flight is never without a record.
+ * Record a new attempt atomically with mode 0600. The caller holds the operation lock and calls this before the native
+ * start request can be issued, so a request in flight is never without a record. An earlier record is evidence of a
+ * request that may not have landed, so it is never replaced: a record that is still there (or cannot be read) fails the
+ * write, and no request is issued. A caller resolves the earlier attempt first (`assessLaunchAttempt`).
  */
 export async function writeLaunchAttempt(stateDirectory: string, details: { manager: LaunchAttempt['manager']; label: string; now: number }): Promise<LaunchAttempt> {
+  const earlier = await readLaunchAttempt(stateDirectory);
+  if (earlier !== null) throw new Error(`an earlier launch attempt for ${earlier.label} is still recorded and unresolved`);
   const attempt: LaunchAttempt = {
     schemaVersion: 1, attemptId: randomUUID(), manager: details.manager, label: details.label,
-    dispatchedAt: details.now, phase: 'dispatching', ownerPid: process.pid,
+    dispatchedAt: details.now, phase: 'dispatching', ownerPid: process.pid, recordsClients: true,
   };
   await writePrivateFile(recordPath(stateDirectory), JSON.stringify(attempt));
   return attempt;
@@ -123,7 +137,9 @@ export function launchClientRunning(client: LaunchClient): boolean {
 export function launchMayStillDeliver(attempt: LaunchAttempt): string | null {
   if (attempt.phase === 'requested') return null;
   if (attempt.client === undefined) {
-    return 'no record of the start client exists (the attempt was recorded without one, or its command ended before it started one), so it cannot be ruled out that the request is still on its way to the manager';
+    // A client is recorded before it can run its tool, so a record of such a version that names none never had one.
+    if (attempt.recordsClients === true) return null;
+    return 'no record of the start client exists (the attempt was recorded by a version that did not record its client), so it cannot be ruled out that the request is still on its way to the manager';
   }
   if (launchClientRunning(attempt.client)) return `its start client (process group ${attempt.client.pid}) is still running and may deliver the request`;
   return null;
@@ -179,8 +195,8 @@ export type LaunchAssessment =
  * evidence only when nothing of the attempt can still be in flight: the request completed (`requested`), or the
  * client that carried it is proven finished and the manager reports no queued start job. A client that may still run,
  * or that was never recorded, keeps the attempt unresolved whatever the manager reports; a manager that cannot report
- * queued jobs never resolves a `dispatching` attempt by absence. A running service resolves it only through the authenticated instance, which callers that
- * reached one record with `clearLaunchAttempt` themselves.
+ * queued jobs never resolves a `dispatching` attempt by absence. A running service resolves it only through the
+ * authenticated instance, which callers that reached one settle with `clearLandedAttempt`.
  *
  * Reads and clears the record on resolution. Starts, stops and changes nothing in the service manager.
  */
@@ -202,6 +218,8 @@ export async function assessLaunchAttempt(stateDirectory: string, adapter: Nativ
   // The manager can only report what it has received. A client that may not have delivered yet is invisible to it.
   const delivery = launchMayStillDeliver(attempt);
   if (delivery !== null) return unresolved(delivery);
+  // Its command ended before it released a client: nothing ever left it, so there is no request for the manager to hold.
+  if (attempt.client === undefined) return resolve(`the command that recorded it ended before it started a start client, so no request reached the manager and ${label} is not running`);
   if (adapter.startJobPending === undefined) {
     return unresolved(`${attempt.manager} does not report queued start requests, so the request may still be in flight`);
   }
@@ -209,6 +227,21 @@ export async function assessLaunchAttempt(stateDirectory: string, adapter: Nativ
   if (pending === true) return unresolved(`the service manager still has a start job queued for ${label}`);
   if (pending === 'unknown') return unresolved(`queued start requests of ${label} could not be read`);
   return resolve(`${label} is not running and the service manager has no start request queued for it`);
+}
+
+/**
+ * The explanation an explicit `start` gives while an earlier attempt is unresolved. The earlier record is the only
+ * thing that keeps `stop` from claiming a stopped coordinator while its request can still land, so the start neither
+ * replaces it nor issues a second request. The owner is pointed at the record only where no evidence can resolve it.
+ */
+export function unresolvedStartMessage(stateDirectory: string, attempt: LaunchAttempt, reason: string): string {
+  const blocked = launchMayStillDeliver(attempt) === null || attempt.client === undefined;
+  const hand = blocked
+    ? ` If you have confirmed that no start tool process of that request is still running and ${attempt.label} is not running, remove ${launchRecordFile(stateDirectory)} yourself and run \`heimdall coordinator start\` again; Heimdall does not guess.`
+    : '';
+  return `An earlier start request for ${attempt.label} (issued by process ${attempt.ownerPid}) is not resolved: ${reason}. `
+    + 'It may still launch the coordinator, and a second start would replace the record that keeps `stop` honest about it, so this start did not replace the record, change the service definition or issue another request. '
+    + `Nothing was requested, stopped, killed or restarted. Run \`heimdall coordinator status\`, and run \`heimdall coordinator start\` again once the request has landed or been ruled out.${hand}`;
 }
 
 /** The explanation `stop` gives while an attempt is unresolved. */

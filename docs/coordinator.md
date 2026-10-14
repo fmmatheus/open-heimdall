@@ -318,12 +318,27 @@ Other starts:
   run from another process after the first command was killed or timed out still
   treats the request as possibly in flight: it reports `completion-unknown` and does
   not report `stopped` or `already-stopped`. It sends no stop, kill or removal. The
-  record is cleared when the authenticated coordinator instance runs as the owned
-  service's main process, or when the service is proven inactive and nothing of the
-  request can still be queued (the manager accepted it, or systemd reports no queued
-  start job). launchd cannot report a queued request, so a `kickstart` whose command
-  ended before it finished stays unresolved until the coordinator appears or `start`
-  is run again, which replaces the record.
+  record names the released start client (the process group that carries the request
+  to the manager), written before that client can run its tool. It is cleared when the
+  authenticated coordinator instance runs as the owned service's main process and no
+  recorded client that is not proven finished could still deliver a request, or when
+  the service is proven inactive and nothing of the request can still be queued (the
+  manager accepted it, or the command ended before it released a client, or the client
+  is proven finished and systemd reports no queued start job). A running instance does
+  not settle an attempt whose client can still deliver, because that request would
+  launch the coordinator again after a stop. launchd cannot report a queued request, so
+  a `kickstart` whose command ended before it finished stays unresolved until the
+  coordinator appears.
+- An unresolved earlier attempt is never replaced. An explicit `start` that finds one
+  first assesses it with the same observations as `stop`. While it stays unresolved (a
+  client that may still deliver, a manager that cannot report queued requests, or a
+  record that cannot be read or is malformed), the start is a `conflict` with
+  `state-unknown`: it does not replace the record, refresh the service definition or
+  issue another request, and nothing is stopped, killed or restarted. The message names
+  the record file; remove it only after confirming that no start tool process of that
+  request is still running and the service is not running, then run `start` again.
+  Once the earlier request has landed or the observations rule it out, `start`
+  continues normally.
 - A foreign service registration, a mismatched target, a changed credential or data
   directory selection, or an endpoint that cannot be verified is a `conflict`.
   Heimdall does not remove a socket, take over a registration or signal a process.

@@ -329,8 +329,16 @@ for (const manager of MANAGERS) {
     hold.release();
     // Nothing killed or removed the launch: the coordinator comes up and a stop drains it.
     await until(() => h.service().starts === 2, 'the issued launch to land');
-    const next = await ready(h);
+    // An explicit start never replaces the earlier record nor issues a second launch; it is a bounded non-success until
+    // the launched instance answers, which settles the attempt.
+    let next;
+    await until(async () => {
+      next = await h.start(['--timeout', '60']);
+      assert.ok(['ready', 'already-running', 'conflict'].includes(next.document.outcome), `${next.stdout}\n${next.stderr}`);
+      return next.document.outcome !== 'conflict';
+    }, 'the launched instance to answer an explicit start');
     assert.ok(['ready', 'already-running'].includes(next.document.outcome));
+    assert.equal(h.service().starts, 2, 'no second launch was issued');
     const halt = await h.stop(['--timeout', '60']);
     assert.equal(halt.document.outcome, 'stopped', `${halt.stdout}\n${halt.stderr}`);
     assertNoForcedStop(h);

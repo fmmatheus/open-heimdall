@@ -160,7 +160,7 @@ test('systemd: an attempt resolves by absence only once the manager reports no q
   assertNoDestructiveVerb(h);
 });
 
-test('launchd: without queued-request evidence an issued kickstart stays unresolved until a start is run explicitly', { skip }, async t => {
+test('launchd: without queued-request evidence an issued kickstart stays unresolved, for stop and for an explicit start, until the owner removes the record', { skip }, async t => {
   const h = await createSubprocessNative(t, 'launchd');
   const { tool, record } = await dispatchAndKill(h);
   assert.ok(record, 'the launch attempt is recorded before the manager is asked to start');
@@ -173,8 +173,23 @@ test('launchd: without queued-request evidence an issued kickstart stays unresol
   assertNoStopClaim(first, 'stop after the held request ended without a service');
   assert.deepEqual(h.readRecord(), record);
 
-  await sleep(0);
   await fs.rm(`${h.managerDirectory}/fail/kickstart`, { force: true });
+  // An explicit start must not replace the record that keeps `stop` honest, nor issue a second request: launchd gives
+  // no evidence that the first one left nothing behind, so the start is a bounded non-success that changes nothing.
+  const issuing = () => h.verbs().filter(verb => verb === 'kickstart' || verb === 'bootstrap');
+  const issuedBefore = issuing();
+  const refused = await h.start(['--timeout', '60']);
+  assert.equal(refused.document.ok, false, `${refused.stdout}\n${refused.stderr}`);
+  assert.equal(refused.document.outcome, 'conflict');
+  assert.equal(refused.document.error.code, 'state-unknown');
+  assert.match(refused.document.message, /did not replace the record/);
+  assert.match(refused.document.message, /remove .*launch-attempt\.json yourself/);
+  assert.deepEqual(h.readRecord(), record, 'the earlier record is untouched');
+  assert.deepEqual(issuing(), issuedBefore, 'the refused start installed nothing and issued no second request');
+  assertNoStopClaim(await h.stop(['--timeout', '10']), 'stop after the refused start');
+
+  // The owner confirmed that nothing of the request remains and removes the record, as the message directs.
+  await fs.rm(h.recordFile(), { force: true });
   const started = await h.start(['--timeout', '60']);
   assert.equal(started.document.outcome, 'ready', `${started.stdout}\n${started.stderr}`);
   assert.equal(h.readRecord(), null);
