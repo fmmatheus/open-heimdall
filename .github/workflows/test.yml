@@ -98,8 +98,8 @@ jobs:
             # create users or change any persistent setting; a runner that cannot do this fails below.
             export XDG_RUNTIME_DIR="/run/user/${uid}"
             sudo -n systemctl start "user@${uid}.service" || true
-            if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"; fi
           fi
+          if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"; fi
           if ! usable; then
             echo "::error::No systemd user manager and user bus are usable for uid ${uid} (XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-unset}); native systemd verification is pending on this runner."
             exit 1
