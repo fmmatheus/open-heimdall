@@ -20,8 +20,8 @@ Evidence for `heimdall coordinator start`, `stop` and `logs` and the native user
    gathered on. It is not evidence for the corrected code.
 
 - **Follow-up corrections (in progress)**, the first section below. It records the evidence gathered for the start
-  and stop corrections made after `97552f9`, starting with a baseline that reproduces a defect. It is not acceptance
-  evidence for any commit.
+  and stop corrections made after `97552f9`, starting with a baseline that reproduces a defect and the correction that
+  makes it pass. It is not acceptance evidence for any commit.
 
 Nothing in this record shows that a run can execute under a native service. A user's real OpenCode or
 OpenChamber installation, provider accounts and quota were not involved.
@@ -102,9 +102,87 @@ and no tool call was signalled. The synthetic tool refused no verb.
 so it stays unresolved even after a client has ended without delivering. Nothing shows how long a started client
 lives or what happens once it is gone. The synthetic tool stands in for both managers, so the behavior of real
 `systemctl --user start` and `launchctl kickstart` clients under a deadline, Ctrl-C or kill is not established by
-these cases. The 3 failing cases are expected to keep failing until the correction for this defect lands and is
-recorded in this section; they assert that no `stop` claims `stopped`, `already-stopped` or `stop-requested` while the held client is
-alive and can still deliver.
+these cases. The 3 failing cases assert that no `stop` claims `stopped`, `already-stopped` or `stop-requested` while
+the held client is alive and can still deliver; the next subsection records them passing with these assertions
+unchanged.
+
+### Pre-delivery start request: fixed
+
+**Change.** The released start client is now recorded durably before it can deliver, and a recorded client that is not
+proven finished keeps its attempt unresolved whatever the manager reports.
+
+- When a `start` runs its native start call, the production runner starts the client (`systemctl --user start`,
+  `launchctl kickstart`) through a small launcher process: spawned detached, so it leads its own process group and its
+  process id names the group. The launcher waits on its standard input and runs the tool only after the invoking
+  command has written the client's `{ pid, spawnedAt }` into `launch-attempt.json` (an additive optional `client`
+  field of the existing `schemaVersion: 1` record) and then sent the go-ahead. If the record cannot be written, or the
+  command's deadline or Ctrl-C comes first, or the command dies, the launcher's input closes without the go-ahead and
+  it exits without running the tool, so no request was issued and none is left behind.
+- Liveness is the process group: `kill(-pid, 0)`. Only `ESRCH` means gone. A group that exists, a refused probe, and a
+  process id reused by something else all count as running, so the answer errs toward unresolved. Elapsed time, the exit
+  of the invoking command, an interruption and its `ownerPid` are never evidence.
+- `assessLaunchAttempt` resolves a `dispatching` attempt only when the client is proven gone and the manager has no
+  queued job (systemd: inactive and `Job=` empty). A `dispatching` record with no `client`, which is what a record
+  written before this change looks like and what remains when a command ended before it started a client, is
+  unresolved with the message "no record of the start client exists ...". A malformed `client` makes the record
+  unreadable, and `stop` reports `completion-unknown` / `state-unknown`. A `requested` record (the client exited
+  successfully and the manager answered) resolves as before. launchd has no queued-request probe, so a `dispatching`
+  launchd attempt stays unresolved after the client is gone, as before.
+- `stop` with no endpoint (including `--no-wait`, which never returns `stop-requested` or `already-stopped` there)
+  keeps returning `completion-unknown` while the attempt is unresolved. When the endpoint answers, the authenticated
+  instance no longer clears a record whose client may still deliver; after a clean drain, `stop` returns
+  `completion-unknown` ("... completed a clean shutdown, but a stopped coordinator is not established") instead of
+  `stopped`, and `stop --no-wait` still reports `stop-requested` but adds that an earlier start request may still
+  launch the coordinator. Stop-generation fencing, expected-instance validation and the drain request itself are
+  unchanged.
+- The command's lifetime is unchanged: the client is released at the deadline or on Ctrl-C exactly as before, and
+  nothing is killed, cancelled, stopped or signalled that was not before.
+
+**Commands** (macOS, Node v22.22.3, mocked-manager evidence as above):
+
+```
+node --test test/coordinator-lifecycle-pre-delivery.test.mjs
+node --test test/coordinator-lifecycle-released-client.test.mjs
+node --test test/coordinator-lifecycle-pre-delivery.test.mjs test/coordinator-lifecycle-released-client.test.mjs test/coordinator-lifecycle-launch-uncertainty.test.mjs test/coordinator-lifecycle-process-exit.test.mjs test/coordinator-lifecycle-ordering.test.mjs test/coordinator-lifecycle-ownership.test.mjs test/coordinator-lifecycle-deadline.test.mjs test/coordinator-drain.test.mjs test/coordinator-native-systemd.test.mjs test/coordinator-native-launchd.test.mjs test/coordinator-lifecycle-cli.test.mjs
+npm run check
+npm test
+```
+
+**Results.** `coordinator-lifecycle-pre-delivery.test.mjs`: 8 of 8 pass, with the assertions of the baseline unchanged
+(no assertion was weakened, removed or given a longer wait). The eleven files of the third command (the ten of the
+focused lifecycle set plus the new released-client file): 212 of 212 pass. `npm run check` exits 0; `npm test` passes, 1407 of 1407 (the 1390 of the earlier record plus the 8
+pre-delivery and 9 released-client cases).
+
+| Case (per manager) | Invoking command | Elapsed (budget) | `stop`, repeated `stop`, `stop --no-wait` while the client is held | After release |
+| --- | --- | --- | --- | --- |
+| deadline | `startup-not-confirmed` / `startup-timeout`, exit 1 | 1055 to 1058 ms (1000 ms budget, 2500 ms limit) | `completion-unknown`, `completion-unknown`, `completion-unknown` (`ok: false`, exit 1, 105 to 215 ms each) | one start delivered, coordinator launched once, final `stop` returned `stopped`, record removed |
+| Ctrl-C | `startup-not-confirmed` / `interrupted`, exit 1 | 241 to 414 ms (2 to 6 ms after the signal; 1500 ms limit) | the same three `completion-unknown` | the same |
+| kill | killed by SIGKILL | 263 to 388 ms | the same three `completion-unknown` | the same |
+
+In every case the held client stayed alive, unsignalled, with its attempt record `dispatching` and no in-flight
+marker or call recorded across all three stops. The synthetic tool's `violations` and `signals` logs were empty, and no
+`stop`, `kill`, `bootout`, `restart`, `disable`, removal or unload verb was called. Both managers behave alike here:
+the launchd cases already passed at baseline, and the systemd cases that answered `already-stopped` now answer
+`completion-unknown`.
+
+`coordinator-lifecycle-released-client.test.mjs` (9 cases) adds: the record names the client, as the leader of the
+process group the tool runs in, before the tool runs (checked while the tool is held before delivery, with no
+in-flight marker and no recorded start call); a recorded live client makes the drain path end in `completion-unknown`
+rather than `stopped`, keeps the record unchanged, and makes `stop` and `stop --no-wait` claim nothing afterwards; the
+record resolves once the client group is gone on systemd (`already-stopped`) and stays unresolved on launchd;
+`stop --no-wait` after a drain request returns `stop-requested` with the late-launch note; and records without client
+evidence, with a malformed client, or in the `requested` phase are handled as described above. The drain-path case
+was checked to fail (`stopped`) when the new check is removed from the built output.
+
+**Assertion changes to existing tests.** None.
+
+**What remains unproven.** The synthetic tool stands in for both managers; real `systemctl --user start` and
+`launchctl kickstart` clients under a deadline, Ctrl-C or kill are not exercised. Process-group liveness is the only
+client-completion evidence: a process id reused by an unrelated group keeps an attempt unresolved until that group
+ends, and a command that died between writing the record and starting a client leaves a record that only an explicit
+start or a `requested` outcome replaces. An explicit `start` still replaces an earlier record, the authenticated
+instance still clears a record in the start paths, and recovery of attempts, are not changed here. The Linux VM and
+the native suites were not run for this change.
 
 ## Final acceptance: verified commit `01b073f`
 

@@ -6,7 +6,7 @@ import type { CoordinatorLifecycle, ShutdownAcknowledgement, ShutdownRecord } fr
 import { resolveLaunchContext, selectConfigurationFile } from './launch-context.js';
 import type { ConfigurationSelection, LaunchContext } from './launch-context.js';
 import { acquireOperationLock, advanceStopGeneration } from './lifecycle-lock.js';
-import { assessLaunchAttempt, clearLaunchAttempt, unresolvedLaunchMessage } from './lifecycle-launch.js';
+import { assessLaunchAttempt, clearLandedAttempt, launchMayStillDeliver, readLaunchAttempt, unresolvedLaunchMessage } from './lifecycle-launch.js';
 import type { ParsedLifecycleArguments } from './lifecycle-arguments.js';
 import { createLifecycleResult, sanitizeResultText } from './lifecycle-result.js';
 import type { LifecycleErrorCode, LifecycleResult, LifecycleResultInput, LifecycleTarget, ObservedInstance } from './lifecycle-result.js';
@@ -149,8 +149,9 @@ async function stopBefore(args: ParsedLifecycleArguments, deps: LifecycleDepende
       if (prepared) return prepared;
       const verified = await verifyOwned(lifecycle, instance);
       if (verified) return verified;
-      // Owned registration plus the authenticated instance's own process: a start attempt recorded earlier has landed.
-      await clearLaunchAttempt(configuration.stateDirectory).catch(() => undefined);
+      // Owned registration plus the authenticated instance's own process: a start attempt recorded earlier has landed,
+      // unless its client may still deliver a request that would launch the coordinator again after this stop.
+      await clearLandedAttempt(configuration.stateDirectory);
 
       progress(`Requesting a graceful drain of coordinator instance ${lifecycle.instanceId}.`);
       // Ownership can change between the inspection above and the action: look again immediately before the request.
@@ -279,9 +280,10 @@ async function stopBefore(args: ParsedLifecycleArguments, deps: LifecycleDepende
       }
       const retried = acknowledgement.retried ? ` It retried a failed drain${acknowledgement.previousError ? ` (previous error: ${acknowledgement.previousError})` : ''}.` : '';
       if (args.noWait) {
+        const late = await lateLaunchNote();
         return finish({
           outcome: 'stop-requested',
-          message: `Coordinator instance ${answered.instanceId} accepted the drain request; admission is disabled.${retried} It has not necessarily exited: active runs keep their capacity until native execution is idle. Run stop again to wait for completion.`,
+          message: `Coordinator instance ${answered.instanceId} accepted the drain request; admission is disabled.${retried} It has not necessarily exited: active runs keep their capacity until native execution is idle. Run stop again to wait for completion.${late ? ` ${late}` : ''}`,
           instance: observed(answered),
         });
       }
@@ -319,6 +321,12 @@ async function stopBefore(args: ParsedLifecycleArguments, deps: LifecycleDepende
           observation = answer.kind === 'problem' ? answer.message : 'The coordinator endpoint no longer exists.';
           const exit = await assessExit(expected);
           if (exit.kind === 'clean') {
+            // A start client that may not have delivered yet can launch the coordinator again right after this exit.
+            const late = await lateLaunchNote();
+            if (late) {
+              const message = `Instance ${expected.instanceId} completed a clean shutdown, but a stopped coordinator is not established. ${late} Nothing was stopped, killed or restarted beyond the drain. Run \`heimdall coordinator stop\` again once the launch has landed or been ruled out, and check \`heimdall coordinator status\`.`;
+              return finish({ outcome: 'completion-unknown', message, error: { code: 'completion-unknown', message }, instance, logs: logsHint() });
+            }
             if (remaining() > 0) return stopped(expected, instance);
             // A success is never reported after the deadline; the next stop reports the already-stopped coordinator.
             observation = `Instance ${expected.instanceId} completed a clean shutdown, but that was established only after the stop deadline.`;
@@ -343,6 +351,22 @@ async function stopBefore(args: ParsedLifecycleArguments, deps: LifecycleDepende
           ? `Interrupted. Instance ${expected.instanceId} keeps draining: the drain request stays in effect and nothing was stopped, killed or restarted. Run \`heimdall coordinator stop\` to wait again.`
           : `Interrupted while confirming completion of instance ${expected.instanceId}. The drain request stays in effect; nothing was stopped, killed or restarted.`;
         return finish({ outcome: draining ? 'still-draining' : 'completion-unknown', message, error: { code: 'interrupted', message }, instance, logs: logsHint() });
+      }
+    }
+
+    /**
+     * A sentence saying that an earlier start request may still launch the coordinator after this stop, or null when the
+     * client that carried it is proven finished (or none is recorded as unresolved). A record that cannot be read counts
+     * as a request that may still land.
+     */
+    async function lateLaunchNote(): Promise<string | null> {
+      try {
+        const attempt = await readLaunchAttempt(configuration.stateDirectory);
+        const reason = attempt === null ? null : launchMayStillDeliver(attempt);
+        return attempt === null || reason === null ? null
+          : `An earlier start request for ${attempt.label} (issued by process ${attempt.ownerPid}) is not resolved: ${reason}. It may still launch the coordinator after it stops.`;
+      } catch (error) {
+        return `The record of an earlier start request cannot be used (${errorText(error)}), so it cannot be ruled out that the coordinator is launched again after it stops.`;
       }
     }
 

@@ -9,13 +9,13 @@ import type { CoordinatorLifecycle } from './lifecycle.js';
 import { resolveLaunchContext, selectConfigurationFile } from './launch-context.js';
 import type { ConfigurationSelection, LaunchContext, LaunchContextOptions } from './launch-context.js';
 import { acquireOperationLock, readStopGeneration } from './lifecycle-lock.js';
-import { afterStart, clearLaunchAttempt, markLaunchRequested, readLaunchAttempt, writeLaunchAttempt } from './lifecycle-launch.js';
+import { afterStart, clearLaunchAttempt, markLaunchRequested, readLaunchAttempt, recordLaunchClient, writeLaunchAttempt } from './lifecycle-launch.js';
 import type { LaunchAttempt } from './lifecycle-launch.js';
 import type { ParsedLifecycleArguments } from './lifecycle-arguments.js';
 import { createLifecycleResult, sanitizeResultText } from './lifecycle-result.js';
 import type { LifecycleErrorCode, LifecycleResult, LifecycleResultInput, LifecycleTarget, ObservedInstance } from './lifecycle-result.js';
-import { abandonLaunch, confirmOwnedProcess, createLaunchProgress, inspectOwnership, launchNativeService, nativeServiceNames, withCommandBudget } from './native/types.js';
-import type { LaunchRecord, LaunchResult, NativeOwnership, NativeServiceAdapter, ServiceConflict } from './native/types.js';
+import { abandonLaunch, confirmOwnedProcess, createLaunchProgress, inspectOwnership, launchNativeService, nativeServiceNames, withClientWitness, withCommandBudget } from './native/types.js';
+import type { ClientWitness, LaunchRecord, LaunchResult, NativeOwnership, NativeServiceAdapter, ServiceConflict } from './native/types.js';
 import { selectNativeAdapter, selectNativeManager } from './native/platform.js';
 import type { NativeAdapterSelection } from './native/platform.js';
 import { parseCoordinatorStatus } from './status.js';
@@ -343,8 +343,15 @@ async function startBefore(args: ParsedLifecycleArguments, deps: LifecycleDepend
         },
       };
       const launchProgress = createLaunchProgress(record);
+      // A start client the command may have to give up on is recorded before it can deliver the request.
+      const witness: ClientWitness = {
+        async spawned(client) {
+          if (!attempt) throw new Error('no launch attempt is recorded');
+          await recordLaunchClient(configuration.stateDirectory, attempt, { pid: client.pid, now: deps.now() });
+        },
+      };
       let call: Promise<LaunchResult> | undefined;
-      const launched = await bounded(() => (call = launchNativeService(adapter!, launchProgress)), deps, deadlineAt).catch((error: unknown) => ({ kind: 'error' as const, error }));
+      const launched = await bounded(() => (call = withClientWitness(witness, () => launchNativeService(adapter!, launchProgress))), deps, deadlineAt).catch((error: unknown) => ({ kind: 'error' as const, error }));
       if (launched.kind === 'error') return failed('launch-failed', `The service manager call failed: ${errorText(launched.error)}`, { logs: logsHint() });
       // Seen before the launch was started: nothing was requested, so nothing may have started either.
       if (launched.kind === 'aborted' && !launched.dispatched) return failed('interrupted', 'Interrupted before the coordinator was started. Nothing was started.');

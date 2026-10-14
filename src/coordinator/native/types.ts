@@ -30,6 +30,9 @@ export interface CommandRunOptions {
    * command's deadline passes or it is interrupted, the tool client is then left running instead of being ended: ending
    * it could drop a request the manager has not received yet, and the durable launch attempt record, not this process,
    * is what keeps that request from being forgotten. Every other tool is ended with the command.
+   *
+   * Inside `withClientWitness` the client is started through a launcher that waits for the witness to record the
+   * client before it runs the tool, so the record exists before the request can reach the manager.
    */
   outlivesCommand?: boolean;
 }
@@ -58,6 +61,41 @@ export function withCommandBudget<T>(budget: CommandBudget, work: () => T): T {
   return commandBudgets.run(budget, work);
 }
 
+/**
+ * Durable evidence of a released tool client, supplied by the command that may have to give up on it. `spawned` runs
+ * once the client exists and before it has been told to run its tool: the client waits for the answer, so the
+ * evidence is on disk before the request can reach the manager. When it fails, the client is never told to run.
+ */
+export interface ClientWitness {
+  spawned(client: { pid: number }): Promise<void>;
+}
+
+const clientWitnesses = new AsyncLocalStorage<ClientWitness>();
+
+/** Run `work` so that a tool client released by the production runner is made known to `witness` before it can deliver. */
+export function withClientWitness<T>(witness: ClientWitness, work: () => T): T {
+  return clientWitnesses.run(witness, work);
+}
+
+/**
+ * What a witnessed client runs: wait for the go-ahead on stdin, then run the tool with the client's own output. The
+ * client is spawned detached, so it leads its own process group and its process id names that group. Standard input
+ * ending without the go-ahead means the command went away or could not record the client: the tool never runs.
+ */
+const CLIENT_LAUNCHER = [
+  "const { spawn } = require('node:child_process');",
+  'const [file, ...args] = JSON.parse(process.argv[1]);',
+  'let go = false;',
+  "process.stdin.on('data', chunk => { if (go || !String(chunk).includes('go')) return; go = true; process.stdin.destroy(); run(); });",
+  "process.stdin.on('end', () => { if (!go) process.exit(125); });",
+  "process.stdin.on('error', () => { if (!go) process.exit(125); });",
+  'function run() {',
+  "  const child = spawn(file, args, { stdio: ['ignore', 'inherit', 'inherit'] });",
+  "  child.once('error', error => { process.stderr.write(file + ' could not run: ' + (error.code || error.message) + '\\n'); process.exit(127); });",
+  "  child.once('close', (code, signal) => { if (code !== null) process.exit(code); process.removeAllListeners(signal); process.kill(process.pid, signal); });",
+  '}',
+].join('\n');
+
 const DEFAULT_TOOL_TIMEOUT_MS = 15000;
 const OUTPUT_BOUND = 1024 * 1024;
 /** After SIGTERM, how long a tool client may take to exit before it is killed, and when the runner stops waiting for it. */
@@ -67,6 +105,7 @@ const GIVE_UP_AFTER_MS = 500;
 /** Stop holding the event loop for a child that is not waited for any more. */
 function release(child: ChildProcess): void {
   child.unref();
+  child.stdin?.destroy();
   child.stdout?.destroy();
   child.stderr?.destroy();
 }
@@ -86,10 +125,15 @@ export function createExecFileRunner(): CommandRunner {
         const allowance = budget ? budget.deadlineAt - budget.now() : Infinity;
         if (allowance <= 0) { resolve({ exitCode: null, stdout: '', stderr: '', error: `${file} was not run: the command's deadline had passed` }); return; }
 
+        // A released client is witnessed: it leads its own process group and waits for the witness to record it before it
+        // runs the tool, so the record exists before the request can reach the manager.
+        const witness = options.outlivesCommand ? clientWitnesses.getStore() : undefined;
         let child: ChildProcess;
         try {
           // A released tool leaves the command's process group, so a terminal Ctrl-C meant for the command cannot reach it.
-          child = spawn(file, [...args], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, detached: options.outlivesCommand === true });
+          child = witness
+            ? spawn(process.execPath, ['-e', CLIENT_LAUNCHER, JSON.stringify([file, ...args])], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, detached: true })
+            : spawn(file, [...args], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, detached: options.outlivesCommand === true });
         } catch (error) {
           resolve({ exitCode: null, stdout: '', stderr: '', error: `${file} could not run: ${(error as NodeJS.ErrnoException).code ?? (error as Error).message}` });
           return;
@@ -98,6 +142,8 @@ export function createExecFileRunner(): CommandRunner {
         let stderr = '';
         let settled = false;
         let endReason: string | null = null;
+        /** False while a witnessed client still waits to be told to run its tool. */
+        let told = witness === undefined;
         const timers: NodeJS.Timeout[] = [];
         const later = (milliseconds: number, action: () => void) => { timers.push(setTimeout(action, milliseconds)); };
         const abort = () => end('the command was interrupted');
@@ -113,10 +159,22 @@ export function createExecFileRunner(): CommandRunner {
         function end(reason: string, command = true): void {
           if (settled || endReason !== null) return;
           endReason = reason;
+          if (!told) {
+            // The client was never told to run its tool, so nothing reached the manager and nothing is left behind: closing
+            // its input makes it exit without running anything.
+            release(child);
+            finish({ exitCode: null, stdout, stderr, error: `${file} was not run: ${reason}` });
+            return;
+          }
           if (command && options.outlivesCommand) { release(child); finish(unfinished(reason)); return; }
-          child.kill('SIGTERM');
-          later(TERMINATE_GRACE_MS, () => { child.kill('SIGKILL'); });
+          signalClient('SIGTERM');
+          later(TERMINATE_GRACE_MS, () => { signalClient('SIGKILL'); });
           later(GIVE_UP_AFTER_MS, () => { release(child); finish(unfinished(reason)); });
+        }
+        /** A witnessed client is a process group (its launcher and the tool); signalling it signals only the client this call started. */
+        function signalClient(signal: NodeJS.Signals): void {
+          if (witness && child.pid !== undefined) { try { process.kill(-child.pid, signal); return; } catch { /* the group is gone; address the launcher itself */ } }
+          child.kill(signal);
         }
 
         const collect = (which: 'stdout' | 'stderr') => (chunk: string) => {
@@ -135,6 +193,20 @@ export function createExecFileRunner(): CommandRunner {
           else finish(unfinished(endReason ?? `it was terminated by ${signal ?? 'a signal'}`));
         });
 
+        if (witness && child.pid !== undefined) {
+          const client = child.pid;
+          child.stdin!.on('error', () => undefined);
+          witness.spawned({ pid: client }).then(() => {
+            if (settled || endReason !== null) return;
+            told = true;
+            child.stdin!.end('go\n');
+          }, (error: unknown) => {
+            if (settled || endReason !== null) return;
+            endReason = 'the client could not be recorded';
+            release(child);
+            finish({ exitCode: null, stdout, stderr, error: `${file} was not run: the client could not be recorded (${error instanceof Error ? error.message : 'unknown error'})` });
+          });
+        }
         later(Math.min(options.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS, 2 ** 31 - 1), () => end('the tool timeout passed', false));
         if (budget) {
           if (Number.isFinite(allowance)) later(Math.min(allowance, 2 ** 31 - 1), () => end("the command's deadline passed"));
