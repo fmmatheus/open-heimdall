@@ -12,7 +12,7 @@ import { acquireOperationLock, readStopGeneration } from './lifecycle-lock.js';
 import { assessLaunchAttempt, clearLandedAttempt, launchRecordFile, readLaunchAttempt, unresolvedStartMessage } from './lifecycle-launch.js';
 import { createLaunchAttemptOwner } from './launch-owner.js';
 import type { LaunchAttemptOwner } from './launch-owner.js';
-import type { LaunchAttempt } from './lifecycle-launch.js';
+import type { LaunchAssessment, LaunchAttempt } from './lifecycle-launch.js';
 import type { ParsedLifecycleArguments } from './lifecycle-arguments.js';
 import { createLifecycleResult, sanitizeResultText } from './lifecycle-result.js';
 import type { LifecycleErrorCode, LifecycleResult, LifecycleResultInput, LifecycleTarget, ObservedInstance } from './lifecycle-result.js';
@@ -258,10 +258,12 @@ async function startBefore(args: ParsedLifecycleArguments, deps: LifecycleDepend
       return finish({ outcome: 'busy', message: 'Another lifecycle operation for this coordinator did not finish before the startup deadline. Nothing was started; retry the command.', error: { code: 'busy', message: 'Another lifecycle operation holds the lock for this coordinator' } });
     }
     /**
-     * The native call this start left running after giving up on it (deadline or interruption). The operation lock is
-     * kept until it settles, so no other lifecycle operation overlaps a late definition change or an issued launch.
+     * The work this start left running after giving up on it (deadline or interruption): the native call, or the
+     * assessment of an earlier attempt, which may still remove the launch attempt record it resolved. The operation lock
+     * is kept until it settles, so no other lifecycle operation overlaps a late definition change, an issued launch or
+     * a late removal of the record.
      */
-    const pendingNativeCall: { settled: Promise<unknown> | null } = { settled: null };
+    const abandonedWork: { settled: Promise<unknown> | null } = { settled: null };
     /** The writer of this start's launch attempt record; the lock is released only after it has closed. */
     const attemptOwner: { current: LaunchAttemptOwner | null } = { current: null };
     try {
@@ -273,11 +275,12 @@ async function startBefore(args: ParsedLifecycleArguments, deps: LifecycleDepend
       }
       return await startLocked();
     } finally {
-      // Serialization ends only when nothing this start began can still finish: the native call it abandoned (which
-      // includes the publication of its client) and every record change its owner accepted.
+      // Serialization ends only when nothing this start began can still finish: the work it abandoned (the native call,
+      // which includes the publication of its client, or the assessment of an earlier attempt) and every record change
+      // its owner accepted.
       const release = () => lock.lock.release();
       const quiet = () => (attemptOwner.current?.close() ?? Promise.resolve()).then(undefined, () => undefined);
-      if (pendingNativeCall.settled) void pendingNativeCall.settled.then(quiet).then(release, release);
+      if (abandonedWork.settled) void abandonedWork.settled.then(quiet).then(release, release);
       else if (attemptOwner.current) await quiet().then(release, release);
       else release();
     }
@@ -352,7 +355,7 @@ async function startBefore(args: ParsedLifecycleArguments, deps: LifecycleDepend
       if (launched.kind === 'aborted' || launched.kind === 'timeout') {
         // The native call keeps running. The lock stays held until it settles, and a call that is still installing
         // is told never to request the start; one that already requested it stays unconfirmed and is not undone.
-        pendingNativeCall.settled = call!.catch(() => undefined);
+        abandonedWork.settled = call!.catch(() => undefined);
         if (abandonLaunch(launchProgress)) {
           if (launched.kind === 'aborted') return failed('interrupted', 'Interrupted while the service definition was being installed. No start was requested and none will be; the installation under way finishes without launching the coordinator. Run start again to start it.', { logs: logsHint() });
           const message = 'The startup deadline passed while the service definition was being installed. No start was requested and none will be; the installation under way finishes without launching the coordinator. Retry the command.';
@@ -404,7 +407,11 @@ async function startBefore(args: ParsedLifecycleArguments, deps: LifecycleDepend
           return blocked(`The record of an earlier start request cannot be used (${errorText(error)}), so it cannot be ruled out that a request is still on its way to the service manager. Nothing was requested, installed, stopped, killed or restarted. If you have confirmed that no start tool process is still running and ${target!.label} is not running, remove ${launchRecordFile(configuration.stateDirectory)} yourself and run \`heimdall coordinator start\` again.`);
         }
         if (earlier === null) return undefined;
-        const assessed = await bounded(async () => assessLaunchAttempt(configuration.stateDirectory, adapter!, await inspectOwnership(adapter!)), deps, deadlineAt).catch((error: unknown) => ({ kind: 'error' as const, error }));
+        let assessment: Promise<LaunchAssessment> | undefined;
+        const assess = async () => assessLaunchAttempt(configuration.stateDirectory, adapter!, await inspectOwnership(adapter!));
+        const assessed = await bounded(() => (assessment = assess()), deps, deadlineAt).catch((error: unknown) => ({ kind: 'error' as const, error }));
+        // An assessment this start gives up on may still remove the record it resolved: the lock stays held until it settles.
+        if (assessed.kind === 'aborted' || assessed.kind === 'timeout') abandonedWork.settled = assessment?.catch(() => undefined) ?? null;
         if (assessed.kind === 'aborted') return failed('interrupted', 'Interrupted while checking an earlier start request. Nothing was started or changed.');
         if (assessed.kind === 'timeout') return deadlineBeforeAction('checked an earlier start request');
         if (assessed.kind === 'error') return blocked(`An earlier start request for ${earlier.label} could not be checked (${errorText(assessed.error)}), so it cannot be ruled out that it is still on its way to the service manager. Nothing was requested, installed, stopped, killed or restarted.`);
