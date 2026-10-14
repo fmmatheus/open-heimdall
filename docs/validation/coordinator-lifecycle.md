@@ -19,8 +19,92 @@ Evidence for `heimdall coordinator start`, `stop` and `logs` and the native user
 2. **Earlier evidence, `3bfdc76`** (sections headed "Historical"). Kept as recorded, attributed to the code it was
    gathered on. It is not evidence for the corrected code.
 
+- **Follow-up corrections (in progress)**, the first section below. It records the evidence gathered for the start
+  and stop corrections made after `97552f9`, starting with a baseline that reproduces a defect. It is not acceptance
+  evidence for any commit.
+
 Nothing in this record shows that a run can execute under a native service. A user's real OpenCode or
 OpenChamber installation, provider accounts and quota were not involved.
+
+## Follow-up corrections (in progress)
+
+This section is written as the corrections land. Each subsection names the code it was gathered on. Until a later
+subsection says otherwise, nothing here shows a correction works.
+
+### Pre-delivery start request: baseline
+
+**Trigger.** The production runner lets a native start client outlive the lifecycle command that spawned it. A start
+command can therefore end (its `--timeout` deadline, Ctrl-C, or being killed) while its client has not yet delivered
+the request to the service manager. At that moment the manager has no job queued and reports nothing, so a later
+`heimdall coordinator stop` that consults the manager sees an inactive service with a correlated clean shutdown. The
+client can still deliver afterwards and launch the coordinator. A `stop` that answers `already-stopped` in that
+window is a false success.
+
+**Method.** `test/fixtures/synthetic-native-tool.mjs` gains an additive `predeliver/<verb>` control: while the file
+exists a starting call (`systemctl --user start`, `launchctl kickstart`) waits before it is recorded in `calls.jsonl`,
+before it writes its `inflight/` marker, and so before `show <unit> -p Job` can report a queued job; after the file is
+removed it proceeds as an ordinary call. `test/coordinator-lifecycle-pre-delivery.test.mjs` runs the production
+lifecycle commands, adapters and `createExecFileRunner` in separate CLI subprocesses against that synthetic tool,
+with file barriers and finite harness deadlines. It is mocked-manager evidence: the synthetic tool is neither
+launchd nor systemd. Each case starts from an owned inactive definition with a correlated previous clean shutdown
+(`start` ready, `stop` stopped), holds the next start before delivery, ends the invoking command, and runs `stop`,
+the same `stop` again and `stop --no-wait` from other processes while the held client is alive, then releases the
+client.
+
+| Case (per manager) | Invoking command is ended by |
+| --- | --- |
+| hold control | nothing: the held client is released while the command waits |
+| deadline | `start --timeout 1` expiring |
+| Ctrl-C | an actual SIGINT sent to the start process |
+| kill | SIGKILL of only the start process; its detached client is not signalled |
+
+The hold-control case shows, while the client is held: `show -p Job` prints nothing (systemd), no `inflight/` marker
+exists, the call is absent from `calls.jsonl`, the attempt record is `dispatching` and no service is running. After
+release, with a second gate set, the same client is recorded, marks its request in flight, `show -p Job` prints
+`Job=1`, and once the gate is lifted the start completes `ready`.
+
+**Baseline code and commands.** The cases were run on a disposable build of `97552f9` (`git archive 97552f9`
+extracted into a fresh directory, `npm ci --ignore-scripts` and `npm run build` with an isolated `HOME` and npm
+cache; the new test file and the changed fixture and harness files were copied in unchanged; `src/` identical to the
+managed checkout, which is at the same source) and, with the same source, in the managed checkout, on macOS (Node
+v22.22.3):
+
+```
+node --test test/coordinator-lifecycle-pre-delivery.test.mjs
+```
+
+**Results (identical in the disposable copy and the checkout): 8 cases, 5 pass, 3 fail.**
+
+| Manager | Case | Result |
+| --- | --- | --- |
+| launchd | hold control, deadline, Ctrl-C, kill | pass: no `kickstart` probe reports a queued request, so the attempt stays unresolved and every `stop` answers `completion-unknown` |
+| systemd | hold control | pass |
+| systemd | deadline, Ctrl-C, kill | **fail** (expected): every `stop` answered `already-stopped` while the held client was alive |
+
+Outcomes of the three failing cases (client-exit times from the baseline run; the checkout run differed by at most
+30 ms):
+
+| systemd case | Invoking command | Elapsed | `stop`, repeated `stop`, `stop --no-wait` | Held client after the stops | Attempt record after the stops |
+| --- | --- | --- | --- | --- | --- |
+| deadline | `startup-not-confirmed` / `startup-timeout`, exit 1, one document | 1052 ms | `already-stopped`, `already-stopped`, `already-stopped` (all `ok: true`, exit 0; 150 to 230 ms each) | alive, no inflight marker, no recorded start call | removed |
+| Ctrl-C | `startup-not-confirmed` / `interrupted`, exit 1, one document | 341 ms (4 ms after the signal) | the same three `already-stopped` | alive, no inflight marker | removed |
+| kill | killed by SIGKILL, no output | 328 ms | the same three `already-stopped` | alive, no inflight marker | removed |
+
+The attempt record was `dispatching` (written by the invoking command, `ownerPid` equal to its pid) before the first
+`stop`. The first `stop` removed it because the manager reported no queued job, and the record did not exist for the
+two later stops, which therefore had nothing to consult.
+
+After release the held client delivered exactly one `start` call and the manager launched the coordinator in every
+failing case, that is, after the three `already-stopped` answers. A `stop` after that launch returned `stopped`
+and no tool call was signalled. The synthetic tool refused no verb.
+
+**What remains unproven here.** launchd passes only because it has no probe, not because it knows the client is gone,
+so it stays unresolved even after a client has ended without delivering. Nothing shows how long a started client
+lives or what happens once it is gone. The synthetic tool stands in for both managers, so the behavior of real
+`systemctl --user start` and `launchctl kickstart` clients under a deadline, Ctrl-C or kill is not established by
+these cases. The 3 failing cases are expected to keep failing until the correction for this defect lands and is
+recorded in this section; they assert that no `stop` claims `stopped`, `already-stopped` or `stop-requested` while the held client is
+alive and can still deliver.
 
 ## Final acceptance: verified commit `01b073f`
 

@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { parseLifecycleResult } from '../../dist/coordinator/lifecycle-result.js';
 import { nativeServiceNames } from '../../dist/coordinator/native/types.js';
@@ -50,7 +50,7 @@ export async function createSubprocessNative(t, manager) {
   const managerDirectory = path.join(root, 'manager');
   const stateDirectory = path.join(root, 'state');
   for (const directory of [home, openchamber, runtimeDirectory, managerDirectory]) await fsp.mkdir(directory, { mode: 0o700 });
-  for (const directory of ['gates', 'reached', 'delay', 'fail', 'inflight']) await fsp.mkdir(path.join(managerDirectory, directory));
+  for (const directory of ['gates', 'reached', 'delay', 'fail', 'inflight', 'predeliver', 'reached-predeliver']) await fsp.mkdir(path.join(managerDirectory, directory));
   const configFile = path.join(root, 'coordinator.toml');
   await fsp.writeFile(configFile, `[coordinator]\nstateDirectory = ${JSON.stringify(stateDirectory)}\nglobalConcurrency = 1\nprojectConcurrency = 1\n`);
   const credentialFile = path.join(root, 'credentials.env');
@@ -76,6 +76,11 @@ export async function createSubprocessNative(t, manager) {
     for (const cli of spawned) if (cli.exitStatus === null) cli.child.kill('SIGKILL');
     // Harness cleanup: end what the synthetic manager started, gracefully first.
     for (const name of await fsp.readdir(path.join(managerDirectory, 'inflight')).catch(() => [])) {
+      const pid = Number(name.split('.')[1]);
+      if (alive(pid)) process.kill(pid, 'SIGKILL');
+    }
+    // Clients still held before delivery have no inflight marker.
+    for (const name of await fsp.readdir(path.join(managerDirectory, 'reached-predeliver')).catch(() => [])) {
       const pid = Number(name.split('.')[1]);
       if (alive(pid)) process.kill(pid, 'SIGKILL');
     }
@@ -133,6 +138,22 @@ export async function createSubprocessNative(t, manager) {
         return name ? Number(name.split('.')[1]) : null;
       }, `a ${verb} call to reach its gate`);
     },
+    /** Hold every starting call of `verb` before it delivers its request to the manager (no inflight marker, no queued job). */
+    predeliver: verb => fsp.writeFile(path.join(managerDirectory, 'predeliver', verb), ''),
+    release: verb => fsp.rm(path.join(managerDirectory, 'predeliver', verb), { force: true }),
+    /** Resolves with the pid of a starting call that is waiting before delivery. */
+    async reachedPredeliver(verb) {
+      return until(async () => {
+        const name = (await fsp.readdir(path.join(managerDirectory, 'reached-predeliver')).catch(() => [])).find(entry => entry.startsWith(`${verb}.`));
+        return name ? Number(name.split('.')[1]) : null;
+      }, `a ${verb} call to wait before delivery`);
+    },
+    /** Pids of starting calls whose request is marked in flight. */
+    inflight: () => { try { return fs.readdirSync(path.join(managerDirectory, 'inflight')).map(name => Number(name.split('.')[1])).filter(alive); } catch { return []; } },
+    /** What `systemctl --user show <unit> -p Job` prints right now (systemd fixtures only). */
+    showJob: () => new Promise((resolve, reject) => {
+      execFile(tool, ['--user', 'show', label, '-p', 'Job'], (error, stdout) => error ? reject(error) : resolve(stdout));
+    }),
     toolAlive: pid => alive(pid),
     calls: () => lines(path.join(managerDirectory, 'calls.jsonl')),
     verbs: () => lines(path.join(managerDirectory, 'calls.jsonl')).map(call => call.verb),

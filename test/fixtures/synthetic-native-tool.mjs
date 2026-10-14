@@ -18,6 +18,12 @@
  *                     its request is in flight); `reached/<verb>.<pid>` is written when a call starts waiting.
  *   delay/<verb>      milliseconds every call of the verb sleeps before it takes effect.
  *   fail/<verb>       exit status the call returns after any gate, without taking effect.
+ *   predeliver/<verb> (starting verbs only) while this file exists a starting call has not delivered its request to the
+ *                     manager yet: it waits before it records the call in `calls.jsonl` or writes its `inflight/` marker, so
+ *                     `show <unit> -p Job` prints nothing and no start is pending. `reached-predeliver/<verb>.<pid>` is
+ *                     written when a call starts waiting. Once the file is removed the call proceeds as an ordinary call:
+ *                     it is recorded, marks its request in flight, honours the controls above and launches the service.
+ *                     Termination signals received while waiting are recorded like any other.
  * Evidence, one JSON object per line:
  *   calls.jsonl       {at, verb, args, pid}      every call received
  *   signals.jsonl     {at, signal, pid, verb}    every termination signal a call received (the call then exits)
@@ -90,6 +96,14 @@ async function call(args) {
   for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
     process.on(signal, () => { if (signalled) return; signalled = true; append('signals.jsonl', { signal, pid: process.pid, verb }); process.exit(128); });
   }
+  const starting = verb === 'start' || verb === 'kickstart';
+  // A client the manager has not received a request from yet: nothing is recorded, no job is queued, and nothing happens
+  // to the service until the hold is released, after which the call is an ordinary one.
+  if (starting && fs.existsSync(path.join(dir, 'predeliver', verb))) {
+    fs.mkdirSync(path.join(dir, 'reached-predeliver'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'reached-predeliver', `${verb}.${process.pid}`), '');
+    while (fs.existsSync(path.join(dir, 'predeliver', verb))) await sleep(20);
+  }
   append('calls.jsonl', { verb, args, pid: process.pid });
   const refuse = reason => { append('violations.jsonl', { verb, args, reason }); fail(99, `synthetic ${config.kind} refused: ${reason}\n`); };
   const allowed = config.kind === 'systemctl' ? ['show-environment', 'show', 'link', 'daemon-reload', 'start'] : ['print', 'bootstrap', 'kickstart', 'bootout'];
@@ -97,7 +111,6 @@ async function call(args) {
   if (args.includes('-k') || args.includes('--now') || args.includes('--force') || args.includes('--system') || args.includes('--global')) refuse(`unexpected option in ${args.join(' ')}`);
   if (config.kind === 'systemctl' && args[0] !== '--user') refuse('only the user manager is addressed');
 
-  const starting = verb === 'start' || verb === 'kickstart';
   const inflight = path.join(dir, 'inflight', `${verb}.${process.pid}`);
   if (starting) fs.writeFileSync(inflight, '');
   try {
