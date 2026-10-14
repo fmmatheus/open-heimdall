@@ -24,6 +24,10 @@
  *                     written when a call starts waiting. Once the file is removed the call proceeds as an ordinary call:
  *                     it is recorded, marks its request in flight, honours the controls above and launches the service.
  *                     Termination signals received while waiting are recorded like any other.
+ *   flood/<verb>      (starting verbs only) `stdout` or `stderr`: before anything else, including the `predeliver` hold, a
+ *                     starting call writes more than two MiB to that stream. Writes never wait for a reader (a closed pipe
+ *                     ends the flood, a pipe nobody drains is abandoned after three seconds), so the call still reaches its
+ *                     hold and stays a client that can deliver whatever happened to its output.
  * Evidence, one JSON object per line:
  *   calls.jsonl       {at, verb, args, pid}      every call received
  *   signals.jsonl     {at, signal, pid, verb}    every termination signal a call received (the call then exits)
@@ -34,6 +38,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { Worker } from 'node:worker_threads';
 import { parsePlist } from '../../dist/coordinator/native/launchd.js';
 import { parseSystemdUnit } from '../../dist/coordinator/native/systemd.js';
 
@@ -97,6 +102,9 @@ async function call(args) {
     process.on(signal, () => { if (signalled) return; signalled = true; append('signals.jsonl', { signal, pid: process.pid, verb }); process.exit(128); });
   }
   const starting = verb === 'start' || verb === 'kickstart';
+  // Output produced before anything is delivered: more than a runner's output bound, on the stream the control names.
+  const flood = starting ? read(`flood/${verb}`) : null;
+  if (flood === 'stdout' || flood === 'stderr') await floodOutput(flood === 'stdout' ? 1 : 2);
   // A client the manager has not received a request from yet: nothing is recorded, no job is queued, and nothing happens
   // to the service until the hold is released, after which the call is an ordinary one.
   if (starting && fs.existsSync(path.join(dir, 'predeliver', verb))) {
@@ -125,6 +133,27 @@ async function call(args) {
     if (failure !== null) fail(Number(failure) || 1, `synthetic ${config.kind} ${verb} failed on request\n`);
     await (config.kind === 'systemctl' ? systemctl(verb, args.slice(2)) : launchctl(verb, args.slice(1)));
   } finally { fs.rmSync(inflight, { force: true }); }
+}
+
+/**
+ * Write more than two MiB to `fd` without ever blocking the call on a reader: a reader that went away makes the write
+ * fail (the call then goes on without the rest), and a reader that stopped reading cannot hold the call for more than
+ * three seconds.
+ */
+async function floodOutput(fd) {
+  // A worker thread does the writing, so a pipe that nobody drains blocks the worker and never the call itself.
+  const worker = new Worker([
+    "const fs = require('node:fs');",
+    "const { workerData: fd } = require('node:worker_threads');",
+    "const chunk = Buffer.alloc(64 * 1024, 'x');",
+    'for (let total = 0; total < 2 * 1024 * 1024;) {',
+    '  try { total += fs.writeSync(fd, chunk); }',
+    "  catch (error) { if (error.code === 'EAGAIN') { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5); continue; } break; }",
+    '}',
+  ].join('\n'), { eval: true, workerData: fd });
+  worker.on('error', () => undefined);
+  worker.unref();
+  await Promise.race([new Promise(resolve => worker.once('exit', resolve)), sleep(3000)]);
 }
 
 function startPending() {

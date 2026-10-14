@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { spawn, execFile } from 'node:child_process';
+import { spawn, execFile, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { parseLifecycleResult } from '../../dist/coordinator/lifecycle-result.js';
 import { nativeServiceNames } from '../../dist/coordinator/native/types.js';
@@ -23,6 +23,7 @@ import { systemdPaths } from '../../dist/coordinator/native/systemd.js';
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const CLI_ENTRY = path.join(repository, 'dist', 'cli.js');
 const ENTRY = path.join(repository, 'test', 'fixtures', 'lifecycle-cli-entry.mjs');
+const PUBLICATION_ENTRY = path.join(repository, 'test', 'fixtures', 'lifecycle-cli-publication-entry.mjs');
 const TOOL = path.join(repository, 'test', 'fixtures', 'synthetic-native-tool.mjs');
 export const SENTINEL = 'lifecycle-subprocess-synthetic-credential';
 
@@ -50,7 +51,7 @@ export async function createSubprocessNative(t, manager) {
   const managerDirectory = path.join(root, 'manager');
   const stateDirectory = path.join(root, 'state');
   for (const directory of [home, openchamber, runtimeDirectory, managerDirectory]) await fsp.mkdir(directory, { mode: 0o700 });
-  for (const directory of ['gates', 'reached', 'delay', 'fail', 'inflight', 'predeliver', 'reached-predeliver']) await fsp.mkdir(path.join(managerDirectory, directory));
+  for (const directory of ['gates', 'reached', 'delay', 'fail', 'inflight', 'predeliver', 'reached-predeliver', 'flood']) await fsp.mkdir(path.join(managerDirectory, directory));
   const configFile = path.join(root, 'coordinator.toml');
   await fsp.writeFile(configFile, `[coordinator]\nstateDirectory = ${JSON.stringify(stateDirectory)}\nglobalConcurrency = 1\nprojectConcurrency = 1\n`);
   const credentialFile = path.join(root, 'credentials.env');
@@ -65,14 +66,28 @@ export async function createSubprocessNative(t, manager) {
   await fsp.writeFile(tool, `#!/bin/sh\nexec '${process.execPath}' '${TOOL}' '${toolConfig}' "$@"\n`, { mode: 0o755 });
   await fsp.chmod(tool, 0o755);
   const fixturePath = path.join(root, 'fixture.json');
-  await fsp.writeFile(fixturePath, JSON.stringify({ manager, tool, uid, home, openchamber, configHome, runtimeDirectory, entryPoint: CLI_ENTRY }));
+  const recordFile = path.join(stateDirectory, 'lifecycle', 'launch-attempt.json');
+  const publicationHold = path.join(root, 'publication-hold');
+  await fsp.writeFile(fixturePath, JSON.stringify({ manager, tool, uid, home, openchamber, configHome, runtimeDirectory, entryPoint: CLI_ENTRY, recordFile, publicationHold }));
 
   const names = nativeServiceNames(stateDirectory);
   const label = manager === 'launchd' ? names.launchdLabel : names.systemdUnit;
   const startVerb = manager === 'launchd' ? 'kickstart' : 'start';
   const spawned = [];
 
+  /** Processes whose command line names this fixture's root: its supervisors and the coordinators they run. */
+  const fixtureProcesses = () => {
+    try {
+      return execFileSync('ps', ['-axww', '-o', 'pid=,command=']).toString().split('\n')
+        .filter(line => line.includes(`${root}/`))
+        .map(line => Number(/^\s*(\d+)\s/.exec(line)?.[1]))
+        .filter(pid => pid > 1 && pid !== process.pid);
+    } catch { return []; }
+  };
+
   t.after(async () => {
+    // A held publication must not outlive the fixture.
+    await fsp.rm(publicationHold, { force: true });
     for (const cli of spawned) if (cli.exitStatus === null) cli.child.kill('SIGKILL');
     // Harness cleanup: end what the synthetic manager started, gracefully first.
     for (const name of await fsp.readdir(path.join(managerDirectory, 'inflight')).catch(() => [])) {
@@ -88,14 +103,16 @@ export async function createSubprocessNative(t, manager) {
     if (state.supervisorPid && alive(state.supervisorPid)) process.kill(state.supervisorPid, 'SIGTERM');
     const ended = await until(() => !state.pid || !alive(state.pid), 'the coordinator to end', 12_000).then(() => true, () => false);
     if (!ended && state.pid && alive(state.pid)) process.kill(state.pid, 'SIGKILL');
+    // The state names the latest supervisor only: a fixture that was launched twice leaves the first one behind.
+    for (const pid of fixtureProcesses()) if (alive(pid)) { try { process.kill(-pid, 'SIGKILL'); } catch { /* not a group leader */ } try { process.kill(pid, 'SIGKILL'); } catch { /* ended */ } }
     await fsp.rm(root, { recursive: true, force: true });
   });
 
   const toolState = () => { try { return JSON.parse(fs.readFileSync(path.join(managerDirectory, 'state.json'), 'utf8')); } catch { return {}; } };
 
   /** Start a lifecycle command in its own process. `exit` resolves with the status once the process has ended. */
-  function cli(command, args = []) {
-    const child = spawn(process.execPath, [ENTRY, fixturePath, command, ...args], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, HOME: home } });
+  function cli(command, args = [], entry = ENTRY) {
+    const child = spawn(process.execPath, [entry, fixturePath, command, ...args], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, HOME: home } });
     const handle = { child, pid: child.pid, startedAt: Date.now(), elapsedMs: null, stdout: '', stderr: '', exitStatus: null };
     child.stdout.on('data', chunk => { handle.stdout += chunk; });
     child.stderr.on('data', chunk => { handle.stderr += chunk; });
@@ -120,8 +137,45 @@ export async function createSubprocessNative(t, manager) {
     stop: (extra = []) => runJson('stop', ['--coordinator-config', configFile, ...extra]),
     /** Spawn `start` without waiting for it. */
     spawnStart: (extra = []) => cli('start', ['--coordinator-config', configFile, '--env-file', credentialFile, '--json', ...extra]),
-    recordFile: () => path.join(stateDirectory, 'lifecycle', 'launch-attempt.json'),
-    readRecord: () => { try { return JSON.parse(fs.readFileSync(path.join(stateDirectory, 'lifecycle', 'launch-attempt.json'), 'utf8')); } catch { return null; } },
+    /** Spawn `start` whose client-evidence publication is held while `holdPublication()` is in effect (see `publication-barrier.mjs`). */
+    spawnHeldStart: (extra = []) => cli('start', ['--coordinator-config', configFile, '--env-file', credentialFile, '--json', ...extra], PUBLICATION_ENTRY),
+    holdPublication: () => fsp.writeFile(publicationHold, ''),
+    releasePublication: () => fsp.rm(publicationHold, { force: true }),
+    /** Resolves with `{ pid, published }` once a held command is waiting with the publication of a client record pending. */
+    async reachedPublication() {
+      return until(async () => {
+        const name = (await fsp.readdir(root).catch(() => [])).find(entry => entry.startsWith('publication-reached.'));
+        if (!name) return null;
+        try { return { pid: Number(name.split('.')[1]), published: JSON.parse(await fsp.readFile(path.join(root, name), 'utf8')) }; } catch { return null; }
+      }, 'a command to hold the publication of its client record');
+    },
+    /** Resolves once the held publication of a command was carried out (the real rename returned). */
+    async landedPublication() {
+      return until(async () => (await fsp.readdir(root).catch(() => [])).some(entry => entry.startsWith('publication-landed.')), 'the held publication to be carried out');
+    },
+    /**
+     * Make every starting call of `verb` write more than the runner's output bound to `stream` ('stdout' or 'stderr')
+     * before it reaches its pre-delivery hold. The flood is written without waiting for a reader, so a runner that stops
+     * reading cannot stall the call forever.
+     */
+    flood: (verb, stream) => fsp.writeFile(path.join(managerDirectory, 'flood', verb), stream),
+    /** Process ids of the witnessed start clients (launchers) of this fixture that are running. */
+    startClients: () => {
+      // A launcher's command line contains its script, which spans lines: group continuation lines with their process.
+      const entries = [];
+      for (const line of execFileSync('ps', ['-axww', '-o', 'pid=,command=']).toString().split('\n')) {
+        const start = /^\s*(\d+)\s(.*)$/.exec(line);
+        if (start) entries.push({ pid: Number(start[1]), command: start[2] });
+        else if (entries.length > 0) entries[entries.length - 1].command += `\n${line}`;
+      }
+      return entries.filter(entry => entry.command.includes(`["${tool}"`) && entry.command.includes('-e')).map(entry => entry.pid).filter(alive);
+    },
+    /** The process group of `pid`, or null when it does not exist. */
+    processGroup: pid => { try { return Number(execFileSync('ps', ['-o', 'pgid=', '-p', String(pid)], { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim()) || null; } catch { return null; } },
+    /** Pids of every call of `verb` that reached its pre-delivery hold, in the order they arrived. */
+    reachedPredeliverAll: verb => { try { return fs.readdirSync(path.join(managerDirectory, 'reached-predeliver')).filter(name => name.startsWith(`${verb}.`)).map(name => Number(name.split('.')[1])); } catch { return []; } },
+    recordFile: () => recordFile,
+    readRecord: () => { try { return JSON.parse(fs.readFileSync(recordFile, 'utf8')); } catch { return null; } },
     definitionPath: () => manager === 'launchd'
       ? launchdPaths(stateDirectory, label).definition
       : systemdPaths(stateDirectory, label).definition,
