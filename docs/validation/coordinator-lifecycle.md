@@ -416,6 +416,85 @@ are unchanged (the list taken before and after the runs is identical) and no `hn
 22.19.0 directory was removed by its exact name. Not run in this pass: the Linux VM, native systemd, and the
 GitHub-hosted jobs.
 
+### Linux results at `686de72`
+
+The Linux installed-package suite, the setup, doctor and runtime-identity set, the lifecycle regressions and the
+native systemd suite were run in a new VM against `686de72` (`docs(validation): record the macOS matrix and real
+launchd suite at 254b436`). Its `src/` is identical to `254b436`: `git diff 254b436 686de72` touches only this page.
+As the macOS subsection above says, the Linux results at `01b073f` were gathered on earlier code and are not evidence
+for this source; the table below replaces them for Linux.
+
+| Item | Value |
+| --- | --- |
+| Hypervisor | Lima 2.2.1, `vz` driver, stock `ubuntu-24.04` template (cloud image release 20260926), `--mount-none`, 2 CPUs, 3 GiB memory, 12 GiB disk; instance `heimdall-vf-37c515f3`, created for this run and deleted afterwards |
+| OS | Ubuntu 24.04.5 LTS, Linux 6.8.0-142-generic aarch64 |
+| Service manager | systemd 255 (255.4-1ubuntu8.17), user manager reachable (`XDG_RUNTIME_DIR=/run/user/501`, user bus), `is-system-running`: `running` |
+| Execution context | ordinary non-root VM user in an SSH login session |
+| Linger | the template enabled it (`Linger=yes`); `sudo loginctl disable-linger` was run inside the VM only; `Linger=no` before the suites and after them |
+| Node.js / npm | v22.19.0 / 10.9.3 (SHA-256 `0b2d9f564b6594222a62c82e1df2efe119dd4a4aff29644f4dd325bf360b6bcc`) and v24.21.0 / 11.19.0 (SHA-256 `6ad1325edbdb5649c379b75a237147a666c95d4f9ae8d340fef2d1575d289ad2`); official `linux-arm64` tarballs, each checked against the `SHASUMS256.txt` of the same release, extracted under the VM user's home |
+| Source | `git archive HEAD` of `686de72` (tarball SHA-256 `9b4ccc5a0d076c3c59ca1ebb6a158c2526bbb36c0bd419b172a6da0635c6d8ec`) copied with `limactl copy` and committed into a scratch repository (`40c346d`, fixture identity; `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` set to `/dev/null` for the test processes), then `npm ci --ignore-scripts` and `npm run build` on Node 22.19.0 (both exit 0) |
+| C compiler | none (`gcc` not installed), as in the earlier VM |
+
+| Command | Environment | Result |
+| --- | --- | --- |
+| `npm run test:package` | Node 22.19.0 / npm 10.9.3 | 64 tests, 64 pass, 0 fail, 0 cancelled, 0 skipped (194 s) |
+| `npm run test:package` | Node 24.21.0 / npm 11.19.0 | 64 tests, 64 pass, 0 fail, 0 cancelled, 0 skipped (195 s) |
+| `node --test --test-concurrency=1 test/setup-*.test.mjs test/doctor*.test.mjs test/runtime-identity*.test.mjs` | Node 22.19.0 | 253 tests, 253 pass, 0 fail, 0 skipped (35 s) |
+| same command | Node 24.21.0 | 253 tests, 253 pass, 0 fail, 0 skipped (35 s) |
+| `node --test test/coordinator-lifecycle-pre-delivery.test.mjs test/coordinator-lifecycle-launch-uncertainty.test.mjs test/coordinator-lifecycle-process-exit.test.mjs test/coordinator-lifecycle-ordering.test.mjs` | Node 22.19.0 | 68 tests, 68 pass, 0 fail, 0 cancelled, 0 skipped (87 s) |
+| `node --test test/coordinator-lifecycle-released-client.test.mjs` | Node 22.19.0 | 9 tests, 9 pass, 0 fail (5 s) |
+| `HEIMDALL_NATIVE_LIFECYCLE=1 node --test --test-concurrency=1 test/native/*.test.mjs` | Node 22.19.0, real systemd user manager | 16 tests: 14 pass, 2 skipped, 0 fail, 0 cancelled (14 s) |
+
+Counts against the macOS host at `254b436`: `test:package` 64 and 64 on both hosts, setup, doctor and
+runtime-identity 253 and 253. Against the Linux run at `01b073f`: `test:package` 46 to 64, native 16 tests with the
+same 14 pass and 2 skips.
+
+**The npm 10 leftover is exercised and accepted at its locked identity.** The 64 cases of `test:package` include the
+consumer and global installs that run the tree rule. On Node 22.19.0 / npm 10.9.3 the real consumer install of the
+tarball leaves the optional platform package of `msgpackr-extract` behind, as diagnosed in "Linux installed package:
+the extraneous `msgpackr-extract` platform package". To show that this path is the one the passing test takes, the
+repository's own helpers (`installConsumer`, `listTree`, `listPackages`, `leftoverOptionalPackages`,
+`verifyDependencyTree`) were run outside the test runner in a scratch directory against the same build of the same
+tarball, on both Node versions:
+
+| Observation (consumer install of the tarball) | Node 22.19.0 / npm 10.9.3 | Node 24.21.0 / npm 11.19.0 |
+| --- | --- | --- |
+| `npm ls --all` exit status | 0 | 0 |
+| `extraneous` lines | `@msgpackr-extract/msgpackr-extract-linux-arm64@3.0.4 extraneous` (one) | none |
+| Orphan installed at | `node_modules/@msgpackr-extract/msgpackr-extract-linux-arm64`, version 3.0.4 | no `@msgpackr-extract` directory |
+| `msgpackr-extract` (the parent) installed | no | no |
+| Version in the lockfile for the orphan's location | 3.0.4 (equal to the installed version) | 3.0.4 |
+| `leftoverOptionalPackages` accepts | exactly `@msgpackr-extract/msgpackr-extract-linux-arm64@3.0.4` | nothing |
+| `verifyDependencyTree` problems | none | none |
+
+The observed orphan is `@msgpackr-extract/msgpackr-extract-linux-arm64@3.0.4`: the version equals the one the lockfile
+records for that location, which is the only identity the rule accepts. That the rule rejects any other version, an
+absent or inconsistent parent chain and an unrelated extraneous package is established by the 40 controls of
+`test/package/tree-validation.test.mjs`, which are part of the 64 passing cases on both Node versions. The Node 24
+run shows npm 11.19.0 removing the orphan, so the exception is not exercised there.
+
+**Native systemd suite.** 14 cases passed against the real user manager, including the delayed-shutdown fixture and the
+three systemd foreign-link cases that macOS skips. The 2 skips are the ones the suite itself reports: the launchd
+refresh case (macOS only) and the case that needs a synthetic executor after a restart (a managed service always runs
+the production executor). The native suite does not hold a real `systemctl --user start` before delivery, so the
+pre-delivery start, released-client and earlier-attempt behaviour is established on Linux only by the
+controlled-manager tests above, which use the synthetic native tool; nothing here shows how a real systemd client
+behaves under a deadline, Ctrl-C or kill.
+
+**Defects found.** None. Each suite ran once; the `npm test` instabilities recorded for `01b073f` were not
+investigated here. The full `npm test` was not run in the VM.
+
+**Cleanup audit** (inside the VM, after all runs and before deleting it): `Linger=no`; no `heimdall-coordinator-*`
+unit, unit file or link (`systemctl --user list-units --all`, `list-unit-files`, `find` for the name) and no failed
+user unit; `~/.config/systemd/user` held only the template's own units (containerd, buildkit, stargz-snapshotter); no
+`/tmp/hn-*`, `/tmp/hl-*` or `/tmp/heimdall-*` directory; no coordinator, `synthetic-native-tool` or Heimdall
+process; the scratch source tree had no tracked change. Then `limactl stop` and `limactl delete` removed the
+instance and `limactl list` reported no instance; the downloaded image remains in the host's Lima cache. On the host
+the 18 unattributed `/private/tmp/hl-*` roots listed above are unchanged and no `hn-*` root exists. Not run in this
+pass: the GitHub-hosted jobs.
+
+Reproduce: the "Reproduce: Linux VM" steps below, with the commands in the table above.
+
 ## Final acceptance: verified commit `01b073f`
 
 The source verified in this section is `01b073f` (`fix(coordinator): publish the access key only once it holds a
