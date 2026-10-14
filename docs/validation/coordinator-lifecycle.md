@@ -181,8 +181,68 @@ was checked to fail (`stopped`) when the new check is removed from the built out
 client-completion evidence: a process id reused by an unrelated group keeps an attempt unresolved until that group
 ends, and a command that died between writing the record and starting a client leaves a record that only an explicit
 start or a `requested` outcome replaces. An explicit `start` still replaces an earlier record, the authenticated
-instance still clears a record in the start paths, and recovery of attempts, are not changed here. The Linux VM and
-the native suites were not run for this change.
+instance still clears a record in the start paths, and recovery of attempts, are not changed here (the next
+subsection changes all three). The Linux VM and the native suites were not run for this change.
+
+### Explicit start and the authenticated instance no longer settle an unresolved attempt
+
+**Defect.** At `97552f9` (source identical at `6850805`), an explicit `start` that found an earlier launch attempt
+logged "this explicit start replaces its record", wrote a new record, refreshed the service definition and issued a
+second start, even when the earlier request was a client that could still deliver. The record is the only thing that
+keeps `stop` from claiming a stopped coordinator, so replacing it discarded the evidence. Separately, the two
+authenticated-instance paths of `start` cleared the record unconditionally, although a client that was not proven
+finished could still deliver a request that launches the coordinator again after a stop.
+
+**Change** (`lifecycle-launch.ts`, `lifecycle-start.ts`; no flag, outcome or error code was added):
+
+- `writeLaunchAttempt` refuses to write while any record exists, so a replacement cannot happen even by mistake. An
+  explicit `start` first assesses the earlier record with the observations `stop` uses (`assessLaunchAttempt`). While
+  it is unresolved, unreadable or malformed, or its assessment fails, the start is a `conflict` / `state-unknown` that
+  names the record file and does not replace the record, refresh the definition or issue a request. If it resolves,
+  the start continues with a fresh record.
+- The authenticated-instance sites call `clearLandedAttempt`, which clears the record only when no recorded client that
+  is not proven finished could deliver; an unreadable record is kept.
+- A record written by this version carries `recordsClients: true`. A record with it that names no client belongs to a
+  command that ended before it released one: nothing left that command, so it resolves without a manager probe. A
+  record without it (written by an earlier version) that names no client stays unresolved, as before.
+
+**Commands** (macOS, Node v22.22.3, mocked-manager evidence):
+
+```
+node --test test/coordinator-lifecycle-pre-delivery.test.mjs test/coordinator-lifecycle-launch-uncertainty.test.mjs test/coordinator-lifecycle-ordering.test.mjs
+node --test test/coordinator-lifecycle-*.test.mjs test/coordinator-lifecycle.test.mjs test/coordinator-native-systemd.test.mjs test/coordinator-native-launchd.test.mjs
+npm run check
+```
+
+**Baseline versus fixed.** The new cases in `coordinator-lifecycle-pre-delivery.test.mjs` (per manager: an explicit
+start while a client is held before delivery; recovery after the client finished; a malformed record; plus one
+manager-independent case for the record helpers) were run on a disposable worktree of `6850805` with the fixtures
+from the checkout, and on the fixed code.
+
+| Case | Baseline `6850805` | Fixed |
+| --- | --- | --- |
+| explicit start while the client is held, both managers | `startup-not-confirmed`: the start logged "this explicit start replaces its record" and went on to start (the first assertion that failed was the outcome, so the later ones were not reached) | `conflict` / `state-unknown`, record, definition and native calls unchanged, `stop` still claims nothing; after release one delivery, one launch, `stopped`, record removed |
+| explicit start after the client finished and no request is queued | launchd: the start replaced the record and went on (the case expects `conflict`); systemd: the case passed, the record resolves by absence | systemd starts (the record resolves); launchd is `conflict` until the owner removes the record, then `ready` |
+| explicit start with a malformed record | `ok: true` on launchd (record replaced, start went on); systemd failed the same expectation | `conflict` / `state-unknown`, record bytes unchanged, no native call, no definition installed |
+| `clearLandedAttempt` with a live, a finished and no client, and an unreadable record | not present | live client and unreadable record keep the record; finished or absent client clears it |
+
+On the fixed code `coordinator-lifecycle-pre-delivery.test.mjs` passes 15 of 15; the lifecycle set (the second
+command) passes 248 of 248; `npm run check` exits 0.
+
+**Assertion changes to existing tests.** Two cases encoded the replacement and now assert the stricter behavior:
+`launchd: without queued-request evidence an issued kickstart stays unresolved ...` in
+`coordinator-lifecycle-launch-uncertainty.test.mjs` used an explicit `start` to settle the record. It now asserts that
+`stop` and `start` both stay unresolved, that the refused start issues no `kickstart` or `bootstrap`, and that the
+start reaches `ready` after the owner removes the record as the message directs. This is the launchd uncertainty
+claim kept truthful: launchd still cannot report a queued request, so Heimdall still does not guess. In
+`coordinator-lifecycle-ordering.test.mjs`, `a native launch that was already issued ...` (both managers) ran an
+explicit `start` right after the held launch landed; the instance may not have answered yet, so that start is now a
+`conflict` until it does. The case retries the start until it is ready and asserts that no second launch was issued.
+
+**What remains unproven.** The synthetic tool stands in for both managers; real clients under a deadline, Ctrl-C or
+kill are not exercised. A record whose client is a process id reused by an unrelated group stays unresolved until that
+group ends; the owner can then remove the record as the message states. The Linux VM, the native suites, the package
+tests and the full suite were not run for this change.
 
 ## Final acceptance: verified commit `01b073f`
 
@@ -575,7 +635,7 @@ request accepted (`requested`) or, for systemd, `systemctl --user show -p Job` r
 tool that was ended by its timeout keeps the record `dispatching`. `stop` with no answering coordinator reads the
 record after inspecting ownership and, while it is unresolved, returns `completion-unknown` (`completion-unknown`)
 without a stopped claim and without any native stop, kill or removal. An unreadable record is `state-unknown`. An
-explicit `start` replaces an unresolved record. No flag, result field or error code was added.
+explicit `start` replaced an unresolved record (superseded by "Explicit start and the authenticated instance no longer settle an unresolved attempt"). No flag, result field or error code was added.
 
 Regression file: `test/coordinator-lifecycle-launch-uncertainty.test.mjs` (10 cases, both managers). With the start
 held on the gate: the invoking CLI is killed with `SIGKILL`; a separate-process `stop` (twice) does not report
@@ -584,7 +644,7 @@ is released, the coordinator launches, `stop` reports `stopped` and the record i
 `already-stopped` and a later explicit `start` reaches `ready`. Also: the invoking CLI reaching its deadline
 (`startup-not-confirmed`, a `stop` meanwhile is not a stopped claim, then `stopped`; since the next subsection the CLI
 exits at the deadline instead of staying alive for the request); systemd resolving by absence only
-after the queued job ended; launchd staying unresolved after a failed `kickstart` until a `start` is run; and controls
+after the queued job ended; launchd staying unresolved after a failed `kickstart` (a `start` ran it then; now the owner removes the record); and controls
 for a coordinator that never ran (`not-managed`, as before) and for a start the tool refused (no record left).
 
 | Run | Command | Result |
@@ -1162,7 +1222,7 @@ entry existed in the user's domain. All commands ran with an isolated `HOME` and
 - A start whose native call was already issued survives the death of its process only through the private launch
   attempt record (see "Launch attempts survive the invoking process"). Real launchd and systemd behavior for these
   races was not exercised, and launchd cannot report a queued start request, so an issued `kickstart` that never
-  produced the coordinator stays unresolved until a `start` is run again.
+  produced the coordinator stays unresolved until the coordinator appears or the owner removes the record.
 - The post-deadline shutdown-request defect and the failing-install variant of the abandoned-start defect did not
   reproduce as runtime failures; they are covered by invariant tests only.
 - Windows is unsupported and was not exercised.
