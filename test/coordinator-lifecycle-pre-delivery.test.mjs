@@ -1,6 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { createSubprocessNative, until } from './fixtures/lifecycle-subprocess-harness.mjs';
+import { clearLandedAttempt, launchClientRunning, writeLaunchAttempt } from '../dist/coordinator/lifecycle-launch.js';
 
 /**
  * A start request whose client has not delivered it to the manager yet. The production runner lets a native start
@@ -186,4 +191,140 @@ for (const manager of MANAGERS) {
       assert.deepEqual(problems, []);
     });
   }
+
+  test(`${manager}: an explicit start while a start client is held before delivery replaces nothing and issues no second request`, { skip }, async t => {
+    const h = await createSubprocessNative(t, manager);
+    await cleanShutdown(h);
+    const startsBefore = count(h, h.startVerb);
+    const coordinatorStartsBefore = h.toolState().starts;
+
+    await h.predeliver(h.startVerb);
+    const invoking = h.spawnStart(['--timeout', '60']);
+    const client = await h.reachedPredeliver(h.startVerb);
+    const record = h.readRecord();
+    assert.equal(record?.phase, 'dispatching');
+    invoking.child.kill('SIGKILL');
+    await invoking.exit;
+    assert.equal(h.toolAlive(client), true, 'the held client outlives the invoking command');
+    const definition = fs.readFileSync(h.definitionPath(), 'utf8');
+    const definitionStat = fs.statSync(h.definitionPath());
+    const issuing = () => h.verbs().filter(verb => verb === h.startVerb || verb === 'bootstrap' || verb === 'daemon-reload' || verb === 'link');
+    const issuedBefore = issuing();
+
+    // Another process asks to start again. The earlier request has not been delivered and can still launch the service.
+    for (const name of ['start', 'start (repeated)']) {
+      const result = await h.start(['--timeout', '5']);
+      assert.equal(result.document?.ok, false, `${name}: ${result.stdout}\n${result.stderr}`);
+      assert.equal(result.document.outcome, 'conflict', name);
+      assert.equal(result.document.error.code, 'state-unknown', name);
+      assert.match(result.document.message, /did not replace the record, change the service definition or issue another request/, name);
+      assert.notEqual(result.status.code, 0, name);
+      assert.deepEqual(h.readRecord(), record, `${name}: the earlier record is replaced or removed`);
+      assert.equal(fs.readFileSync(h.definitionPath(), 'utf8'), definition, `${name}: the service definition was refreshed`);
+      assert.equal(fs.statSync(h.definitionPath()).mtimeMs, definitionStat.mtimeMs, `${name}: the service definition was rewritten`);
+      assert.deepEqual(issuing(), issuedBefore, `${name}: a native request or definition change was issued`);
+      assert.equal(count(h, h.startVerb), startsBefore, name);
+      assert.equal(h.toolAlive(client), true, `${name}: the held client was disturbed`);
+    }
+
+    // The record still keeps `stop` honest about the held request.
+    const stopped = await h.stop(['--timeout', '5']);
+    assert.equal(stopped.document?.ok, false, `${stopped.stdout}\n${stopped.stderr}`);
+    assert.ok(!STOP_CLAIMS.includes(stopped.document?.outcome), `stop claimed ${stopped.document?.outcome}`);
+
+    // The held client delivers late: exactly one launch, which resolves the attempt and drains cleanly.
+    await h.release(h.startVerb);
+    await until(() => !h.toolAlive(client), 'the released client to finish');
+    await h.coordinatorUp();
+    assert.equal(count(h, h.startVerb) - startsBefore, 1, 'the released client delivered once');
+    assert.equal(h.toolState().starts - coordinatorStartsBefore, 1, 'only the original request launched the coordinator');
+    const final = await h.stop(['--timeout', '30']);
+    assert.equal(final.document?.outcome, 'stopped', `${final.stdout}\n${final.stderr}`);
+    assert.equal(h.readRecord(), null);
+    assert.deepEqual(h.violations(), []);
+    assert.deepEqual(h.signals(), []);
+  });
+
+  test(`${manager}: an explicit start recovers once its earlier client is proven finished and the manager holds no request`, { skip }, async t => {
+    const h = await createSubprocessNative(t, manager);
+    await cleanShutdown(h);
+    await h.predeliver(h.startVerb);
+    const invoking = h.spawnStart(['--timeout', '60']);
+    const client = await h.reachedPredeliver(h.startVerb);
+    invoking.child.kill('SIGKILL');
+    await invoking.exit;
+    await h.failWith(h.startVerb, 1);
+    await h.release(h.startVerb);
+    await until(() => !h.toolAlive(client), 'the released client to finish');
+    await fs.promises.rm(path.join(h.managerDirectory, 'fail', h.startVerb), { force: true });
+
+    if (manager === 'launchd') {
+      // launchd cannot report queued requests, so a finished client alone resolves nothing; the owner removes the record.
+      const refused = await h.start(['--timeout', '10']);
+      assert.equal(refused.document?.outcome, 'conflict', `${refused.stdout}\n${refused.stderr}`);
+      assert.match(refused.document.message, /remove .*launch-attempt\.json yourself/);
+      assert.notEqual(h.readRecord(), null);
+      fs.rmSync(h.recordFile(), { force: true });
+    }
+    const started = await h.start(['--timeout', '60']);
+    assert.equal(started.document?.outcome, 'ready', `${started.stdout}\n${started.stderr}`);
+    assert.equal(h.readRecord(), null);
+    const stopped = await h.stop(['--timeout', '30']);
+    assert.equal(stopped.document?.outcome, 'stopped', `${stopped.stdout}\n${stopped.stderr}`);
+  });
+
+  test(`${manager}: an explicit start with a malformed attempt record is a bounded non-success that leaves the record`, { skip }, async t => {
+    const h = await createSubprocessNative(t, manager);
+    fs.mkdirSync(path.dirname(h.recordFile()), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(h.recordFile(), '{"schemaVersion": 1, "label": 7', { mode: 0o600 });
+    const before = h.verbs().length;
+    const result = await h.start(['--timeout', '10']);
+    assert.equal(result.document?.ok, false, `${result.stdout}\n${result.stderr}`);
+    assert.equal(result.document.outcome, 'conflict', result.document.message);
+    assert.equal(result.document.error.code, 'state-unknown');
+    assert.match(result.document.message, /remove .*launch-attempt\.json yourself/);
+    assert.equal(fs.readFileSync(h.recordFile(), 'utf8'), '{"schemaVersion": 1, "label": 7');
+    assert.equal(h.verbs().length, before, 'nothing was asked of the manager');
+    assert.equal(fs.existsSync(h.definitionPath()), false, 'no definition was installed');
+  });
 }
+
+/** A process group that stays alive until the test ends it: the stand-in for a client that has not finished. */
+function liveClient(t) {
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });
+  child.unref();
+  const end = () => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ } };
+  t.after(end);
+  return { pid: child.pid, end, gone: () => until(() => !launchClientRunning({ pid: child.pid, spawnedAt: 0 }), 'the client group to end') };
+}
+
+test('an authenticated instance clears an attempt only once no recorded client can still deliver', { skip }, async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'hl-landed-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const recordFile = path.join(directory, 'lifecycle', 'launch-attempt.json');
+  fs.mkdirSync(path.dirname(recordFile), { recursive: true });
+  const client = liveClient(t);
+
+  const attempt = await writeLaunchAttempt(directory, { manager: 'systemd', label: 'unit', now: Date.now() });
+  await assert.rejects(writeLaunchAttempt(directory, { manager: 'systemd', label: 'unit', now: Date.now() }), /still recorded and unresolved/, 'a recorded attempt is never replaced');
+  assert.equal(JSON.parse(fs.readFileSync(recordFile, 'utf8')).attemptId, attempt.attemptId);
+
+  // The command ended before it released a client: nothing can deliver, the instance settles the attempt.
+  await clearLandedAttempt(directory);
+  assert.equal(fs.existsSync(recordFile), false, 'an attempt that never released a client is settled by a running instance');
+
+  const withClient = await writeLaunchAttempt(directory, { manager: 'systemd', label: 'unit', now: Date.now() });
+  fs.writeFileSync(recordFile, JSON.stringify({ ...withClient, client: { pid: client.pid, spawnedAt: 0 } }), { mode: 0o600 });
+  await clearLandedAttempt(directory);
+  assert.equal(JSON.parse(fs.readFileSync(recordFile, 'utf8')).attemptId, withClient.attemptId, 'a client that can still deliver keeps the attempt past a running instance');
+
+  fs.writeFileSync(recordFile, '{not json', { mode: 0o600 });
+  await clearLandedAttempt(directory);
+  assert.equal(fs.readFileSync(recordFile, 'utf8'), '{not json', 'an unreadable record is kept');
+
+  fs.writeFileSync(recordFile, JSON.stringify({ ...withClient, client: { pid: client.pid, spawnedAt: 0 } }), { mode: 0o600 });
+  client.end();
+  await client.gone();
+  await clearLandedAttempt(directory);
+  assert.equal(fs.existsSync(recordFile), false, 'a client proven finished lets the instance settle the attempt');
+});
