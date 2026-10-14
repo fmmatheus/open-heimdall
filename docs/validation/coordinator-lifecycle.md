@@ -2,7 +2,15 @@
 
 Evidence for `heimdall coordinator start`, `stop` and `logs` and the native user-service adapters.
 
-**Status: this page holds four separate bodies of evidence.**
+**Status: this page holds five separate bodies of evidence.**
+
+Latest. **Launch-attempt ownership and output-overflow corrections, accepted source commit `47f88af`** (the first
+section below). Publication of the launch attempt record is now owned by one per-attempt owner, and an output overflow
+no longer counts as proof that nothing can deliver. Checks pass on macOS (including the real launchd native suite) and
+on Linux (including the real systemd native suite), with one Linux timing failure that did not reproduce. The two
+defects are reproduced and corrected only against the synthetic native tool, not against real launchd or systemd.
+PENDING and missing: see "Pending evidence and limits" in that section. The numbered bodies below are earlier
+evidence, kept as recorded.
 
 0. **Final acceptance of the pending-start and package-identity corrections, source `65bd4c9`** (the first section
    below; the macOS suite ran at `254b436` and the Linux suites at `686de72`, both with `src/` identical to
@@ -33,6 +41,237 @@ they appear.
 
 Nothing in this record shows that a run can execute under a native service. A user's real OpenCode or
 OpenChamber installation, provider accounts and quota were not involved.
+
+## Launch-attempt ownership and output overflow: accepted source commit `47f88af`
+
+Two defects remained in the way `heimdall coordinator start` protects a launch attempt after the corrections recorded
+in "Final acceptance: verified source commit `65bd4c9`":
+
+- **Defect A, publication outlives cancellation.** The record that names the released start client was written by a
+  continuation that nothing owned. If the command's deadline or an interrupt fired while that write was pending, the
+  command finished as "the tool was not run", the operation lock was released and a newer `start` was admitted. The
+  old write then landed late and replaced or removed the newer attempt's record, leaving the newer attempt's live client
+  unprotected.
+- **Defect B, output overflow taken as proof of non-delivery.** When the start client wrote more than 1 MiB to stdout
+  or stderr, the runner killed only the launcher process, reported a definitive failure and cleared the record. The
+  tool, which the launcher had spawned in the same process group, could still be alive and could deliver. `stop` then
+  answered `already-stopped` while the tool was alive, and a second `start` issued a second request.
+
+A third issue, found by the second review round, was in the same class as Defect A and was corrected too:
+
+- **Finding F-B1, abandoned assessment of an earlier attempt.** When a deadline or Ctrl-C ended a `start` that was
+  still assessing an earlier attempt's record, the lock was released at once while the assessment kept running. It could
+  later clear a record that a newer attempt had written in the meantime.
+
+The accepted source is `47f88af` (`fix(coordinator): keep the lock until an abandoned assessment of an earlier attempt
+settles`), the last commit that changed `src/` or `test/`. `d9832ec` is an ancestor of the branch head. Independent
+safety review accepted `47f88af`; `git diff 47f88af..HEAD` touches `docs/` only. Commits after `d9832ec`, in order:
+
+| Commit | Subject | Role |
+| --- | --- | --- |
+| `55e88b8` | `test(coordinator): reproduce launch publication and output-overflow protection loss` | reproductions of A and B, failing at `d9832ec` |
+| `02167df` | `fix(coordinator): give each start attempt one owner for publication and completion` | implementation (`src/`) |
+| `c3b3357` | `test(coordinator): cover the evidence disposition of every released-client ending` | per-ending tests |
+| `47f88af` | `fix(coordinator): keep the lock until an abandoned assessment of an earlier attempt settles` | F-B1 correction (`src/`) and its regression |
+
+The commits that record this section and the matching `docs/coordinator.md` change touch documentation only.
+
+### Baseline versus fixed
+
+Both defects were reproduced with the production adapters and `createExecFileRunner` in separate CLI subprocesses,
+against the synthetic native tool (`test/fixtures/synthetic-native-tool.mjs`), which stands in for both managers.
+Evidence is controlled-fixture evidence. Publication is held by patching the default export of `node:fs/promises`
+so that only the rename whose target is `launch-attempt.json` waits; delivery is held independently by the tool's
+`predeliver` control; output is produced by a `flood/<verb>` control that writes 2 MiB before the hold.
+
+Baseline check: `d9832ec` source built in a disposable directory, the final `test/` tree copied in, then
+`node --test --test-concurrency=1` over the three regression files. 14 tests: 2 pass (the caller-death controls,
+which are safe by design), 12 fail.
+
+| Defect | Baseline `d9832ec` | Fixed `47f88af` |
+| --- | --- | --- |
+| A: publication held across the deadline, across Ctrl-C and across a CLI-process deadline (launchd and systemd; 6 tests) | all 6 fail: "the old, cancelled attempt's publication replaced the newer attempt's record"; "the record names no running client" | all 6 pass with unchanged assertions; the second start waits behind the first, the record names the newer attempt's live client after the old write lands, stops answer `completion-unknown`, one delivery |
+| B: stdout and stderr overflow on launchd and systemd (4 tests) | all 4 fail: `start` answered `failed` / `launch-failed` in about 350 to 440 ms; the record was cleared; `stop`, repeated `stop` and `stop --no-wait` answered `already-stopped` (exit 0) while the tool lived; a second `start` issued another request (2 clients held, 2 manager calls) | all 4 pass with unchanged assertions: the record stays in phase `dispatching`; three stops answer `completion-unknown`; a second `start` is a `conflict` / `state-unknown` with no second request; after release one delivery, final `stop` is `stopped` |
+| F-B1: record removed by an abandoned assessment (2 tests, held `rm` of `launch-attempt.json`) | both fail: "the newer attempt's record was removed by the earlier assessment" | both pass: the second start holds the lock, `stop` answers `busy` and claims nothing, the record names the newer attempt's client |
+
+The caller-death controls (the command is killed while publication is held) pass at the baseline and after the fix,
+because the launcher never receives the go-ahead and exits on stdin end.
+
+### Ownership model, before and after
+
+**Before (`d9832ec`).** Responsibility for one launch attempt was spread over loose closures:
+
+- the start command wrote the attempt record and settled it after the manager call (`afterStart`);
+- the runner spawned the client and published it through a continuation that nothing awaited or owned;
+- five paths in the runner could end a released client (deadline before the go-ahead, deadline after it, overflow, the
+  publication callback, `error` or `close`), each assigning its own evidence disposition, and the adapters inferred
+  "possibly delivering" from a single `timedOut` flag;
+- the lock lasted as long as the manager call promise, which did not include the publication.
+
+Two writers (the runner continuation and `afterStart`) could therefore act on the same record without a shared order,
+and a result of "definitely not delivered" could be produced while work that could still contradict it was running.
+
+**After.**
+
+- `launch-owner.ts`: one owner per attempt, created under the operation lock. Creation, client publication,
+  mark-requested and settlement are chained in order. After settlement or close it accepts no work, so a cleared record
+  cannot be recreated and a write cannot finish after the attempt's serialization ended.
+- `native/types.ts`: every ending of a released client goes through one function with four endings:
+  *exited* (an exit status was observed), *not-run* (the client was never told to run), *could-not-run* (spawn failed)
+  and *left-running* (told to run, no exit observed). The result is reported only after the publication has settled.
+  The go-ahead is sent only if the publication succeeded and the call is still open. Only *left-running* is
+  `unresolved`; the adapters copy that flag instead of inferring it. Overflow before the go-ahead is *not-run*; after
+  it, the output kept stays bounded to 1 MiB, nothing is signalled and the ending is *left-running*. The runner also
+  watches the launcher's `exit`, with a 250 ms drain grace, so a launcher that dies while its tool survives settles
+  promptly instead of waiting for the tool's pipes.
+- `lifecycle-start.ts`: the lock is released only after the abandoned manager call, or the abandoned assessment of an
+  earlier attempt, has settled and the owner has closed. A start whose tool was left running returns
+  `startup-not-confirmed` (error code `launch-failed`) with the record kept; before, the same situation was `failed`
+  with the record kept.
+
+**Rationale.** Safety requires that nothing the attempt started can outlive the attempt's serialization, and that the
+evidence for "not delivered" be one decision instead of five. Holding the lock until the work settles is the smallest
+change that gives both; it needs no new daemon, no new file and no change to the record shape or to
+`schemaVersion: 1`. Releasing the lock earlier would reopen Defect A, which is why a stalled publication keeps the
+command alive (see finding F-A1).
+
+Per-ending evidence disposition (tests in `test/coordinator-launch-terminal-branches.test.mjs`, 14 tests):
+
+| Situation | Ending | Record |
+| --- | --- | --- |
+| tool exit observed, any numeric status | exited | cleared or settled by the manager answer |
+| spawn failure | could-not-run | cleared |
+| publication fails or the client ends before the go-ahead (stdin end, deadline, interrupt, tool timeout, overflow) | not-run, reported after the publication settles | cleared |
+| deadline or interrupt after the go-ahead | left-running, nothing signalled | kept |
+| tool timeout after the go-ahead | left-running; only the client's own process group is signalled | kept |
+| tool dies of a signal, or the launcher dies while the tool lives | left-running | kept |
+| output above 1 MiB after the go-ahead | left-running, no kill, output bounded | kept |
+
+### Review rounds
+
+Two independent review rounds ran in separate contexts, followed by a final independent safety gate. Severities are
+those assigned by the reviewer and were not changed afterwards.
+
+| Round | Reviewed commit | Finding | Severity | Disposition |
+| --- | --- | --- | --- | --- |
+| A | `c3b3357` | no material-safety finding, no regression | none | the correction pass made no change and no commit |
+| A | `c3b3357` | F-A1: a stalled filesystem publication keeps the CLI process and the operation lock alive past the deadline | minor | deferred. This is the safe direction; releasing the lock earlier would reopen Defect A. A bound needs a publication timeout plus a record fence, which is a design change outside this work |
+| A | `c3b3357` | F-A2: a tool that exits 0 and leaves a background descendant is reported *exited* after the 250 ms drain, with its group still alive | minor | deferred, not a regression: the baseline `close` handler also treated any numeric exit as definitive, and only the timing differs (about 320 ms against about 2 s in the reviewer's experiment) |
+| A | `c3b3357` | F-A3: no documentation citation for `exit` versus `close`, stdio release and `unref` | process | recorded below ("Node.js behavior relied on") |
+| B | `c3b3357` | confirmed the three round-A dispositions; no round-A disposition rejected | none | none needed |
+| B | `c3b3357` | F-B1: an abandoned assessment of an earlier attempt can clear a newer attempt's record (invariant: old work cannot overwrite or clear a newer attempt; reproduced with a held `rm`) | minor, pre-existing at `d9832ec` | fixed in `47f88af`, regression `test/coordinator-lifecycle-earlier-attempt-assessment.test.mjs` fails 2 of 2 before and passes 2 of 2 after |
+| gate | `47f88af` | six safety invariants traced in source and the baseline and final runs: protection exists before delivery; old work cannot overwrite or clear a newer attempt; protection holds across deadline, Ctrl-C, caller death and overflow; `stop` cannot report success while a delayed launch is possible; command lifetime and output stay bounded; reliable evidence permits recovery | no new finding | accepted `47f88af` |
+
+Test-quality notes raised by both rounds and not gating: some safety assertions in the overflow test sit inside
+`if` guards (the final run's diagnostics show the guarded conditions were live); the flood tool cannot exercise
+SIGPIPE; there is no witnessed spawn-failure case, no direct unit test of the owner's refusal after settlement and no
+dedicated caller-death case in the terminal-branches file; some negative checks wait a fixed time. The
+reproduction files are byte-identical between `55e88b8` and `47f88af`, so no assertion was weakened.
+
+### Environments
+
+| Item | macOS host | Linux VM |
+| --- | --- | --- |
+| OS | macOS 27.0.1 (Darwin 27.0.0, arm64), ordinary logged-in user | Ubuntu 24.04.5 LTS, Linux 6.8.0-142-generic aarch64, ordinary non-root user, `Linger=no` (set inside the VM only; confirmed in two shell sessions and at the end) |
+| Service manager | real launchd user domain | systemd 255 (255.4-1ubuntu8.17) user manager |
+| Node.js / npm | v22.22.3 / 10.9.8; v24.21.0 / 11.19.0; v22.19.0 / 10.9.3 (official tarballs, SHA-256 checked against nodejs.org, disposable directories) | v22.19.0 and v24.21.0 (official linux-arm64 tarballs, SHA-256 checked) |
+| Source | managed checkout at `47f88af` | `git archive` of `47f88af` committed into a scratch repository |
+| Created for this run | disposable baseline copies and tarball directories, removed | a Lima 2.2.1 instance, deleted afterwards |
+
+Git signing and hooks were disabled through the environment only (`commit.gpgsign=false`, `core.hooksPath=/dev/null`).
+
+### Commands and results at `47f88af`
+
+| Command | Environment | Result |
+| --- | --- | --- |
+| `npm ci --ignore-scripts`, `npm run build`, `npm run check`, `npm run build:extension` | macOS, Node 22.22.3 | exit 0 each |
+| serial lifecycle, native-adapter, drain, stop-logs and terminal-branches files (`--test-concurrency=1`) | macOS, Node 22.22.3 | 307 of 307 pass |
+| `npm test` | macOS, Node 22.22.3 | 1442 tests, 1442 pass, 0 fail, 0 cancelled, 0 skipped (one run; `d9832ec` baseline was 1414, plus 28 new tests) |
+| `npm run test:package` | macOS, Node 22.22.3 / 24.21.0 / 22.19.0 | 64 of 64 pass on each |
+| setup, doctor and runtime-identity set (`--test-concurrency=1`) | macOS, Node 22.22.3 | 253 of 253 pass |
+| `HEIMDALL_NATIVE_LIFECYCLE=1 npm run test:native` | macOS, real launchd, Node 22.22.3 | 16 tests: 12 pass, 4 skipped, 0 fail |
+| `npm ci --ignore-scripts`, `npm run build` | Linux, Node 22.19.0 | exit 0 each |
+| focused files: publication-ownership, output-overflow, earlier-attempt-assessment, pre-delivery, launch-uncertainty, process-exit, ordering, released-client, terminal-branches | Linux, Node 22.19.0 | first run 104 pass, 1 fail; rerun 105 of 105 pass |
+| `HEIMDALL_NATIVE_LIFECYCLE=1 node --test --test-concurrency=1 test/native/*.test.mjs` | Linux, real systemd user manager | 16 tests: 14 pass, 2 skipped, 0 fail, on Node 22.19.0 and on 24.21.0 |
+| `npm run test:package` | Linux, Node 22.19.0 / 24.21.0 | 64 of 64 pass on each |
+| three regression files plus terminal-branches (`--test-reporter=spec`) | macOS, Node 22.22.3, gate run | 28 of 28 pass |
+
+The native skips are the ones the suites report themselves: the case that needs a synthetic executor after a restart
+(covered by `test/coordinator-service.test.mjs`), the three systemd foreign-link cases on macOS, and the launchd
+refresh case on Linux. The delayed-shutdown case passed under both real managers. `package.json`,
+`package-lock.json` and `scripts/` are unchanged since `d9832ec`, so no package evidence was reused: all package
+checks were rerun on the changed code.
+
+**Reported verbatim and not claimed fixed.** On Linux with Node 22.19.0, in the first focused run, one test failed:
+`not ok 87 - systemd: after an already-issued start, a timeout ends the command without ending the request, and stop
+claims nothing until it resolves` (`test/coordinator-lifecycle-process-exit.test.mjs`; expected error code
+`startup-timeout`, got `launch-failed`; elapsed 1058 ms for a 1000 ms budget, the start call issued). The same file
+passed five whole-file runs (22 of 22 each), the test passed eight name-filtered runs under three CPU-burn processes,
+and the rerun of the whole set passed (105 of 105). It was not reproduced. The likely cause, from reading the code and
+not verified by experiment, is that the command deadline in `lifecycle-start.ts` and the runner's own budget timer
+expire in the same millisecond, so that the runner's *left-running* result wins and the code reads `launch-failed`.
+Both codes are `startup-not-confirmed` with the record kept, so the safety outcome is the same. Both timers existed at
+`d9832ec`. It is not shown to be the earlier unexplained `npm test` instability.
+
+### Node.js behavior relied on
+
+Checked afterwards against the Node.js v22 `child_process` and `process` documentation; the implementation commits did
+not cite it.
+
+- `'exit'` is emitted when the child ends, and the stdio streams "might still be open"; `'close'` is emitted after
+  the process has ended and its stdio streams have closed, always after `'exit'`. The runner therefore treats the
+  launcher's `exit` as the signal that the launcher ended, with a bounded drain for remaining output.
+- On non-Windows platforms a `detached` child becomes the leader of a new process group and session, which is why the
+  launcher, and the tool it spawns, are tracked as one group; children may outlive the parent either way, and
+  `subprocess.unref()` stops the parent from waiting for them.
+- `process.kill(pid, 0)` tests for existence; a missing target throws. The documentation states that Windows throws when
+  a pid is used to kill a process group, which is consistent with Windows being unsupported here.
+
+Not separately checked against the documentation: the exact effects of destroying the read ends of a child's inherited
+stdio on a tool that keeps writing. The reviewer observed a Node tool receive `EPIPE` and still deliver, with the result
+`unresolved`; a non-Node tool that receives `SIGPIPE` was not exercised.
+
+### Cleanup
+
+- The test harness removes its own fixture roots; the post-run listing of `/private/tmp/hl-*` equals the pre-run
+  listing in every task of this work (18 roots, the names under "Fixture and virtual machine cleanup" below). No root
+  of this run remains and no process names a `/tmp/hl-` path. The harness teardown also ends every process whose
+  command line names the fixture root, so a fixture that is launched twice cannot leak its first supervisor and
+  coordinator.
+- Disposable directories (baseline copies, Node tarballs and trees, `git archive` copies, review scratch) were removed
+  by exact path after confirming no open files and no referencing process.
+- The Lima instance was audited before deletion (no `heimdall` user unit or unit file, no fixture process, no
+  `/tmp/hl-*` or `/tmp/hn-*` root, `Linger=no`), stopped and deleted; `limactl list` shows no instance. No
+  `dev.openheimdall.coordinator` launchd label or Heimdall LaunchAgent existed after the macOS runs.
+- Other entries in `/private/tmp` (three `hn-*.log` files and many `heimdall-*` entries from other sessions) were not
+  created by this work and were not touched.
+
+### Pending evidence and limits
+
+- **PENDING: real-manager coverage of the two defects.** Defect A, Defect B and F-B1 were reproduced and corrected only
+  against the synthetic native tool. No run held a real `launchctl kickstart` or `systemctl --user start`, published a
+  record under a stalled filesystem with a real manager, or overflowed a real client's output. The real launchd and
+  systemd suites passed on the corrected source but are not reproductions of these windows.
+- **launchd limitation, unchanged.** launchd cannot report a queued start request, so a `dispatching` launchd attempt
+  stays unresolved until the coordinator appears or the owner removes the record named in the message.
+- **F-A1.** A filesystem call that never returns keeps the CLI process and the operation lock alive. This applies to
+  the write of the record and, after `47f88af`, to the assessment of an earlier attempt. The commands those assessments
+  run are bounded by the command budget; a hung filesystem call is not.
+- **F-A2.** A tool that exits 0 and leaves a descendant is reported as exited after about 250 ms; the descendant is not
+  tracked after that.
+- **Public outcome change.** A start whose tool was told to run and was then left running (tool timeout, death by
+  signal, launcher death with the tool alive, output overflow) is now `startup-not-confirmed` with error code
+  `launch-failed` and the record kept; it was `failed` with the record kept. `docs/coordinator.md` is updated. The
+  outcome set, flags, `/status` schema and the `schemaVersion: 1` record shape are unchanged.
+- **Missing evidence, not failures:** the full `npm test` and the setup, doctor and runtime-identity set on Linux (the
+  earlier acceptance omitted them as well); native launchd runs on macOS with Node 24.21.0 and 22.19.0 (the native suite
+  ran on 22.22.3 only); the GitHub-hosted CI jobs (the branch was not pushed); Windows (unsupported); platforms beyond
+  one macOS and one Ubuntu release on arm64.
+- **Unexplained instability:** the Linux timing failure above, and the earlier `npm test` instabilities recorded for
+  `01b073f`, remain unexplained. The single macOS `npm test` run passed and neither reproduces nor fixes them.
+- **Not changed by this work (out of scope):** malformed synthetic package-version identities in the optional-dependency
+  test helper; the path inventory and the "installed manifest optional" wording in the validation records of earlier
+  commits; the 18 unattributed `/private/tmp/hl-*` roots.
 
 ## Final acceptance: verified source commit `65bd4c9`
 
