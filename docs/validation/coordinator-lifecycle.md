@@ -316,6 +316,39 @@ test/package/install.test.mjs` passes for the consumer and global layouts (2 tes
 here, so the leftover path is not exercised by that run. The full installed-package matrix and the Linux VM, where npm
 10 leaves the package behind, were not run for this change.
 
+### Inherited fixture cleanup
+
+"Cleanup" under "Final acceptance" lists 19 `/private/tmp/hl-*` roots that could not be attributed to that
+verification pass and were left in place. One of them has since been attributed and removed. This subsection is
+separate from the Lima virtual machines of earlier passes, which were deleted at the time, and from the remaining
+roots, whose origin is still unknown.
+
+**Attribution.** The root `hl-Y4lOxB` is a synthetic launchd fixture root created by the preceding verification
+pass. Its own manifest says so: `fixture.json` names `manager: launchd` and the synthetic `launchctl` wrapper inside the
+root as the tool, with the root itself as home, OpenChamber, runtime and tool directory, and an entry point in an
+earlier checkout of this repository. `tool.json` names the same root as the synthetic tool's manager directory. The wrapper
+script was read, not run: it executes the repository's `test/fixtures/synthetic-native-tool.mjs` with `tool.json`. The
+root was canonical (`realpath` returned the same path), owned by the invoking user and mode `0700`.
+
+**Observations before removal** (macOS host, 2026-10-14; read-only commands, nothing inside the root was executed):
+
+- The root held the manifest files, a private synthetic `credentials.env`, `coordinator.toml`, the wrapper, and
+  empty `home/`, `openchamber/` and `run/` directories. `manager/` held empty `inflight/`, `reached/`, `gates/` and
+  `fail/` directories and a `delay/bootstrap` file; there was no `state.json`, so no tool call, supervisor or
+  coordinator had recorded a process there.
+- `ps -axo pid,command` listed no process whose command mentioned the root, and none for `synthetic-native-tool`.
+- `lsof +D` on the root, `lsof -nP` filtered by the root path, and `lsof -U` filtered by the root path found no open
+  file or socket.
+- `launchctl print gui/<uid>` and `launchctl list` showed no reference to the root, and a search of
+  `~/Library/LaunchAgents`, `/Library/LaunchAgents` and `/Library/LaunchDaemons` for the root path found nothing.
+  The fixture used a synthetic `launchctl`, so no real launchd registration was expected.
+
+**Result.** Exactly `/private/tmp/hl-Y4lOxB` was removed with `rm -rf` on that single path, and its absence was
+confirmed. The 18 other `hl-*` roots were listed before and after and are unchanged; no `/private/tmp/hn-*` root
+exists. Those 18 roots remain unattributed and untouched: nothing here shows what created them, whether anything uses
+them, or that they are safe to delete. Before removing any of them, check each for a manifest and for open files
+(`lsof +D <dir>`) first.
+
 ## Final acceptance: verified commit `01b073f`
 
 The source verified in this section is `01b073f` (`fix(coordinator): publish the access key only once it holds a
