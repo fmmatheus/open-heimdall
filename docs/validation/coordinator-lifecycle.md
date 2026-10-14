@@ -349,6 +349,73 @@ exists. Those 18 roots remain unattributed and untouched: nothing here shows wha
 them, or that they are safe to delete. Before removing any of them, check each for a manifest and for open files
 (`lsof +D <dir>`) first.
 
+### macOS results at `254b436`
+
+The full local matrix was run on the macOS host against `254b436` (`docs(validation): record the inherited fixture
+cleanup`), the head of the corrections above. The source is the last source change in this series plus the test and
+documentation commits after `97552f9`.
+
+**Which earlier evidence this supersedes.** `git diff --stat 97552f9..254b436` touches 14 files, 1449 insertions and 68
+deletions: `src/coordinator/lifecycle-launch.ts`, `lifecycle-start.ts`, `lifecycle-stop.ts` and
+`native/types.ts` (lifecycle launch-attempt handling and the native runner); `docs/coordinator.md`; the lifecycle
+tests and fixtures (`coordinator-lifecycle-launch-uncertainty`, `-ordering`, `-pre-delivery`, `-released-client`,
+`lifecycle-subprocess-harness.mjs`, `synthetic-native-tool.mjs`); and the package-test helpers
+(`test/package/helpers.mjs`, `tree-validation.test.mjs`). The macOS results recorded at `01b073f` for the lifecycle
+commands, the package tests and the native suite therefore describe different code and are superseded by the table
+below for the macOS host. Nothing under `src/` outside those four files changed, and the Linux results at `01b073f`
+(installed-package suite, native systemd suite) are not repeated here: they were gathered on the earlier code and
+are not evidence for this one.
+
+| Item | Value |
+| --- | --- |
+| OS | macOS 27.0.1 (Darwin 27.0.0, arm64), ordinary logged-in user |
+| Node.js / npm | v22.22.3 / 10.9.8 (default, mise); v24.21.0 / 11.19.0 (mise); v22.19.0 / 10.9.3 (official `darwin-arm64` tarball, SHA-256 `c59006db713c770d6ec63ae16cb3edc11f49ee093b5c415d667bb4f436c6526d` checked against `SHASUMS256.txt`, extracted into a disposable directory that was removed afterwards) |
+| Source | managed checkout at `254b436`, clean worktree, `node_modules` already installed from the lockfile |
+| Test processes | `GIT_CONFIG_COUNT=2` with `commit.gpgsign=false` and `core.hooksPath=/dev/null` in the environment of the test commands only (the host signs commits globally); no global Git configuration changed |
+| Load | `uptime` load averages 5.5 / 6.9 / 7.0 before `npm test` and 10.7 / 8.5 / 7.6 after it |
+
+| Command | Environment | Result |
+| --- | --- | --- |
+| `npm run check` | Node 22.22.3 | exit 0 |
+| `npm run build:extension` | Node 22.22.3 | exit 0 (28 quota files vendored) |
+| `npm test` (one process, default parallelism) | Node 22.22.3 | 1414 tests, 1414 pass, 0 fail, 0 cancelled, 0 skipped (93 s) |
+| `npm run test:package` | Node 22.22.3 / npm 10.9.8 | 64 of 64 pass (149 s) |
+| `npm run test:package` | Node 24.21.0 / npm 11.19.0 | 64 of 64 pass (161 s) |
+| `npm run test:package` | Node 22.19.0 / npm 10.9.3 | 64 of 64 pass (138 s) |
+| `node --test --test-concurrency=1 test/setup-*.test.mjs test/doctor*.test.mjs test/runtime-identity*.test.mjs` | Node 22.22.3 | 253 of 253 pass (87 s; 7 files) |
+| Serial lifecycle regression set (25 files, `--test-concurrency=1`, listed below) | Node 22.22.3 | 476 of 476 pass (220 s) |
+| `HEIMDALL_NATIVE_LIFECYCLE=1 npm run test:native` | Node 22.22.3, real launchd user domain | 16 tests: 12 pass, 4 skipped, 0 fail (24 s) |
+
+The serial set was `coordinator-` `key-creation`, `redaction-collisions`, `systemd-link-ownership`,
+`lifecycle-launch-uncertainty`, `lifecycle-process-exit`, `journal-logs`, `lifecycle-ownership`, `lifecycle-refresh`,
+`private-paths`, `managed-credentials`, `short-credentials`, `lifecycle-deadline`, `lifecycle-ordering`, `credentials`,
+`lifecycle-adapters`, `lifecycle-cli`, `stop-logs`, `drain`, `native-launchd`, `native-systemd`, `executor`,
+`service`, `lifecycle`, `lifecycle-pre-delivery` and `lifecycle-released-client`, each as
+`test/coordinator-<name>.test.mjs`. The earlier set of 452 tests grew by the pre-delivery and released-client files
+and the cases added to the existing ones.
+
+Counts against `01b073f`: `npm test` 1390 to 1414; `npm run test:package` 46 to 64 (the 18 added controls are in
+`tree-validation.test.mjs`); setup, doctor and runtime-identity 253 to 253; native 16 to 16 with the same 12 pass and 4
+skips.
+
+**Native suite.** The 4 skips are the ones the suite itself reports: the case that needs a synthetic executor after a
+restart (a managed service always runs the production executor) and the 3 systemd foreign-link cases, which run on
+Linux only. The 12 passing cases and the delayed-shutdown fixture ran against launchd with uniquely named synthetic
+fixtures (state directory, label and definition derived from an isolated root). The pre-delivery start, released
+client and earlier-attempt behaviour is established here only by the controlled-manager tests above, which use the
+synthetic native tool; the native suite does not hold a real `launchctl kickstart` before delivery, so nothing here
+shows how a real launchd client behaves under a deadline, Ctrl-C or kill.
+
+**Defects found.** None. `npm test` was run once in this pass; it passed. The instabilities recorded for `01b073f`
+("`npm test` on the macOS host: recorded instability") did not occur, and one clean run does not show them fixed.
+
+**Cleanup audit** (after all runs): `launchctl list` and `launchctl print gui/<uid>` showed no
+`dev.openheimdall.coordinator` label; `~/Library/LaunchAgents` held no Heimdall entry; no `synthetic-native-tool`
+process and no process mentioning an `hl-` or `hn-` root was running; the 18 `/private/tmp/hl-*` roots listed above
+are unchanged (the list taken before and after the runs is identical) and no `hn-*` root exists. The disposable Node
+22.19.0 directory was removed by its exact name. Not run in this pass: the Linux VM, native systemd, and the
+GitHub-hosted jobs.
+
 ## Final acceptance: verified commit `01b073f`
 
 The source verified in this section is `01b073f` (`fix(coordinator): publish the access key only once it holds a
