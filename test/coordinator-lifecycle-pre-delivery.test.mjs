@@ -241,6 +241,10 @@ for (const manager of MANAGERS) {
     const final = await h.stop(['--timeout', '30']);
     assert.equal(final.document?.outcome, 'stopped', `${final.stdout}\n${final.stderr}`);
     assert.equal(h.readRecord(), null);
+    const later = await h.start(['--timeout', '60']);
+    assert.equal(later.document?.outcome, 'ready', `${later.stdout}\n${later.stderr}`);
+    const again = await h.stop(['--timeout', '30']);
+    assert.equal(again.document?.outcome, 'stopped', `${again.stdout}\n${again.stderr}`);
     assert.deepEqual(h.violations(), []);
     assert.deepEqual(h.signals(), []);
   });
