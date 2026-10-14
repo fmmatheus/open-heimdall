@@ -9,7 +9,7 @@ import type { CoordinatorLifecycle } from './lifecycle.js';
 import { resolveLaunchContext, selectConfigurationFile } from './launch-context.js';
 import type { ConfigurationSelection, LaunchContext, LaunchContextOptions } from './launch-context.js';
 import { acquireOperationLock, readStopGeneration } from './lifecycle-lock.js';
-import { afterStart, clearLaunchAttempt, markLaunchRequested, readLaunchAttempt, recordLaunchClient, writeLaunchAttempt } from './lifecycle-launch.js';
+import { afterStart, assessLaunchAttempt, clearLandedAttempt, clearLaunchAttempt, launchRecordFile, markLaunchRequested, readLaunchAttempt, recordLaunchClient, unresolvedStartMessage, writeLaunchAttempt } from './lifecycle-launch.js';
 import type { LaunchAttempt } from './lifecycle-launch.js';
 import type { ParsedLifecycleArguments } from './lifecycle-arguments.js';
 import { createLifecycleResult, sanitizeResultText } from './lifecycle-result.js';
@@ -327,8 +327,8 @@ async function startBefore(args: ParsedLifecycleArguments, deps: LifecycleDepend
         }
       }
 
-      const earlier = await readLaunchAttempt(configuration.stateDirectory).catch(() => undefined);
-      if (earlier !== null) progress('An earlier start request for this coordinator was never confirmed; this explicit start replaces its record.');
+      const unsettled = await settleEarlierAttempt();
+      if (unsettled) return unsettled;
       progress(`Starting the coordinator through ${target!.manager} (${target!.label}).`);
       // Durable evidence for every other process, written under the operation lock right before the request is issued.
       let attempt: LaunchAttempt | undefined;
@@ -391,6 +391,29 @@ async function startBefore(args: ParsedLifecycleArguments, deps: LifecycleDepend
 
       function logsHint() { return adapter ? `Process logs: ${adapter.logLocation()}` : undefined; }
 
+      /**
+       * An earlier launch attempt is evidence of a request that may still land, so an explicit start never replaces it,
+       * refreshes the service definition or issues another request while it is unresolved. It is settled only by the
+       * same observations `stop` relies on; otherwise this start is a bounded non-success that changes nothing.
+       */
+      async function settleEarlierAttempt(): Promise<LifecycleResult | undefined> {
+        const blocked = (message: string, code: LifecycleErrorCode = 'state-unknown') =>
+          finish({ outcome: 'conflict', message, error: { code, message }, logs: logsHint() });
+        let earlier: LaunchAttempt | null;
+        try { earlier = await readLaunchAttempt(configuration.stateDirectory); }
+        catch (error) {
+          return blocked(`The record of an earlier start request cannot be used (${errorText(error)}), so it cannot be ruled out that a request is still on its way to the service manager. Nothing was requested, installed, stopped, killed or restarted. If you have confirmed that no start tool process is still running and ${target!.label} is not running, remove ${launchRecordFile(configuration.stateDirectory)} yourself and run \`heimdall coordinator start\` again.`);
+        }
+        if (earlier === null) return undefined;
+        const assessed = await bounded(async () => assessLaunchAttempt(configuration.stateDirectory, adapter!, await inspectOwnership(adapter!)), deps, deadlineAt).catch((error: unknown) => ({ kind: 'error' as const, error }));
+        if (assessed.kind === 'aborted') return failed('interrupted', 'Interrupted while checking an earlier start request. Nothing was started or changed.');
+        if (assessed.kind === 'timeout') return deadlineBeforeAction('checked an earlier start request');
+        if (assessed.kind === 'error') return blocked(`An earlier start request for ${earlier.label} could not be checked (${errorText(assessed.error)}), so it cannot be ruled out that it is still on its way to the service manager. Nothing was requested, installed, stopped, killed or restarted.`);
+        if (assessed.value.kind === 'unresolved') return blocked(unresolvedStartMessage(configuration.stateDirectory, assessed.value.attempt, assessed.value.reason));
+        if (assessed.value.kind === 'resolved') progress(`An earlier start request for ${earlier.label} is resolved: ${assessed.value.reason}.`);
+        return undefined;
+      }
+
       async function awaitReadiness(): Promise<LifecycleResult> {
         progress(`Waiting up to ${args.timeoutSeconds} seconds for the coordinator to become ready.`);
         let observation = 'No coordinator has answered yet.';
@@ -438,8 +461,9 @@ async function startBefore(args: ParsedLifecycleArguments, deps: LifecycleDepend
               if (confirmed.kind === 'refused') observation = `The coordinator answered with process ${lifecycle.pid}, but it is not confirmed as the started service: ${confirmed.reason}.`;
               else if (deadlineAt - deps.now() <= 0) observation = 'The coordinator answered only after the startup deadline.';
               else if (answer.status?.status === 'running' && answer.status.acceptingNewRuns) {
-                // The authenticated instance is the owned service's own main process: the attempt has landed.
-                await clearLaunchAttempt(configuration.stateDirectory).catch(() => undefined);
+                // The authenticated instance is the owned service's own main process: the attempt has landed, unless a
+                // client that is not proven finished could still deliver a request that launches it again after a stop.
+                await clearLandedAttempt(configuration.stateDirectory);
                 return finish({ outcome: 'ready', message: 'Coordinator started and ready. Readiness confirms coordinator IPC only; it does not check OpenCode connectivity, credentials or quota.', instance: observed(lifecycle) });
               } else observation = 'The coordinator answered but is not yet running and accepting runs.';
             }
@@ -520,8 +544,9 @@ async function startBefore(args: ParsedLifecycleArguments, deps: LifecycleDepend
           : `A coordinator answered as a managed instance, but ${confirmed.reason}. It was left unchanged.`;
         return finish({ outcome: 'conflict', message, error: { code: confirmed.code, message }, instance });
       }
-      // Owned registration and the authenticated instance's own process: any earlier start attempt has landed.
-      await clearLaunchAttempt(configuration.stateDirectory).catch(() => undefined);
+      // Owned registration and the authenticated instance's own process: an earlier start attempt has landed, unless a
+      // client that is not proven finished could still deliver its request. An instance cannot settle a different request.
+      await clearLandedAttempt(configuration.stateDirectory);
       const remembered = await adapter.remembered().catch((error: unknown) => ({ kind: 'foreign' as const, reason: errorText(error) }));
       if (remembered.kind !== 'owned') {
         const message = `The running managed coordinator has no definition owned by Heimdall${remembered.kind === 'foreign' ? ` (${remembered.reason})` : ''}. It was left unchanged.`;
