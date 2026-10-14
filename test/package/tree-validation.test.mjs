@@ -145,6 +145,185 @@ describe('installed dependency-tree rule', () => {
     });
   });
 
+  describe('leftover optional native package: supported identity', () => {
+    const parentName = 'msgpackr-extract';
+    const lockedPlatformPath = `node_modules/${platformPackage}`;
+    const rejected = async (t, packages, lock = baselineLock()) => {
+      const { listing, problems } = await inspect(t, packages, lock);
+      assert.match(listing.stdout, /extraneous/);
+      assert.ok(mentions(problems, /extraneous/), problems.join('\n'));
+      return problems;
+    };
+
+    test('the supported locked version is accepted', async t => {
+      const { listing, problems } = await inspect(t, { ...baseline(), ...leftover() });
+      assert.match(listing.stdout, new RegExp(`${platformPackage}@3\\.0\\.4 extraneous`));
+      assert.deepEqual(problems, []);
+    });
+
+    test('a different version is rejected while the optional parent is absent', async t => {
+      const { listing, problems } = await inspect(t, { ...baseline(), ...leftover({ version: '99.0.0' }) });
+      assert.match(listing.stdout, new RegExp(`${platformPackage}@99\\.0\\.0 extraneous`));
+      assert.ok(mentions(problems, new RegExp(`${platformPackage}@99\\.0\\.0 extraneous`)), problems.join('\n'));
+    });
+
+    test('a version that is not the locked one is rejected for every neighbouring version', async t => {
+      for (const version of ['3.0.3', '3.0.5', '3.1.0', '2.9.9', '3.0.4-rc.1']) {
+        const problems = await rejected(t, { ...baseline(), ...leftover({ version }) });
+        assert.ok(mentions(problems, new RegExp(`@${version.replace(/\./g, '\\.')} extraneous`)), `${version}: ${problems.join('\n')}`);
+      }
+    });
+
+    test('a missing or malformed manifest version is rejected', async t => {
+      for (const version of [undefined, '', 'not-a-version', '3', '3.0', 3, null, ['3.0.4']]) {
+        const { listing, problems } = await inspect(t, { ...baseline(), ...leftover({ version }) });
+        assert.match(listing.stdout, /extraneous/, JSON.stringify(version));
+        assert.ok(mentions(problems, /extraneous/), `${JSON.stringify(version)}: ${problems.join('\n')}`);
+      }
+    });
+
+    test('a manifest whose name differs from its directory, or has none, is rejected', async t => {
+      for (const name of ['@msgpackr-extract/msgpackr-extract-other-arch', 'something-else', undefined]) {
+        const { listing, problems } = await inspect(t, { ...baseline(), ...leftover({ name }) });
+        assert.match(listing.stdout, /extraneous/, String(name));
+        assert.ok(mentions(problems, /extraneous/), `${name}: ${problems.join('\n')}`);
+      }
+    });
+
+    test('a leftover installed where the lockfile has no record for it is rejected', async t => {
+      const packages = { ...baseline() };
+      const tree = await buildTree(t, packages);
+      const nested = path.join(tree.modules, 'dep-a', 'node_modules', ...platformPackage.split('/'));
+      await fs.mkdir(nested, { recursive: true });
+      await fs.writeFile(path.join(nested, 'package.json'), JSON.stringify({ name: platformPackage, version: '3.0.4', ...hostRestriction }));
+      const listing = await listTree(tree.install, { env: tree.env, cwd: tree.cwd });
+      assert.match(listing.stdout, /extraneous/);
+      const problems = await verifyDependencyTree({ modules: tree.modules, listing, lock: baselineLock() });
+      assert.ok(mentions(problems, /extraneous/), problems.join('\n'));
+    });
+
+    test('a lockfile record at another version than the installed one is rejected', async t => {
+      const lock = baselineLock();
+      lock.packages[lockedPlatformPath].version = '3.0.5';
+      lock.packages[`node_modules/${parentName}`].optionalDependencies[platformPackage] = '3.0.5';
+      await rejected(t, { ...baseline(), ...leftover() }, lock);
+    });
+
+    test('the locked version is exact even when the parent edge is a range', async t => {
+      const newerLock = baselineLock();
+      newerLock.packages[lockedPlatformPath].version = '3.0.5';
+      newerLock.packages[`node_modules/${parentName}`].optionalDependencies[platformPackage] = '^3.0.4';
+      await rejected(t, { ...baseline(), ...leftover() }, newerLock);
+
+      const rangeLock = baselineLock();
+      rangeLock.packages[`node_modules/${parentName}`].optionalDependencies[platformPackage] = '^3.0.4';
+      const problems = await rejected(t, { ...baseline(), ...leftover({ version: '3.0.5' }) }, rangeLock);
+      assert.ok(mentions(problems, /@3\.0\.5 extraneous/), problems.join('\n'));
+    });
+
+    test('a lockfile record without this host in its platform restriction is rejected', async t => {
+      for (const extra of [{ os: ['other'] }, { cpu: ['other'] }, { os: undefined }, { cpu: undefined }]) {
+        const lock = baselineLock();
+        Object.assign(lock.packages[lockedPlatformPath], extra);
+        await rejected(t, { ...baseline(), ...leftover() }, lock);
+      }
+    });
+
+    test('a parent edge the installed version does not satisfy is rejected', async t => {
+      for (const range of ['4.0.0', '3.0.5', '^4.0.0', '~3.1.0', 'latest', '']) {
+        const lock = baselineLock();
+        lock.packages[`node_modules/${parentName}`].optionalDependencies[platformPackage] = range;
+        await rejected(t, { ...baseline(), ...leftover() }, lock);
+      }
+    });
+
+    test('a parent edge the installed version satisfies is accepted', async t => {
+      for (const range of ['3.0.4', '^3.0.4', '^3.0.0', '~3.0.1']) {
+        const lock = baselineLock();
+        lock.packages[`node_modules/${parentName}`].optionalDependencies[platformPackage] = range;
+        const { problems } = await inspect(t, { ...baseline(), ...leftover() }, lock);
+        assert.deepEqual(problems, [], range);
+      }
+    });
+
+    test('an absent or non-optional ancestry is rejected', async t => {
+      const withoutOwnerEdge = { ...baseline() };
+      withoutOwnerEdge.msgpackr = { version: '2.1.0', dependencies: { 'msgpackr-extract': '^3.0.4' } };
+      await rejected(t, { ...withoutOwnerEdge, ...leftover() });
+
+      const noOwner = { ...baseline() };
+      delete noOwner.msgpackr;
+      await rejected(t, { ...noOwner, ...leftover() });
+
+      const noParentRecord = baselineLock();
+      delete noParentRecord.packages[`node_modules/${parentName}`];
+      await rejected(t, { ...baseline(), ...leftover() }, noParentRecord);
+
+      const noChildRecord = baselineLock();
+      delete noChildRecord.packages[lockedPlatformPath];
+      await rejected(t, { ...baseline(), ...leftover() }, noChildRecord);
+    });
+
+    test('an owner whose lookup finds a different lockfile record for the parent is rejected', async t => {
+      const lock = baselineLock();
+      lock.packages[`node_modules/dep-a/node_modules/${parentName}`] = { version: '3.0.4', optional: true };
+      const packages = { ...baseline(), ...leftover() };
+      delete packages.msgpackr;
+      packages['dep-a/node_modules/msgpackr'] = { name: 'msgpackr', version: '2.1.0', optionalDependencies: { 'msgpackr-extract': '^3.0.4' } };
+      const { listing, problems } = await inspect(t, packages, lock);
+      assert.match(listing.stdout, new RegExp(`${platformPackage}@3\\.0\\.4 extraneous`));
+      assert.ok(mentions(problems, new RegExp(`${platformPackage}@3\\.0\\.4 extraneous`)), problems.join('\n'));
+    });
+
+    test('an owner range the locked parent version does not satisfy is rejected', async t => {
+      for (const range of ['^4.0.0', '3.0.5', '~3.1.0', 'latest', '']) {
+        const packages = { ...baseline(), ...leftover() };
+        packages.msgpackr = { version: '2.1.0', optionalDependencies: { 'msgpackr-extract': range } };
+        await rejected(t, packages);
+      }
+    });
+
+    test('a malformed locked parent version or optional flag is rejected', async t => {
+      for (const version of [undefined, 'garbage', 3]) {
+        const lock = baselineLock();
+        lock.packages[`node_modules/${parentName}`].version = version;
+        await rejected(t, { ...baseline(), ...leftover() }, lock);
+      }
+    });
+
+    test('conflicting lockfile records for the same package name are rejected', async t => {
+      const conflictingChild = baselineLock();
+      conflictingChild.packages[`node_modules/dep-a/${lockedPlatformPath}`] = { version: '3.0.3', optional: true, ...hostRestriction };
+      await rejected(t, { ...baseline(), ...leftover() }, conflictingChild);
+
+      const conflictingParent = baselineLock();
+      conflictingParent.packages[`node_modules/dep-a/node_modules/${parentName}`] = { version: '3.0.3', optional: true };
+      await rejected(t, { ...baseline(), ...leftover() }, conflictingParent);
+
+      const conflictingEdge = baselineLock();
+      conflictingEdge.packages[`node_modules/dep-a/node_modules/${parentName}`] = {
+        version: '3.0.3', optional: true, optionalDependencies: { [platformPackage]: '3.0.3' },
+      };
+      await rejected(t, { ...baseline(), ...leftover() }, conflictingEdge);
+
+      const nonOptionalCopy = baselineLock();
+      nonOptionalCopy.packages[`node_modules/dep-a/${lockedPlatformPath}`] = { version: '3.0.4', ...hostRestriction };
+      await rejected(t, { ...baseline(), ...leftover() }, nonOptionalCopy);
+    });
+
+    test('two optional parents that both resolve to the leftover are ambiguous and rejected', async t => {
+      const lock = baselineLock();
+      lock.packages['node_modules/other-parent'] = { version: '1.0.0', optional: true, optionalDependencies: { [platformPackage]: '3.0.4' } };
+      await rejected(t, { ...baseline(), ...leftover() }, lock);
+    });
+
+    test('an unrelated extraneous package is rejected next to the supported leftover', async t => {
+      const { problems } = await inspect(t, { ...baseline(), ...leftover(), 'left-pad': { version: '1.3.0' } });
+      assert.deepEqual(problems.filter(problem => !/left-pad/.test(problem)), []);
+      assert.ok(mentions(problems, /left-pad@1\.3\.0 extraneous/), problems.join('\n'));
+    });
+  });
+
   describe('other problems', () => {
     test('an unrelated extraneous package is rejected', async t => {
       const { listing, problems } = await inspect(t, { ...baseline(), 'left-pad': { version: '1.3.0' } });

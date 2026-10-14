@@ -201,43 +201,108 @@ export async function readDependencyLock() {
   return JSON.parse(await fs.readFile(path.join(checkout, 'package-lock.json'), 'utf8'));
 }
 
-function lockedOptionalChildren(lock) {
-  const byName = new Map();
-  for (const [location, entry] of Object.entries(lock.packages ?? {})) {
-    if (!location.includes('node_modules/')) continue;
-    byName.set(location.slice(location.lastIndexOf('node_modules/') + 'node_modules/'.length), entry);
-  }
-  const parents = new Map();
-  for (const [name, entry] of byName) {
-    if (entry.optional !== true) continue;
-    for (const child of Object.keys(entry.optionalDependencies ?? {})) {
-      if (byName.get(child)?.optional === true) parents.set(child, [...(parents.get(child) ?? []), name]);
-    }
-  }
-  return parents;
+const exactVersion = /^(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+
+// Whether a version satisfies an exact, caret or tilde range. Any other range syntax, a prerelease under a
+// non-exact range and a malformed version or range all answer false, so unrecognised evidence grants nothing.
+function satisfies(version, range) {
+  if (typeof version !== 'string' || typeof range !== 'string' || !exactVersion.test(version)) return false;
+  const operator = /^[\^~]/.exec(range)?.[0] ?? '';
+  const base = range.slice(operator.length);
+  if (!exactVersion.test(base)) return false;
+  if (operator === '') return version === base;
+  if (version.includes('-')) return false;
+  const [major, minor, patch] = version.split(/[-+]/)[0].split('.').map(Number);
+  const [lowMajor, lowMinor, lowPatch] = base.split(/[-+]/)[0].split('.').map(Number);
+  if (base.includes('-')) return false;
+  const atLeast = major !== lowMajor ? major > lowMajor : minor !== lowMinor ? minor > lowMinor : patch >= lowPatch;
+  if (!atLeast) return false;
+  if (operator === '~') return major === lowMajor && minor === lowMinor;
+  if (lowMajor > 0) return major === lowMajor;
+  if (lowMinor > 0) return major === 0 && minor === lowMinor;
+  return major === 0 && minor === 0 && patch === lowPatch;
 }
+
+// The lockfile path of an installed package. The lockfile describes the package's own install tree, so a copy
+// below the installed package (global layout) and a hoisted copy beside it (consumer layout) both map to
+// `node_modules/<name>` records.
+function lockLocation(modules, location) {
+  const relative = path.relative(modules, location).split(path.sep).join('/');
+  if (relative === '' || relative.startsWith('..')) return undefined;
+  const full = `node_modules/${relative}`;
+  const prefix = 'node_modules/@open-heimdall/core/node_modules/';
+  return full.startsWith(prefix) ? `node_modules/${full.slice(prefix.length)}` : full;
+}
+
+// The package names along a lockfile path: `node_modules/a/node_modules/@s/b` is ['a', '@s/b'].
+const lockPathNames = location => location.split('node_modules/').slice(1).map(segment => segment.replace(/\/$/, ''));
+const packageNameInLockPath = location => lockPathNames(location).at(-1);
+
+// The lockfile record Node's lookup finds for `name` when required from the package at `location`: the nearest
+// `node_modules/<name>` in the package's own tree, then in each enclosing tree.
+function lookupInLock(lock, location, name) {
+  const names = lockPathNames(location);
+  for (let depth = names.length; depth >= 0; depth -= 1) {
+    const candidate = `${names.slice(0, depth).map(segment => `node_modules/${segment}/`).join('')}node_modules/${name}`;
+    if (lock.packages?.[candidate] !== undefined) return candidate;
+  }
+  return undefined;
+}
+
+const recordsNamed = (lock, name) => Object.entries(lock.packages ?? {})
+  .filter(([location]) => location.includes('node_modules/') && packageNameInLockPath(location) === name);
+
+// Several lockfile records for one name must agree on what they describe; otherwise the evidence is ambiguous.
+function agreeing(records) {
+  return records.length > 0 && records.every(([, entry]) => entry.version === records[0][1].version
+    && (entry.optional === true) === (records[0][1].optional === true));
+}
+
+const matchesHost = (systems, architectures) => Array.isArray(systems) && systems.includes(process.platform)
+  && Array.isArray(architectures) && architectures.includes(process.arch);
 
 // npm 10 does not drop an optional package's own optional dependencies when the package's install script fails
 // and npm removes it (arborist `optional-set.js`: only non-optional edges were followed; fixed in npm 11.6.2,
 // npm/cli#8537). For msgpackr-extract that leaves its platform package installed without its parent, and `npm ls`
-// reports it `extraneous`. The leftover is accepted only when every condition below holds:
-//  - the lockfile declares it as an optional dependency of a package that is itself optional,
-//  - that optional parent is an optional dependency of an installed package and is not installed,
-//  - the leftover's own manifest restricts os and cpu and matches this host.
-// Anything else npm reports stays a problem.
-export async function leftoverOptionalPackages({ packages, lock }) {
-  const parents = lockedOptionalChildren(lock);
-  const installedNames = new Set(packages.map(entry => entry.name));
+// reports it `extraneous`. The leftover is accepted only when every condition below holds, resolving each
+// lockfile record by installed location (the lookup chain npm uses) and never by bare package name:
+//  - the leftover is installed at a location the lockfile has a record for, its directory name equals its
+//    manifest name, and its manifest version is a valid version equal to that record's version,
+//  - that record is optional and restricts os and cpu to this host, as does the leftover's own manifest,
+//  - exactly one lockfile record for an optional parent resolves the leftover's name to that record and lists the
+//    leftover in `optionalDependencies` with a range the installed version satisfies,
+//  - that parent is not installed anywhere, and an installed package whose lookup finds the same parent record
+//    declares it in `optionalDependencies` with a range the locked parent version satisfies,
+//  - lockfile records sharing the leftover's name, or the parent's, agree on version and optionality.
+// Missing, malformed, incompatible or ambiguous evidence grants nothing; anything else npm reports stays a problem.
+export async function leftoverOptionalPackages({ modules, packages, lock }) {
   const leftovers = new Set();
+  const installedNames = new Set(packages.map(entry => entry.name));
+  const locations = new Map(packages.map(entry => [entry, lockLocation(modules, entry.location)]));
   for (const entry of packages) {
-    const optionalParents = parents.get(entry.name);
-    if (!optionalParents) continue;
-    const { os: systems, cpu: architectures } = entry.manifest;
-    if (!Array.isArray(systems) || !systems.includes(process.platform)) continue;
-    if (!Array.isArray(architectures) || !architectures.includes(process.arch)) continue;
-    const orphaned = optionalParents.some(parent => !installedNames.has(parent)
-      && packages.some(owner => owner.manifest.optionalDependencies?.[parent] !== undefined));
-    if (orphaned) leftovers.add(`${entry.name}@${entry.version}`);
+    const location = locations.get(entry);
+    const record = location === undefined ? undefined : lock.packages?.[location];
+    const name = location === undefined ? undefined : packageNameInLockPath(location);
+    if (!record || name === undefined || entry.name !== name) continue;
+    if (typeof entry.version !== 'string' || !exactVersion.test(entry.version) || record.version !== entry.version) continue;
+    if (record.optional !== true || !matchesHost(record.os, record.cpu)) continue;
+    if (!matchesHost(entry.manifest.os, entry.manifest.cpu)) continue;
+    if (!agreeing(recordsNamed(lock, name))) continue;
+    const parents = Object.entries(lock.packages ?? {}).filter(([parentLocation, parent]) => parentLocation.includes('node_modules/')
+      && parent.optional === true && parent.optionalDependencies?.[name] !== undefined
+      && lookupInLock(lock, parentLocation, name) === location);
+    if (parents.length !== 1) continue;
+    const [parentLocation, parent] = parents[0];
+    const parentName = packageNameInLockPath(parentLocation);
+    if (!satisfies(entry.version, parent.optionalDependencies[name])) continue;
+    if (!agreeing(recordsNamed(lock, parentName)) || typeof parent.version !== 'string' || !exactVersion.test(parent.version)) continue;
+    if (installedNames.has(parentName)) continue;
+    const declared = packages.some(owner => {
+      const ownerLocation = locations.get(owner);
+      return ownerLocation !== undefined && lookupInLock(lock, ownerLocation, parentName) === parentLocation
+        && satisfies(parent.version, owner.manifest.optionalDependencies?.[parentName]);
+    });
+    if (declared) leftovers.add(`${entry.name}@${entry.version}`);
   }
   return leftovers;
 }
@@ -257,7 +322,7 @@ export async function verifyDependencyTree({ modules, listing, lock }) {
   for (const entry of packages.filter(candidate => candidate.name === quotaPackageName)) {
     problems.push(`${quotaPackageName} is installed at ${entry.location}`);
   }
-  const leftovers = await leftoverOptionalPackages({ packages, lock });
+  const leftovers = await leftoverOptionalPackages({ modules, packages, lock });
   for (const line of listing.stdout.split('\n')) {
     if (!/\binvalid\b|extraneous|UNMET DEPENDENCY/.test(line)) continue;
     const leftover = /(\S+@\S+) extraneous\s*$/.exec(line);
