@@ -312,6 +312,13 @@ Other starts:
   lifecycle command overlaps a definition change. A start that was already requested from the service manager stays
   `startup-not-confirmed`: Heimdall does not undo it, and `stop` does not report
   `stopped` or `already-stopped` for the target until that call has settled.
+- The operation lock is released only after everything the start began has settled: the
+  service manager call, every write of the launch attempt record, and the assessment of
+  an earlier attempt that the start gave up on at its deadline or on Ctrl-C. A write
+  that is still in flight therefore cannot land after a newer start was admitted and
+  replace or remove its record. The command reports its result at the deadline or on
+  Ctrl-C, but the process and the lock stay until the write or assessment settles; a
+  filesystem call that never returns would hold both.
 - Before it asks the service manager to start, `start` records the launch attempt in a
   private file (`launch-attempt.json`, mode `0600`) in the `lifecycle` state directory.
   The record outlives the command that wrote it and the operation lock, so a `stop`
@@ -319,7 +326,17 @@ Other starts:
   treats the request as possibly in flight: it reports `completion-unknown` and does
   not report `stopped` or `already-stopped`. It sends no stop, kill or removal. The
   record names the released start client (the process group that carries the request
-  to the manager), written before that client can run its tool. It is cleared when the
+  to the manager), written before that client can run its tool: the client is told to
+  run only after the record naming it has been written durably, and one owner per
+  attempt serializes every write and removal of that attempt's record, so a cleared
+  record is never recreated. A client that was told to run and then does not report an
+  exit (the command's deadline or Ctrl-C, the tool's own timeout, a death by signal, a
+  launcher that dies while the tool lives, or more than 1 MiB of output on stdout or
+  stderr) is left running: nothing outside the tool's timeout signals it, the output
+  kept is bounded, the record stays, and the start reports `startup-not-confirmed`
+  (error code `launch-failed`) instead of a failure. Only a client that was never told
+  to run, could not be spawned or reported an exit status ends the attempt as
+  definitively not delivered. The record is cleared when the
   authenticated coordinator instance runs as the owned service's main process and no
   recorded client that is not proven finished could still deliver a request, or when
   the service is proven inactive and nothing of the request can still be queued (the
