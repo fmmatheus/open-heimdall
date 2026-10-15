@@ -116,7 +116,8 @@ function statusFor(kind: ErrorKind): number {
   switch (kind) {
     case 'not-found': return 404;
     case 'coordinator-timeout': return 504;
-    case 'coordinator-offline': case 'coordinator-unauthorized': case 'configuration-invalid': case 'coordinator-error': return 503;
+    case 'coordinator-offline': case 'coordinator-unauthorized': case 'configuration-invalid': case 'coordinator-error':
+    case 'coordinator-response-too-large': case 'coordinator-incompatible': return 503;
     default: return 500;
   }
 }

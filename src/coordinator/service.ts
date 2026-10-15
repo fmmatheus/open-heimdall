@@ -225,6 +225,17 @@ async function startOwnedService(options: ServiceOptions, root: string, ownershi
         send(202, acknowledgement); return;
       }
       if (draining && method !== 'GET') { send(503, { error: 'Coordinator is draining; new work is disabled' }); return; }
+      if (method === 'GET' && segments.length === 1 && segments[0] === 'run-list') {
+        const integer = (name: string): number | undefined => {
+          const values = url.searchParams.getAll(name);
+          if (values.length === 0) return undefined;
+          if (values.length !== 1 || !/^(0|[1-9][0-9]*)$/.test(values[0]!)) throw new Error('Invalid run list query');
+          const value = Number(values[0]);
+          if (!Number.isSafeInteger(value)) throw new Error('Invalid run list query');
+          return value;
+        };
+        send(200, store.listRunPage(integer('after'), integer('through'), integer('limit'))); return;
+      }
       if (segments.length === 1 && segments[0] === 'projects') {
         if (method === 'GET') { send(200, store.listProjects()); return; }
         if (method === 'POST') {

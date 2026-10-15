@@ -25,10 +25,11 @@ export function createCoordinatorClient(endpoint: string, accessToken?: string, 
       return new Promise((resolve, reject) => {
         if (signal?.aborted) { reject(abortError()); return; }
         let deadlineTimer: NodeJS.Timeout | undefined;
+        let settled = false;
         const onAbort = () => { fail(abortError()); request.destroy(); };
         const settle = () => { clearTimeout(deadlineTimer); signal?.removeEventListener('abort', onAbort); };
-        const succeed = (value: unknown) => { settle(); resolve(value); };
-        const fail = (error: Error) => { settle(); reject(error); };
+        const succeed = (value: unknown) => { if (settled) return; settled = true; settle(); resolve(value); };
+        const fail = (error: Error) => { if (settled) return; settled = true; settle(); reject(error); };
         const request = http.request({
           socketPath: endpoint, method, path: route,
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, ...(payload === undefined ? {} : { 'Content-Length': Buffer.byteLength(payload) }) },
@@ -36,12 +37,18 @@ export function createCoordinatorClient(endpoint: string, accessToken?: string, 
           const chunks: Buffer[] = [];
           let size = 0;
           response.on('data', (chunk: Buffer) => {
+            if (settled) return;
             size += chunk.length;
-            if (size > 2 * 1024 * 1024) response.destroy(new Error('Coordinator response is too large'));
-            else chunks.push(chunk);
+            if (size > 2 * 1024 * 1024) {
+              const error = Object.assign(new Error('Coordinator response is too large'), { code: 'response-too-large' });
+              // Socket teardown can emit a request error first; preserve the known failure before closing it.
+              fail(error);
+              response.destroy(error);
+            } else chunks.push(chunk);
           });
           response.on('error', fail);
           response.on('end', () => {
+            if (settled) return;
             let value: unknown;
             try { value = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
             catch { fail(new Error('Invalid coordinator JSON response')); return; }
@@ -54,7 +61,10 @@ export function createCoordinatorClient(endpoint: string, accessToken?: string, 
           });
         });
         request.setTimeout(timeoutMs, () => request.destroy(new Error('Coordinator request timed out')));
-        request.on('error', error => fail(new Error(`Coordinator unavailable: ${error.message}`)));
+        request.on('error', error => {
+          const code = (error as NodeJS.ErrnoException).code;
+          fail(Object.assign(new Error(`Coordinator unavailable: ${error.message}`, { cause: error }), code === undefined ? {} : { code }));
+        });
         signal?.addEventListener('abort', onAbort, { once: true });
         if (deadlineMs !== undefined) {
           // Reject directly: once headers have arrived, destroying the request may not emit a request 'error'.

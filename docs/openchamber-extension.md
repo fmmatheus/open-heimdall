@@ -4,6 +4,12 @@ A read-only Heimdall panel for OpenChamber (version **0.1.1**). It lists
 coordinator runs, shows a compact overview of each run, opens the run's existing
 OpenCode sessions, and reviews the files a run changed in its managed worktree.
 
+The runs list loads bounded summary pages rather than all saved checkpoints.
+Full run details stay available on demand; listing never alters saved history.
+A failed connection is shown as unreachable, and an oversized response has its
+own message rather than claiming the coordinator stopped. Update the coordinator
+and extension together; older coordinators report that the list needs an update.
+
 ## Reading a run
 
 Selecting a run shows a compact **overview**: label, project, one status badge,

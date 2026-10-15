@@ -12,6 +12,8 @@ import {
 } from '../workflow/submission-store.js';
 import type { NativeOutcome, RunState, SubmissionReceipt } from '../workflow/types.js';
 import type { CoordinatorEvent, ProjectRecord, Receipt, RunRecord, RunStatus, StartBinding } from './types.js';
+import { RUN_LIST_FEATURE_HEAD, RUN_LIST_MAX_BYTES, RUN_LIST_PAGE_SIZE } from './run-list.js';
+import type { RunListEntry, RunListPage } from './run-list.js';
 
 type Row = Record<string, SQLOutputValue>;
 type ProjectInput = Omit<ProjectRecord, 'id' | 'createdAt'>;
@@ -296,6 +298,64 @@ export class CoordinatorStore {
   }
 
   listRuns(): RunRecord[] { return this.db.prepare('SELECT * FROM runs ORDER BY created_at, rowid').all().map(runFromRow); }
+  /** Read-only, bounded projection: never deserialize specifications or full checkpoints for a list. */
+  listRunPage(after = 0, through?: number, limit = RUN_LIST_PAGE_SIZE): RunListPage {
+    for (const cursor of [after, through ?? 0]) {
+      if (!Number.isSafeInteger(cursor) || cursor < 0) throw new Error('Run list cursor must be a nonnegative safe integer');
+    }
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > RUN_LIST_PAGE_SIZE) throw new Error('Invalid run list page size');
+    const fence = through ?? Number(this.db.prepare('SELECT coalesce(max(rowid), 0) AS cursor FROM runs').get()!.cursor);
+    const total = Number(this.db.prepare('SELECT count(*) AS count FROM runs WHERE rowid <= ?').get(fence)!.count);
+    const rows = this.db.prepare(`SELECT rowid AS cursor, id, project_id, worktree_path, status, created_at, updated_at,
+      substr(CAST(feature AS BLOB), 1, ? * 4) AS feature_head,
+      CASE json_extract(checkpoint_json, '$.phase') WHEN 'planner' THEN 'planner' WHEN 'executor' THEN 'executor' END AS phase,
+      coalesce(json_array_length(checkpoint_json, '$.tasks'), 0) AS task_count,
+      coalesce(json_array_length(checkpoint_json, '$.results'), 0) AS completed_count,
+      CASE WHEN json_type(checkpoint_json, '$.index') = 'integer'
+        AND json_extract(checkpoint_json, '$.index') >= 0
+        AND json_extract(checkpoint_json, '$.index') < json_array_length(checkpoint_json, '$.tasks')
+        AND json_type(checkpoint_json, '$.tasks[' || json_extract(checkpoint_json, '$.index') || ']') = 'object'
+        THEN json_extract(checkpoint_json, '$.index') END AS task_index,
+      CASE WHEN json_type(checkpoint_json, '$.index') = 'integer'
+        AND json_extract(checkpoint_json, '$.index') >= 0
+        AND json_extract(checkpoint_json, '$.index') < json_array_length(checkpoint_json, '$.tasks')
+        AND json_type(checkpoint_json, '$.tasks[' || json_extract(checkpoint_json, '$.index') || '].id') = 'text'
+        THEN substr(CAST(json_extract(checkpoint_json, '$.tasks[' || json_extract(checkpoint_json, '$.index') || '].id') AS BLOB), 1, 484) END AS task_id,
+      CASE WHEN json_type(checkpoint_json, '$.index') = 'integer'
+        AND json_extract(checkpoint_json, '$.index') >= 0
+        AND json_extract(checkpoint_json, '$.index') < json_array_length(checkpoint_json, '$.tasks')
+        AND json_type(checkpoint_json, '$.tasks[' || json_extract(checkpoint_json, '$.index') || '].title') = 'text'
+        THEN substr(CAST(json_extract(checkpoint_json, '$.tasks[' || json_extract(checkpoint_json, '$.index') || '].title') AS BLOB), 1, 804) END AS task_title
+      FROM runs WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?`).all(RUN_LIST_FEATURE_HEAD, after, fence, limit);
+    const page: RunListPage = { runs: [], total, nextCursor: null, through: fence };
+    let cursor = after;
+    let bytes = Buffer.byteLength(JSON.stringify(page)) + 32;
+    // SQLite's text substr stops at NUL. Bound UTF-8 bytes instead, then apply the display's UTF-16 scan limit.
+    const head = (value: SQLOutputValue, length: number): string => Buffer.from(value as Uint8Array).toString('utf8').slice(0, length);
+    for (const row of rows) {
+      const totalTasks = Number(row.task_count);
+      const entry: RunListEntry = {
+        id: String(row.id), projectId: String(row.project_id), worktreePath: String(row.worktree_path),
+        status: row.status as RunStatus, createdAt: Number(row.created_at), updatedAt: Number(row.updated_at),
+        feature: head(row.feature_head!, RUN_LIST_FEATURE_HEAD),
+        progress: {
+          phase: typeof row.phase === 'string' ? row.phase : null, total: totalTasks, completed: Number(row.completed_count),
+          currentTask: row.phase === 'executor' && row.status !== 'succeeded' && row.task_index !== null
+            ? { id: row.task_id === null ? `task-${Number(row.task_index) + 1}` : head(row.task_id!, 121), title: row.task_title === null ? '' : head(row.task_title!, 201) } : null,
+        },
+      };
+      const size = Buffer.byteLength(JSON.stringify(entry)) + 1;
+      if (bytes + size > RUN_LIST_MAX_BYTES) {
+        if (page.runs.length === 0) throw new Error('Run list entry exceeds the response size limit');
+        break;
+      }
+      page.runs.push(entry);
+      bytes += size;
+      cursor = Number(row.cursor);
+    }
+    if (this.db.prepare('SELECT 1 FROM runs WHERE rowid > ? AND rowid <= ? LIMIT 1').get(cursor, fence)) page.nextCursor = cursor;
+    return page;
+  }
   getRun(id: string): RunRecord | null {
     const row = this.db.prepare('SELECT * FROM runs WHERE id = ?').get(id);
     return row ? runFromRow(row) : null;

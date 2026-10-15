@@ -98,6 +98,59 @@ test('coordinator client honours an optional timeout and rejects invalid ones', 
   assert.equal(typeof createCoordinatorClient(socket, 'k').request, 'function');
 });
 
+test('oversized coordinator responses stay data-size failures through the client and extension adapter', async t => {
+  const temporary = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'hd-')));
+  t.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const socket = path.join(temporary, 's.sock');
+  let receivedToken;
+  const server = http.createServer((request, response) => {
+    receivedToken = request.headers.authorization;
+    response.end(JSON.stringify({ text: 'x'.repeat(2 * 1024 * 1024) }));
+  });
+  await new Promise(resolve => server.listen(socket, resolve));
+  t.after(() => { server.close(); server.closeAllConnections(); });
+  const token = 'k'.repeat(64);
+  const client = createCoordinatorClient(socket, token);
+  await assert.rejects(client.request('GET', '/projects'), error => {
+    assert.equal(error.code, 'response-too-large');
+    assert.equal(error.message, 'Coordinator response is too large');
+    return true;
+  });
+  assert.equal(receivedToken, `Bearer ${token}`);
+
+  const adapter = createCoordinatorAdapter({
+    loadConfiguration: async () => ({ stateDirectory: temporary, endpoint: socket, globalConcurrency: 1, projectConcurrency: 1 }),
+    readToken: async () => token,
+  });
+  await assert.rejects(adapter.projects(), error => {
+    assert.equal(error.kind, 'coordinator-response-too-large');
+    assert.equal(error.message.includes(temporary), false);
+    assert.equal(error.message.includes(token), false);
+    assert.doesNotMatch(error.message, /not running|unavailable|could not be reached/);
+    return true;
+  });
+  const extension = await listening(t, { token: SERVICE_TOKEN, adapter });
+  const oversized = await call(extension, { path: '/projects' });
+  assert.equal(oversized.status, 503);
+  assert.equal(oversized.json.error.kind, 'coordinator-response-too-large');
+  assert.equal(oversized.json.error.message, 'The Heimdall coordinator response is too large to load.');
+  assert.doesNotMatch(oversized.text, /not running|could not be reached/);
+  assert.equal(oversized.text.includes(temporary), false);
+  assert.equal(oversized.text.includes(token), false);
+});
+
+test('coordinator transport wrapping preserves the original failure code and cause', async t => {
+  const temporary = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'hd-')));
+  t.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const client = createCoordinatorClient(path.join(temporary, 'missing.sock'), 'k'.repeat(64));
+  await assert.rejects(client.request('GET', '/projects'), error => {
+    assert.equal(error.code, 'ENOENT');
+    assert.equal(error.cause.code, 'ENOENT');
+    assert.match(error.message, /^Coordinator unavailable:/);
+    return true;
+  });
+});
+
 test('service rejects every request without the exact bearer token and binds loopback only', async t => {
   const f = await fixture(t);
   const adapter = createCoordinatorAdapter({ configPath: f.configPath });
@@ -280,13 +333,24 @@ test('adapter maps rejected keys, bad configuration and timeouts to fixed saniti
   });
   await assert.rejects(slow.runs(), error => error.kind === 'coordinator-timeout');
 
+  for (const error of [
+    new Error('Coordinator unavailable: Coordinator response is too large'),
+    Object.assign(new Error('Coordinator unavailable: hidden transport detail'), { code: 'response-too-large' }),
+  ]) {
+    const oversized = createCoordinatorAdapter({
+      configPath: f.configPath,
+      clientFactory: () => ({ request: async () => { throw error; } }),
+    });
+    await assert.rejects(oversized.projects(), mapped => mapped.kind === 'coordinator-response-too-large' && !mapped.message.includes('hidden'));
+  }
+
   // Failure drops the cached client: the next call reloads configuration and key.
   let reads = 0;
   let healthy = false;
   const reconnecting = createCoordinatorAdapter({
     configPath: f.configPath,
     readToken: async () => { reads++; return 'a'.repeat(64); },
-    clientFactory: () => ({ request: async () => { if (!healthy) throw new Error('Coordinator unavailable: connect ECONNREFUSED'); return []; } }),
+    clientFactory: () => ({ request: async (_method, route) => { if (!healthy) throw new Error('Coordinator unavailable: connect ECONNREFUSED'); return route.startsWith('/run-list') ? { runs: [], total: 0, nextCursor: null, through: 0 } : []; } }),
   });
   await assert.rejects(reconnecting.projects(), error => error.kind === 'coordinator-offline');
   await assert.rejects(reconnecting.projects(), error => error.kind === 'coordinator-offline');
@@ -305,7 +369,7 @@ test('adapter exposes no mutating method and issues only GET requests on allowed
     clientFactory: (endpoint, token, options) => {
       assert.equal(options.timeoutMs, 8000);
       return {
-        request: async (...args) => { calls.push(args); return []; },
+        request: async (...args) => { calls.push(args); return args[1].startsWith('/run-list') ? { runs: [], total: 0, nextCursor: null, through: 0 } : []; },
         // Anything beyond `request` would be a mutation path; the adapter never sees one.
       };
     },
@@ -316,11 +380,25 @@ test('adapter exposes no mutating method and issues only GET requests on allowed
   await adapter.run('run_1-A');
   await adapter.events(7);
   assert.deepEqual(calls, [
-    ['GET', '/projects'], ['GET', '/runs'], ['GET', '/runs/run_1-A'], ['GET', '/events?after=7'],
+    ['GET', '/projects'], ['GET', '/run-list?after=0'], ['GET', '/runs/run_1-A'], ['GET', '/events?after=7'],
   ]);
   const source = await fs.readFile(path.join(root, 'src', 'extension', 'service', 'coordinator.ts'), 'utf8');
   assert.doesNotMatch(source, /'(POST|PUT|PATCH|DELETE)'/);
   assert.doesNotMatch(source, /\/reconcile|\/resume|\/checkpoint|\/binding|\/receipts?/);
+});
+
+test('an older coordinator reports an explicit update requirement without fetching the full history', async () => {
+  const calls = [];
+  const adapter = createCoordinatorAdapter({
+    loadConfiguration: async () => ({ stateDirectory: '/unused', endpoint: '/unused/coordinator.sock', globalConcurrency: 1, projectConcurrency: 1 }),
+    readToken: async () => 'b'.repeat(64),
+    clientFactory: () => ({ request: async (method, route) => {
+      calls.push([method, route]);
+      throw Object.assign(new Error('Unknown coordinator route'), { statusCode: 404 });
+    } }),
+  });
+  await assert.rejects(adapter.runs(), error => error.kind === 'coordinator-incompatible');
+  assert.deepEqual(calls, [['GET', '/run-list?after=0']]);
 });
 
 test('built service bundle has no node:sqlite, refuses to start without env, and enforces auth', async t => {
