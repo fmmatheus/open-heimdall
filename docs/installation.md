@@ -41,7 +41,7 @@ The tarball is named after the package and version, for example
 `npm run build`, but it packs whatever is in the checkout's `dist/`;
 `pack:clean` is the supported way to build a tarball.
 
-The tarball contains the built CLI, prompts, examples and these docs. It does not
+The tarball contains the built CLI, prompts, skills, examples and these docs. It does not
 contain sources, tests, the OpenChamber extension build or `node_modules`. See
 [Packaging](development.md#packaging) for the inventory and the reason the quota
 provider modules are vendored.
@@ -74,7 +74,7 @@ npm config set prefix "$HOME/.local"
 Then make sure `$HOME/.local/bin` is on your `PATH` (add it to your shell
 profile) and open a new shell. Check with `command -v heimdall`. `npm prefix
 --global` shows the prefix npm is using; the installed package, including its
-`examples/` and `docs/`, is under `$(npm root --global)/@open-heimdall/core`.
+`skills/`, `examples/` and `docs/`, is under `$(npm root --global)/@open-heimdall/core`.
 
 To remove it later, run `npm uninstall --global @open-heimdall/core` with the same
 prefix. Configuration and state files are never removed by npm.

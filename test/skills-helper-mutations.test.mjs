@@ -927,6 +927,54 @@ test('start from a linked worktree creates exactly one run for the registered pr
   assert.equal(countOf(await f.calls(), 'run submit'), 1);
 });
 
+test('start from a linked worktree registers the main worktree, never the disposable linked directory', async t => {
+  const f = await coordinatorFixture(t);
+  const other = await makeRepository(f.env, f.root, 'third repository');
+  await fs.writeFile(path.join(other, '.heimdall.toml'), PROJECT_CONFIGURATION);
+  const linked = path.join(f.root, 'third linked worktree');
+  await gitIn(f.env, other, 'worktree', 'add', '-q', '-b', 'third-linked', linked, 'HEAD~1');
+  await fs.writeFile(path.join(linked, 'spec.md'), '# Third\n\nBuild it.\n');
+  const before = f.state();
+  await f.reset();
+  const start = (...args) => runHelper(['start', '--cwd', linked, '--spec', 'spec.md', '--coordinator-config', f.configFile, ...args], f.env);
+
+  let result = await start();
+  assert.equal(result.report.outcome, 'needs-registration');
+  assert.equal(result.report.directory, other, 'the proposed project directory is the main worktree');
+  assertNoMutation(await f.calls());
+  assert.deepEqual(f.state(), before);
+
+  await f.reset();
+  result = await start('--register');
+  assert.equal(result.report.outcome, 'submitted', result.text);
+  const calls = await f.calls();
+  assert.deepEqual(calls.find(argv => verbOf(argv) === 'project add'), ['coordinator', 'project', 'add', other, '--coordinator-config', f.configFile]);
+  const registered = f.service.store.listProjects().find(project => project.directory === other);
+  assert.ok(registered, 'the main worktree is the registered directory');
+  assert.ok(!f.service.store.listProjects().some(project => project.directory === linked));
+  assert.ok(result.report.notices.some(notice => notice.includes(other) && /linked worktree/i.test(notice)));
+});
+
+test('start refuses to register when the main worktree cannot be derived from the Git directory', async t => {
+  const f = await coordinatorFixture(t);
+  const base = path.join(f.root, 'detached git dir');
+  const work = path.join(base, 'work');
+  await fs.mkdir(work, { recursive: true });
+  await exec('git', ['-C', work, 'init', '-q', '--separate-git-dir', path.join(base, 'store.git')], { env: f.env });
+  await gitIn(f.env, work, 'symbolic-ref', 'HEAD', 'refs/heads/main');
+  await fs.writeFile(path.join(work, 'file.txt'), 'x\n');
+  await gitIn(f.env, work, 'add', '.');
+  await gitIn(f.env, work, 'commit', '-q', '-m', 'one');
+  await fs.writeFile(path.join(work, 'spec.md'), '# Detached\n\nBuild it.\n');
+  const before = f.state();
+  await f.reset();
+  const result = await runHelper(['start', '--cwd', work, '--spec', 'spec.md', '--register', '--coordinator-config', f.configFile], f.env);
+  assert.equal(result.report.outcome, 'needs-registration');
+  assert.equal(result.report.reason, 'registration-directory-unknown');
+  assertNoMutation(await f.calls());
+  assert.deepEqual(f.state(), before);
+});
+
 test('start registers an unregistered repository only with --register, adds it once with no extra options, and reuses it afterwards', async t => {
   const f = await coordinatorFixture(t);
   const other = await makeRepository(f.env, f.root, 'second repository');

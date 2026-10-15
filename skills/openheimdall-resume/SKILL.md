@@ -16,9 +16,11 @@ Not for: a new task spec (`openheimdall-start`), a status check (`openheimdall-m
 
 ## Helper
 
-The helper is `scripts/openheimdall.mjs` inside this skill's own directory. The host prints that directory when it loads the skill ("Base directory for this skill"); if it does not, use the directory that contains this `SKILL.md`. Call it with Node, one quoted argument per value:
+The helper is `scripts/openheimdall.mjs` inside this skill's own directory. The host prints that directory when it loads the skill ("Base directory for this skill"); if it does not, use the directory that contains this `SKILL.md`. Call it with Node. Put every path, ref and other value in single quotes, one quoted argument per value:
 
-`node "<skill directory>/scripts/openheimdall.mjs" <command> --cwd "<user's working directory>" [--coordinator-config "<file>"] ...`
+`node '<skill directory>/scripts/openheimdall.mjs' <command> --cwd '<working directory>' [--coordinator-config '<file>'] ...`
+
+Single quotes keep `$(...)`, backticks and `$VAR` in a path or ref literal; double quotes do not. Write each single quote inside a value as `'\''` (end the quote, an escaped quote, restart the quote). If the host shell is not POSIX-style or a value cannot be quoted safely, ask the user to rename the path instead of guessing.
 
 - `--cwd` is the directory the user is working in, not the skill directory. Relative guidance paths resolve against it.
 - Pass `--coordinator-config` only when the user named a coordinator configuration, and then pass the same value on every call. Otherwise omit it.
@@ -32,10 +34,10 @@ The helper is `scripts/openheimdall.mjs` inside this skill's own directory. The 
    - paused but capacity still reserved: the coordinator has not confirmed the run idle; do not force it, wait and look again.
    - `reconciliation-required`: the outcome is uncertain; recovery is a separate owner decision. Do not reconcile, and do not clear locks or checkpoints.
    - succeeded or failed: finished; it cannot be resumed.
-3. **Show the blocker only briefly** (`run.blocker`) so the user can confirm their guidance answers it. If the guidance obviously does not address the blocker, say so; the user decides.
+3. **Show the blocker only briefly** (`run.blocker`) so the user can confirm their guidance answers it. If `run.blockerTruncated` is true, say that the text is cut. If the guidance obviously does not address the blocker, say so; the user decides.
 4. **Prepare the guidance as data.**
    - File given: pass it as `--guidance-file FILE`.
-   - Text given: write the exact text, unmodified, to a new file with the host's file-writing tool (outside the repository, for example in the system temporary directory), then pass `--guidance-file`. Use `--guidance-stdin` only when the host can supply the text as standard input without it appearing in the command text.
+   - Text given: write the exact text, unmodified, to a new, uniquely named file with the host's file-writing tool (outside the repository, for example in the system temporary directory; never reuse or overwrite an existing file), then pass `--guidance-file`. Guidance may be sensitive: after the resume report is produced, remove that file with the host's tooling, whatever the outcome. Use `--guidance-stdin` only when the host can supply the text as standard input without it appearing in the command text.
    - Never put guidance into the command line, an environment variable or a shell here-string; never pass the file name instead of its contents; never summarise or edit it.
 5. **Resume once.** Run `resume RUN_ID --guidance-file FILE` exactly one time. The helper re-checks that the run is a confirmed idle paused run, labels the guidance as a transport message that keeps it verbatim (so leading dashes are safe) and sends one resume request.
 6. **Interpret the result.** `resumed`: the coordinator accepted the resume and queued the same run again; it is not running until admitted, and may already have progressed or paused again. Check `preserved` (run ID, worktree, branch, parent session) and `completedResults` (before and after) and report them. `not-resumable`, `refused`, `rejected`, `not-resumed`, `not-found`: nothing was sent or the coordinator refused; give the reason. `uncertain`: see Rules.

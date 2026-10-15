@@ -251,3 +251,44 @@ test('start and resume skills do not name commands the helper must never run', (
     }
   }
 });
+
+test('the helper command template single-quotes every value and states the escaping rule', () => {
+  for (const name of expectedSkills) {
+    const { body } = loaded.get(name);
+    assert.match(body, /node '<skill directory>\/scripts\/openheimdall\.mjs' <command> --cwd '<working directory>'/, `${name}: template is not single-quoted`);
+    assert.ok(!/"<[^">]*>"/.test(body), `${name}: a placeholder is double-quoted, so the shell would expand $(...) or backticks in it`);
+    assert.ok(body.includes("'\\''"), `${name}: does not give the single-quote escape '\\''`);
+    assert.match(body, /ask the user to rename/i, `${name}: no fallback for values that cannot be quoted`);
+    assert.match(body, /single quotes/i, name);
+  }
+  assert.match(loaded.get('openheimdall-start').body, /file paths as separate single-quoted arguments/);
+});
+
+test('single-quoting a value as the skills document it keeps shell syntax literal', { skip: process.platform === 'win32' }, async t => {
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const os = await import('node:os');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'skills-quote-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
+  const specification = path.join(directory, "spec $(echo INJECTED) `echo INJECTED` it's \"q\".md");
+  fs.writeFileSync(specification, '# Feature\n\nDo it.\n');
+  const helper = path.join(skillsRoot, 'openheimdall-start', helperRelative);
+  const command = `node ${quote(helper)} inspect-spec ${quote(specification)} --cwd ${quote(directory)}`;
+  const { stdout } = await promisify(execFile)('/bin/sh', ['-c', command]);
+  const report = JSON.parse(stdout);
+  assert.equal(report.usable, true, stdout);
+  assert.ok(!stdout.includes('INJECTED') || stdout.includes('$(echo INJECTED)'), 'the shell expanded text inside the quoted value');
+});
+
+test('the monitor skill allows reads only through the helper, with the same coordinator selection', () => {
+  const { body } = loaded.get('openheimdall-monitor');
+  assert.ok(!/heimdall (?:coordinator )?(?:run show|status)/.test(body), 'plain CLI reads would print whole run records and skip --coordinator-config');
+});
+
+test('the resume skill writes guidance to a uniquely named file and removes it afterwards', () => {
+  const { body } = loaded.get('openheimdall-resume');
+  assert.match(body, /unique(?:ly named)? (?:file )?name|new, uniquely named file/i);
+  assert.match(body, /(?:remove|delete) (?:that|the) (?:temporary )?file/i);
+  assert.match(body, /may be sensitive/i);
+});

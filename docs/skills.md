@@ -32,7 +32,10 @@ The skills run the coordinator workflow; they do not set it up.
    checks the installation.
 2. A Git project with at least one commit. Starting a run needs the project to
    be registered with the coordinator (the start skill can do this when you name
-   or confirm the repository) and to have a valid project configuration.
+   or confirm the repository) and to have a valid project configuration. When
+   started from a linked worktree, the start skill registers the repository's
+   main worktree, never the linked directory, and asks you to register the
+   project yourself if the main worktree cannot be derived from the Git directory.
 3. A running coordinator, unless you ask the start skill to start it
    ([Coordinator operation](coordinator.md#background-service-start-stop-and-logs)).
    The monitor and resume skills never start one.
@@ -237,9 +240,18 @@ Values outside the range are rejected, not adjusted. A watch prints one line per
 real change, nothing for an unchanged state, and ends when the run pauses or
 reaches a terminal state, when the budget ends, when it is interrupted or when
 the coordinator becomes unreachable. If your host limits how long a command may
-run, ask for a budget below that limit. Ending a watch never affects the run. A
+run, ask for a budget below that limit. A watch can overrun its budget by up to
+one command timeout (30 seconds) when a coordinator read is in flight; it is
+still finite. Ending a watch never affects the run. A
 reserved capacity slot is not proof that an agent is active and a quiet run is not
 proof of a stall.
+
+## Advanced: helper binary override
+
+The helper runs `heimdall` from `PATH`. Setting `HEIMDALL_BIN` to an executable
+path makes it run that binary instead. This exists for tests and the evaluation
+kit; normal use does not need it. Reports show a blocker up to 1500 characters
+and set `blockerTruncated` when the text was cut.
 
 ## Uncertain outcomes
 

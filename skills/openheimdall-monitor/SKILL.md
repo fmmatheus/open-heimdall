@@ -16,19 +16,21 @@ Not for creating runs or acting on a blocker; see Prohibitions for where to send
 
 ## Helper
 
-The helper is `scripts/openheimdall.mjs` inside this skill's own directory. The host prints that directory when it loads the skill ("Base directory for this skill"); if it does not, use the directory that contains this `SKILL.md`. Call it with Node, one quoted argument per value:
+The helper is `scripts/openheimdall.mjs` inside this skill's own directory. The host prints that directory when it loads the skill ("Base directory for this skill"); if it does not, use the directory that contains this `SKILL.md`. Call it with Node. Put every path, ref and other value in single quotes, one quoted argument per value:
 
-`node "<skill directory>/scripts/openheimdall.mjs" <command> --cwd "<user's working directory>" [--coordinator-config "<file>"] ...`
+`node '<skill directory>/scripts/openheimdall.mjs' <command> --cwd '<working directory>' [--coordinator-config '<file>'] ...`
+
+Single quotes keep `$(...)`, backticks and `$VAR` in a path or ref literal; double quotes do not. Write each single quote inside a value as `'\''` (end the quote, an escaped quote, restart the quote). If the host shell is not POSIX-style or a value cannot be quoted safely, ask the user to rename the path instead of guessing.
 
 - `--cwd` is the directory the user is working in, not the skill directory.
 - Pass `--coordinator-config` only when the user named a coordinator configuration, and then pass the same value on every call. Otherwise omit it.
 - Output is JSON on stdout. Exit 0 = a report, 1 = coordinator or transport failure, 2 = usage error.
-- Read commands: `snapshot [RUN_ID]`, `watch [RUN_ID] [--budget-seconds N] [--interval-seconds N]`, `context`. Plain `heimdall run show RUN_ID` and `heimdall status --json` are also read-only.
+- Read commands: `snapshot [RUN_ID]`, `watch [RUN_ID] [--budget-seconds N] [--interval-seconds N]`, `context`.
 
 ## Procedure
 
-1. **Pick the run.** Use the run ID the user gave. Otherwise run `snapshot` without an ID: it uses the managed run branch of the working directory, else the single active run of the matching project. If it answers `needs-run-id`, show its `reason` and candidates and ask which run; do not report another run as the user's. If it answers `none`, say there is no active run. A run list can be incomplete or too large, so a run missing from it is not proof that it does not exist; `run show RUN_ID` is authoritative.
-2. **Take one snapshot.** Run `snapshot RUN_ID`. Read `run.status` and `run.stateClass`, `run.progress`, `run.currentTask`, `run.blocker`, `run.worktreePath`, `run.branch`, `run.parentSessionId` and `limits`.
+1. **Pick the run.** Use the run ID the user gave. Otherwise run `snapshot` without an ID: it uses the managed run branch of the working directory, else the single active run of the matching project. If it answers `needs-run-id`, show its `reason` and candidates and ask which run; do not report another run as the user's. If it answers `none`, say there is no active run. A run list can be incomplete or too large, so a run missing from it is not proof that it does not exist; `snapshot RUN_ID` is authoritative.
+2. **Take one snapshot.** Run `snapshot RUN_ID`. Read `run.status` and `run.stateClass`, `run.progress`, `run.currentTask`, `run.blocker`, `run.worktreePath`, `run.branch`, `run.parentSessionId` and `limits`. If `run.blockerTruncated` is true, say that the blocker text is cut.
 3. **Interpret carefully.**
    - `queued`: accepted, waiting for a slot. `admitted` (preparing): a worktree is being prepared. `executing`: a task is in progress. `paused`: the run stopped for an owner decision. `succeeded` or `failed`: finished. `reconciliation-required`: the outcome is uncertain and needs the owner.
    - A reserved capacity slot does not prove that an agent is active. A quiet run is not proof of a stall; the record changes only when the coordinator records something.

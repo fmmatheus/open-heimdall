@@ -259,7 +259,8 @@ test('run projection is compact and never carries the feature, checkpoint bodies
   assert.equal(projected.phase, 'executor');
   assert.deepEqual(projected.progress, { completed: 1, total: 2 });
   assert.deepEqual(projected.currentTask, { id: 'T2', title: 'Second task' });
-  assert.ok(projected.blocker.length <= 300 && projected.blocker.startsWith('Blocked needs an owner decision'));
+  assert.ok(projected.blocker.length <= 1500 && projected.blocker.startsWith('Blocked needs an owner decision'));
+  assert.equal(projected.blockerTruncated, false, 'a blocker within the limit is complete');
   assert.equal(projected.parentSessionId, 'ses_parent');
   assert.equal(projected.updatedAt, new Date(1700000100000).toISOString());
   const text = JSON.stringify(projected);
@@ -273,6 +274,17 @@ test('run projection is compact and never carries the feature, checkpoint bodies
   assert.equal(projectRun(runRecord({ checkpoint: { ...runRecord().checkpoint, phase: 'planner' } })).currentTask, null);
   assert.equal(projectRun(runRecord({ checkpoint: { ...runRecord().checkpoint, tasks: [{}, {}], index: 0 } })).currentTask.id, 'task-1');
   assert.throws(() => projectRun({}), /unexpected shape/);
+});
+
+test('a long blocker keeps its closing question and is flagged only when it is actually cut', () => {
+  const question = 'Which format should the export use: plain or json?';
+  const long = projectRun(runRecord({ status: 'paused', capacityReserved: false, reason: `${'Context. '.repeat(100)}${question}` }));
+  assert.ok(long.blocker.endsWith(question), 'the closing question survives');
+  assert.equal(long.blockerTruncated, false);
+  const huge = projectRun(runRecord({ status: 'paused', capacityReserved: false, reason: `${'y'.repeat(20000)}${question}` }));
+  assert.ok(huge.blocker.length <= 1500, 'still bounded');
+  assert.equal(huge.blockerTruncated, true, 'a cut blocker says so');
+  assert.equal(projectRun(runRecord({ status: 'running', reason: 'stale' })).blockerTruncated, false);
 });
 
 test('state keys ignore bare timestamp refreshes; stop reasons cover paused and terminal states', () => {
