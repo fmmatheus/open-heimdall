@@ -40,8 +40,8 @@ replaced by a stub that fails. It needs registry access, uses isolated HOME and 
 cache/configuration, and is not part of `npm test`. `test/package/helpers.mjs`
 holds the reusable tarball and install helpers.
 
-The tarball contains `dist` (without source maps), `prompts`, `examples`, `README.md`
-and `docs`. It excludes `src`, `test`, `scripts`, `node_modules`, lockfiles,
+The tarball contains `dist` (without source maps), `prompts`, `examples`, `skills`,
+`README.md` and `docs`. It excludes `src`, `test`, `scripts`, `node_modules`, lockfiles,
 `.heimdall` and the extension outputs. `dist/extension/**` is compiled from the
 OpenChamber extension sources and imports the `@openchamber/sdk` development
 dependency; no export or CLI path imports it, so it is not part of the core package

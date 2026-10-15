@@ -23,6 +23,7 @@
     "!dist/openchamber-extension",
     "prompts",
     "examples",
+    "skills",
     "README.md",
     "docs"
   ],
