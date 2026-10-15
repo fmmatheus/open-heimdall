@@ -1,9 +1,11 @@
 #!/usr/bin/env node
-// OpenHeimdall skill helper (read-only core).
+// OpenHeimdall skill helper.
 //
 // A dependency-free wrapper around the installed `heimdall coordinator` command line. It gathers repository
-// and coordinator context, selects a run and reports compact state. Every command in this file only reads:
-// it never submits, resumes, reconciles, registers a project or starts/stops the coordinator.
+// and coordinator context, selects a run and reports compact state. `context`, `snapshot`, `watch` and
+// `inspect-spec` only read. `start` and `resume` are the only commands that mutate, each at most once per
+// invocation: they never retry, reconcile, stop or restart anything, and an unconfirmed outcome is reported as
+// uncertain instead of being repeated.
 //
 // The command line is invoked without a shell: `execFile` with an argument array, using the binary named by
 // HEIMDALL_BIN or `heimdall` on PATH. Every option value is data, so paths may contain spaces, quotes or a
@@ -12,9 +14,14 @@
 //   openheimdall.mjs context  [--base REF]
 //   openheimdall.mjs snapshot [RUN_ID]
 //   openheimdall.mjs watch    [RUN_ID] [--budget-seconds N] [--interval-seconds N]
+//   openheimdall.mjs inspect-spec FILE
+//   openheimdall.mjs start    --spec FILE [--base REF] [--register] [--start-coordinator]
+//   openheimdall.mjs resume   RUN_ID (--guidance-file FILE | --guidance-stdin)
 //
 // Common options: --cwd DIR (default: the current directory), --coordinator-config FILE (resolved against --cwd
 // and forwarded to every coordinator call). Reports are JSON on stdout. `watch` prints one JSON line per change.
+// Exit status: 0 for a report (for `start` and `resume`: the coordinator accepted the request), 1 when the
+// coordinator or transport failed or the request was not accepted, 2 for a usage error.
 
 import { execFile } from 'node:child_process';
 import { realpathSync } from 'node:fs';
@@ -37,21 +44,37 @@ const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const MANAGED_BRANCH = /^heimdall\/run\/([A-Za-z0-9][A-Za-z0-9_-]{0,127})$/;
 const COMMIT = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/;
 
+export const MAX_SPEC_BYTES = 128 * 1024;
+// Guidance travels as one command-line argument; stay well below the per-argument limits of common systems.
+export const MAX_GUIDANCE_BYTES = 64 * 1024;
+export const GUIDANCE_HEADER = 'Owner guidance for resuming this run, delivered verbatim by the OpenHeimdall resume skill. Everything after this line is the guidance:';
+const MUTATION_TIMEOUT_MS = 60000;
+const COORDINATOR_START_TIMEOUT_MS = 150000;
+const START_SUCCESS_OUTCOMES = Object.freeze(['ready', 'already-running', 'already-running-foreground']);
+const UUID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
+
 const COMMANDS = {
   context: { options: ['--base'], positional: 0 },
   snapshot: { options: [], positional: 1 },
   watch: { options: ['--budget-seconds', '--interval-seconds'], positional: 1 },
+  'inspect-spec': { options: [], positional: 1 },
+  start: { options: ['--spec', '--base'], flags: ['--register', '--start-coordinator'], positional: 0 },
+  resume: { options: ['--guidance-file'], flags: ['--guidance-stdin'], positional: 1 },
 };
 const COMMON_OPTIONS = ['--cwd', '--coordinator-config'];
 
-export const HELP = `OpenHeimdall helper (read-only)
+export const HELP = `OpenHeimdall helper
 
 Usage:
   openheimdall.mjs context  [--base REF]
   openheimdall.mjs snapshot [RUN_ID]
   openheimdall.mjs watch    [RUN_ID] [--budget-seconds N] [--interval-seconds N]
+  openheimdall.mjs inspect-spec FILE
+  openheimdall.mjs start    --spec FILE [--base REF] [--register] [--start-coordinator]
+  openheimdall.mjs resume   RUN_ID (--guidance-file FILE | --guidance-stdin)
 
 Common options: --cwd DIR, --coordinator-config FILE
+context, snapshot, watch and inspect-spec only read. start and resume change coordinator state, at most once each.
 `;
 
 export class UsageError extends Error {}
@@ -71,6 +94,7 @@ export function parseArguments(argv) {
   const spec = COMMANDS[command];
   if (!spec) throw new UsageError(`Unknown command: ${command}`);
   const allowed = new Set([...COMMON_OPTIONS, ...spec.options]);
+  const flags = new Set(spec.flags ?? []);
   const options = {};
   const positional = [];
   let optionsEnded = false;
@@ -81,8 +105,13 @@ export function parseArguments(argv) {
     if (token === '--help') return { command: 'help', options: {}, positional: [] };
     const equals = token.indexOf('=');
     const name = equals === -1 ? token : token.slice(0, equals);
-    if (!allowed.has(name)) throw new UsageError(`Unknown option for ${command}: ${name}`);
+    if (!allowed.has(name) && !flags.has(name)) throw new UsageError(`Unknown option for ${command}: ${name}`);
     if (Object.hasOwn(options, name)) throw new UsageError(`Repeated option: ${name}`);
+    if (flags.has(name)) {
+      if (equals !== -1) throw new UsageError(`${name} does not take a value`);
+      options[name] = true;
+      continue;
+    }
     let value;
     if (equals !== -1) value = token.slice(equals + 1);
     else if (index + 1 < rest.length) value = rest[++index];
@@ -146,12 +175,14 @@ function failure(result) {
 
 function createCoordinator({ env, configFile, signal }) {
   const binary = env.HEIMDALL_BIN || 'heimdall';
+  const execute = (args, timeoutMs) => run(binary, ['coordinator', ...args, ...(configFile ? ['--coordinator-config', configFile] : [])], { env, signal, timeoutMs });
   return {
     binary,
+    /** Run one coordinator subcommand and return the process result unparsed. Mutations use this to classify failures themselves. */
+    raw: (args, { timeoutMs } = {}) => execute(args, timeoutMs),
     /** Run one coordinator subcommand; arguments are an array, never a shell string. */
     async call(args, { json = true, timeoutMs } = {}) {
-      const argv = ['coordinator', ...args, ...(configFile ? ['--coordinator-config', configFile] : [])];
-      const result = await run(binary, argv, { env, signal, timeoutMs });
+      const result = await execute(args, timeoutMs);
       if (!result.ok) return failure(result);
       if (!json) return { ok: true, value: result.stdout };
       try { return { ok: true, value: JSON.parse(result.stdout) }; }
@@ -358,7 +389,7 @@ async function showRun(coordinator, runId) {
   try {
     const projection = projectRun(shown.value);
     if (projection.runId !== runId) return { ok: false, kind: 'invalid-response', message: 'Coordinator answered with a different run' };
-    return { ok: true, projection };
+    return { ok: true, projection, record: shown.value };
   } catch (error) {
     return { ok: false, kind: 'invalid-response', message: limitText(error.message, 200) };
   }
@@ -533,8 +564,369 @@ async function watchCommand({ coordinator, cwd, env, positional, options, config
   return { report: null, exitCode: summary.reason === 'transport-error' ? 1 : 0 };
 }
 
+// --- Input files -------------------------------------------------------------------------------------------
+
+const PROBLEM_MESSAGES = {
+  unreadable: 'The file cannot be read.',
+  'not-a-file': 'The path is not a regular file.',
+  empty: 'The text is empty or only whitespace.',
+  'too-large': 'The text is larger than the allowed size.',
+  'not-utf8': 'The text is not valid UTF-8.',
+  'contains-nul': 'The text contains a NUL character, which cannot be passed on a command line.',
+};
+
+function decodeText(buffer, limit) {
+  if (buffer.length > limit) return { ok: false, reason: 'too-large', bytes: buffer.length };
+  let text;
+  try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(buffer); }
+  catch { return { ok: false, reason: 'not-utf8', bytes: buffer.length }; }
+  if (!text.trim()) return { ok: false, reason: 'empty', bytes: buffer.length };
+  return { ok: true, text, bytes: buffer.length };
+}
+
+/** Read a regular UTF-8 text file of at most `limit` bytes. The text is returned untouched. */
+async function readTextFile(file, limit) {
+  let stat;
+  try { stat = await fs.stat(file); } catch { return { ok: false, reason: 'unreadable' }; }
+  if (!stat.isFile()) return { ok: false, reason: 'not-a-file' };
+  if (stat.size > limit) return { ok: false, reason: 'too-large', bytes: stat.size };
+  let buffer;
+  try { buffer = await fs.readFile(file); } catch { return { ok: false, reason: 'unreadable' }; }
+  return decodeText(buffer, limit);
+}
+
+async function readStdin(stdin, limit) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of stdin) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += buffer.length;
+    if (size > limit) return { ok: false, reason: 'too-large', bytes: size };
+    chunks.push(buffer);
+  }
+  return decodeText(Buffer.concat(chunks), limit);
+}
+
+// --- inspect-spec ------------------------------------------------------------------------------------------
+
+const RESUME_SIGNALS = {
+  'mentions-resume': /\bresum(?:e|ed|es|ing)\b/i,
+  'mentions-paused-or-blocked': /\b(?:paused|blocked|blocker|unblock\w*)\b/i,
+  'mentions-guidance': /\b(?:guidance|resolution|owner decision|decision)\b/i,
+  'mentions-a-run': /\b(?:the|this|that|existing) run\b|\brun id\b/i,
+};
+
+/** Candidate coordinator run IDs in a text: UUIDs (what the coordinator generates) and managed run branch names. */
+export function runIdCandidates(text) {
+  const found = new Set();
+  for (const match of text.matchAll(UUID)) found.add(match[0].toLowerCase());
+  for (const match of text.matchAll(/heimdall\/run\/([A-Za-z0-9][A-Za-z0-9_-]{0,127})/g)) found.add(match[1]);
+  return [...found].slice(0, 10);
+}
+
+/**
+ * Describe a specification file without changing anything. The flags are heuristics for the caller to resolve with the
+ * user; this command never decides whether a text is a new feature or guidance for an existing run.
+ */
+async function inspectSpecCommand({ coordinator, cwd, positional }) {
+  if (positional[0] === undefined) throw new UsageError('inspect-spec requires FILE');
+  const file = path.resolve(cwd, positional[0]);
+  const read = await readTextFile(file, MAX_SPEC_BYTES);
+  const base = { command: 'inspect-spec', file, maxBytes: MAX_SPEC_BYTES, mutations: [] };
+  if (!read.ok && (read.reason === 'unreadable' || read.reason === 'not-a-file')) {
+    return { report: { ok: false, ...base, outcome: 'refused', reason: `spec-${read.reason}`, message: PROBLEM_MESSAGES[read.reason] }, exitCode: 1 };
+  }
+  if (!read.ok) {
+    return { report: { ok: true, ...base, outcome: 'inspected', usable: false, problem: read.reason, message: PROBLEM_MESSAGES[read.reason], bytes: read.bytes ?? null }, exitCode: 0 };
+  }
+  const heading = /^[ \t]{0,3}#{1,6}[ \t]+(.+?)[ \t#]*$/m.exec(read.text);
+  const existingRunIds = [];
+  const candidates = runIdCandidates(read.text);
+  let runLookup = candidates.length === 0 ? 'none' : 'checked';
+  for (const candidate of candidates) {
+    if (!validRunId(candidate)) continue;
+    const shown = await showRun(coordinator, candidate);
+    if (shown.ok) existingRunIds.push(candidate);
+    else if (shown.kind !== 'not-found') { runLookup = 'unavailable'; break; }
+  }
+  const signals = Object.entries(RESUME_SIGNALS).filter(([, pattern]) => pattern.test(read.text)).map(([name]) => name);
+  if (existingRunIds.length > 0) signals.push('mentions-existing-run-id');
+  return {
+    report: {
+      ...base, ok: true, outcome: 'inspected', usable: true, bytes: read.bytes,
+      firstHeading: heading ? limitText(heading[1], 120) : null,
+      mentionsExistingRun: existingRunIds.length > 0, existingRunIds, runIdCandidates: candidates.length, runLookup,
+      signals, looksLikeResumeGuidance: signals.length >= 2,
+      note: 'Heuristic flags only. Ask the user whether this is a new feature or guidance for an existing run before changing anything.',
+    },
+    exitCode: 0,
+  };
+}
+
+// --- Mutations ---------------------------------------------------------------------------------------------
+
+// Refusals the coordinator makes before changing anything. The command line prints no HTTP status code, so any other
+// failure of a request that may have been delivered is reported as uncertain rather than guessed to be a refusal.
+const SERVER_REJECTIONS = [
+  /Project not found/, /Feature specification exceeds/, /must be nonempty text/, /Invalid coordinator record ID/,
+  /Coordinator is draining; new work is disabled/, /Provide a Git base revision/, /Git did not resolve a full base commit/,
+  /already tracks a managed runtime path/, /Register a non-bare Git worktree/, /Project already registered with different/,
+  /Project configuration/, /Runtime dependencies/, /Run not found/, /Unknown run/,
+  /Only a confirmed idle paused run may be resumed/, /Native parent and children must be confirmed idle/,
+  /Runtime snapshot refused/, /Resume requires a released paused run/,
+];
+
+/**
+ * What a failed mutation tells us. `not-sent`: the request provably never reached the coordinator. `rejected`: the
+ * coordinator answered with a known refusal. Anything else (timeout, reset, unreadable answer, unknown text) leaves
+ * the outcome unknown. Only the diagnostic is examined: the process error message repeats the command line.
+ */
+export function classifyMutationFailure(result) {
+  if (result.kind === 'not-installed') return 'not-sent';
+  if (result.kind !== 'error') return 'uncertain';
+  if (/Coordinator unavailable: connect (?:ENOENT|ECONNREFUSED)\b/.test(result.stderr)) return 'not-sent';
+  if (SERVER_REJECTIONS.some(pattern => pattern.test(result.stderr))) return 'rejected';
+  return 'uncertain';
+}
+
+function failureText(result) {
+  const diagnostic = result.stderr.replace(/^Heimdall:\s*/, '').trim();
+  if (diagnostic) return limitText(diagnostic, 500);
+  return result.kind === 'error' ? 'The command failed without a diagnostic.' : `The command ended early (${result.kind}).`;
+}
+
+const UNCERTAIN_RULE = 'The request may or may not have been applied. Do not repeat it. Treat the records below as unconfirmed and check the run with the owner before any further step.';
+
+function parseJson(text) {
+  try { return JSON.parse(text); } catch { return undefined; }
+}
+
+async function readiness(coordinator) {
+  const status = await coordinator.call(['status', '--json'], { timeoutMs: 15000 });
+  if (!status.ok) return { state: 'unavailable', error: { kind: status.kind, message: status.message } };
+  const parsed = projectCoordinatorStatus(status.value);
+  if (!parsed) return { state: 'unavailable', error: { kind: 'invalid-response', message: 'Coordinator status is not a valid status document' } };
+  return { state: parsed.readiness, acceptingNewRuns: parsed.acceptingNewRuns, queuedRuns: parsed.queuedRuns, reservedRuns: parsed.reservedRuns };
+}
+
+const readinessSummary = state => (state.state === 'unavailable' ? { readiness: 'unavailable', error: state.error } : { readiness: state.state, acceptingNewRuns: state.acceptingNewRuns, queuedRuns: state.queuedRuns, reservedRuns: state.reservedRuns });
+
+/** Interpret the one document `coordinator start --json` prints. Only the documented success outcomes count. */
+function lifecycleResult(result) {
+  const document = parseJson(result.stdout);
+  if (!isObject(document) || typeof document.outcome !== 'string') return { success: false, summary: { outcome: 'unknown', message: failureText(result) } };
+  const error = isObject(document.error) ? document.error : null;
+  return {
+    success: result.ok && document.ok === true && START_SUCCESS_OUTCOMES.includes(document.outcome),
+    summary: { outcome: document.outcome, ok: document.ok === true, errorCode: error && typeof error.code === 'string' ? error.code : null, message: limitText(error?.message ?? document.message ?? '', 300) },
+  };
+}
+
+function dirtyNotice(changes) {
+  if (!changes || (!changes.tracked && !changes.untracked)) return null;
+  return `The working tree has ${changes.tracked} changed and ${changes.untracked} untracked paths. A run starts from the committed base and does not include them.`;
+}
+
+/** Read-only look at what a lost submit may have created. Candidates are never treated as confirmation. */
+async function inspectSubmission({ coordinator, projectId, oid, text, since }) {
+  const listed = await coordinator.call(['run', 'list']);
+  if (!listed.ok) return { source: 'run list', available: false, reason: listed.kind, message: listed.message, candidates: [], confirmed: false };
+  let parsed;
+  try { parsed = parseRunList(listed.value); }
+  catch (error) { return { source: 'run list', available: false, reason: 'invalid-response', message: limitText(error.message, 200), candidates: [], confirmed: false }; }
+  const candidates = parsed.runs
+    .filter(entry => entry.projectId === projectId && typeof entry.id === 'string' && typeof entry.createdAt === 'number' && entry.createdAt >= since)
+    .slice(0, 10)
+    .map(entry => ({
+      runId: entry.id, status: String(entry.status), createdAt: timestamp(entry.createdAt),
+      baseMatches: entry.baseCommit === oid, specMatches: typeof entry.feature === 'string' ? entry.feature === text : null,
+    }));
+  return { source: 'run list', available: true, completeness: parsed.completeness, candidates, confirmed: false };
+}
+
+/**
+ * Start a run: validate everything locally, make sure the coordinator can take work, find (or with --register add)
+ * the project, then submit exactly once. Nothing before the submit retries or replaces anything.
+ */
+async function startCommand({ coordinator, cwd, env, options, configFile, signal }) {
+  if (options['--spec'] === undefined) throw new UsageError('start requires --spec FILE');
+  const attempted = [];
+  const notices = [];
+  const configuration = configurationSelection({ configFile, env });
+  const done = (outcome, fields = {}, ok = false) => ({
+    report: { ok, command: 'start', outcome, ...fields, ...(notices.length ? { notices } : {}), mutationsAttempted: attempted, coordinator: { configuration } },
+    exitCode: ok ? 0 : 1,
+  });
+
+  const specFile = path.resolve(cwd, options['--spec']);
+  const spec = await readTextFile(specFile, MAX_SPEC_BYTES);
+  if (!spec.ok) return done('refused', { reason: `spec-${spec.reason}`, message: PROBLEM_MESSAGES[spec.reason], spec: { file: specFile, ...(spec.bytes === undefined ? {} : { bytes: spec.bytes }), maxBytes: MAX_SPEC_BYTES } });
+  const repository = await inspectRepository(cwd, env);
+  if (!repository.ok) return done('refused', { reason: repository.kind, message: repository.kind === 'git-missing' ? 'Git is not available on PATH.' : 'The working directory is not inside a Git worktree.' });
+  const requested = options['--base'] ?? 'HEAD';
+  const resolved = await resolveBase(repository.topLevel, requested, env);
+  if (!resolved.ok) return done('refused', { reason: 'base-unresolved', message: resolved.message });
+  const base = { ref: requested, oid: resolved.oid, resolvedIn: repository.topLevel };
+  const dirty = dirtyNotice(repository.changes);
+  if (dirty) notices.push(dirty);
+  const specSummary = { file: specFile, bytes: spec.bytes };
+
+  let state = await readiness(coordinator);
+  if (state.state === 'unavailable' && options['--start-coordinator'] === true && (state.error.kind === 'unavailable' || /Cannot read the coordinator key/.test(state.error.message))) {
+    if (signal?.aborted) return done('interrupted', { reason: 'interrupted-before-mutation' });
+    attempted.push('coordinator start');
+    const started = lifecycleResult(await coordinator.raw(['start', '--json'], { timeoutMs: COORDINATOR_START_TIMEOUT_MS }));
+    if (!started.success) return done('coordinator-start-failed', { coordinatorStart: started.summary, message: 'The coordinator did not report a started state. It was not retried, stopped or restarted.' });
+    state = await readiness(coordinator);
+  }
+  if (state.state === 'unavailable') {
+    return done('coordinator-unavailable', { ...readinessSummary(state), canStartCoordinator: options['--start-coordinator'] !== true, message: 'The coordinator is not reachable, so nothing was submitted.' });
+  }
+  if (state.state === 'draining' || state.acceptingNewRuns !== true) {
+    return done('coordinator-draining', { ...readinessSummary(state), message: 'The coordinator is draining and accepts no new runs. Nothing was submitted; the owner decides whether to wait or restart it.' });
+  }
+
+  const found = await findProjects(coordinator, repository.commonGitDirectory);
+  if (!found.ok) return done('error', { error: found.error });
+  if (found.match === 'many') return done('needs-project', { reason: 'multiple-matching-projects', projects: found.projects, message: 'More than one registered project matches this repository. Ask the owner which one to use.' });
+  let project = found.projects[0];
+  if (found.match === 'none') {
+    if (options['--register'] !== true) return done('needs-registration', { reason: 'no-matching-project', directory: repository.topLevel, message: 'No registered project uses this repository. Registering it is a separate change; rerun with --register once the owner agrees.' });
+    if (signal?.aborted) return done('interrupted', { reason: 'interrupted-before-mutation' });
+    attempted.push('project add');
+    const added = await coordinator.raw(['project', 'add', repository.topLevel], { timeoutMs: MUTATION_TIMEOUT_MS });
+    if (!added.ok) {
+      const kind = classifyMutationFailure(added);
+      const message = failureText(added);
+      if (kind === 'not-sent') return done('registration-not-sent', { message });
+      if (kind === 'rejected') return done('registration-rejected', { message, directory: repository.topLevel });
+      const again = await findProjects(coordinator, repository.commonGitDirectory);
+      return done('registration-uncertain', { message, rule: UNCERTAIN_RULE, inspection: { source: 'project list', available: again.ok, matches: again.ok ? again.projects : [], confirmed: false } });
+    }
+    const record = parseJson(added.stdout);
+    if (!isObject(record) || typeof record.id !== 'string' || (await canonical(String(record.commonGitDirectory))) !== repository.commonGitDirectory) {
+      return done('registration-uncertain', { message: 'The coordinator answered, but the answer is not the expected project record.', rule: UNCERTAIN_RULE });
+    }
+    project = { id: record.id, directory: String(record.directory), commonGitDirectory: record.commonGitDirectory, concurrency: record.concurrency };
+  } else if ((await canonical(project.directory)) !== repository.topLevel) {
+    notices.push(`The registered project directory is ${project.directory}; this worktree is ${repository.topLevel}. The run is created from the registered project.`);
+  }
+  if (!validRunId(project.id)) return done('error', { error: { kind: 'invalid-response', message: 'The registered project ID cannot be passed safely on a command line.' } });
+  if (signal?.aborted) return done('interrupted', { reason: 'interrupted-before-mutation' });
+
+  const since = Date.now() - 1000;
+  attempted.push('run submit');
+  const submitted = await coordinator.raw(['run', 'submit', project.id, '--feature', specFile, '--base', resolved.oid], { timeoutMs: MUTATION_TIMEOUT_MS });
+  const known = { project: { id: project.id, directory: project.directory }, base, spec: specSummary };
+  if (!submitted.ok) {
+    const kind = classifyMutationFailure(submitted);
+    const message = failureText(submitted);
+    if (kind === 'not-sent') return done('not-submitted', { message, ...known });
+    if (kind === 'rejected') return done('rejected', { message, ...known });
+    return done('uncertain', { message, rule: UNCERTAIN_RULE, ...known, inspection: await inspectSubmission({ coordinator, projectId: project.id, oid: resolved.oid, text: spec.text, since }) });
+  }
+  const record = parseJson(submitted.stdout);
+  if (!isObject(record) || typeof record.id !== 'string' || !validRunId(record.id) || record.status !== 'queued' || record.projectId !== project.id) {
+    return done('uncertain', { message: 'The coordinator answered, but the answer is not a queued run record.', rule: UNCERTAIN_RULE, ...known, inspection: await inspectSubmission({ coordinator, projectId: project.id, oid: resolved.oid, text: spec.text, since }) });
+  }
+  const run = projectRun(record);
+  if (run.baseCommit !== resolved.oid) notices.push('The run records a different base commit than the one requested; inspect it before relying on it.');
+  return done('submitted', {
+    accepted: true, status: 'queued',
+    note: 'The coordinator accepted and queued the run. It is not admitted or started yet; monitor it for admission.',
+    runId: run.runId, ...known, base: { ...base, recordedCommit: run.baseCommit }, worktreePath: run.worktreePath, branch: run.branch, run,
+  }, true);
+}
+
+/** Read-only look at a run after a resume whose outcome is unknown. It is never treated as confirmation. */
+async function inspectRun(coordinator, runId) {
+  const inspected = await showRun(coordinator, runId);
+  if (!inspected.ok) return { source: 'run show', available: false, reason: inspected.kind, message: inspected.message, confirmed: false };
+  return { source: 'run show', available: true, run: inspected.projection, version: inspected.record.version ?? null, confirmed: false };
+}
+
+function resumeNextAction(projection) {
+  switch (projection.status) {
+    case 'queued': case 'preparing': case 'running':
+      return { action: 'wait', detail: 'The run is already queued or executing. Monitor it; there is nothing to resume.' };
+    case 'paused':
+      return { action: 'wait', detail: 'The run reports paused, but the coordinator still holds its capacity because it has not confirmed the run idle. It can be resumed only after that. Monitor it.' };
+    case 'reconciliation-required':
+      return { action: 'owner-decision', detail: 'The outcome of this run is uncertain. `run reconcile` is an explicit, separate recovery decision for the owner; this helper never runs it.' };
+    default:
+      return { action: 'none', detail: 'The run has finished and cannot be resumed.' };
+  }
+}
+
+/**
+ * Resume a paused run with the owner's guidance. The guidance is data: it is read from a file or stdin, wrapped in a
+ * labeled message (so text beginning with a dash never reaches the command line as an option) and sent once.
+ */
+async function resumeCommand({ coordinator, cwd, env, options, positional, configFile, stdin, signal }) {
+  const runId = positional[0];
+  if (runId === undefined) throw new UsageError('resume requires RUN_ID');
+  if (!validRunId(runId)) throw new UsageError('RUN_ID must be letters, digits, underscore or dash and must not start with a dash');
+  const fromStdin = options['--guidance-stdin'] === true;
+  const guidanceFile = options['--guidance-file'];
+  if (fromStdin === (guidanceFile !== undefined)) throw new UsageError('resume requires exactly one of --guidance-file FILE or --guidance-stdin');
+  const attempted = [];
+  const configuration = configurationSelection({ configFile, env });
+  const done = (outcome, fields = {}, ok = false) => ({
+    report: { ok, command: 'resume', outcome, runId, ...fields, mutationsAttempted: attempted, coordinator: { configuration } },
+    exitCode: ok ? 0 : 1,
+  });
+
+  let guidance = fromStdin ? await readStdin(stdin, MAX_GUIDANCE_BYTES) : await readTextFile(path.resolve(cwd, guidanceFile), MAX_GUIDANCE_BYTES);
+  if (guidance.ok && guidance.text.includes('\0')) guidance = { ok: false, reason: 'contains-nul', bytes: guidance.bytes };
+  if (!guidance.ok) return done('refused', { reason: `guidance-${guidance.reason}`, message: PROBLEM_MESSAGES[guidance.reason], guidance: { source: fromStdin ? 'stdin' : 'file', ...(guidance.bytes === undefined ? {} : { bytes: guidance.bytes }), maxBytes: MAX_GUIDANCE_BYTES } });
+  const guidanceSummary = { source: fromStdin ? 'stdin' : 'file', bytes: guidance.bytes };
+
+  const before = await showRun(coordinator, runId);
+  if (!before.ok) {
+    if (before.kind === 'not-found') return done('not-found', { message: 'The coordinator has no run with this ID.' });
+    return done('error', { error: { kind: before.kind, message: before.message } });
+  }
+  if (before.record.status !== 'paused' || before.record.capacityReserved === true) {
+    return done('not-resumable', { run: before.projection, next: resumeNextAction(before.projection), message: 'The run is not a confirmed idle paused run, so nothing was sent.' });
+  }
+  if (signal?.aborted) return done('interrupted', { reason: 'interrupted-before-mutation' });
+
+  const message = `${GUIDANCE_HEADER}\n${guidance.text}`;
+  attempted.push('run resume');
+  const resumed = await coordinator.raw(['run', 'resume', runId, '--input', message], { timeoutMs: MUTATION_TIMEOUT_MS });
+  const known = { guidance: guidanceSummary, before: { status: before.projection.status, version: before.record.version ?? null, completedResults: before.projection.progress?.completed ?? null } };
+  if (!resumed.ok) {
+    const kind = classifyMutationFailure(resumed);
+    const text = failureText(resumed);
+    if (kind === 'not-sent') return done('not-resumed', { message: text, ...known });
+    if (kind === 'rejected') return done('rejected', { message: text, ...known });
+    return done('uncertain', { message: text, rule: UNCERTAIN_RULE, ...known, inspection: await inspectRun(coordinator, runId) });
+  }
+  const answer = parseJson(resumed.stdout);
+  let accepted;
+  try { accepted = isObject(answer) && answer.id === runId ? projectRun(answer) : null; } catch { accepted = null; }
+  if (!accepted || accepted.status !== 'queued') {
+    return done('uncertain', { message: 'The coordinator answered, but the answer is not a queued run record.', rule: UNCERTAIN_RULE, ...known, inspection: await inspectRun(coordinator, runId) });
+  }
+  const after = await showRun(coordinator, runId);
+  const current = after.ok ? after.projection : accepted;
+  const original = before.projection;
+  return done('resumed', {
+    accepted: true, status: current.status,
+    note: 'The coordinator accepted the resume and queued the same run again. It is not running until it is admitted; monitor it.',
+    run: current,
+    preserved: {
+      runId: current.runId === runId, worktreePath: current.worktreePath === original.worktreePath, branch: current.branch === original.branch,
+      parentSessionId: current.parentSessionId === original.parentSessionId,
+    },
+    completedResults: { before: original.progress?.completed ?? null, after: current.progress?.completed ?? null },
+    ...(after.ok ? {} : { confirmation: { available: false, reason: after.kind, message: after.message } }),
+    guidance: guidanceSummary,
+  }, true);
+}
+
 /** Run the helper. Returns the exit status: 0 for a report, 1 for a coordinator or transport failure, 2 for bad usage. */
-export async function main(argv, { env = process.env, stdout = process.stdout, stderr = process.stderr, signal } = {}) {
+export async function main(argv, { env = process.env, stdout = process.stdout, stderr = process.stderr, stdin = process.stdin, signal } = {}) {
   try {
     const parsed = parseArguments(argv);
     if (parsed.command === 'help') { stdout.write(HELP); return 0; }
@@ -544,10 +936,9 @@ export async function main(argv, { env = process.env, stdout = process.stdout, s
     if (!isDirectory) throw new UsageError('--cwd must name an existing directory');
     const configFile = parsed.options['--coordinator-config'] === undefined ? undefined : path.resolve(cwd, parsed.options['--coordinator-config']);
     const coordinator = createCoordinator({ env, configFile, signal });
-    const context = { coordinator, cwd, env, options: parsed.options, positional: parsed.positional, configFile, stdout, signal };
-    const result = parsed.command === 'context' ? await contextReport(context)
-      : parsed.command === 'snapshot' ? await snapshotReport(context)
-        : await watchCommand(context);
+    const context = { coordinator, cwd, env, options: parsed.options, positional: parsed.positional, configFile, stdout, stdin, signal };
+    const handlers = { context: contextReport, snapshot: snapshotReport, watch: watchCommand, 'inspect-spec': inspectSpecCommand, start: startCommand, resume: resumeCommand };
+    const result = await handlers[parsed.command](context);
     if (result.report) stdout.write(`${JSON.stringify(result.report, null, 2)}\n`);
     return result.exitCode;
   } catch (error) {
