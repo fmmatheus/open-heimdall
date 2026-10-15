@@ -164,7 +164,54 @@ Both create their own temporary sandbox, remove it when done (`--keep` preserves
 for inspection) and print JSON observations. They are manual tools, not part of
 `npm test`.
 
+## Behavior evaluation kit
+
+`scripts/live/skills-eval/` compares an agent with and without the skills on five
+synthetic requests (start from a specification file, snapshot status, bounded watch,
+resume with a guidance file, and a boundary prompt that names a guidance file as if it
+were a specification). A fake `heimdall` command line records argv and answers canned
+coordinator documents, so mutating calls can be counted without a coordinator. See the
+kit's [README](../../scripts/live/skills-eval/README.md).
+
+### Deterministic helper results (PASSED)
+
+`node scripts/live/skills-eval/run-eval.mjs selftest` ran on 2026-10-15 (Node.js
+v22.22.3, no model, no credentials, no network) against the packaged helper:
+
+| Check | Recorded mutating calls |
+| --- | --- |
+| Start from `specs/add-greeting.md` | one `run submit` with the registered project id, `--feature` and `--base <HEAD>` |
+| Snapshot of a queued run | none |
+| Bounded watch of a run that pauses | none; the final event is `stopped` with reason `paused` |
+| Resume with `guidance/pick-format.md` | one `run resume` for the same run id, `--input` starting with the labeled guidance header; run id preserved |
+| `inspect-spec` on the guidance file | none; flagged as resume guidance and the existing run id reported |
+| Resume of a queued (not paused) run | refused as `not-resumable`; none |
+| Sandbox isolation | skills only in the with-skills arm; every sandbox path variable stays inside the sandbox |
+
+This establishes the helper and the shim only. It says nothing about whether a model
+loads a skill or chooses these commands.
+
+### Model-backed behavior (NOT RUN)
+
+No approved model, provider credential or model-backed environment was supplied for
+this work, so the with-skill and without-skill arms were not executed and no model
+output was recorded. The `run` command refuses to start without an explicit `--model`
+and `--pass-env`. To obtain the evidence, an operator with an approved environment runs:
+
+```sh
+node scripts/live/skills-eval/run-eval.mjs run --model PROVIDER/MODEL --pass-env NAME[,NAME] --auto --out "$OUT"
+```
+
+and records `results.json` (skills loaded, mutating counts, argv, expectation flags) for
+both arms. The `run` path, including the parsing of skill loads from
+`opencode run --format json`, has not been exercised against a real model; treat its
+first results as a check of the harness as well as of the skills.
+
 ## Unverified
+
+- Model-backed behavior of the skills in either arm (see the evaluation kit above):
+  whether the right skill loads for each prompt, whether the without-skill arm differs,
+  and the boundary prompt outcome.
 
 - Loading any of the skills in a model-backed OpenCode or OpenChamber session: the
   `skill` tool call, the printed base directory, running the helper from it, `@skill-id`

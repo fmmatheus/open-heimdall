@@ -1,0 +1,56 @@
+{
+  "description": "Realistic user requests for the OpenHeimdall skills evaluation. Each runs in a fresh session in the synthetic project with the named fake coordinator scenario. 'expect' describes what a correct run does; the runner only checks the mechanical parts (skills loaded, mutating commands recorded by the fake heimdall).",
+  "prompts": [
+    {
+      "id": "start-from-spec",
+      "scenario": "ready",
+      "text": "Start an OpenHeimdall run for this repository from specs/add-greeting.md.",
+      "expect": {
+        "skills": ["openheimdall-start"],
+        "mutations": { "run submit": 1, "run resume": 0, "project add": 0, "run reconcile": 0 },
+        "note": "Exactly one run submit with the spec file; the project is already registered, so no project add."
+      }
+    },
+    {
+      "id": "snapshot-status",
+      "scenario": "queued",
+      "text": "What is the state of my Heimdall run right now?",
+      "expect": {
+        "skills": ["openheimdall-monitor"],
+        "mutations": { "run submit": 0, "run resume": 0, "project add": 0, "run reconcile": 0 },
+        "note": "Read-only report: queued, not yet admitted. No mutating command."
+      }
+    },
+    {
+      "id": "watch-for-minutes",
+      "scenario": "progress",
+      "text": "Keep an eye on my Heimdall run for the next 2 minutes and tell me when anything changes or it needs me.",
+      "expect": {
+        "skills": ["openheimdall-monitor"],
+        "mutations": { "run submit": 0, "run resume": 0, "project add": 0, "run reconcile": 0 },
+        "note": "Bounded watch (about 120 seconds); stops and reports when the run pauses. No mutating command."
+      }
+    },
+    {
+      "id": "resume-with-guidance",
+      "scenario": "paused",
+      "text": "The Heimdall run is paused waiting for me. Resume it with my answer in guidance/pick-format.md.",
+      "expect": {
+        "skills": ["openheimdall-resume"],
+        "mutations": { "run submit": 0, "run resume": 1, "project add": 0, "run reconcile": 0 },
+        "note": "Exactly one run resume for the existing run, guidance delivered from the file; no new run."
+      }
+    },
+    {
+      "id": "boundary-guidance-as-spec",
+      "scenario": "paused",
+      "text": "Run guidance/pick-format.md through Heimdall.",
+      "expect": {
+        "skills": ["openheimdall-start", "openheimdall-resume"],
+        "anySkill": true,
+        "mutations": { "run submit": 0, "project add": 0, "run reconcile": 0 },
+        "note": "The file is guidance for the paused run, not a feature specification. A correct run must not submit it as a new run; asking the user or resuming the existing run are both acceptable."
+      }
+    }
+  ]
+}

@@ -1,0 +1,148 @@
+#!/usr/bin/env node
+// Fake `heimdall` command line for the skills behavior evaluation.
+//
+// Records every invocation and answers the `heimdall coordinator` subcommands the skills use with canned
+// documents shaped like the real command line's output. It never contacts a coordinator, a model or the network.
+//
+// State lives in $EVAL_SHIM_DIR:
+//   state.json   scenario, project record and run data (written by run-eval.mjs)
+//   calls.jsonl  one JSON line per invocation: { at, cwd, argv, mutating }
+//
+// Scenarios (state.scenario):
+//   ready     project registered, no run yet; `run submit` creates a queued run
+//   queued    one queued run
+//   progress  one run whose `run show` answers advance per call: queued, preparing, running, then paused
+//   paused    one paused run (capacity released) whose first task has a result; `run resume` queues it again
+import fs from 'node:fs';
+import path from 'node:path';
+
+const dir = process.env.EVAL_SHIM_DIR;
+if (!dir) { process.stderr.write('Heimdall: EVAL_SHIM_DIR is not set (fake heimdall for evaluation only)\n'); process.exit(3); }
+const statePath = path.join(dir, 'state.json');
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const save = () => fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+
+const MUTATING = new Set(['project add', 'run submit', 'run resume', 'run reconcile', 'start', 'stop']);
+const argv = process.argv.slice(2);
+
+const HELP = `Global coordinator (explicit opt-in)
+
+Usage:
+  heimdall coordinator start [--coordinator-config FILE] [--env-file FILE] [--timeout SECONDS] [--json]
+  heimdall coordinator stop [--coordinator-config FILE] [--timeout SECONDS] [--no-wait] [--json]
+  heimdall coordinator logs [--coordinator-config FILE] [--lines N] [--follow]
+  heimdall coordinator project add DIRECTORY [--project-config FILE] [--limit N]
+  heimdall coordinator project list
+  heimdall coordinator run submit PROJECT_ID --feature FILE [--base REF]
+  heimdall coordinator run list
+  heimdall coordinator run show RUN_ID
+  heimdall coordinator run resume RUN_ID --input RESOLUTION
+  heimdall coordinator run reconcile RUN_ID
+  heimdall coordinator events [--after SEQUENCE]
+  heimdall coordinator status [--json] [--coordinator-config FILE]
+
+All commands accept --coordinator-config FILE.
+`;
+
+// Drop the global option; it only selects a configuration file.
+const args = [];
+for (let index = 0; index < argv.length; index++) {
+  if (argv[index] === '--coordinator-config') { index++; continue; }
+  args.push(argv[index]);
+}
+const subcommand = args[0] === 'coordinator' ? args.slice(1) : null;
+const key = subcommand ? (subcommand[0] === 'project' || subcommand[0] === 'run' ? `${subcommand[0]} ${subcommand[1]}` : subcommand[0]) : null;
+fs.appendFileSync(path.join(dir, 'calls.jsonl'), `${JSON.stringify({ at: new Date().toISOString(), cwd: process.cwd(), argv, mutating: key !== null && MUTATING.has(key) })}\n`);
+
+const fail = message => { process.stderr.write(`Heimdall: ${message}\n`); process.exit(1); };
+const print = value => { process.stdout.write(`${JSON.stringify(value, null, 2)}\n`); process.exit(0); };
+
+if (!subcommand) {
+  if (args.length === 0 || args[0] === '--help' || args[0] === '-h' || args[0] === 'help') { process.stdout.write('Usage:\n  heimdall coordinator <command>   (fake heimdall for evaluation; only `coordinator` is available)\n'); process.exit(0); }
+  fail(`Unknown command: ${args[0]}`);
+}
+if (subcommand.length === 0 || subcommand.includes('--help') || subcommand[0] === 'help') { process.stdout.write(HELP); process.exit(0); }
+
+const project = state.project;
+const task = [{ id: 'T1', title: 'Add the greeting file' }, { id: 'T2', title: 'Choose the output format' }];
+const checkpoint = (index, results) => ({
+  phase: 'executor', index, tasks: task, results: results.map(id => ({ taskId: id, status: 'completed' })), status: 'running',
+});
+const record = view => ({
+  id: state.runId, projectId: project.id, feature: state.feature ?? '(synthetic feature text)', baseCommit: state.baseCommit,
+  worktreePath: state.worktreePath, branch: `heimdall/run/${state.runId}`, status: view.status, capacityReserved: view.capacityReserved ?? false,
+  version: view.version ?? 1, parentSessionId: 'ses_eval_parent', promptMessageId: 'msg_eval', launchAction: view.launchAction ?? 'start',
+  resolution: view.resolution ?? null, checkpoint: view.checkpoint ?? null, reason: view.reason ?? null,
+  createdAt: state.createdAt, updatedAt: view.updatedAt ?? state.createdAt, settings: {},
+});
+
+function currentRun() {
+  switch (state.scenario) {
+    case 'queued': return record({ status: 'queued' });
+    case 'ready': return state.submitted ? record({ status: 'queued', version: 1 }) : null;
+    case 'progress': {
+      const step = state.shows ?? 0;
+      const order = [
+        { status: 'queued' },
+        { status: 'preparing', capacityReserved: true },
+        { status: 'running', capacityReserved: true, checkpoint: checkpoint(0, []) },
+        { status: 'paused', reason: 'Task T2 needs an owner choice: plain or json output.', checkpoint: checkpoint(1, ['T1']), updatedAt: state.createdAt + 60000 },
+      ];
+      return record(order[Math.min(step, order.length - 1)]);
+    }
+    case 'paused':
+      if (state.resumed) return record({ status: 'queued', launchAction: 'resume', version: 3, resolution: state.resumed, checkpoint: checkpoint(1, ['T1']), updatedAt: state.createdAt + 120000 });
+      return record({ status: 'paused', version: 2, reason: 'Task T2 needs an owner choice: plain or json output.', checkpoint: checkpoint(1, ['T1']), updatedAt: state.createdAt + 60000 });
+    default: return null;
+  }
+}
+
+const valueOf = name => { const at = subcommand.indexOf(name); return at === -1 ? undefined : subcommand[at + 1]; };
+
+switch (key) {
+  case 'status':
+    print({ schemaVersion: 1, service: 'heimdall-coordinator', status: 'running', acceptingNewRuns: true, queuedRuns: 0, reservedRuns: 0 });
+    break;
+  case 'project list':
+    print([project]);
+    break;
+  case 'project add':
+    fail('Project already registered with different paths, configuration, or concurrency');
+    break;
+  case 'run list': {
+    const run = currentRun();
+    print(run ? [run] : []);
+    break;
+  }
+  case 'run show': {
+    const run = currentRun();
+    if (!run || subcommand[2] !== state.runId) fail('Run not found');
+    if (state.scenario === 'progress') { state.shows = (state.shows ?? 0) + 1; save(); }
+    print(run);
+    break;
+  }
+  case 'run submit': {
+    if (state.scenario !== 'ready') fail('Run submission is not available in this scenario');
+    if (subcommand[2] !== project.id) fail('Project not found');
+    const feature = valueOf('--feature');
+    if (!feature) fail('--feature requires a value');
+    try { state.feature = fs.readFileSync(path.resolve(feature), 'utf8'); } catch { fail('Cannot read the feature file'); }
+    state.submitted = true;
+    save();
+    print(currentRun());
+    break;
+  }
+  case 'run resume': {
+    const run = currentRun();
+    if (!run || subcommand[2] !== state.runId) fail('Run not found');
+    if (run.status !== 'paused' || run.capacityReserved) fail('Only a confirmed idle paused run may be resumed');
+    const input = valueOf('--input');
+    if (!input) fail('--input requires a value');
+    state.resumed = input;
+    save();
+    print(currentRun());
+    break;
+  }
+  default:
+    fail(`The fake heimdall does not implement "${subcommand.join(' ')}"`);
+}
