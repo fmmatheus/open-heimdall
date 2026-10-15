@@ -419,3 +419,6 @@ stop outcomes and exit codes, logs and the supported service contexts are
 described in [Background service](coordinator.md#background-service-start-stop-and-logs).
 `heimdall coordinator serve` remains available to run the coordinator in a
 terminal.
+
+To start, monitor and resume runs from an OpenCode or OpenChamber session, see
+the [OpenHeimdall skills guide](skills.md).
