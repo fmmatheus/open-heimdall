@@ -215,7 +215,44 @@ both arms. The `run` path, including the parsing of skill loads from
 `opencode run --format json`, has not been exercised against a real model; treat its
 first results as a check of the harness as well as of the skills.
 
+## Final integrated verification
+
+Run on the settled tree at `f23f7da` (`fix(skills): address review findings`), which
+is the last code and skill change; this record is the only later edit. Commits since
+the base `71be91d`: `e426fb4`, `cbb9953`, `2b34846`, `125c127`, `a7c7d47`, `2a98fe1`,
+`1bc7a2d`, `f23f7da`.
+
+| Item | Value |
+| --- | --- |
+| Date | 2026-10-15 |
+| OS | macOS 27.0.1 (Darwin, arm64) |
+| Node.js / npm | v22.22.3 / 10.9.8 |
+| OpenCode | `opencode v2.0.22` |
+
+| Check | Result |
+| --- | --- |
+| `npm run check` | exit 0, no type errors |
+| `npm test` | 1525 tests, 1525 pass, 0 fail, 0 cancelled, 0 skipped |
+| `npm run build:extension` | exit 0 |
+| `npm run test:package` | 74 tests, 74 pass, 0 fail, 0 cancelled |
+| `git diff --stat 71be91d..HEAD -- src` | empty: no coordinator lifecycle, CLI or service change, so the native lifecycle suites were not run separately |
+| `npm pack --dry-run --ignore-scripts` | 215 files; `skills/` holds exactly `openheimdall-{start,monitor,resume}/SKILL.md` and `openheimdall-{start,monitor,resume}/scripts/openheimdall.mjs` |
+| Helper copies | `cmp` identical across the three skills; no symlinks under `skills/` |
+
+Review of the correction diff (`f23f7da`) found no regression and no unresolved finding:
+each correction has a test that failed before it. The one assertion that changed
+(`blocker.length <= 300` to `<= 1500`) tracks the corrected limit rather than weakening
+a check. The inspect-spec resume-guidance heuristic was left unchanged on purpose;
+the start skill asks whenever the request and the file disagree.
+
+These runs are automated tests. They do not exercise a model, the OpenChamber UI or a
+live coordinator started by the owner.
+
 ## Unverified
+
+- Owner dogfood: the end-to-end start, monitor, pause, resume and monitor sequence in
+  [`examples/skills-dogfood`](../../examples/skills-dogfood/README.md) is **pending**
+  and operated by the owner. It is an outstanding verification step, not a known defect.
 
 - Model-backed behavior of the skills in either arm (see the evaluation kit above):
   whether the right skill loads for each prompt, whether the without-skill arm differs,
