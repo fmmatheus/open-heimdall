@@ -28,6 +28,9 @@
  *                     starting call writes more than two MiB to that stream. Writes never wait for a reader (a closed pipe
  *                     ends the flood, a pipe nobody drains is abandoned after three seconds), so the call still reaches its
  *                     hold and stays a client that can deliver whatever happened to its output.
+ *   gates/supervisor-exit  holds the supervisor after it reaps the service but before it publishes the exit status;
+ *                     `reached/supervisor-exit.<pid>` records that boundary. Inspections retain the previous running
+ *                     state until the manager publishes the exit and inactive state together.
  * Evidence, one JSON object per line:
  *   calls.jsonl       {at, verb, args, pid}      every call received
  *   signals.jsonl     {at, signal, pid, verb}    every termination signal a call received (the call then exits)
@@ -60,7 +63,9 @@ function writeState(patch) {
   fs.renameSync(temporary, path.join(dir, STATE_FILE));
   return next;
 }
-const running = state => state.pid !== null && state.exit === null && alive(state.pid);
+// Only the supervisor publishes a service's exit. Probing its PID here could report it inactive between the kernel's
+// reap and that publication, with no exit status (or a fabricated default 0 for systemd).
+const running = state => state.pid !== null && state.exit === null;
 
 const ok = (stdout = '') => { process.stdout.write(stdout); process.exit(0); };
 const fail = (code, stderr) => { process.stderr.write(stderr); process.exit(code); };
@@ -87,7 +92,14 @@ async function supervise(definitionPath) {
   const child = spawn(definition.program, definition.args, { env: definition.env, cwd: '/', stdio: ['ignore', open(definition.out), open(definition.err)] });
   child.once('error', () => { writeState({ pid: null, exit: { code: 127, signal: null }, supervisorPid: process.pid }); process.exit(1); });
   child.once('spawn', () => writeState({ pid: child.pid, exit: null, supervisorPid: process.pid, starts: readState().starts + 1 }));
-  child.once('exit', (code, signal) => { writeState({ exit: { code, signal } }); process.exit(0); });
+  child.once('exit', async (code, signal) => {
+    if (fs.existsSync(path.join(dir, 'gates', 'supervisor-exit'))) {
+      fs.writeFileSync(path.join(dir, 'reached', `supervisor-exit.${process.pid}`), '');
+      while (fs.existsSync(path.join(dir, 'gates', 'supervisor-exit'))) await sleep(20);
+    }
+    writeState({ exit: { code, signal } });
+    process.exit(0);
+  });
   // Harness cleanup only: the fixture ends its own coordinator with the graceful signal a foreground coordinator drains on.
   process.on('SIGTERM', () => child.kill('SIGTERM'));
   await new Promise(() => {});
