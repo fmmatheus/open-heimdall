@@ -1,5 +1,6 @@
 import path from 'node:path';
 import type { ProjectRecord } from '../../coordinator/types.js';
+import type { RunListEntry } from '../../coordinator/run-list.js';
 import { LIMITS, RUN_STATUSES } from '../shared/protocol.js';
 import { CONTENT_LIMITS } from '../shared/protocol.js';
 import type {
@@ -101,17 +102,22 @@ export function summarizeProject(project: ProjectRecord): ProjectSummary {
 }
 
 const STATUSES = new Set<string>(RUN_STATUSES);
-const statusOf = (run: PublicRun): WireRunStatus => (STATUSES.has(run.status) ? run.status : 'failed');
+const statusOf = (run: Pick<PublicRun, 'status'>): WireRunStatus => (STATUSES.has(run.status) ? run.status : 'failed');
 
-export function phaseOf(run: PublicRun): RunPhase {
+export function phaseOf(run: PublicRun | RunListEntry): RunPhase {
   const status = statusOf(run);
   if (status !== 'running') return status;
+  if ('progress' in run) return run.progress.phase === 'planner' || run.progress.total === 0 ? 'planning' : 'executing';
   const checkpoint = record(run.checkpoint);
   if (!checkpoint || checkpoint.phase === 'planner' || list(checkpoint.tasks).length === 0) return 'planning';
   return 'executing';
 }
 
-function currentTaskOf(run: PublicRun, budget: Budget): TaskRef | null {
+function currentTaskOf(run: PublicRun | RunListEntry, budget: Budget): TaskRef | null {
+  if ('progress' in run) {
+    const task = run.progress.currentTask;
+    return task ? { id: budget.clipOr(task.id, LIMITS.taskId, ''), title: budget.clipOr(task.title, LIMITS.title, '') } : null;
+  }
   const checkpoint = record(run.checkpoint);
   if (!checkpoint || checkpoint.phase !== 'executor' || statusOf(run) === 'succeeded') return null;
   const tasks = list(checkpoint.tasks);
@@ -122,9 +128,9 @@ function currentTaskOf(run: PublicRun, budget: Budget): TaskRef | null {
   return { id: budget.clipOr(task.id, LIMITS.taskId, `task-${index + 1}`), title: budget.clipOr(task.title, LIMITS.title, '') };
 }
 
-export function summarizeRun(run: PublicRun, project: { directory?: string } | undefined): RunSummary {
+export function summarizeRun(run: PublicRun | RunListEntry, project: { directory?: string } | undefined): RunSummary {
   const budget = new Budget();
-  const checkpoint = record(run.checkpoint);
+  const checkpoint = 'checkpoint' in run ? record(run.checkpoint) : undefined;
   const tasks = list(checkpoint?.tasks);
   return {
     id: clip(String(run.id ?? ''), LIMITS.identifier).text,
@@ -133,8 +139,8 @@ export function summarizeRun(run: PublicRun, project: { directory?: string } | u
     projectName: project?.directory ? projectName(project.directory) : 'unknown project',
     status: statusOf(run),
     phase: phaseOf(run),
-    completed: list(checkpoint?.results).length,
-    total: tasks.length > 0 ? tasks.length : null,
+    completed: 'progress' in run ? run.progress.completed : list(checkpoint?.results).length,
+    total: 'progress' in run ? run.progress.total || null : tasks.length > 0 ? tasks.length : null,
     currentTask: currentTaskOf(run, budget),
     createdAt: count(run.createdAt),
     updatedAt: count(run.updatedAt),

@@ -249,8 +249,8 @@ test('offline keeps the last data marked stale with a fixed message, then recove
   let state = store.getState();
   assert.equal(state.connection, 'offline');
   assert.equal(state.stale, true);
-  assert.equal(state.message, 'The Heimdall coordinator is not running.');
-  assert.match(state.hint, /heimdall coordinator serve/);
+  assert.equal(state.message, 'The Heimdall coordinator could not be reached.');
+  assert.match(state.hint, /heimdall coordinator status/);
   assert.equal(JSON.stringify(state).includes('RAW-SECRET'), false);
   assert.deepEqual(state.runs, before.runs);
   assert.deepEqual(state.projects, before.projects);
@@ -267,6 +267,31 @@ test('offline keeps the last data marked stale with a fixed message, then recove
   assert.equal(state.hint, null);
   assert.equal(state.failures, 0);
   assert.equal(state.lastSuccessAt > before.lastSuccessAt, true);
+  store.dispose();
+});
+
+test('an oversized response keeps saved panel data and shows a data-size error without a liveness claim', async () => {
+  const { store, service, clock } = fixture();
+  store.start();
+  await clock.advance(0);
+  store.select('run_1');
+  await clock.advance(0);
+  const before = store.getState();
+
+  service.fail = { status: 503, body: JSON.stringify({ error: { kind: 'coordinator-response-too-large', message: SECRET } }) };
+  await clock.advance(POLL);
+  const state = store.getState();
+  assert.equal(state.connection, 'service-unavailable');
+  assert.equal(state.stale, true);
+  assert.equal(state.message, 'The Heimdall coordinator response is too large to load.');
+  assert.doesNotMatch(state.message, /not running|could not be reached/);
+  assert.match(state.hint, /Retry/);
+  assert.doesNotMatch(state.hint, /restart|coordinator serve/i);
+  assert.deepEqual(state.runs, before.runs);
+  assert.deepEqual(state.projects, before.projects);
+  assert.deepEqual(state.detail, before.detail);
+  assert.equal(state.lastSuccessAt, before.lastSuccessAt);
+  assert.equal(JSON.stringify(state).includes('RAW-SECRET'), false);
   store.dispose();
 });
 
@@ -413,9 +438,11 @@ test('host and service failures map to fixed messages and never relay raw text',
   assert.equal(mapHostFailure(null).category, 'offline');
 
   const serviceCases = [
-    ['coordinator-offline', 'offline', /coordinator is not running/, /heimdall coordinator serve/],
-    ['coordinator-unauthorized', 'offline', /refused the service credentials/, /heimdall coordinator serve/],
+    ['coordinator-offline', 'offline', /coordinator could not be reached/, /heimdall coordinator status/],
+    ['coordinator-unauthorized', 'offline', /refused the service credentials/, /heimdall coordinator status/],
     ['coordinator-timeout', 'offline', /did not answer in time/, /retry automatically/],
+    ['coordinator-response-too-large', 'service-unavailable', /response is too large to load/, /Retry/],
+    ['coordinator-incompatible', 'service-unavailable', /does not support this runs list/, /Update Heimdall after active tasks finish/],
     ['configuration-invalid', 'service-unavailable', /configuration is not valid/, /coordinator\.toml/],
     ['coordinator-error', 'offline', /reported an error/, /retry automatically/],
     ['made-up-kind', 'service-unavailable', /unexpected error/, /Settings → Extensions/],

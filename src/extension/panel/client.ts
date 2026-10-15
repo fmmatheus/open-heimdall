@@ -47,7 +47,7 @@ export class PanelError extends Error {
 interface Mapped { category: FailureCategory; message: string; hint: string | null }
 
 const SETTINGS_HINT = 'Allow the local service in Settings → Extensions.';
-const START_COORDINATOR_HINT = 'Start the Heimdall coordinator: heimdall coordinator serve';
+const COORDINATOR_STATUS_HINT = 'Retry. If this continues, check the coordinator with: heimdall coordinator status';
 
 const HOST_ERRORS: Record<string, Mapped> = {
   NO_SERVICE: { category: 'service-unavailable', message: 'The Heimdall extension service is not installed or not built.', hint: 'Reinstall the extension from Settings → Extensions.' },
@@ -60,9 +60,11 @@ const HOST_ERRORS: Record<string, Mapped> = {
 };
 
 const SERVICE_ERRORS: Record<string, Mapped> = {
-  'coordinator-offline': { category: 'offline', message: 'The Heimdall coordinator is not running.', hint: START_COORDINATOR_HINT },
-  'coordinator-unauthorized': { category: 'offline', message: 'The Heimdall coordinator refused the service credentials.', hint: 'Restart the coordinator: heimdall coordinator serve' },
+  'coordinator-offline': { category: 'offline', message: 'The Heimdall coordinator could not be reached.', hint: COORDINATOR_STATUS_HINT },
+  'coordinator-unauthorized': { category: 'offline', message: 'The Heimdall coordinator refused the service credentials.', hint: COORDINATOR_STATUS_HINT },
   'coordinator-timeout': { category: 'offline', message: 'The Heimdall coordinator did not answer in time.', hint: 'It will retry automatically.' },
+  'coordinator-response-too-large': { category: 'service-unavailable', message: 'The Heimdall coordinator response is too large to load.', hint: 'Retry. If this continues, update Heimdall and the extension.' },
+  'coordinator-incompatible': { category: 'service-unavailable', message: 'The Heimdall coordinator does not support this runs list.', hint: 'Update Heimdall after active tasks finish, then retry.' },
   'configuration-invalid': { category: 'service-unavailable', message: 'The Heimdall coordinator configuration is not valid.', hint: 'Check ~/.config/heimdall/coordinator.toml, then retry.' },
   'not-found': { category: 'request', message: 'That Heimdall item no longer exists.', hint: null },
   'invalid-request': { category: 'request', message: 'The Heimdall service rejected the request.', hint: null },

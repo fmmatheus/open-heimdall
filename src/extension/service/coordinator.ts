@@ -3,6 +3,7 @@ import { loadCoordinatorConfiguration } from '../../coordinator/config.js';
 import type { CoordinatorConfiguration } from '../../coordinator/config.js';
 import { readCoordinatorToken } from '../../coordinator/token.js';
 import type { CoordinatorEvent, ProjectRecord, RunRecord } from '../../coordinator/types.js';
+import type { RunListEntry, RunListPage } from '../../coordinator/run-list.js';
 
 export type PublicRun = Omit<RunRecord, 'ownerToken' | 'specification' | 'binding'> & { settings: unknown };
 
@@ -10,15 +11,19 @@ export type AdapterErrorKind =
   | 'coordinator-offline'
   | 'coordinator-unauthorized'
   | 'coordinator-timeout'
+  | 'coordinator-response-too-large'
+  | 'coordinator-incompatible'
   | 'configuration-invalid'
   | 'not-found'
   | 'coordinator-error';
 
 /** Fixed texts: nothing from the underlying failure (paths, keys, headers, stacks) reaches the panel. */
 const MESSAGES: Record<AdapterErrorKind, string> = {
-  'coordinator-offline': 'The Heimdall coordinator is not running or cannot be reached.',
+  'coordinator-offline': 'The Heimdall coordinator could not be reached.',
   'coordinator-unauthorized': 'The Heimdall coordinator rejected the access key.',
   'coordinator-timeout': 'The Heimdall coordinator did not answer in time.',
+  'coordinator-response-too-large': 'The Heimdall coordinator response is too large to load.',
+  'coordinator-incompatible': 'The Heimdall coordinator does not support this runs list.',
   'configuration-invalid': 'The Heimdall coordinator configuration or access key is invalid.',
   'not-found': 'The requested Heimdall record was not found.',
   'coordinator-error': 'The Heimdall coordinator could not complete the request.',
@@ -50,7 +55,7 @@ export interface CoordinatorAdapterOptions {
 
 export interface CoordinatorAdapter {
   projects(): Promise<ProjectRecord[]>;
-  runs(): Promise<PublicRun[]>;
+  runs(): Promise<Array<PublicRun | RunListEntry>>;
   run(id: string): Promise<PublicRun>;
   events(after: number): Promise<CoordinatorEvent[]>;
 }
@@ -60,6 +65,10 @@ const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 function classify(error: unknown): AdapterErrorKind {
   if (error instanceof CoordinatorAdapterError) return error.kind;
   const message = error instanceof Error ? error.message : '';
+  const code = (error as { code?: unknown } | null)?.code;
+  if ((error as { statusCode?: unknown } | null)?.statusCode === 404) return 'not-found';
+  // Older clients wrapped local response failures as “unavailable”; they do not establish coordinator liveness.
+  if (code === 'response-too-large' || /Coordinator response is too large/i.test(message)) return 'coordinator-response-too-large';
   if (/timed out/i.test(message)) return 'coordinator-timeout';
   if (/^Coordinator unavailable/i.test(message)) return 'coordinator-offline';
   if (/authorization required|cannot administer/i.test(message)) return 'coordinator-unauthorized';
@@ -102,7 +111,28 @@ export function createCoordinatorAdapter(options: CoordinatorAdapterOptions = {}
 
   return {
     projects: () => get<ProjectRecord[]>('/projects'),
-    runs: () => get<PublicRun[]>('/runs'),
+    async runs() {
+      const runs: RunListEntry[] = [];
+      let after = 0;
+      let through: number | undefined;
+      do {
+        let page: RunListPage;
+        try { page = await get<RunListPage>(`/run-list?after=${after}${through === undefined ? '' : `&through=${through}`}`); }
+        catch (error) {
+          if (error instanceof CoordinatorAdapterError && error.kind === 'not-found') throw new CoordinatorAdapterError('coordinator-incompatible');
+          throw error;
+        }
+        if (!page || !Array.isArray(page.runs) || !Number.isSafeInteger(page.through) || page.through < 0
+          || (through !== undefined && page.through !== through)
+          || (page.nextCursor !== null && (!Number.isSafeInteger(page.nextCursor) || page.nextCursor <= after || page.nextCursor > page.through))) {
+          throw new CoordinatorAdapterError('coordinator-error');
+        }
+        runs.push(...page.runs);
+        through = page.through;
+        if (page.nextCursor === null) return runs;
+        after = page.nextCursor;
+      } while (true);
+    },
     run(id: string) {
       if (typeof id !== 'string' || !IDENTIFIER.test(id)) return Promise.reject(new CoordinatorAdapterError('not-found'));
       return get<PublicRun>(`/runs/${id}`);

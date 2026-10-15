@@ -318,12 +318,12 @@ test('connection banners: connecting, offline, service unavailable, stale, healt
 
   const offline = bannerInfo({
     ...STATE, connection: 'offline', stale: true, lastSuccessAt: NOW - 90_000,
-    message: 'The Heimdall coordinator is not running.', hint: 'Start the Heimdall coordinator: heimdall coordinator serve',
+    message: 'The Heimdall coordinator could not be reached.', hint: 'Retry. If this continues, check the coordinator with: heimdall coordinator status',
   }, NOW);
   assert.equal(offline.tone, 'warning');
-  assert.equal(offline.title, 'The Heimdall coordinator is not running. Showing stale data.');
+  assert.equal(offline.title, 'The Heimdall coordinator could not be reached. Showing stale data.');
   assert.match(offline.body, /Last updated 1 min ago \(2026-03-09 11:58 UTC\)\./);
-  assert.match(offline.body, /heimdall coordinator serve/);
+  assert.match(offline.body, /heimdall coordinator status/);
   assert.deepEqual(offline.action, { label: 'Retry', kind: 'retry' });
 
   const unavailable = bannerInfo({ ...STATE, connection: 'service-unavailable', stale: false, lastSuccessAt: null, message: 'The Heimdall extension is disabled.', hint: 'Enable Heimdall in Settings → Extensions.' }, NOW);
@@ -340,9 +340,9 @@ test('connection banners: connecting, offline, service unavailable, stale, healt
 test('empty states: loading, no coordinator, no runs, filters match nothing, none when runs exist', () => {
   assert.equal(emptyInfo({ ...STATE, connection: 'connecting', lastSuccessAt: null }).title, 'Loading runs…');
 
-  const offline = emptyInfo({ ...STATE, connection: 'offline', lastSuccessAt: null, message: 'The Heimdall coordinator is not running.', hint: 'Start it.' });
+  const offline = emptyInfo({ ...STATE, connection: 'offline', lastSuccessAt: null, message: 'The Heimdall coordinator could not be reached.', hint: 'Retry.' });
   assert.equal(offline.title, 'No coordinator connection');
-  assert.equal(offline.body, 'The Heimdall coordinator is not running. Start it.');
+  assert.equal(offline.body, 'The Heimdall coordinator could not be reached. Retry.');
   assert.deepEqual(offline.action, { label: 'Retry', kind: 'retry' });
 
   assert.equal(emptyInfo({ ...STATE, connection: 'service-unavailable', lastSuccessAt: null, message: 'x', hint: null }).title, 'Heimdall service unavailable');
