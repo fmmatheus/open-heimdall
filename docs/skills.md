@@ -15,10 +15,13 @@ dependency-free Node helper (identical in all three directories) that calls the
 you copy the directories into a skills location that your host reads.
 
 > **Status:** pre-alpha, like the rest of Heimdall. Automated tests cover the
-> helper, the skill files and the packaged copies. Loading and following the
-> skills inside a live OpenCode or OpenChamber session has not been observed yet;
-> see [Verification status](#verification-status) for which statements about
-> hosts come from documentation or source and which are unverified.
+> helper, the skill files and the packaged copies. Discovery of the copied skills
+> by OpenCode 2.0.22, and catalog installation by OpenChamber 2.1.0, were observed
+> in isolated hosts ([validation record](validation/openheimdall-skills.md)).
+> Loading and following the skills inside a model-backed OpenCode or OpenChamber
+> session has not been observed yet; see [Verification status](#verification-status)
+> for which statements about hosts come from documentation or source and which are
+> unverified.
 
 ## Prerequisites
 
@@ -310,14 +313,17 @@ pinned sources.
 
 **Unverified:**
 
-- Loading the skills and following them in a live OpenCode 2.0.22 or OpenChamber
-  2.1.0 session (the `skill` tool call, the printed base directory, running the
-  helper). Only the packaged files and the helper are covered by automated tests.
+- Loading the skills and following them in a model-backed OpenCode 2.0.22 or
+  OpenChamber 2.1.0 session (the `skill` tool call, the printed base directory,
+  running the helper). Discovery was observed without a model; see the
+  [validation record](validation/openheimdall-skills.md).
 - OpenChamber 2.1.0 printing the skill's base directory to the model.
 - A skill picker in OpenCode V2 (only the `@skill-id` mention is documented).
-- Whether `opencode debug config` lists skills.
-- Installing from a custom Git source in the OpenChamber UI with this repository,
-  and what its overwrite option does to an existing directory.
+- Whether `opencode debug config` lists skills. The server API `GET /api/skill`
+  lists them in 2.0.22.
+- Installing from a custom Git source in the OpenChamber UI (the install routes
+  were driven directly), and what its overwrite option does to an existing
+  directory.
 - Skills copied to `~/.claude/skills`, `~/.agents/skills`, `.claude/skills` or
   `.agents/skills`, which the hosts discover but this guide does not use.
 - Native Windows: the commands above are POSIX shell, and native Windows operation
