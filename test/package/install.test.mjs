@@ -22,6 +22,9 @@ const requiredFiles = [
   'examples/opencode/agents/adr-planner.md', 'examples/opencode/agents/adr-executor.md', 'examples/opencode/agents/adr-orchestrator.md',
   'examples/opencode/commands/adr-run.md', 'examples/opencode/commands/adr-status.md', 'examples/opencode/commands/adr-resume.md',
   'examples/opencode/plugins/heimdall.ts',
+  'skills/openheimdall-start/SKILL.md', 'skills/openheimdall-start/scripts/openheimdall.mjs',
+  'skills/openheimdall-monitor/SKILL.md', 'skills/openheimdall-monitor/scripts/openheimdall.mjs',
+  'skills/openheimdall-resume/SKILL.md', 'skills/openheimdall-resume/scripts/openheimdall.mjs',
 ];
 const forbiddenPrefixes = [
   'dist/openchamber-extension/', 'dist/extension/', 'extension/', 'src/', 'test/', 'scripts/', 'node_modules/', '.heimdall/', '.github/',
