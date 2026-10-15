@@ -72,7 +72,9 @@ See [installation and setup](docs/installation.md), [coordinator operation and r
 for connection options, compatibility limits, and existing workflow separation.
 
 To watch and review runs inside OpenChamber 2.1.0, see the read-only
-[OpenChamber extension guide](docs/openchamber-extension.md).
+[OpenChamber extension guide](docs/openchamber-extension.md). To start, monitor
+and resume runs from an OpenCode or OpenChamber session, see the
+[skills guide](docs/skills.md).
 
 ## Why Heimdall?
 
