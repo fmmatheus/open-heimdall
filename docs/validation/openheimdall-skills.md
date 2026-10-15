@@ -31,7 +31,7 @@ No model, credential, user profile, running host or coordinator was used.
   only for the custom-directory scenario.
 - OpenCode runs a background service by default (`opencode service`). It was never
   started, queried or stopped: each check used its own `opencode serve` instance. The
-  process that already served the owner's profile kept its original start time.
+  process that already served the host's existing service kept its original start time.
 - The packed tarball and the OpenChamber install were created with an isolated npm
   `HOME` and cache.
 - All temporary directories and processes were removed afterwards (the harness
@@ -190,6 +190,14 @@ v22.22.3, no model, no credentials, no network) against the packaged helper:
 
 This establishes the helper and the shim only. It says nothing about whether a model
 loads a skill or chooses these commands.
+
+After the independent review, the same selftest passed again with the corrected
+helper. The review corrections are covered by automated tests only: a blocker is
+reported up to 1500 characters with a `blockerTruncated` flag, `start --register` from
+a linked worktree registers the main worktree (and stops when it cannot be derived),
+and the skill text single-quotes shell values, reads runs only through the helper
+and removes the temporary guidance file. Skill frontmatter and the packaged file
+layout did not change, so the host discovery results above still apply.
 
 ### Model-backed behavior (NOT RUN)
 

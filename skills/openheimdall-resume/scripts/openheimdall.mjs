@@ -38,6 +38,7 @@ export const MAX_WATCH_INTERVAL_SECONDS = 300;
 export const ACTIVE_STATUSES = Object.freeze(['queued', 'preparing', 'running', 'paused', 'reconciliation-required']);
 export const TERMINAL_STATUSES = Object.freeze(['succeeded', 'failed', 'reconciliation-required']);
 
+export const BLOCKER_LIMIT = 1500;
 const COMMAND_TIMEOUT_MS = 30000;
 const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
@@ -249,6 +250,22 @@ export async function inspectRepository(cwd, env) {
   };
 }
 
+/**
+ * The directory a new project should be registered under: the main worktree of the repository. A linked worktree is
+ * disposable, so it is never registered. The main worktree is derived from the common Git directory (`<main>/.git`);
+ * a bare, separate or submodule Git directory has no derivable main worktree and yields null.
+ */
+export async function registrationDirectory(repository) {
+  if (repository.commonGitDirectory === path.join(repository.topLevel, '.git')) return repository.topLevel;
+  if (path.basename(repository.commonGitDirectory) !== '.git') return null;
+  const main = path.dirname(repository.commonGitDirectory);
+  try {
+    return (await fs.stat(main)).isDirectory() ? await canonical(main) : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Resolve REF to a full commit ID inside one worktree. HEAD differs between linked worktrees of a repository. */
 export async function resolveBase(directory, ref, env) {
   if (typeof ref !== 'string' || !ref.trim() || ref.includes('\0')) return { ok: false, message: 'Provide a Git base revision' };
@@ -349,6 +366,8 @@ export function projectRun(record) {
   const reason = typeof record.reason === 'string' && record.reason ? record.reason
     : checkpoint && typeof checkpoint.reason === 'string' && checkpoint.reason ? checkpoint.reason : null;
   const blocked = record.status === 'paused' || record.status === 'failed' || record.status === 'reconciliation-required';
+  const blockerText = blocked && reason ? limitText(reason, Number.MAX_SAFE_INTEGER) : '';
+  const blocker = { text: blockerText ? limitText(blockerText, BLOCKER_LIMIT) : null, truncated: blockerText.length > BLOCKER_LIMIT };
   return {
     runId: record.id,
     projectId: typeof record.projectId === 'string' ? record.projectId : null,
@@ -359,7 +378,8 @@ export function projectRun(record) {
     phase,
     progress: tasks && checkpoint ? { completed: Array.isArray(checkpoint.results) ? checkpoint.results.length : 0, total: tasks.length } : null,
     currentTask,
-    blocker: blocked && reason ? limitText(reason, 300) : null,
+    blocker: blocker.text,
+    blockerTruncated: blocker.truncated,
     worktreePath: typeof record.worktreePath === 'string' ? record.worktreePath : null,
     branch: typeof record.branch === 'string' ? record.branch : null,
     baseCommit: typeof record.baseCommit === 'string' ? record.baseCommit : null,
@@ -371,7 +391,7 @@ export function projectRun(record) {
 
 /** The fields whose change is worth a watch line. updatedAt is excluded so a bare timestamp refresh stays quiet. */
 export function stateKey(projection) {
-  return JSON.stringify([projection.status, projection.capacityReserved, projection.launchAction, projection.phase, projection.progress, projection.currentTask?.id ?? null, projection.blocker]);
+  return JSON.stringify([projection.status, projection.capacityReserved, projection.launchAction, projection.phase, projection.progress, projection.currentTask?.id ?? null, projection.blocker, projection.blockerTruncated]);
 }
 
 /** Why a watch must stop once it has seen this state, or null to keep going. */
@@ -791,15 +811,20 @@ async function startCommand({ coordinator, cwd, env, options, configFile, signal
   if (found.match === 'many') return done('needs-project', { reason: 'multiple-matching-projects', projects: found.projects, message: 'More than one registered project matches this repository. Ask the owner which one to use.' });
   let project = found.projects[0];
   if (found.match === 'none') {
-    if (options['--register'] !== true) return done('needs-registration', { reason: 'no-matching-project', directory: repository.topLevel, message: 'No registered project uses this repository. Registering it is a separate change; rerun with --register once the owner agrees.' });
+    const registrationRoot = await registrationDirectory(repository);
+    if (registrationRoot === null) {
+      return done('needs-registration', { reason: 'registration-directory-unknown', directory: repository.topLevel, message: 'The main worktree of this repository cannot be derived from its Git directory, so nothing was registered. Ask the owner to register the project, then rerun.' });
+    }
+    if (options['--register'] !== true) return done('needs-registration', { reason: 'no-matching-project', directory: registrationRoot, message: 'No registered project uses this repository. Registering it is a separate change; rerun with --register once the owner agrees.' });
     if (signal?.aborted) return done('interrupted', { reason: 'interrupted-before-mutation' });
+    if (registrationRoot !== repository.topLevel) notices.push(`This is a linked worktree; the main worktree ${registrationRoot} is registered as the project instead.`);
     attempted.push('project add');
-    const added = await coordinator.raw(['project', 'add', repository.topLevel], { timeoutMs: MUTATION_TIMEOUT_MS });
+    const added = await coordinator.raw(['project', 'add', registrationRoot], { timeoutMs: MUTATION_TIMEOUT_MS });
     if (!added.ok) {
       const kind = classifyMutationFailure(added);
       const message = failureText(added);
       if (kind === 'not-sent') return done('registration-not-sent', { message });
-      if (kind === 'rejected') return done('registration-rejected', { message, directory: repository.topLevel });
+      if (kind === 'rejected') return done('registration-rejected', { message, directory: registrationRoot });
       const again = await findProjects(coordinator, repository.commonGitDirectory);
       return done('registration-uncertain', { message, rule: UNCERTAIN_RULE, inspection: { source: 'project list', available: again.ok, matches: again.ok ? again.projects : [], confirmed: false } });
     }

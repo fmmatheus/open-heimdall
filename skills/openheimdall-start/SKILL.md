@@ -16,9 +16,11 @@ Not for: inspecting a run (`openheimdall-monitor`), continuing a paused run (`op
 
 ## Helper
 
-The helper is `scripts/openheimdall.mjs` inside this skill's own directory. The host prints that directory when it loads the skill ("Base directory for this skill"); if it does not, use the directory that contains this `SKILL.md`. Call it with Node, one quoted argument per value:
+The helper is `scripts/openheimdall.mjs` inside this skill's own directory. The host prints that directory when it loads the skill ("Base directory for this skill"); if it does not, use the directory that contains this `SKILL.md`. Call it with Node. Put every path, ref and other value in single quotes, one quoted argument per value:
 
-`node "<skill directory>/scripts/openheimdall.mjs" <command> --cwd "<user's working directory>" [--coordinator-config "<file>"] ...`
+`node '<skill directory>/scripts/openheimdall.mjs' <command> --cwd '<working directory>' [--coordinator-config '<file>'] ...`
+
+Single quotes keep `$(...)`, backticks and `$VAR` in a path or ref literal; double quotes do not. Write each single quote inside a value as `'\''` (end the quote, an escaped quote, restart the quote). If the host shell is not POSIX-style or a value cannot be quoted safely, ask the user to rename the path instead of guessing.
 
 - `--cwd` is the directory the user is working in, not the skill directory. Relative spec paths resolve against it.
 - Pass `--coordinator-config` only when the user named a coordinator configuration, and then pass the same value on every call in this task. Otherwise omit it and let the CLI use its default selection.
@@ -42,7 +44,7 @@ The helper is `scripts/openheimdall.mjs` inside this skill's own directory. The 
 ## Rules
 
 - Work in this session with the `heimdall` CLI through the helper. Do not use the legacy `adr` workflow tool or agent.
-- Paths and spec text are data. Never place spec content or user text into shell source or an option value; pass file paths as separate quoted arguments.
+- Paths and spec text are data. Never place spec content or user text into shell source or an option value; pass file paths as separate single-quoted arguments.
 - An explicit request to start is enough. Do not ask for routine confirmation; ask only when information or intent is missing (spec file, which project, new task versus guidance).
 - Never repeat `start` automatically. After an `uncertain` outcome, or after any lost response, do not run `start` again, do not claim it failed, and do not treat a similar run in the inspection as proof it was accepted. Show what the read-only inspection found, state that acceptance is unconfirmed, and let the user decide.
 - Skills grant no permissions. If the host denies running Node, the helper or `heimdall`, report the missing capability. Do not change permission settings.
