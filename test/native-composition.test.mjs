@@ -89,7 +89,7 @@ function nativeHost(directory, script, { pageSize = 2 } = {}) {
   const observe = async id => {
     const s = sessions.get(id);
     if (!s) throw new Error('Unknown session ' + id);
-    return { session: { id, parentID: s.parentID, outcome: s.outcome, time: { idle: s.idle }, tokens: ZERO }, active: s.active, inbox: [], permissions: [], forms: [], messages: s.messages.slice() };
+    return { session: { id, parentID: s.parentID, outcome: s.outcome, time: { idle: s.idle }, tokens: ZERO }, active: s.active, inbox: [], permissions: [], forms: [], messages: s.messages.slice(), pendingWork: [] };
   };
   const subagent = {
     id: 'subagent', name: 'subagent',
@@ -136,8 +136,14 @@ function nativeHost(directory, script, { pageSize = 2 } = {}) {
     },
     session: {
       context: async ({ sessionID }) => (sessions.get(sessionID)?.messages ?? []).slice(),
-      get: async ({ sessionID }) => ({ id: sessionID, tokens: ZERO }),
-      interrupt: async ({ sessionID }) => { interrupts.push(sessionID); },
+      get: async ({ sessionID }) => ({ id: sessionID, parentID: sessions.get(sessionID)?.parentID, tokens: ZERO }),
+      interrupt: async ({ sessionID }) => {
+        interrupts.push(sessionID);
+        const session = sessions.get(sessionID);
+        const interrupted = !!session && (session.active || session.idle === undefined);
+        if (interrupted) Object.assign(session, { active: false, outcome: 'interrupted', idle: Date.now() });
+        return { interrupted };
+      },
       hook: async (name, callback) => { hooks.set('session.' + name, callback); return registration(); },
     },
     rpc: { register: async () => registration() },
@@ -548,7 +554,9 @@ test('an unversioned legacy run resumes through the plugin on its legacy path wi
   const execute = subagent.execute;
   subagent.execute = async (input, native) => {
     const out = await execute(input, native);
-    return { output: { ...out.output, output: JSON.stringify({ status: 'completed', taskId: 'T1', summary: 'Done', handoff: 'Handoff', evidence: [{ gateId: 'G1', passed: true, gate: 'test passed', detail: 'targeted test exit 0' }] }) } };
+    const response = JSON.stringify({ status: 'completed', taskId: 'T1', summary: 'Done', handoff: 'Handoff', evidence: [{ gateId: 'G1', passed: true, gate: 'test passed', detail: 'targeted test exit 0' }] });
+    host.sessions.get(out.output.sessionID).messages.filter(message => message.type === 'assistant').at(-1).content = [{ type: 'text', text: response }];
+    return { output: { ...out.output, output: response } };
   };
   const setup = await createPlugin({ configuration, observe: host.observe, history: history(host, directory), quota, git }).setup(host.ctx);
   t.after(setup);

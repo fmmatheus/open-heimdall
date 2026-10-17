@@ -47,14 +47,16 @@ export interface SubmissionBoundary {
  * implementation lives with the runner; the in-memory one below is for tests.
  */
 export interface SubmissionGate {
+  /** Whether durable workflow history identifies this native session as a workflow child. */
+  owns?(sessionID: string): boolean | Promise<boolean>;
   /** The kind a session may submit right now, or undefined when the session is not the bound child. */
   exposed(sessionID: string, agent: string): SubmissionKind | undefined | Promise<SubmissionKind | undefined>;
   submit(kind: SubmissionKind, raw: unknown, native: NativeCallContext, boundary?: SubmissionBoundary): Promise<SubmissionResponse>;
   /**
-   * True when persisted state shows the session's current attempt already sealed its reporting boundary, so no new
-   * implementation work may start even if no process-local timeline survived. Unverifiable state counts as sealed.
+   * True when the child has no current execution ownership or already sealed its reporting boundary. This also
+   * fences paused, completed and superseded children after the process-local dispatch was removed.
    */
-  sealed?(sessionID: string, agent: string): boolean | Promise<boolean>;
+  sealed?(sessionID: string, agent?: string): boolean | Promise<boolean>;
 }
 
 export const SUBMISSION_DENIAL = 'Heimdall submission denied: this session is not the bound child for this submission kind.';

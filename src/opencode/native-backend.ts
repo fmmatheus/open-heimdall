@@ -11,6 +11,7 @@ const unprompted = (value: SessionSnapshot) => value.session.outcome === undefin
 
 export function requireIdle(value: SessionSnapshot, id: string, parent?: string, allowUnprompted = false): SessionSnapshot {
   if (value.session.id !== id || (parent !== undefined && value.session.parentID !== parent)) throw new Error('Child session does not belong to this parent');
+  if (!Array.isArray(value.pendingWork) || value.pendingWork.length) throw new Error('Session has pending background work or its completion cannot be verified; resolve it before resuming');
   if (value.active || value.inbox.length || value.permissions.length || value.forms.length || (!terminal(value.session) && !(allowUnprompted && unprompted(value)))) throw new Error('Session is active, awaiting input, or has no durable terminal outcome; resolve it before resuming');
   return value;
 }
@@ -165,8 +166,8 @@ export function createNativeBackend({ ctx, observe, history, pause = ms => new P
       while (true) {
         const value = await observe(id);
         if (value.session.id !== id || value.session.parentID !== parent) throw new Error('Cancellation target changed');
-        if (!value.active && !value.inbox.length && !value.permissions.length && !value.forms.length && (terminal(value.session) || unprompted(value))) return;
-        if (Date.now() >= until) throw new Error('Could not confirm child termination and empty inbox. Resolve its pending work before resuming');
+        if (!value.active && !value.inbox.length && !value.permissions.length && !value.forms.length && Array.isArray(value.pendingWork) && !value.pendingWork.length && (terminal(value.session) || unprompted(value))) return;
+        if (Date.now() >= until) throw new Error('Could not confirm child termination, settled background work and empty inbox. Resolve its pending work before resuming');
         await pause(250);
       }
     },
@@ -190,13 +191,29 @@ export function createNativeBackend({ ctx, observe, history, pause = ms => new P
       const result = await native.execute({ agent: input.agent, description: input.title, prompt: input.prompt, model: nativeModel(input.model, input.variant), ...(input.child ? { sessionID: input.child } : {}), background: false }, nativeContext);
       const output = result?.output as unknown;
       if (!output || typeof output !== 'object' || !('sessionID' in output) || !output.sessionID || output.sessionID !== input.currentChild() || !('status' in output) || output.status !== 'completed' || !('output' in output) || typeof output.output !== 'string') throw new Error('Native child did not return foreground completion; the task has not advanced');
-      const value = requireIdle(await observe(output.sessionID as string, signal), output.sessionID as string, input.parent, true);
+      let value = await observe(output.sessionID as string, signal);
+      let deferred = false;
+      // A background shell settles its current turn before its completion wakes another one. Keep the original
+      // foreground dispatch (and its guards/submission authority) alive; never enqueue a duplicate prompt.
+      while (true) {
+        signal.throwIfAborted();
+        if (value.session.id !== output.sessionID || value.session.parentID !== input.parent) throw new Error('Child session does not belong to this parent');
+        if (!Array.isArray(value.pendingWork)) throw new Error('Session background completion cannot be verified');
+        deferred ||= value.pendingWork.length > 0 || value.active || value.inbox.length > 0 || value.permissions.length > 0 || value.forms.length > 0;
+        if (!value.pendingWork.length && (!deferred || (!value.active && !value.inbox.length && !value.permissions.length && !value.forms.length && terminal(value.session)))) break;
+        await pause(250);
+        signal.throwIfAborted();
+        value = await observe(output.sessionID as string, signal);
+      }
+      requireIdle(value, output.sessionID as string, input.parent, true);
       if (value.session.outcome !== 'succeeded') throw new Error('Native child did not finish successfully');
       const messages = await ctx.session.context({ sessionID: output.sessionID as string });
       const answer = messages.filter(m => m.type === 'assistant').at(-1);
       if (answer?.finish === 'length') throw new Error('Planner/executor output truncated at model output limit. Recover artifacts before resuming');
       if (!answer?.time.completed || answer.error || answer.finish !== 'stop') throw new Error('Native child has no successful final stop response');
-      return output.output;
+      // The tool's original output can be a waiting placeholder. The final native context is authoritative after
+      // an automatic continuation, including one that finished before our first observation.
+      return Array.isArray(answer.content) ? answer.content.filter(part => part.type === 'text').map(part => part.text).join('\n') : output.output;
     },
   };
 }

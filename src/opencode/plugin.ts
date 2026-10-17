@@ -23,6 +23,7 @@ import { createSubmissionSupervisor } from '../workflow/submission-repair.js';
 import type { SubmissionSupervisor } from '../workflow/submission-repair.js';
 import { createNativeSubmissionGate } from './submission-gate.js';
 import type { SubmissionGate } from '../workflow/submission.js';
+import { requestsBackgroundWork } from './ownership-guard.js';
 
 const actions = ['start', 'resume', 'status'];
 const inputSchema = {
@@ -33,6 +34,8 @@ const inputSchema = {
 const delegated = (name: string) => ['subagent', 'task', 'call_omo_agent', 'adr_workflow', 'opencode', 'session_goal', 'session_goals'].some(leaf => name === leaf || name.endsWith('__' + leaf) || name.endsWith('.' + leaf) || name.endsWith(':' + leaf) || name.endsWith('/' + leaf));
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
 const nonempty = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
+export const BACKGROUND_WORK_DENIAL = 'Heimdall denied background execution: workflow commands must finish in the foreground so the run retains ownership until they settle.';
+export const WORKFLOW_DELEGATION_DENIAL = 'Heimdall denied delegation: only the owning workflow dispatch may start or resume a child.';
 
 export interface PluginOptions {
   configPath?: string;
@@ -74,7 +77,7 @@ export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
       const run = metadata ? undefined : createWorkflow({ configuration, ctx, observe, history, guards, reportOnly, promptSync, supervisor, quota: options.quota, git: options.git });
       const registrations: Array<{ dispose(): Promise<void> }> = [];
       const recoveries = new Map<string, { operation: Promise<string>; controller: AbortController }>();
-      const submissions = options.submissionGate ?? createNativeSubmissionGate({ configuration, history, metadata });
+      const submissions = options.submissionGate ?? createNativeSubmissionGate({ configuration, history, metadata, nativeSession: sessionID => ctx.session.get({ sessionID: sessionID as never }) });
       // Exact registered ids only. A caller is allowed only when the gate binds its session to this kind.
       const permitted = async (kind: SubmissionKind, sessionID: string, agent: string) => (await submissions.exposed(sessionID, agent)) === kind;
       registrations.push(await ctx.tool.transform(editor => {
@@ -138,7 +141,6 @@ export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
         });
       }));
       const submissionIds = Object.values(SUBMISSION_TOOL_IDS);
-      const roleAgents = [configuration.settings.plannerAgent, configuration.settings.executorAgent];
       registrations.push(await ctx.tool.hook('execute.before', async input => {
         if (submissionKindOfTool(input.tool)) reached.add(input.id);
         // Report-only keeps at most the one exact submission tool id: anything else (lookalikes, MCP, delegation, nested) is denied here.
@@ -147,10 +149,18 @@ export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
         if (kind) { if (!await permitted(kind, input.sessionID, input.agent)) throw new Error(SUBMISSION_DENIAL); }
         else if (isLookalikeSubmissionTool(input.tool)) throw new Error(SUBMISSION_DENIAL);
         // No process-local timeline (a plugin restart, say): the persisted sealed boundary still denies new implementation work.
-        if (!kind && !supervisor.tracked(input.sessionID) && roleAgents.includes(input.agent) && await submissions.sealed?.(input.sessionID, input.agent)) throw new Error(SEALED_DENIAL);
+        if (!kind && !supervisor.tracked(input.sessionID) && await submissions.sealed?.(input.sessionID, input.agent)) throw new Error(SEALED_DENIAL);
+        const background = requestsBackgroundWork(input.input);
+        if (!kind && (background || delegated(input.tool)) && (supervisor.tracked(input.sessionID) || await submissions.owns?.(input.sessionID))) {
+          throw new Error(background ? BACKGROUND_WORK_DENIAL : WORKFLOW_DELEGATION_DENIAL);
+        }
         // Registered before anything awaits, so a boundary sealed while the guards run still sees this call. A sealed one is denied.
         const admitted = kind ? true : await supervisor.begin(input.sessionID, input.id, input.tool);
         if (!admitted) throw new Error(SEALED_DENIAL);
+        if (!kind && supervisor.tracked(input.sessionID) && await submissions.sealed?.(input.sessionID, input.agent)) {
+          supervisor.finished(input.sessionID, input.id);
+          throw new Error(SEALED_DENIAL);
+        }
         try { await guards.get(input.sessionID)?.(); } // Usage and quota guards also run for submission calls.
         catch (error) { if (!kind) supervisor.finished(input.sessionID, input.id); throw error; }
       }));
@@ -165,6 +175,10 @@ export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
       }));
       reportOnly.setHook('execute.before', true);
       registrations.push(await ctx.session.hook('context', async event => {
+        if (await submissions.sealed?.(event.sessionID, event.agent)) {
+          event.tools = {};
+          return;
+        }
         if (reportOnly.has(event.sessionID)) {
           // Only a tool the restriction names exactly survives, and only while the gate still binds this session to it.
           const bound = await submissions.exposed(event.sessionID, event.agent);
@@ -196,7 +210,12 @@ export function createPlugin(options: PluginOptions = {}): Plugin.Plugin {
       reportOnly.setHook('context', true);
       // Enforcement stays unavailable (fail closed) when the host exposes no permission hook.
       if (ctx.permission?.hook) {
-        registrations.push(await ctx.permission.hook('evaluate', event => {
+        registrations.push(await ctx.permission.hook('evaluate', async event => {
+          if (await submissions.sealed?.(event.sessionID)) {
+            event.effect = 'deny';
+            event.message = SEALED_DENIAL;
+            return;
+          }
           if (!reportOnly.has(event.sessionID) || reportOnly.permits(event.sessionID, event.action)) return;
           event.effect = 'deny';
           event.message = REPORT_ONLY_DENIAL;

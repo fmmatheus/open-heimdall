@@ -5,7 +5,7 @@ import { createNativeBackend, createNativeOriginResolver, requireIdle, resolveSu
 import { OriginProofError } from '../dist/opencode/types.js';
 import { SUBMISSION_TOOL_IDS } from '../dist/workflow/contracts.js';
 
-const idle = () => ({ session: { id: 'child', parentID: 'parent', tokens: { input: 2, output: 3, reasoning: 4, cache: { read: 5, write: 6 } }, outcome: 'succeeded', time: { idle: 10 } }, active: false, inbox: [], permissions: [], forms: [] });
+const idle = () => ({ session: { id: 'child', parentID: 'parent', tokens: { input: 2, output: 3, reasoning: 4, cache: { read: 5, write: 6 } }, outcome: 'succeeded', time: { idle: 10 } }, active: false, inbox: [], permissions: [], forms: [], pendingWork: [] });
 const context = () => ({ id: 'call_1', messageID: 'msg_1', sessionID: 'parent', agent: 'adr-orchestrator', signal: new AbortController().signal, progress: async () => {} });
 const input = (events, child) => ({ parent: 'parent', child, agent: 'adr-executor', model: 'openai/gpt-5.6-sol', variant: 'max', title: 'T1', prompt: 'Implement T1', currentChild: () => 'child', onStarted: async id => { assert.equal(id, 'child'); events.push('persisted'); } });
 
@@ -32,6 +32,70 @@ test('resume passes the existing child and foreground backgrounding cannot advan
   } }] } };
   const backend = createNativeBackend({ ctx, directory: '/project', observe: async () => idle() });
   await assert.rejects(backend.runSubagent(input([], 'child'), context()), /foreground completion/);
+});
+
+test('a parked shell and its automatic continuation keep the original foreground dispatch until the final stop', { timeout: 1000 }, async () => {
+  let executions = 0, phase = 0, returned = false, notify;
+  const gates = [];
+  const entered = () => new Promise(resolve => { notify = resolve; });
+  let nextPause = entered();
+  const ctx = { tool: { list: async () => [{ id: 'subagent', name: 'subagent', execute: async (_args, call) => {
+    executions++;
+    await call.progress({ sessionID: 'child' });
+    return { output: { sessionID: 'child', status: 'completed', output: 'The check is running; I will continue when it finishes.' } };
+  } }] }, session: { context: async () => [{ type: 'assistant', finish: 'stop', time: { completed: 40 }, content: [{ type: 'text', text: 'Final result after the check.' }] }] } };
+  const states = [
+    { ...idle(), pendingWork: ['continuation:sh_check'] },
+    { ...idle(), active: true },
+    { ...idle(), forms: [{ id: 'owner_question' }] },
+    { ...idle(), session: { ...idle().session, time: { idle: 41 } } },
+  ];
+  const backend = createNativeBackend({ ctx, observe: async () => states[phase], pause: async () => { notify(); await new Promise(resolve => gates.push(resolve)); } });
+  const running = backend.runSubagent(input([]), context()).then(value => { returned = true; return value; });
+  await nextPause;
+  for (phase = 1; phase < 3; phase++) {
+    assert.equal(returned, false, 'no return at an intermediate native idle/active boundary');
+    nextPause = entered(); gates.shift()(); await nextPause;
+  }
+  assert.equal(returned, false, 'a continuation question still belongs to the original dispatch');
+  phase = 3; gates.shift()();
+  assert.equal(await running, 'Final result after the check.');
+  assert.equal(executions, 1, 'no repeated prompt or replacement child');
+  const unknown = idle(); delete unknown.pendingWork;
+  assert.throws(() => requireIdle(unknown, 'child', 'parent'), /completion cannot be verified/);
+});
+
+test('a deferred continuation wait observes parent cancellation without dispatching another prompt', async () => {
+  const controller = new AbortController();
+  let executions = 0;
+  const ctx = { tool: { list: async () => [{ id: 'subagent', name: 'subagent', execute: async (_args, call) => {
+    executions++; await call.progress({ sessionID: 'child' });
+    return { output: { sessionID: 'child', status: 'completed', output: 'Waiting' } };
+  } }] } };
+  const backend = createNativeBackend({ ctx, observe: async () => ({ ...idle(), pendingWork: ['shell:sh_check'] }), pause: async () => { controller.abort(new Error('Owner cancelled')); } });
+  await assert.rejects(backend.runSubagent(input([]), { ...context(), signal: controller.signal }), /Owner cancelled/);
+  assert.equal(executions, 1);
+});
+
+test('an automatic continuation already active at the first observation is awaited as the same dispatch', async () => {
+  let observations = 0, pauses = 0;
+  const ctx = { tool: { list: async () => [{ id: 'subagent', name: 'subagent', execute: async (_args, call) => {
+    await call.progress({ sessionID: 'child' });
+    return { output: { sessionID: 'child', status: 'completed', output: 'Waiting for the command' } };
+  } }] }, session: { context: async () => [{ type: 'assistant', finish: 'stop', time: { completed: 40 }, content: [{ type: 'text', text: 'Continuation finished' }] }] } };
+  const backend = createNativeBackend({ ctx, observe: async () => ({ ...idle(), active: ++observations === 1 }), pause: async () => { pauses++; } });
+  assert.equal(await backend.runSubagent(input([]), context()), 'Continuation finished');
+  assert.equal(pauses, 1);
+});
+
+test('interrupt acknowledgement does not release a background command or a not-yet-consumed continuation', async () => {
+  const ctx = { session: { interrupt: async () => ({ interrupted: false }) } };
+  let polls = 0;
+  const backend = createNativeBackend({ ctx, pause: async () => {}, observe: async () => ({ ...idle(), pendingWork: ++polls < 3 ? ['continuation:sh_check'] : [] }) });
+  await backend.interrupt('child', 'parent');
+  assert.equal(polls, 3);
+  const unresolved = createNativeBackend({ ctx, cancellationWaitMs: 0, observe: async () => ({ ...idle(), pendingWork: ['shell:sh_check'] }) });
+  await assert.rejects(unresolved.interrupt('child', 'parent'), /Could not confirm child termination/);
 });
 
 test('no active entry alone does not prove safe resume; pending and terminal states fail closed', () => {

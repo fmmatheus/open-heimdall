@@ -108,14 +108,82 @@ export async function connect(directory: string, sessionID?: string, {
 export async function snapshot(api: SessionAPI, id: string, { limit = 5, signal }: { limit?: number; signal?: AbortSignal } = {}): Promise<SessionSnapshot> {
   if (!Number.isInteger(limit) || limit < 1) throw new Error('Invalid session observation limit');
   const base = '/api/session/' + encodeURIComponent(id);
-  const [session, active, inbox, permissions, forms, messages] = await Promise.all([
+  let [session, active, inbox, permissions, forms, messages] = await Promise.all([
     base, '/api/session/active', base + '/inbox', base + '/permission', base + '/form', base + '/message?order=desc&limit=' + limit,
   ].map(route => api.request(route, { signal })));
   if (!record(session) || session.id !== id || !record(session.time) || !record(active) || !Array.isArray(inbox) || !Array.isArray(permissions) || !Array.isArray(forms) || !Array.isArray(messages)) {
     throw new Error('Cannot verify complete V2 session state');
   }
   if (active[id] && (!record(active[id]) || active[id].type !== 'running')) throw new Error('Unknown V2 execution status');
-  return { session: session as unknown as ObservedSession, active: !!active[id], inbox, permissions, forms, messages };
+  // 2.0.22's shell.list is location-scoped, not session-scoped. ShellTool tags its originating session in metadata.
+  // Job.pendingBackground is private: a process disappearing from shell.list does not prove its wake-up was delivered.
+  const shells = async (): Promise<string[]> => {
+    let value: unknown;
+    try { value = await api.request('/api/shell', { signal }); }
+    catch { throw new Error('Cannot verify native pending shell work'); }
+    if (!Array.isArray(value)) throw new Error('Cannot verify native pending shell work');
+    const pending: string[] = [];
+    for (const shell of value) {
+      if (!record(shell) || typeof shell.id !== 'string' || !/^sh_\w+$/.test(shell.id) || shell.status !== 'running' || !record(shell.metadata) || (shell.metadata.sessionID !== undefined && (typeof shell.metadata.sessionID !== 'string' || !shell.metadata.sessionID.startsWith('ses_')))) throw new Error('Cannot verify native pending shell work');
+      // An untagged command in this location has unknown ownership, so it cannot establish an idle worktree.
+      if (shell.metadata.sessionID === undefined || shell.metadata.sessionID === id) pending.push('shell:' + shell.id);
+    }
+    return pending;
+  };
+  let pendingWork = await shells();
+  if (!active[id] && !inbox.length && !permissions.length && !forms.length && !pendingWork.length) {
+    const before = JSON.stringify(session);
+    const archive: HistoryMessage[] = [];
+    try { for await (const message of readMessageHistory(api, id, signal)) archive.push(message); }
+    catch { throw new Error('Cannot verify native background continuations'); }
+    // A full archive scan may cross a native wake-up. Re-read the execution boundary before accepting its result.
+    [session, active, inbox, permissions, forms] = await Promise.all([
+      base, '/api/session/active', base + '/inbox', base + '/permission', base + '/form',
+    ].map(route => api.request(route, { signal })));
+    if (!record(session) || session.id !== id || !record(session.time) || !record(active) || !Array.isArray(inbox) || !Array.isArray(permissions) || !Array.isArray(forms)) throw new Error('Cannot verify complete V2 session state');
+    if (active[id] && (!record(active[id]) || active[id].type !== 'running')) throw new Error('Unknown V2 execution status');
+    pendingWork = await shells();
+    if (JSON.stringify(session) !== before) pendingWork.push('session:changed');
+    pendingWork.push(...backgroundContinuations(archive, session as unknown as ObservedSession));
+  }
+  return { session: session as unknown as ObservedSession, active: !!active[id], inbox, permissions, forms, messages, pendingWork: [...new Set(pendingWork)] };
+}
+
+/**
+ * ShellTool completes its tool call with status=running when a command is backgrounded (explicitly or by the host).
+ * It later appends a synthetic shell result. Keep ownership across the exited-before-notification gap and until the
+ * resumed turn has its own durable idle boundary. Compaction never removes these records from the message archive.
+ */
+function backgroundContinuations(messages: HistoryMessage[], session: ObservedSession): string[] {
+  const handed = new Set<string>(), notified = new Map<string, number>(), pending = new Set<string>();
+  let finalStop = 0;
+  for (const message of messages) {
+    if (message.type === 'synthetic' && record(message.metadata) && message.metadata.source === 'shell') {
+      const metadata = message.metadata;
+      if (typeof metadata.shellID !== 'string' || !/^sh_\w+$/.test(metadata.shellID) || !['completed', 'error', 'cancelled'].includes(String(metadata.state)) || !record(message.time) || typeof message.time.created !== 'number' || !Number.isFinite(message.time.created)) throw new Error('Cannot verify native background continuation');
+      notified.set(metadata.shellID, Math.max(notified.get(metadata.shellID) ?? 0, message.time.created));
+    }
+    if (message.type !== 'assistant') continue;
+    if (!Array.isArray(message.content)) throw new Error('Cannot verify native background tool history');
+    if (message.finish === 'stop' && !message.error && record(message.time) && typeof message.time.completed === 'number' && Number.isFinite(message.time.completed)) finalStop = Math.max(finalStop, message.time.completed);
+    for (const part of message.content) {
+      if (!record(part) || typeof part.type !== 'string') throw new Error('Cannot verify native background tool history');
+      if (part.type !== 'tool') continue;
+      if (typeof part.id !== 'string' || !part.id || typeof part.name !== 'string' || !record(part.state) || !['streaming', 'running', 'completed', 'error'].includes(String(part.state.status))) throw new Error('Cannot verify native background tool history');
+      if (['streaming', 'running'].includes(String(part.state.status))) pending.add('tool:' + String(part.id));
+      if (part.name !== 'shell' || part.state.status !== 'completed') continue;
+      const metadata = part.state.metadata;
+      if (!record(metadata) || metadata.status !== 'running') continue;
+      if (typeof metadata.shellID !== 'string' || !/^sh_\w+$/.test(metadata.shellID)) throw new Error('Cannot verify native background shell handoff');
+      handed.add(metadata.shellID);
+    }
+  }
+  const idle = session.time?.idle;
+  for (const shell of new Set([...handed, ...notified.keys()])) {
+    const notification = notified.get(shell);
+    if (notification === undefined || typeof idle !== 'number' || !Number.isFinite(idle) || idle <= notification || !['succeeded', 'failed', 'interrupted'].includes(session.outcome ?? '') || (session.outcome === 'succeeded' && finalStop <= notification)) pending.add('continuation:' + shell);
+  }
+  return [...pending];
 }
 
 export function createObserver({ directory, ...connection }: ConnectionOptions & { directory: string }): SessionObserver {
@@ -152,31 +220,36 @@ export function createMessageHistory({ directory, pageSize = MESSAGE_HISTORY_PAG
   return async function* (sessionID, signal) {
     let api: SessionAPI;
     try { api = await connect(directory, sessionID, connection); } catch { throw new OriginProofError('history_unavailable'); }
-    const base = '/api/session/' + encodeURIComponent(sessionID) + '/message';
-    const cursors = new Set<string>();
-    const ids = new Set<string>();
-    let cursor: string | undefined;
-    for (let page = 1; ; page++) {
-      const route = base + '?' + (cursor === undefined ? 'order=desc&limit=' + pageSize : 'cursor=' + encodeURIComponent(cursor) + '&limit=' + pageSize);
-      let value: unknown;
-      try { value = await api.request(route, { signal, raw: true }); } catch { throw new OriginProofError('history_unavailable'); }
-      if (!record(value) || !Array.isArray(value.data) || !record(value.cursor)) throw new OriginProofError('page_malformed');
-      // The server reports an absent cursor as `null` (the empty page past the end carries `{ previous: null, next: null }`).
-      const next = value.cursor.next ?? undefined;
-      const previous = value.cursor.previous ?? undefined;
-      if ((next !== undefined && (typeof next !== 'string' || !next)) || (previous !== undefined && typeof previous !== 'string')) throw new OriginProofError('page_malformed');
-      if (next !== undefined && (cursors.has(next) || next === cursor)) throw new OriginProofError('cursor_repeated');
-      // The whole page is validated before any of it is consumed.
-      for (const item of value.data) {
-        if (!record(item) || typeof item.id !== 'string' || !item.id || typeof item.type !== 'string') throw new OriginProofError('page_malformed');
-        if (ids.has(item.id)) throw new OriginProofError('duplicate_message');
-        ids.add(item.id);
-      }
-      yield* value.data as HistoryMessage[];
-      if (next === undefined || value.data.length === 0) return;
-      if (page >= maxPages) throw new OriginProofError('scan_exhausted');
-      cursors.add(next);
-      cursor = next;
-    }
+    yield* readMessageHistory(api, sessionID, signal, pageSize, maxPages);
   };
+}
+
+/** Shared bounded archive reader for origin proof and pending-work observation. */
+async function* readMessageHistory(api: SessionAPI, sessionID: string, signal?: AbortSignal, pageSize = MESSAGE_HISTORY_PAGE_SIZE, maxPages = MESSAGE_HISTORY_MAX_PAGES): AsyncGenerator<HistoryMessage> {
+  const base = '/api/session/' + encodeURIComponent(sessionID) + '/message';
+  const cursors = new Set<string>();
+  const ids = new Set<string>();
+  let cursor: string | undefined;
+  for (let page = 1; ; page++) {
+    const route = base + '?' + (cursor === undefined ? 'order=desc&limit=' + pageSize : 'cursor=' + encodeURIComponent(cursor) + '&limit=' + pageSize);
+    let value: unknown;
+    try { value = await api.request(route, { signal, raw: true }); } catch { throw new OriginProofError('history_unavailable'); }
+    if (!record(value) || !Array.isArray(value.data) || !record(value.cursor)) throw new OriginProofError('page_malformed');
+    // The server reports an absent cursor as `null` (the empty page past the end carries `{ previous: null, next: null }`).
+    const next = value.cursor.next ?? undefined;
+    const previous = value.cursor.previous ?? undefined;
+    if ((next !== undefined && (typeof next !== 'string' || !next)) || (previous !== undefined && typeof previous !== 'string')) throw new OriginProofError('page_malformed');
+    if (next !== undefined && (cursors.has(next) || next === cursor)) throw new OriginProofError('cursor_repeated');
+    // The whole page is validated before any of it is consumed.
+    for (const item of value.data) {
+      if (!record(item) || typeof item.id !== 'string' || !item.id || typeof item.type !== 'string') throw new OriginProofError('page_malformed');
+      if (ids.has(item.id)) throw new OriginProofError('duplicate_message');
+      ids.add(item.id);
+    }
+    yield* value.data as HistoryMessage[];
+    if (next === undefined || value.data.length === 0) return;
+    if (page >= maxPages) throw new OriginProofError('scan_exhausted');
+    cursors.add(next);
+    cursor = next;
+  }
 }

@@ -709,6 +709,25 @@ run. Live record (planner and executor, one task advancement):
   before every resume; any mismatch refuses the run, so a rebuild of the shared
   package cannot change a running workflow. A run admitted without a snapshot
   (an earlier run) is not pinned and follows its existing path.
+- **Pending native work.** A finished model turn is not proof that its task has
+  finished. Idle checks include running native shells and archived background
+  handoffs until their completion notification has been consumed by a settled
+  continuation. The original dispatch retains ownership while it waits; it does
+  not send another prompt or spend a submission repair. Workflow children cannot
+  request background tool execution explicitly.
+- **Paused and superseded children.** Durable child identity fences ordinary
+  tools after a pause, completion or task advancement, including after plugin
+  reload and a change of agent role. Only an explicit, authorized resume opens
+  a new attempt. Unrelated native sessions are unaffected.
+- **Protecting pinned older runtimes.** The separate
+  `@open-heimdall/core/ownership-guard` plugin can be installed alongside the
+  workflow plugin in each managed worktree. It activates only in managed
+  worktrees and checks authenticated coordinator authority before tools run.
+  Use the [ownership plugin example](../examples/opencode/plugins/heimdall-ownership.ts)
+  as an additional file in `.opencode/plugins/` and reload only quiescent managed
+  locations. This adds the ownership fence without changing recorded snapshots,
+  accepted results or worktrees. Older snapshots keep their original execution
+  code; the guard does not migrate or automatically resume them.
 - **Not proven live.** Repair, negative outcomes, the pause codes above and the
   runtime snapshot were not exercised in the live run; they rest on unit tests.
 

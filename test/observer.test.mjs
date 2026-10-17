@@ -75,11 +75,12 @@ test('complete observation includes active execution, inbox, permissions, forms,
     routes.push({ route, options });
     if (route.endsWith('/ses_child')) return session();
     if (route === '/api/session/active') return {};
+    if (options.raw) return { data: [], cursor: {} };
     return [];
   } };
   const signal = new AbortController().signal;
-  assert.deepEqual(await snapshot(api, 'ses_child', { signal }), { session: session(), active: false, inbox: [], permissions: [], forms: [], messages: [] });
-  assert.equal(routes.length, 6);
+  assert.deepEqual(await snapshot(api, 'ses_child', { signal }), { session: session(), active: false, inbox: [], permissions: [], forms: [], messages: [], pendingWork: [] });
+  assert.equal(routes.length, 14);
   assert.ok(routes.every(call => call.options.signal === signal));
   assert.ok(routes.some(call => call.route.endsWith('/message?order=desc&limit=5')));
   await assert.rejects(snapshot({ request: async () => null }, 'ses_child'), /complete V2 session state/);
@@ -92,12 +93,92 @@ test('observer connects lazily and verifies session project before every complet
     routes.push(url.pathname);
     if (url.pathname === '/api/info') return Response.json(info());
     if (url.pathname.endsWith('/ses_child')) return Response.json({ data: session() });
+    if (url.pathname.endsWith('/message')) return Response.json({ data: [], cursor: {} });
     return Response.json({ data: url.pathname === '/api/session/active' ? {} : [] });
   } });
   assert.deepEqual(routes, []);
   assert.equal((await observe('ses_child')).active, false);
   assert.equal(routes.filter(route => route === '/api/info').length, 1);
-  assert.equal(routes.filter(route => route === '/api/session/ses_child').length, 2);
+  assert.equal(routes.filter(route => route === '/api/session/ses_child').length, 3);
+});
+
+const backgroundCall = (id = 'sh_check') => ({ id: 'msg_shell', type: 'assistant', content: [{ id: 'call_shell', type: 'tool', name: 'shell', state: { status: 'completed', input: { background: true }, metadata: { status: 'running', shellID: id } } }] });
+const completion = (id = 'sh_check', created = 30, state = 'completed') => ({ id: 'msg_done', type: 'synthetic', metadata: { source: 'shell', shellID: id, jobID: id, state }, time: { created } });
+
+function pendingFixture({ messages = [], shells = [], active = {}, current = session(), archive, changeAfterArchive } = {}) {
+  const calls = [];
+  let scanned = false;
+  return { calls, api: { request: async (route, options = {}) => {
+    calls.push({ route, options });
+    if (route === '/api/session/ses_child') return scanned && changeAfterArchive ? changeAfterArchive : current;
+    if (route === '/api/session/active') return active;
+    if (route === '/api/shell') {
+      if (shells instanceof Error) throw shells;
+      return shells;
+    }
+    if (route.startsWith('/api/session/ses_child/message')) {
+      if (!options.raw) return messages.slice(0, 5);
+      scanned = true;
+      if (archive) return archive(route);
+      return { data: messages, cursor: {} };
+    }
+    return [];
+  } } };
+}
+
+test('native shell inventory holds otherwise successful idle sessions and ignores another identified session', async () => {
+  const shell = { id: 'sh_check', status: 'running', metadata: { sessionID: 'ses_child' } };
+  const f = pendingFixture({ shells: [shell] });
+  assert.deepEqual((await snapshot(f.api, 'ses_child')).pendingWork, ['shell:sh_check']);
+  assert.ok(!f.calls.some(call => call.options.raw), 'running work never needs an archive scan');
+  const other = pendingFixture({ shells: [{ ...shell, metadata: { sessionID: 'ses_other' } }] });
+  assert.deepEqual((await snapshot(other.api, 'ses_child')).pendingWork, []);
+  const unknown = pendingFixture({ shells: [{ ...shell, metadata: {} }] });
+  assert.deepEqual((await snapshot(unknown.api, 'ses_child')).pendingWork, ['shell:sh_check']);
+});
+
+test('an exited background shell remains pending until its automatic continuation has durably settled', async () => {
+  const handoff = backgroundCall();
+  for (const messages of [[handoff], [completion(), handoff]]) {
+    const f = pendingFixture({ messages });
+    assert.deepEqual((await snapshot(f.api, 'ses_child')).pendingWork, ['continuation:sh_check']);
+  }
+  for (const outcome of ['succeeded', 'failed', 'interrupted']) {
+    const final = { id: 'msg_final', type: 'assistant', content: [], finish: 'stop', time: { completed: 35 } };
+    const f = pendingFixture({ messages: [final, completion(), handoff], current: { ...session(), outcome, time: { idle: 40 } } });
+    assert.deepEqual((await snapshot(f.api, 'ses_child')).pendingWork, [], outcome + ' continuation settled');
+  }
+  const noNewStop = pendingFixture({ messages: [completion(), handoff], current: { ...session(), time: { idle: 40 } } });
+  assert.deepEqual((await snapshot(noNewStop.api, 'ses_child')).pendingWork, ['continuation:sh_check'], 'successful idle alone cannot reuse the old waiting reply');
+  const unmatched = pendingFixture({ messages: [completion('sh_unrelated'), handoff], current: { ...session(), time: { idle: 40 } } });
+  assert.ok((await snapshot(unmatched.api, 'ses_child')).pendingWork.includes('continuation:sh_check'));
+});
+
+test('background handoffs before compaction and beyond recent messages are found through the complete archive', async () => {
+  const f = pendingFixture({ archive: route => route.includes('cursor=')
+    ? { data: [backgroundCall()], cursor: {} }
+    : { data: [{ id: 'msg_compaction', type: 'compaction', status: 'completed' }], cursor: { next: 'older' } },
+  });
+  assert.deepEqual((await snapshot(f.api, 'ses_child')).pendingWork, ['continuation:sh_check']);
+  assert.ok(f.calls.some(call => call.route.includes('cursor=older&limit=200')));
+});
+
+test('unknown shell state, missing inventory and unreadable continuation history fail closed', async () => {
+  for (const shells of [null, [{}], [{ id: 'sh_check', status: 'running', metadata: { sessionID: 3 } }], Object.assign(new Error('missing route'), { status: 404 })]) {
+    const f = pendingFixture({ shells });
+    await assert.rejects(snapshot(f.api, 'ses_child'), error => /pending shell work/.test(error.message) && error.status === undefined, 'a missing shell route must never look like a missing session');
+  }
+  for (const archive of [() => [], () => { throw new Error('offline'); }, () => ({ data: [backgroundCall()], cursor: { next: 'repeated' } })]) {
+    await assert.rejects(snapshot(pendingFixture({ archive }).api, 'ses_child'), /background continuations/);
+  }
+});
+
+test('a session that changes while its archive is scanned cannot be declared settled', async () => {
+  const f = pendingFixture({ changeAfterArchive: { ...session(), time: { idle: 50 } } });
+  assert.deepEqual((await snapshot(f.api, 'ses_child')).pendingWork, ['session:changed']);
+  const active = pendingFixture({ active: { ses_child: { type: 'running' } } });
+  await snapshot(active.api, 'ses_child');
+  assert.ok(!active.calls.some(call => call.options.raw), 'active prompt-watch observations avoid full archive scans');
 });
 
 

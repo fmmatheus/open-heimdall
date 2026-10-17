@@ -26,6 +26,8 @@ export interface SessionSnapshot {
   permissions: unknown[];
   forms: unknown[];
   messages: unknown[];
+  /** Native shell jobs or their automatic continuations that have not durably settled. */
+  pendingWork: string[];
 }
 
 export type SessionObserver = (id: string, signal?: AbortSignal) => Promise<SessionSnapshot>;
