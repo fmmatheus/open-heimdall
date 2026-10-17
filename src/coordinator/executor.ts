@@ -9,7 +9,7 @@ import type { ExecutorInspection, ManagedExecutor, RunRecord } from './types.js'
 
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
 const status = (error: unknown) => record(error) ? error.status : undefined;
-const empty = (value: SessionSnapshot) => !value.active && !value.inbox.length && !value.permissions.length && !value.forms.length;
+const empty = (value: SessionSnapshot) => !value.active && !value.inbox.length && !value.permissions.length && !value.forms.length && Array.isArray(value.pendingWork) && !value.pendingWork.length;
 const terminal = (value: SessionSnapshot) => empty(value) && ['succeeded', 'failed', 'interrupted'].includes(value.session.outcome ?? '') && Number.isFinite(value.session.time?.idle);
 const pristine = (value: SessionSnapshot) => empty(value) && !value.session.outcome && !value.messages.length && [value.session.tokens?.input, value.session.tokens?.output, value.session.tokens?.reasoning, value.session.tokens?.cache?.read, value.session.tokens?.cache?.write].every(token => token === 0);
 const stopped = (value: SessionSnapshot) => {

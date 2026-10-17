@@ -6,6 +6,7 @@ import { sameSubmission, submissionKindForPhase } from './submission-store.js';
 import { ORIGIN_REASONS, originUnverifiedDenial, rejectedSubmission, SUBMISSION_DENIAL } from './submission.js';
 import type { NativeCallContext, OriginReason, SubmissionGate, SubmissionResponse } from './submission.js';
 import type { RunnerPersistence, RunState, RuntimeIdentity, SubmissionBinding, SubmissionReceipt } from './types.js';
+import { childExecutionBlocked, isWorkflowChild } from './child-ownership.js';
 
 /**
  * Proves, from native observation of the bound child session, which dispatch prompt a tool call descends from.
@@ -70,15 +71,20 @@ export function authenticateSubmissionCaller(state: RunState | null | undefined,
 export function createDurableSubmissionGate(options: DurableSubmissionGateOptions): SubmissionGate {
   const { runId, directory, planRoot, persistence, origin, runtime = runtimeIdentity, now = Date.now } = options;
   return {
+    async owns(sessionID) {
+      try { return isWorkflowChild(await persistence.load(runId), sessionID); }
+      catch { return false; }
+    },
     async exposed(sessionID, agent) {
       try {
         const state = await persistence.load(runId);
         return authenticateSubmissionCaller(state, sessionID, agent)?.kind;
       } catch { return undefined; } // Fail closed: an unreadable checkpoint exposes nothing.
     },
-    async sealed(sessionID) {
+    async sealed(sessionID, agent) {
       let state: RunState | null | undefined;
       try { state = await persistence.load(runId); } catch { return true; } // Fail closed: an unreadable checkpoint cannot prove the boundary is open.
+      if (childExecutionBlocked(state, sessionID, agent)) return true;
       const attempt = state?.attempt;
       const sealed = state?.submissionRepair?.sealed;
       if (!state || state.protocol !== SUBMISSION_PROTOCOL || state.status !== 'running' || !attempt || !sealed) return false;

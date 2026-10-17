@@ -13,6 +13,7 @@
   "exports": {
     ".": "./dist/index.js",
     "./plugin": "./dist/opencode/plugin.js",
+    "./ownership-guard": "./dist/opencode/ownership-guard.js",
     "./coordinator": "./dist/coordinator/index.js"
   },
   "files": [

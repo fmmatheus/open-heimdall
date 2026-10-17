@@ -154,7 +154,7 @@ test('recoverResponse binds the attempt marker when the contract follows it', as
   const t2 = task('T2');
   const prompt = 'Task: x\nWorkflow attempt: attempt-1\n\n' + executorContract(t2);
   const messages = [{ type: 'user', text: prompt }, { type: 'assistant', time: { completed: 20 }, finish: 'stop', content: [{ type: 'text', text: '{"status":"completed"}' }] }];
-  const idle = { session: { id: 'child', parentID: 'parent', tokens: { input: 2, output: 3, reasoning: 4, cache: { read: 5, write: 6 } }, outcome: 'succeeded', time: { idle: 10 } }, active: false, inbox: [], permissions: [], forms: [] };
+  const idle = { session: { id: 'child', parentID: 'parent', tokens: { input: 2, output: 3, reasoning: 4, cache: { read: 5, write: 6 } }, outcome: 'succeeded', time: { idle: 10 } }, active: false, inbox: [], permissions: [], forms: [], pendingWork: [] };
   const ctx = { session: { context: async () => messages } };
   const backend = createNativeBackend({ ctx, observe: async () => idle, cancellationWaitMs: 0 });
   assert.equal(await backend.recoverResponse('child', 'parent', { id: 'attempt-1', startedAt: 10 }), '{"status":"completed"}');

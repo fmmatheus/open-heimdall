@@ -8,7 +8,9 @@ import { createDurableSubmissionGate } from '../dist/workflow/durable-submission
 import { createLocalSubmissionStore } from '../dist/workflow/submission-store.js';
 import { createSubmissionSupervisor, MAX_SUBMISSION_REPAIRS } from '../dist/workflow/submission-repair.js';
 import { checkpointReportInfo, submissionRepairInfo } from '../dist/workflow/report-info.js';
-import { createPlugin } from '../dist/opencode/plugin.js';
+import { createPlugin, BACKGROUND_WORK_DENIAL, WORKFLOW_DELEGATION_DENIAL } from '../dist/opencode/plugin.js';
+import { createNativeSubmissionGate } from '../dist/opencode/submission-gate.js';
+import { openSubmissionBinding, recordDispatchPrompt } from '../dist/workflow/submission-store.js';
 import { createReportOnlyRegistry, REPAIR_ONLY_DENIAL, REPORT_ONLY_DENIAL } from '../dist/opencode/report-only.js';
 import { loadConfiguration } from '../dist/config.js';
 import { SEALED_DENIAL } from '../dist/workflow/submission.js';
@@ -218,8 +220,8 @@ test('the restricted boundary denies edit, write, shell, tests, git, delegation,
         try { await call(name, { command: 'x' }); boundary.denied[name] = 'ran'; }
         catch (error) { boundary.denied[name] = error.message; }
       }
-      const evaluate = action => { const event = { sessionID: meta.sessionID, agent: meta.agent, action, resources: [], effect: 'ask' }; f.hooks.get('permission.evaluate')(event); return event.effect; };
-      boundary.permissions = Object.fromEntries(['edit', 'bash', 'external_directory', RESULT_TOOL, 'foo__' + RESULT_TOOL].map(action => [action, evaluate(action)]));
+      const evaluate = async action => { const event = { sessionID: meta.sessionID, agent: meta.agent, action, resources: [], effect: 'ask' }; await f.hooks.get('permission.evaluate')(event); return event.effect; };
+      boundary.permissions = Object.fromEntries(await Promise.all(['edit', 'bash', 'external_directory', RESULT_TOOL, 'foo__' + RESULT_TOOL].map(async action => [action, await evaluate(action)])));
       assert.equal((await call(submitTool, completed())).accepted, true);
       return SPOKEN;
     },
@@ -713,14 +715,93 @@ test('persisted sealed state denies new implementation work when no process-loca
   await fs.writeFile(stateFile, JSON.stringify(sealed));
   await assert.rejects(f.hooks.get('tool.execute.before')(late), error => error.message === SEALED_DENIAL);
   // A different (fresh) attempt is not sealed.
-  await fs.writeFile(stateFile, JSON.stringify({ ...sealed, attempt: { ...sealed.attempt, id: 'attempt-fresh' } }));
+  const fresh = { ...sealed, attempt: { ...sealed.attempt, id: 'attempt-fresh' } };
+  fresh.submissionBinding = recordDispatchPrompt(openSubmissionBinding(fresh, 3), 'prompt-fresh');
+  await fs.writeFile(stateFile, JSON.stringify(fresh));
   await f.hooks.get('tool.execute.before')(late);
   // An unreadable checkpoint cannot prove the boundary is open.
   await fs.writeFile(stateFile, '{ not json');
   await assert.rejects(f.hooks.get('tool.execute.before')(late), error => error.message === SEALED_DENIAL);
-  // A planner or executor session of another role agent never reaches the durable check.
+  // Changing a known child's role cannot reopen its reporting boundary.
   await fs.writeFile(stateFile, JSON.stringify(sealed));
-  await f.hooks.get('tool.execute.before')({ ...late, agent: 'adr-orchestrator' });
+  await assert.rejects(f.hooks.get('tool.execute.before')({ ...late, agent: 'adr-orchestrator' }), error => error.message === SEALED_DENIAL);
+});
+
+test('a child that stopped without a submission stays fenced after pause and plugin reload, then an explicit resume can continue', async t => {
+  const f = await fixture(t, [submitOk(plan('T1')), speaks('Waiting for background checks.'), submitOk(completed())]);
+  assert.equal((await f.start()).status, 'paused');
+  const saved = await f.state();
+  assert.equal(saved.reason.includes('No valid submission'), true);
+  const child = saved.child;
+  assert.equal(f.supervisor.tracked(child), false);
+  const event = { sessionID: child, agent: 'adr-executor', messageID: 'late-shell-notification', id: 'late-call', input: {} };
+  for (const tool of ['edit', 'write', 'shell', 'mcp__server__write', 'execute', 'subagent', 'made_up_tool']) {
+    await assert.rejects(f.hooks.get('tool.execute.before')({ ...event, tool }), error => error.message === SEALED_DENIAL, tool);
+  }
+  await assert.rejects(f.hooks.get('tool.execute.before')({ ...event, agent: 'build', tool: 'shell' }), error => error.message === SEALED_DENIAL);
+  const context = { sessionID: child, agent: 'build', tools: { edit: {}, shell: {}, [RESULT_TOOL]: {} } };
+  await f.hooks.get('session.context')(context);
+  assert.deepEqual(context.tools, {});
+  const permission = { sessionID: child, action: 'shell', resources: [], effect: 'allow' };
+  await f.hooks.get('permission.evaluate')(permission);
+  assert.equal(permission.effect, 'deny');
+  const g = await fixture(t, [], { rebuild: f });
+  await assert.rejects(g.hooks.get('tool.execute.before')({ ...event, tool: 'edit' }), error => error.message === SEALED_DENIAL);
+  // Native gate reconstruction must find a paused standalone child after active.lock has been released.
+  const nativeGate = createNativeSubmissionGate({ configuration: { ...await loadConfiguration({ projectDirectory: f.directory }), workflowRoot: path.join(f.directory, '.heimdall/state') }, history: async function* () {} });
+  assert.equal(await nativeGate.owns(child), true);
+  assert.equal(await nativeGate.sealed(child, 'build'), true);
+  assert.equal(await nativeGate.sealed('unrelated-session', 'build'), false);
+  assert.equal((await f.resume('Checks complete; continue the same task')).status, 'completed');
+  assert.deepEqual((await f.state()).results.map(result => result.taskId), ['T1']);
+  await assert.rejects(f.hooks.get('tool.execute.before')({ ...event, tool: 'shell' }), error => error.message === SEALED_DENIAL);
+});
+
+test('workflow children cannot background tools while foreground work and unrelated sessions remain available', async t => {
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool }) => {
+    await assert.rejects(call('shell', { command: 'synthetic check', background: true }), error => error.message === BACKGROUND_WORK_DENIAL);
+    await assert.rejects(call('execute', { calls: [{ input: { run_in_background: true } }] }), error => error.message === BACKGROUND_WORK_DENIAL);
+    for (const tool of ['subagent', 'native.subagent', 'task', 'session_goals', 'adr_workflow']) await assert.rejects(call(tool, {}), error => error.message === WORKFLOW_DELEGATION_DENIAL);
+    assert.equal((await call('shell', { command: 'synthetic check', background: false })).ran, 'shell');
+    assert.equal((await call(submitTool, completed())).accepted, true);
+    return SPOKEN;
+  }]);
+  assert.equal((await f.start()).status, 'completed');
+  await f.hooks.get('tool.execute.before')({ tool: 'shell', sessionID: 'unrelated', agent: 'build', messageID: 'm', id: 'c', input: { background: true } });
+});
+
+test('a previous child cannot keep implementing while the next task owns the workflow', async t => {
+  let previous;
+  const f = await fixture(t, [submitOk(plan('T1', 'T2')), async ({ child, call, submitTool }) => {
+    previous = child;
+    assert.equal((await call(submitTool, completed())).accepted, true);
+    return SPOKEN;
+  }, async ({ call, submitTool }) => {
+    await assert.rejects(f.hooks.get('tool.execute.before')({ tool: 'edit', sessionID: previous, agent: 'build', messageID: 'old-continuation', id: 'old-call', input: {} }), error => error.message === SEALED_DENIAL);
+    assert.equal((await call(submitTool, completed())).accepted, true);
+    return SPOKEN;
+  }]);
+  assert.equal((await f.start()).status, 'completed');
+  assert.deepEqual((await f.state()).results.map(result => result.taskId), ['T1', 'T2']);
+});
+
+test('a surviving process-local handler cannot override a durable pause', async t => {
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ child, call, submitTool }) => {
+    const active = await f.state();
+    assert.equal(f.supervisor.tracked(child), true);
+    const file = path.join(f.directory, '.heimdall/state/runs', RUN, 'state.json');
+    await fs.writeFile(file, JSON.stringify({ ...active, status: 'paused' }));
+    await assert.rejects(call('edit', {}), error => error.message === SEALED_DENIAL);
+    const permission = { sessionID: child, action: 'write', resources: [], effect: 'allow' };
+    await f.hooks.get('permission.evaluate')(permission);
+    assert.equal(permission.effect, 'deny');
+    // Restore the fixture's authoritative active state; the denied edit has no effect and spends no format retry.
+    await fs.writeFile(file, JSON.stringify(active));
+    assert.equal((await call(submitTool, completed())).accepted, true);
+    return SPOKEN;
+  }]);
+  assert.equal((await f.start()).status, 'completed');
+  assert.equal((await f.state()).reportRecovery, undefined);
 });
 
 // --- Legacy and projection ----------------------------------------------------------------------------------

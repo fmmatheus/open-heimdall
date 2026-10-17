@@ -7,8 +7,8 @@ const tokens = value => ({ input: value, output: 0, reasoning: 0, cache: { read:
 const runFixture = () => ({ id: 'run-one', ownerToken: 'synthetic-owner', capacityReserved: true, version: 1, parentSessionId: 'ses_reserved', promptMessageId: 'msg_reserved', worktreePath: '/synthetic/managed/checkout', launchAction: 'start', resolution: null, checkpoint: null, specification: { settings: { plannerAgent: 'adr-planner', executorAgent: 'adr-executor', plannerModel: 'anthropic/planner', plannerVariant: 'max' }, opencode: { baseUrl: 'http://127.0.0.1:4096', passwordEnvironmentVariable: 'SYNTHETIC_PASSWORD' } } });
 
 function fixture(run = runFixture(), connectionOverrides = {}, executorOptions = {}) {
-  const calls = [], projected = new Map(), sessions = new Map();
-  let active = {}, inbox = [], permissions = [], forms = [], pluginsValid = true, listingAvailable = true, coldReads = 0, pluginFailed = false, clock = 0;
+  const calls = [], projected = new Map(), sessions = new Map(), histories = new Map();
+  let active = {}, inbox = [], permissions = [], forms = [], shells = [], shellInventoryAvailable = true, pluginsValid = true, listingAvailable = true, coldReads = 0, pluginFailed = false, clock = 0;
   const delays = [];
   const parent = { id: run.parentSessionId, agent: 'adr-orchestrator', model: { providerID: 'anthropic', id: 'planner', variant: 'max' }, location: { directory: run.worktreePath }, metadata: { heimdallRunId: run.id }, tokens: tokens(0), time: { created: 1 } };
   sessions.set(parent.id, parent);
@@ -31,6 +31,7 @@ function fixture(run = runFixture(), connectionOverrides = {}, executorOptions =
       return Response.json({ data, cursor: data.length ? { next: parentID + ':' + (start + 1) } : {} });
     }
     if (url.pathname === '/api/session/active') return Response.json({ data: active });
+    if (url.pathname === '/api/shell') return shellInventoryAvailable ? Response.json({ data: shells }) : new Response('', { status: 404 });
     const match = /^\/api\/session\/([^/]+)(.*)$/.exec(url.pathname);
     if (!match) return new Response('', { status: 404 });
     const session = sessions.get(match[1]);
@@ -39,7 +40,7 @@ function fixture(run = runFixture(), connectionOverrides = {}, executorOptions =
     if (match[2] === '/inbox') return Response.json({ data: match[1] === parent.id ? inbox : [] });
     if (match[2] === '/permission') return Response.json({ data: match[1] === parent.id ? permissions : [] });
     if (match[2] === '/form') return Response.json({ data: match[1] === parent.id ? forms : [] });
-    if (match[2] === '/message') return Response.json({ data: session.outcome ? [{ type: 'assistant', finish: 'stop', time: { completed: 20 } }] : [] });
+    if (match[2] === '/message') return Response.json({ data: histories.get(session.id) ?? (session.outcome ? [{ id: 'msg_final_' + session.id, type: 'assistant', finish: 'stop', time: { completed: 20 }, content: [] }] : []), cursor: {} });
     if (match[2].startsWith('/message/')) return projected.has(match[2].slice(9)) ? Response.json({ data: projected.get(match[2].slice(9)) }) : new Response('', { status: 404 });
     if (match[2] === '/prompt' && options.method === 'POST') {
       const value = { id: body.id, sessionID: session.id, type: 'user', delivery: body.delivery, payload: { text: body.text, metadata: body.metadata } };
@@ -51,9 +52,32 @@ function fixture(run = runFixture(), connectionOverrides = {}, executorOptions =
   };
   const executor = createManagedExecutor({ getRun: () => run, preflightTimeoutMs: 1000, now: () => clock, pause: async ms => { assert.ok(!calls.some(call => call.method === 'POST'), 'readiness never writes before active inventory'); delays.push(ms); clock += ms; }, connection: { environment: { SYNTHETIC_PASSWORD: 'synthetic-test-secret' }, fetchImpl, ...connectionOverrides }, ...executorOptions });
   const settled = (id, parentID) => ({ id, ...(parentID ? { parentID } : {}), location: { directory: run.worktreePath }, tokens: tokens(1), outcome: 'succeeded', time: { idle: 10 } });
-  return { run, executor, calls, parent, sessions, projected, settled, delays,
+  return { run, executor, calls, parent, sessions, histories, projected, settled, delays,
+    set shells(value) { shells = value; }, set shellInventoryAvailable(value) { shellInventoryAvailable = value; },
     set active(value) { active = value; }, set inbox(value) { inbox = value; }, set permissions(value) { permissions = value; }, set forms(value) { forms = value; }, set pluginsValid(value) { pluginsValid = value; }, set listingAvailable(value) { listingAvailable = value; }, set coldReads(value) { coldReads = value; }, set pluginFailed(value) { pluginFailed = value; } };
 }
+
+test('a paused checkpoint retains ownership while an idle child has a shell or a deferred automatic continuation', async () => {
+  const f = fixture();
+  f.sessions.set(f.run.parentSessionId, f.settled(f.run.parentSessionId));
+  f.sessions.set('ses_child', f.settled('ses_child', f.run.parentSessionId));
+  f.run.checkpoint = { id: f.run.id, parent: f.run.parentSessionId, status: 'paused', reason: 'Await owner', tasks: [{ id: 'T1' }], results: [], index: 0, child: 'ses_child' };
+  const shell = { id: 'sh_check', status: 'running', metadata: { sessionID: 'ses_child' } };
+  f.shells = [shell];
+  assert.equal((await f.executor.inspect(f.run)).idle, false, 'running shell cannot release capacity');
+  f.shells = [];
+  const handoff = { id: 'msg_handoff', type: 'assistant', finish: 'stop', time: { completed: 9 }, content: [{ id: 'call_shell', type: 'tool', name: 'shell', state: { status: 'completed', metadata: { status: 'running', shellID: shell.id } } }] };
+  f.histories.set('ses_child', [handoff]);
+  assert.equal((await f.executor.inspect(f.run)).idle, false, 'exited process still owes a continuation');
+  const notification = { id: 'msg_done', type: 'synthetic', metadata: { source: 'shell', shellID: shell.id, state: 'completed' }, time: { created: 30 } };
+  f.histories.set('ses_child', [notification, handoff]);
+  assert.equal((await f.executor.inspect(f.run)).idle, false, 'queued wake-up cannot release capacity');
+  f.sessions.get('ses_child').time.idle = 40;
+  f.histories.set('ses_child', [{ id: 'msg_final', type: 'assistant', content: [], finish: 'stop', time: { completed: 35 } }, notification, handoff]);
+  assert.deepEqual(await f.executor.inspect(f.run), { idle: true, status: 'paused', reason: 'Await owner' });
+  f.shellInventoryAvailable = false;
+  assert.equal((await f.executor.inspect(f.run)).idle, false, 'unsupported inventory must not look like an absent parent');
+});
 
 test('native launch uses exact saved session/message IDs, explicit worktree location, and two-phase admission', async () => {
   const f = fixture(); await f.executor.launch(f.run);

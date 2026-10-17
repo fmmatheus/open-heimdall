@@ -10,7 +10,7 @@ import { createNativeBackend } from '../dist/opencode/native-backend.js';
 
 const allHooks = (registry = createReportOnlyRegistry()) => { for (const hook of ['execute.before', 'context', 'permission.evaluate']) registry.setHook(hook, true); return registry; };
 /** Observed child session. Defaults to a terminal child of the fixture parent. */
-const observed = (id, over = {}) => ({ session: { id, parentID: 'parent', tokens: { input: 2, output: 3, reasoning: 4, cache: { read: 5, write: 6 } }, outcome: 'succeeded', time: { idle: 10 }, ...(over.session ?? {}) }, active: false, inbox: [], permissions: [], forms: [], ...Object.fromEntries(Object.entries(over).filter(([key]) => key !== 'session')) });
+const observed = (id, over = {}) => ({ session: { id, parentID: 'parent', tokens: { input: 2, output: 3, reasoning: 4, cache: { read: 5, write: 6 } }, outcome: 'succeeded', time: { idle: 10 }, ...(over.session ?? {}) }, active: false, inbox: [], permissions: [], forms: [], pendingWork: [], ...Object.fromEntries(Object.entries(over).filter(([key]) => key !== 'session')) });
 
 const snapshot = (sonnet = 50, kimi = 40) => Object.fromEntries([['anthropic', sonnet], ['kimi', kimi]].map(([key, n]) => [key, { fetchedAt: Date.now(), entries: [{ name: '5h', percentRemaining: n }, { name: 'Weekly', percentRemaining: n }], errors: [] }]));
 const task = { id: 'T2', title: 'Two', brief: 'Do two', dependsOn: [], dod: ['first gate', 'second gate', 'third gate'] };
@@ -418,7 +418,7 @@ test('a stale owner at the first correction save dispatches nothing and the rota
 test('report-only restriction holds during every correction and implementation files and HEAD are unchanged', async t => {
   const registry = createReportOnlyRegistry();
   for (const hook of ['execute.before', 'context', 'permission.evaluate']) registry.setHook(hook, true);
-  const gitIn = (dir, ...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', ...args], { cwd: dir, encoding: 'utf8' });
+  const gitIn = (dir, ...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', '-c', 'commit.gpgsign=false', ...args], { cwd: dir, encoding: 'utf8' });
   const denials = [];
   let headAfterWork;
   const f = await fixture(t, [plan, async sent => {
@@ -441,7 +441,7 @@ test('report-only restriction holds during every correction and implementation f
   }], { registry });
   gitIn(f.directory, 'init', '-q', '-b', 'main');
   const result = JSON.parse(await f.start(f.run));
-  assert.equal(result.status, 'completed');
+  assert.equal(result.status, 'completed', JSON.stringify(result));
   assert.equal(denials.length, 3);
   assert.equal(gitIn(f.directory, 'rev-parse', 'HEAD').trim(), headAfterWork, 'HEAD unchanged across the correction');
   assert.equal(await fs.readFile(path.join(f.directory, 'impl.txt'), 'utf8'), 'v1');
