@@ -33,7 +33,7 @@ plans = ".heimdall/plans"
 # executorPrompt = "my-prompts/executor.md"
 
 [opencode]
-# Set the local origin of your existing OpenCode 2.0.22 connection.
+# Set the local origin of your existing OpenCode 2.0.32 connection.
 # baseUrl = "http://127.0.0.1:4096"
 # For OpenChamber Desktop, use its local HTTP port and existing client token:
 # authentication = "openchamber"

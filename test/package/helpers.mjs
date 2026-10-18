@@ -191,7 +191,7 @@ export async function findPackages(modules, name) {
   return (await listPackages(modules)).filter(entry => entry.name === name).map(({ location, version }) => ({ location, version }));
 }
 
-export const supportedPluginVersion = '2.0.22';
+export const supportedPluginVersion = '2.0.32';
 export const quotaPackageName = '@slkiser/opencode-quota';
 
 // The dependency graph the package is published against (the checkout's lockfile). It supplies which

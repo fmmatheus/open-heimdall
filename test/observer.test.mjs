@@ -7,7 +7,7 @@ import { OriginProofError } from '../dist/opencode/types.js';
 const baseUrl = 'http://127.0.0.1:4096';
 const directory = '/workspace';
 const connection = { baseUrl, passwordEnvironmentVariable: 'TEST_OPENCODE_PASSWORD', environment: { TEST_OPENCODE_PASSWORD: 'synthetic-test-password' } };
-const info = () => ({ version: '2.0.22', pid: 44 });
+const info = () => ({ version: '2.0.32', pid: 44 });
 const session = () => ({ id: 'ses_child', parentID: 'ses_parent', location: { directory }, time: { idle: 10 }, outcome: 'succeeded' });
 
 test('configured local HTTP uses environment credentials in memory and preserves pagination', async () => {
@@ -34,12 +34,12 @@ test('connection uses the selected server and verifies the matching version and 
     return Response.json(url.pathname === '/api/info' ? info() : { data: session() });
   };
   const api = await connect(directory, 'ses_child', { ...connection, fetchImpl });
-  assert.equal(api.version, '2.0.22');
+  assert.equal(api.version, '2.0.32');
   assert.equal(api.pid, 44);
   assert.deepEqual(routes, ['/api/info', '/api/session/ses_child']);
   await assert.rejects(connect('/different', 'ses_child', { ...connection, fetchImpl }), /different project/);
-  for (const server of [{ ...info(), pid: 0 }, { ...info(), version: '1.2.0' }, { ...info(), version: '2.0.23' }]) {
-    await assert.rejects(connect(directory, undefined, { ...connection, fetchImpl: async () => Response.json(server) }), /supported OpenCode 2.0.22/);
+  for (const server of [{ ...info(), pid: 0 }, { ...info(), version: '1.2.0' }, { ...info(), version: '2.0.22' }, { ...info(), version: '2.0.23' }]) {
+    await assert.rejects(connect(directory, undefined, { ...connection, fetchImpl: async () => Response.json(server) }), /supported OpenCode 2.0.32/);
   }
 });
 
@@ -189,7 +189,7 @@ test('explicit no-auth omits Authorization and never accesses a password environ
     calls.push(options);
     return Response.json(url.pathname === '/api/info' ? info() : { data: session() });
   } });
-  assert.equal(api.version, '2.0.22');
+  assert.equal(api.version, '2.0.32');
   assert.equal(calls.length, 2);
   assert.ok(calls.every(options => !Object.hasOwn(options.headers, 'Authorization')));
   const direct = createAPI({ baseUrl, authentication: 'none', directory, fetchImpl: async (url, options) => {
@@ -237,7 +237,7 @@ test('Desktop connection uses its selected settings and forwards authenticated n
   assert.deepEqual(await api.request('/api/session/ses_child/prompt', { method: 'POST', body }), [{ id: 'msg_reserved', metadata: { heimdallRunId: 'run_reserved' } }]);
   assert.deepEqual((await api.request('/api/session/ses_child/message', { raw: true })).cursor, { next: 'native-cursor' });
   assert.deepEqual(files, [{ file: path.join('/synthetic/desktop-profile', 'settings.json'), encoding: 'utf8' }]);
-  assert.equal(api.version, '2.0.22');
+  assert.equal(api.version, '2.0.32');
   assert.equal(api.pid, 44, 'metadata belongs to the native server, not the Desktop proxy');
   assert.equal(JSON.parse(calls[2].options.body).metadata.heimdallRunId, body.metadata.heimdallRunId);
   assert.deepEqual(JSON.parse(calls[2].options.body), body);

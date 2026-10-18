@@ -17,7 +17,7 @@ import {
  * installed package, not by the checkout's build.
  */
 
-const VERSION = '2.0.22';
+const VERSION = '2.0.32';
 const planner = 'anthropic/planner-x';
 const executor = 'openai/executor-x';
 

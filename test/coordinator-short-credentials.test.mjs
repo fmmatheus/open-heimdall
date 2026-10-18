@@ -124,7 +124,7 @@ test('short, overlapping and long values are accepted from the selected file and
     const headers = [];
     const fetchImpl = async (url, options = {}) => {
       headers.push(options.headers?.Authorization);
-      return Response.json({ version: '2.0.22', pid: 44 });
+      return Response.json({ version: '2.0.32', pid: 44 });
     };
     await connect('/synthetic/project', undefined, {
       baseUrl: 'http://127.0.0.1:4096', authentication: 'basic', passwordEnvironmentVariable: reference, environment: context.environmentFor(reference, {}), fetchImpl,

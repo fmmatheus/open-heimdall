@@ -127,9 +127,9 @@ describe('installed runtime identity and snapshots', () => {
           assert.equal(JSON.parse(created.stdout).sourceRoot, install.root + path.sep);
           const intact = await run(t, install, work, 'verify', namespace, environment.env);
           assert.equal(intact.status, 0, intact.stderr);
-          // `zod` is a dependency of @opencode/plugin, not of Heimdall; it may be hoisted or nested wherever npm placed it.
+          // `effect` is a dependency of @opencode/plugin, not of Heimdall; it may be hoisted or nested wherever npm placed it.
           const plugin = await resolveFrom(install.root, '@opencode/plugin');
-          const transitive = await resolveFrom(plugin, 'zod');
+          const transitive = await resolveFrom(plugin, 'effect');
           t.diagnostic(`${layout}: ${change} ${path.relative(copyRoot, transitive)} (resolved from ${path.relative(copyRoot, plugin)})`);
           assert.notEqual(transitive, install.root);
           if (change === 'changed') {

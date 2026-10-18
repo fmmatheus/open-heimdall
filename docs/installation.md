@@ -13,7 +13,7 @@ your own.
 
 - Node.js **22.19** or newer, with npm.
 - Git, and a Git project that has at least one commit.
-- A running local **OpenCode 2.0.22** server. Heimdall supports only that
+- A running local **OpenCode 2.0.32** server. Heimdall supports only that
   OpenCode version and only loopback URLs (`localhost`, `127.0.0.1` or `[::1]`).
 - Registry access for the producer's `npm ci`; the consumer's install also
   fetches the package's dependencies from the npm registry.

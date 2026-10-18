@@ -51,11 +51,10 @@ and `dist/openchamber-extension/**` (the bundled extension) stays a separate
 ### Quota provider packaging
 
 `@slkiser/opencode-quota` 5.0.1 declares an exact peer on `@opencode/plugin` 2.0.16,
-while Heimdall requires the supported 2.0.22. In the source checkout this is
-`ERESOLVE` (`peer @opencode/plugin@"2.0.16" from @slkiser/opencode-quota@5.0.1`
-against `@opencode/plugin@"2.0.22" from the root project`) and is worked around by a
-root `overrides` entry, which npm does not apply when the package is installed as a
-dependency. A plain `npm install` of the previous tarball then either hoisted a
+while Heimdall requires the supported 2.0.32. A development-only root `overrides`
+entry resolves that peer conflict in the source checkout; npm does not apply that
+override when Heimdall is installed as a dependency. Before quota vendoring, with
+Heimdall pinned to 2.0.22, a plain `npm install` of the previous tarball either hoisted a
 second, unsupported `@opencode/plugin` 2.0.16 next to the nested 2.0.22 or, when the
 consumer also depended on 2.0.22, produced an invalid peer tree (`npm ls`: `invalid:
 "2.0.16" from node_modules/@slkiser/opencode-quota`, `ELSPROBLEMS`).
@@ -102,7 +101,7 @@ settings requires reloading this plugin in its own development environment.
 
 ## OpenCode adapter
 
-The native adapter targets OpenCode and `@opencode/plugin` **2.0.22**. It uses a
+The native adapter targets OpenCode and `@opencode/plugin` **2.0.32**. It uses a
 real parent tool context and the effective native `subagent` tool. Configure the
 existing local connection's URL in `[opencode]`. For OpenChamber Desktop, set
 `authentication = "openchamber"` and use Desktop's local HTTP port. Heimdall
@@ -113,6 +112,20 @@ through the named environment variable. The adapter validates server version, se
 identity and project directory. It does not harvest passwords from processes.
 Explicitly passwordless loopback servers can use `authentication = "none"` in
 `[opencode]`; password authentication remains the default.
+
+The optional native compatibility fixture runs a disposable OpenCode server with
+a scripted local model and synthetic quota. After building, run:
+
+```sh
+node scripts/live/opencode-compatibility/run.mjs --opencode /absolute/path/to/opencode --out /tmp/heimdall-compatibility.json
+```
+
+It isolates the server's configuration, database and home directory, exercises
+structured planning and submission, output-limit continuation, a native file
+write, pause, same-run resume and paginated history, then stops its own server and
+removes its fixture. It does not contact a model provider or the configured live
+coordinator. See [the compatibility record](validation/opencode-2.0.32.md) for
+the checked environment and limits.
 
 To try the native plugin, build the tarball as described in
 [Packaging](#packaging) and install it into a **separate development Git

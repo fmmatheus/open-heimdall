@@ -369,17 +369,17 @@ test('an invalid info document fails', async t => {
   for (const [name, body] of bodies) {
     const server = await fixtureServer(t, (request, response) => json(response, 200, JSON.stringify(body)));
     const s = await sandbox(t, { url: server.url });
-    assertFailed(await doctor(s), /does not match supported OpenCode 2\.0\.22/);
+    assertFailed(await doctor(s), /does not match supported OpenCode 2\.0\.32/);
     assertOnlyInfo(server.log, 2);
     assert.ok(name);
   }
 });
 
 test('a wrong OpenCode version fails, with and without the data envelope', async t => {
-  for (const body of [{ version: '2.0.21', pid: 4242 }, { version: '2.0.23', pid: 4242 }, { version: '3.0.0', pid: 4242 }, { data: { version: '2.0.21', pid: 4242 } }]) {
+  for (const body of [{ version: '2.0.21', pid: 4242 }, { version: '2.0.22', pid: 4242 }, { version: '2.0.23', pid: 4242 }, { version: '3.0.0', pid: 4242 }, { data: { version: '2.0.21', pid: 4242 } }, { data: { version: '2.0.22', pid: 4242 } }]) {
     const server = await fixtureServer(t, (request, response) => json(response, 200, body));
     const s = await sandbox(t, { url: server.url });
-    assertFailed(await doctor(s), /does not match supported OpenCode 2\.0\.22/);
+    assertFailed(await doctor(s), /does not match supported OpenCode 2\.0\.32/);
     assertOnlyInfo(server.log, 2);
   }
   // The documented data envelope with the supported version is accepted.

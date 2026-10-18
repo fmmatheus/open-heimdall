@@ -175,7 +175,7 @@ test('control: one, two and three character values are accepted from a private f
     const reference = `OPAQUE_REFERENCE_${index}`;
     assert.equal(context.lookup(reference), value);
     const headers = [];
-    const fetchImpl = async (url, options = {}) => { headers.push(options.headers?.Authorization); return Response.json({ version: '2.0.22', pid: 44 }); };
+    const fetchImpl = async (url, options = {}) => { headers.push(options.headers?.Authorization); return Response.json({ version: '2.0.32', pid: 44 }); };
     await connect('/synthetic/project', undefined, {
       baseUrl: 'http://127.0.0.1:4096', authentication: 'basic', passwordEnvironmentVariable: reference, environment: context.environmentFor(reference, {}), fetchImpl,
     });
