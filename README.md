@@ -11,7 +11,7 @@ Heimdall is designed to run as a single global service across your local Git pro
 ## Quickstart
 
 Requires Git, Node.js **22.19+**, a Git project with at least one commit, and a
-running local **OpenCode 2.0.22** server. There is no public release, so build an
+running local **OpenCode 2.0.32** server. There is no public release, so build an
 installable tarball from source and install it globally:
 
 ```sh

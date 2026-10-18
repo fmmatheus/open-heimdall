@@ -6,12 +6,12 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
   assertOrdinaryInstall, buildTarball, checkout, findPackages, installConsumer, installGlobal, isolatedEnvironment,
-  listPackages, listTree, readDependencyLock, removeTarballBuild, runBinary, runModule, toolVersions, verifyDependencyTree,
+  listTree, readDependencyLock, removeTarballBuild, runBinary, runModule, toolVersions, verifyDependencyTree,
 } from './helpers.mjs';
 
 const requiredFiles = [
   'package.json', 'README.md',
-  'dist/cli.js', 'dist/index.js', 'dist/opencode/plugin.js', 'dist/coordinator/index.js', 'dist/coordinator/cli.js',
+  'dist/cli.js', 'dist/index.js', 'dist/opencode/plugin.js', 'dist/opencode/ownership-guard.js', 'dist/coordinator/index.js', 'dist/coordinator/cli.js',
   'dist/vendor/opencode-quota/package.json', 'dist/vendor/opencode-quota/LICENSE',
   'dist/vendor/opencode-quota/dist/lib/opencode-auth.js',
   'dist/vendor/opencode-quota/dist/providers/anthropic.js',
@@ -28,7 +28,7 @@ const forbiddenPrefixes = [
 ];
 const forbiddenFiles = ['package-lock.json', 'npm-shrinkwrap.json', 'tsconfig.json', '.heimdall.toml'];
 
-const probeSpecifiers = ['@open-heimdall/core', '@open-heimdall/core/plugin', '@open-heimdall/core/coordinator'];
+const probeSpecifiers = ['@open-heimdall/core', '@open-heimdall/core/plugin', '@open-heimdall/core/ownership-guard', '@open-heimdall/core/coordinator'];
 
 // Runs in the installed package with fetch replaced by a stub that fails and counts attempts.
 function probeSource(installRoot, specifiers) {
@@ -136,10 +136,10 @@ describe('installed package', () => {
     assert.equal(manifest.name, '@open-heimdall/core');
     assert.equal(manifest.version, '0.0.0');
     assert.equal(manifest.private, true);
-    assert.equal(manifest.dependencies['@opencode/plugin'], '2.0.22');
+    assert.equal(manifest.dependencies['@opencode/plugin'], '2.0.32');
     assert.equal(manifest.dependencies['@slkiser/opencode-quota'], undefined);
     assert.equal(manifest.devDependencies['@slkiser/opencode-quota'], '5.0.1');
-    assert.deepEqual(Object.keys(manifest.exports), ['.', './plugin', './coordinator']);
+    assert.deepEqual(Object.keys(manifest.exports), ['.', './plugin', './ownership-guard', './coordinator']);
     assert.equal(manifest.bin.heimdall, './dist/cli.js');
   });
 
@@ -175,7 +175,7 @@ describe('installed package', () => {
         const { modules } = install();
         const plugins = await findPackages(modules, '@opencode/plugin');
         assert.ok(plugins.length >= 1);
-        for (const plugin of plugins) assert.equal(plugin.version, '2.0.22', plugin.location);
+        for (const plugin of plugins) assert.equal(plugin.version, '2.0.32', plugin.location);
         assert.deepEqual(await findPackages(modules, '@slkiser/opencode-quota'), []);
         const listing = await listTree(install(), { env: environment.env, cwd: elsewhere });
         t.diagnostic(`${layout}: npm ${listing.argv.join(' ').replace(install().directory, '<prefix>')} exited ${listing.status}`);
@@ -189,28 +189,28 @@ describe('installed package', () => {
         for (const line of extraneous) t.diagnostic(`${layout}: accepted leftover optional package: ${line}`);
       });
 
-      test('msgpackr loads and round-trips with or without its optional native accelerator', async t => {
-        const { modules, directory } = install();
-        const copies = await findPackages(modules, 'msgpackr');
-        assert.ok(copies.length >= 1, 'msgpackr is installed');
-        const installed = new Set((await listPackages(modules)).map(entry => entry.name));
-        for (const { location } of copies) {
-          const result = await runModule(`
-            import { createRequire } from 'node:module';
-            const require = createRequire(${JSON.stringify(path.join(location, 'package.json'))});
-            let native;
-            try { require('msgpackr-extract'); native = 'loaded'; } catch (error) { native = error.code; }
-            const { pack, unpack } = require(${JSON.stringify(location)});
-            const sample = { text: 'x'.repeat(64), list: [1, 2, 3], nested: { flag: true } };
-            console.log(JSON.stringify({ native, same: JSON.stringify(unpack(pack(sample))) === JSON.stringify(sample) }));
-          `, { cwd: layout === 'consumer' ? directory : elsewhere, env: environment.env });
-          assert.equal(result.status, 0, result.stderr);
-          const report = JSON.parse(result.stdout);
-          t.diagnostic(`${layout}: msgpackr at ${path.relative(modules, location)}; native accelerator ${report.native}`);
-          assert.equal(report.same, true);
-          // An accelerator that is not installed must be reported as missing, never as a broken load.
-          if (!installed.has('msgpackr-extract')) assert.equal(report.native, 'MODULE_NOT_FOUND');
-        }
+      test('the installed SDK and its Effect dependency load and execute the normal API', async t => {
+        const { root } = install();
+        const result = await runModule(`
+          import { createRequire } from 'node:module';
+          import { pathToFileURL } from 'node:url';
+          const sdkEntry = import.meta.resolve('@opencode/plugin');
+          const sdkRequire = createRequire(sdkEntry);
+          const { Plugin } = await import(sdkEntry);
+          const { Effect } = await import(pathToFileURL(sdkRequire.resolve('effect')).href);
+          const definition = { id: 'synthetic.installed-sdk', setup: async () => ({}) };
+          console.log(JSON.stringify({
+            effectVersion: sdkRequire('effect/package.json').version,
+            defined: Plugin.define(definition) === definition,
+            value: Effect.runSync(Effect.succeed('installed-sdk-effect')),
+          }));
+        `, { cwd: root, env: environment.env });
+        assert.equal(result.status, 0, result.stderr);
+        const report = JSON.parse(result.stdout);
+        t.diagnostic(`${layout}: installed SDK uses Effect ${report.effectVersion}`);
+        assert.equal(report.effectVersion, '4.0.1');
+        assert.equal(report.defined, true);
+        assert.equal(report.value, 'installed-sdk-effect');
       });
 
       test('installed heimdall runs from outside the checkout without configuration', async t => {
@@ -242,8 +242,7 @@ describe('installed package', () => {
         assert.deepEqual(Object.keys(report.exportsLoaded), specifiers);
         const core = report.exportsLoaded[specifiers[0]];
         for (const name of ['loadConfiguration', 'chooseExecutor', 'createQuota', 'createObserver']) assert.ok(core.includes(name), `root export ${name}`);
-        assert.ok(report.exportsLoaded[specifiers[1]].length > 0);
-        assert.ok(report.exportsLoaded[specifiers[2]].length > 0);
+        for (const specifier of specifiers.slice(1)) assert.ok(report.exportsLoaded[specifier].length > 0, specifier);
         assert.equal(await fs.realpath(report.quotaBase), path.join(await fs.realpath(root), 'dist', 'vendor', 'opencode-quota'));
         assert.equal(report.quotaName, '@slkiser/opencode-quota');
         assert.equal(report.quotaVersion, '5.0.1');

@@ -5,7 +5,7 @@ import type { DesktopClientConnection, DesktopConnectionOptions } from './opench
 import { OriginProofError } from './types.js';
 import type { HistoryMessage, MessageHistory, ObservedSession, SessionAPI, SessionObserver, SessionSnapshot } from './types.js';
 
-export const supportedOpenCodeVersion = '2.0.22';
+export const supportedOpenCodeVersion = '2.0.32';
 export type OpenCodeAuthentication = 'basic' | 'none' | 'openchamber';
 
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);

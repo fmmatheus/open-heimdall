@@ -37,13 +37,13 @@
     "build:extension": "npm run build && node scripts/build-extension.mjs"
   },
   "dependencies": {
-    "@opencode/plugin": "2.0.22",
+    "@opencode/plugin": "2.0.32",
     "comment-json": "5.0.0",
     "smol-toml": "1.9.0"
   },
   "overrides": {
     "@slkiser/opencode-quota": {
-      "@opencode/plugin": "2.0.22"
+      "@opencode/plugin": "2.0.32"
     }
   },
   "devDependencies": {

@@ -15,7 +15,7 @@ function fixture(run = runFixture(), connectionOverrides = {}, executorOptions =
   const fetchImpl = async (url, options = {}) => {
     const body = options.body ? JSON.parse(options.body) : undefined;
     calls.push({ method: options.method ?? 'GET', route: url.pathname, body, directory: url.searchParams.get('location[directory]'), authenticated: Object.hasOwn(options.headers ?? {}, 'Authorization'), headers: options.headers });
-    if (url.pathname === '/api/info') return Response.json({ version: '2.0.22', pid: 44 });
+    if (url.pathname === '/api/info') return Response.json({ version: '2.0.32', pid: 44 });
     if (url.pathname === '/api/plugin') {
       const cold = coldReads > 0; if (cold) coldReads--;
       return Response.json({ data: pluginsValid && !cold ? [{ id: 'adr.workflow', source: { type: 'local', path: path.join(run.worktreePath, '.opencode/plugins/heimdall.ts') }, state: { status: pluginFailed ? 'failed' : 'active' } }] : [] });

@@ -10,7 +10,7 @@ import { createRunner } from '../dist/workflow/runner.js';
 import { loadConfiguration } from '../dist/config.js';
 import { createMessageHistory } from '../dist/opencode/observer.js';
 import { SUBMISSION_TOOL_IDS } from '../dist/workflow/contracts.js';
-import { originUnverifiedDenial, SUBMISSION_DENIAL } from '../dist/workflow/submission.js';
+import { originUnverifiedDenial, SEALED_DENIAL, SUBMISSION_DENIAL } from '../dist/workflow/submission.js';
 
 const PLANNER_TOOL = SUBMISSION_TOOL_IDS['planner-plan'];
 const EXECUTOR_TOOL = SUBMISSION_TOOL_IDS['executor-result'];
@@ -44,7 +44,7 @@ function nativeHost(directory, script, { pageSize = 2 } = {}) {
   const registered = new Map();
   const contexts = [];
   const dispatches = [];
-  const ctrl = { outcome: 'succeeded', finish: 'stop' };
+  const ctrl = { outcome: 'succeeded', finish: 'stop', text: 'Done.' };
   let children = 0, messages = 0, calls = 0;
   const registration = () => ({ dispose: async () => {} });
   // `messages` is the compacted active context; `archive` is the complete native history in chronological order.
@@ -70,11 +70,26 @@ function nativeHost(directory, script, { pageSize = 2 } = {}) {
     const s = sessions.get(child);
     for (let i = 0; i < count; i++) s.archive.push({ type: 'user', id: 'msg_old_user_' + child + '_' + ++messages, text: 'Older question', time: { created: Date.now() } }, { type: 'assistant', id: 'msg_old_asst_' + messages, agent: 'build', content: [], time: { created: Date.now() } });
   };
+  // OpenCode 2.0.32 continues an output-limited response with synthetic input and a new assistant message,
+  // without admitting a new user prompt or dispatching another subagent. The context hook runs again.
+  const continueAfterLength = async dispatch => {
+    const s = sessions.get(dispatch.child);
+    dispatch.assistant.finish = 'length';
+    dispatch.assistant.time.completed = Date.now();
+    admit(s, { type: 'synthetic', id: 'msg_limit_' + ++messages, text: 'Your last response hit the output token limit (stop reason: length). Do not apologize, recap, or repeat yourself. Break the remaining work into smaller pieces.', time: { created: Date.now() } });
+    const assistant = { type: 'assistant', id: 'msg_limit_asst_' + messages, agent: dispatch.agent, content: [], time: { created: Date.now() } };
+    const event = { sessionID: dispatch.child, agent: dispatch.agent, tools: Object.fromEntries(['read', 'subagent', PLANNER_TOOL, EXECUTOR_TOOL].map(name => [name, {}])) };
+    await hooks.get('session.context')?.(event);
+    contexts.push({ n: dispatch.n, child: dispatch.child, agent: dispatch.agent, tools: Object.keys(event.tools), continuation: true });
+    admit(s, assistant);
+    dispatch.assistant = assistant;
+    return event;
+  };
   // The supported v2 message-list route: native order, an opaque cursor, `order` only on the first page.
   const fetchImpl = async url => {
     const route = url.pathname + '?' + [...url.searchParams].filter(([key]) => key !== 'location[directory]').map(([key, value]) => key + '=' + value).join('&');
     requests.push(route);
-    if (url.pathname === '/api/info') return Response.json({ version: '2.0.22', pid: 77 });
+    if (url.pathname === '/api/info') return Response.json({ version: '2.0.32', pid: 77 });
     const match = /^\/api\/session\/([^/]+)(\/message)?$/.exec(url.pathname);
     const s = match && sessions.get(match[1]);
     if (!s) return new Response('missing', { status: 404 });
@@ -118,13 +133,13 @@ function nativeHost(directory, script, { pageSize = 2 } = {}) {
         return registered.get(name).execute(payload, { sessionID: child, agent: input.agent, messageID, id: info.id, signal: native.signal, progress: async () => {} });
       };
       await script.shift()?.({ dispatch, submit, tools: contexts.at(-1).tools, sessions });
-      dispatch.assistant.content.push({ type: 'text', text: 'Done.' });
+      dispatch.assistant.content.push({ type: 'text', text: ctrl.text });
       dispatch.assistant.finish = ctrl.finish;
       dispatch.assistant.time.completed = Date.now();
       s.active = false;
       if (ctrl.outcome === 'succeeded') s.idle = Date.now();
       s.outcome = ctrl.outcome;
-      return { output: { sessionID: child, status: 'completed', output: 'Done.' } };
+      return { output: { sessionID: child, status: 'completed', output: ctrl.text } };
     },
   };
   const ctx = {
@@ -153,7 +168,7 @@ function nativeHost(directory, script, { pageSize = 2 } = {}) {
     const s = sessions.get(dispatch.child);
     for (let i = 0; i < count; i++) admit(s, { type: 'assistant', id: 'msg_step_' + ++messages, agent: dispatch.agent, content: [], time: { created: Date.now() } });
   };
-  return { ctx, observe, registered, contexts, dispatches, ctrl, sessions, addSession, compact, chat, steps, fetchImpl, requests, interrupts };
+  return { ctx, observe, registered, contexts, dispatches, ctrl, sessions, addSession, compact, chat, continueAfterLength, steps, fetchImpl, requests, interrupts };
 }
 
 /** The real full-archive reader over the fixture's v2 message-list route. */
@@ -182,6 +197,108 @@ test('a normal standalone start through createPlugin selects structured-v1, expo
   const files = (await fs.readdir(receiptDir, { recursive: true })).filter(file => /submission/i.test(file));
   assert.ok(files.length >= 2, 'both submissions persisted a receipt: ' + files.join(', '));
   assert.match(await fs.readFile(path.join(receiptDir, 'ledger.md'), 'utf8'), /T1/);
+});
+
+test('an output-limit continuation ending in stop cannot replace a missing durable submission with final chat JSON', async t => {
+  const { directory, configuration } = await project(t, 'heimdall-native-limit-missing-');
+  const host = nativeHost(directory, [planStep('T1'), async ({ dispatch }) => {
+    await host.continueAfterLength(dispatch);
+    host.ctrl.text = JSON.stringify({ ...completed(), taskId: 'T1', evidence: [{ gateId: 'G1', gate: 'gate for T1', passed: true, detail: 'Claimed only in final chat' }] });
+  }]);
+  const setup = await createPlugin({ configuration, observe: host.observe, history: history(host, directory), quota, git }).setup(host.ctx);
+  t.after(setup);
+  const result = JSON.parse((await host.registered.get('adr_workflow').execute({ action: 'start', adr: '.heimdall/feature.md' }, caller())).content);
+  assert.equal(result.status, 'paused');
+  assert.match(result.reason, /submission/i);
+  const state = await readState(directory, result.runId);
+  assert.equal(state.results.length, 0);
+  assert.equal(state.index, 0);
+  assert.equal(host.dispatches.length, 2, 'the continuation never creates another dispatch');
+  assert.equal((await receiptFiles(directory, result.runId)).length, 1, 'only the planner submitted');
+  const messages = host.sessions.get(host.dispatches[1].child).archive;
+  assert.deepEqual(messages.filter(message => message.type === 'assistant').map(message => message.finish), ['length', 'stop']);
+  assert.equal(messages.filter(message => message.type === 'user').length, 1, 'the synthetic continuation keeps the original dispatch prompt');
+});
+
+test('a receipt submitted after an output-limit continuation advances once when the continued response does no further work', async t => {
+  const { directory, configuration } = await project(t, 'heimdall-native-limit-receipt-');
+  const host = nativeHost(directory, [planStep('T1'), async ({ dispatch, submit }) => {
+    await host.continueAfterLength(dispatch);
+    assert.equal((await submit(EXECUTOR_TOOL, completed())).output.accepted, true, 'the synthetic message does not change the native call origin');
+    const event = await host.continueAfterLength(dispatch);
+    assert.deepEqual(Object.keys(event.tools), [], 'the durable seal applies to the next model context');
+    host.ctrl.text = 'Only the tail of a continued human-readable response.';
+  }]);
+  const setup = await createPlugin({ configuration, observe: host.observe, history: history(host, directory), quota, git }).setup(host.ctx);
+  t.after(setup);
+  const result = JSON.parse((await host.registered.get('adr_workflow').execute({ action: 'start', adr: '.heimdall/feature.md' }, caller())).content);
+  assert.equal(result.status, 'completed', JSON.stringify(result));
+  const state = await readState(directory, result.runId);
+  assert.equal(state.results.length, 1);
+  assert.equal(state.results[0].summary, completed().summary, 'the result comes from the receipt, not the continuation tail');
+  assert.equal(state.index, 1);
+  assert.equal(state.submissionBinding.status, 'closed');
+  assert.equal(host.dispatches.length, 2);
+  assert.equal((await receiptFiles(directory, result.runId)).length, 2, 'one plan and exactly one executor receipt');
+  const messages = host.sessions.get(host.dispatches[1].child).archive;
+  assert.deepEqual(messages.filter(message => message.type === 'assistant').map(message => message.finish), ['length', 'length', 'stop']);
+  assert.equal(messages.filter(message => message.type === 'user').length, 1);
+});
+
+test('a sealed output-limit continuation denies late implementation work and pauses without admitting its receipt', async t => {
+  const { directory, configuration } = await project(t, 'heimdall-native-limit-sealed-');
+  let executions = 0;
+  let denial;
+  const host = nativeHost(directory, [planStep('T1'), async ({ dispatch, submit }) => {
+    assert.equal((await submit(EXECUTOR_TOOL, completed())).output.accepted, true);
+    const event = await host.continueAfterLength(dispatch);
+    assert.deepEqual(Object.keys(event.tools), [], 'the next model context exposes no implementation tool');
+    denial = await submit('read', { filePath: 'should-not-be-read' }).then(() => 'executed', error => error.message);
+    assert.equal(denial, SEALED_DENIAL);
+  }]);
+  host.registered.set('read', { execute: async () => { executions++; return { output: 'Unexpected work' }; } });
+  const setup = await createPlugin({ configuration, observe: host.observe, history: history(host, directory), quota, git }).setup(host.ctx);
+  t.after(setup);
+  const result = JSON.parse((await host.registered.get('adr_workflow').execute({ action: 'start', adr: '.heimdall/feature.md' }, caller())).content);
+  assert.equal(result.status, 'paused');
+  assert.match(result.reason, /tool call started after the submission/);
+  assert.equal(denial, SEALED_DENIAL);
+  assert.equal(executions, 0, 'the denied call never reaches its executor');
+  const state = await readState(directory, result.runId);
+  assert.equal(state.results.length, 0);
+  assert.equal(state.index, 0);
+  assert.equal(state.submissionRepair.conflict.kind, 'later');
+  assert.equal((await receiptFiles(directory, result.runId)).length, 2, 'the receipt is retained rather than admitted');
+  assert.equal(host.dispatches.length, 2, 'the denied call does not redispatch the task');
+});
+
+test('exhausting native output-limit continuations preserves the receipt without advancing the task', async t => {
+  const { directory, configuration } = await project(t, 'heimdall-native-limit-failed-');
+  const host = nativeHost(directory, [planStep('T1'), async ({ dispatch, submit, sessions }) => {
+    assert.equal((await submit(EXECUTOR_TOOL, completed())).output.accepted, true);
+    await host.continueAfterLength(dispatch);
+    await host.continueAfterLength(dispatch);
+    host.ctrl.finish = 'length';
+    host.ctrl.outcome = 'failed';
+    const session = sessions.get(dispatch.child);
+    session.idle = Date.now();
+    const idle = { type: 'idle', id: 'msg_output_limit_failed', outcome: 'failed', error: { type: 'output-limit', message: 'Response still truncated after two output token limit continuations' }, time: { created: session.idle } };
+    session.messages.push(idle);
+    session.archive.push(idle);
+  }]);
+  const setup = await createPlugin({ configuration, observe: host.observe, history: history(host, directory), quota, git }).setup(host.ctx);
+  t.after(setup);
+  const result = JSON.parse((await host.registered.get('adr_workflow').execute({ action: 'start', adr: '.heimdall/feature.md' }, caller())).content);
+  assert.equal(result.status, 'paused');
+  const state = await readState(directory, result.runId);
+  assert.equal(state.results.length, 0);
+  assert.equal(state.index, 0);
+  assert.equal(host.dispatches.length, 2, 'exhaustion does not redispatch implementation');
+  assert.equal((await receiptFiles(directory, result.runId)).length, 2, 'the accepted executor receipt remains available for recovery');
+  const session = host.sessions.get(host.dispatches[1].child);
+  assert.equal(session.outcome, 'failed');
+  assert.deepEqual(session.archive.filter(message => message.type === 'assistant').map(message => message.finish), ['length', 'length', 'length']);
+  assert.equal(session.archive.at(-1).error.type, 'output-limit');
 });
 
 test('an unknown call origin and a late call from an earlier dispatch on a reused child fail closed', async t => {

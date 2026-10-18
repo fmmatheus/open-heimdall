@@ -14,10 +14,10 @@ const hostRestriction = { os: [process.platform], cpu: [process.arch] };
 const baseline = () => ({
   '@open-heimdall/core': {
     version: '0.0.0',
-    dependencies: { '@opencode/plugin': '2.0.22', 'dep-a': '^1.0.0' },
+    dependencies: { '@opencode/plugin': '2.0.32', 'dep-a': '^1.0.0' },
     peerDependencies: { 'peer-a': '^1.0.0' },
   },
-  '@opencode/plugin': { version: '2.0.22', dependencies: { msgpackr: '^2.0.5' } },
+  '@opencode/plugin': { version: '2.0.32', dependencies: { msgpackr: '^2.0.5' } },
   msgpackr: { version: '2.1.0', optionalDependencies: { 'msgpackr-extract': '^3.0.4' } },
   'dep-a': { version: '1.2.0' },
   'peer-a': { version: '1.2.0' },
@@ -363,21 +363,25 @@ describe('installed dependency-tree rule', () => {
     });
 
     test('an unsupported @opencode/plugin version is rejected even when the manifest range accepts it', async t => {
-      const packages = baseline();
-      packages['@open-heimdall/core'].dependencies['@opencode/plugin'] = '^2.0.0';
-      packages['@opencode/plugin'].version = '2.0.21';
-      const { listing, problems } = await inspect(t, packages);
-      assert.equal(listing.status, 0, 'npm itself accepts the tree, so only the version rule can reject it');
-      assert.ok(mentions(problems, /unsupported @opencode\/plugin 2\.0\.21/), problems.join('\n'));
+      for (const version of ['2.0.21', '2.0.22']) {
+        const packages = baseline();
+        packages['@open-heimdall/core'].dependencies['@opencode/plugin'] = '^2.0.0';
+        packages['@opencode/plugin'].version = version;
+        const { listing, problems } = await inspect(t, packages);
+        assert.equal(listing.status, 0, 'npm itself accepts the tree, so only the version rule can reject it');
+        assert.ok(problems.some(problem => problem.includes(`unsupported @opencode/plugin ${version}`)), problems.join('\n'));
+      }
     });
 
     test('an unsupported @opencode/plugin version is rejected when npm also reports it invalid', async t => {
-      const packages = baseline();
-      packages['@opencode/plugin'].version = '2.0.21';
-      const { listing, problems } = await inspect(t, packages);
-      assert.notEqual(listing.status, 0);
-      assert.ok(mentions(problems, /unsupported @opencode\/plugin 2\.0\.21/), problems.join('\n'));
-      assert.ok(mentions(problems, /@opencode\/plugin@2\.0\.21 invalid/), problems.join('\n'));
+      for (const version of ['2.0.21', '2.0.22']) {
+        const packages = baseline();
+        packages['@opencode/plugin'].version = version;
+        const { listing, problems } = await inspect(t, packages);
+        assert.notEqual(listing.status, 0);
+        assert.ok(problems.some(problem => problem.includes(`unsupported @opencode/plugin ${version}`)), problems.join('\n'));
+        assert.ok(problems.some(problem => problem.includes(`@opencode/plugin@${version} invalid`)), problems.join('\n'));
+      }
     });
 
     test('a missing @opencode/plugin is rejected', async t => {
@@ -388,13 +392,15 @@ describe('installed dependency-tree rule', () => {
     });
 
     test('a nested second @opencode/plugin copy at another version is rejected', async t => {
-      const tree = await buildTree(t, baseline());
-      const nested = path.join(tree.modules, 'dep-a', 'node_modules', '@opencode', 'plugin');
-      await fs.mkdir(nested, { recursive: true });
-      await fs.writeFile(path.join(nested, 'package.json'), JSON.stringify({ name: '@opencode/plugin', version: '2.0.21' }));
-      const listing = await listTree(tree.install, { env: tree.env, cwd: tree.cwd });
-      const problems = await verifyDependencyTree({ modules: tree.modules, listing, lock: baselineLock() });
-      assert.ok(mentions(problems, /unsupported @opencode\/plugin 2\.0\.21/), problems.join('\n'));
+      for (const version of ['2.0.21', '2.0.22']) {
+        const tree = await buildTree(t, baseline());
+        const nested = path.join(tree.modules, 'dep-a', 'node_modules', '@opencode', 'plugin');
+        await fs.mkdir(nested, { recursive: true });
+        await fs.writeFile(path.join(nested, 'package.json'), JSON.stringify({ name: '@opencode/plugin', version }));
+        const listing = await listTree(tree.install, { env: tree.env, cwd: tree.cwd });
+        const problems = await verifyDependencyTree({ modules: tree.modules, listing, lock: baselineLock() });
+        assert.ok(problems.some(problem => problem.includes(`unsupported @opencode/plugin ${version}`)), problems.join('\n'));
+      }
     });
 
     test('a declared runtime dependency on the quota package is rejected', async t => {
