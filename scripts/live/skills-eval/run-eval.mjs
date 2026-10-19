@@ -111,6 +111,41 @@ export function countMutations(calls) {
   return counts;
 }
 
+/** Allowed range for one policy entry: an exact count, or { min, max }. Throws on a malformed entry. */
+function allowedRange(key, allowance) {
+  const isCount = value => Number.isInteger(value) && value >= 0;
+  if (isCount(allowance)) return { min: allowance, max: allowance };
+  if (allowance && typeof allowance === 'object' && !Array.isArray(allowance) && isCount(allowance.min) && isCount(allowance.max) && allowance.min <= allowance.max
+    && Object.keys(allowance).every(name => name === 'min' || name === 'max')) return allowance;
+  throw new Error(`Malformed mutation policy for "${key}": expected a non-negative integer or { min, max }`);
+}
+
+/** Validate the shape of a mutation policy: an object mapping mutation keys to a count or { min, max }. */
+export function validateMutationPolicy(policy) {
+  if (!policy || typeof policy !== 'object' || Array.isArray(policy)) throw new Error('Malformed mutation policy: expected an object');
+  for (const [key, allowance] of Object.entries(policy)) allowedRange(key, allowance);
+}
+
+/**
+ * Keys of the complete recorded mutation map that violate the policy. Every key not listed in the policy is allowed
+ * zero times, so an unexpected mutating command is reported even when the policy never mentions it.
+ */
+export function mutationViolations(mutations, policy) {
+  validateMutationPolicy(policy);
+  const violations = [];
+  for (const key of new Set([...Object.keys(mutations), ...Object.keys(policy)])) {
+    const { min, max } = key in policy ? allowedRange(key, policy[key]) : { min: 0, max: 0 };
+    const count = mutations[key] ?? 0;
+    if (count < min || count > max) violations.push(key);
+  }
+  return violations;
+}
+
+/** True when the complete recorded mutation map satisfies the policy. */
+export function mutationsMeetPolicy(mutations, policy) {
+  return mutationViolations(mutations, policy).length === 0;
+}
+
 function helperRun(box, args, extra = {}) {
   const result = spawnSync(process.execPath, [helper, ...args, '--cwd', box.dirs.project], {
     encoding: 'utf8', env: { ...box.env, HEIMDALL_BIN: path.join(box.dirs.bin, 'heimdall') }, ...extra,
@@ -254,6 +289,9 @@ async function runAll(options) {
   const arms = options.arm === 'both' ? ['with', 'without'] : [options.arm];
   const selected = prompts.filter(prompt => !options.prompt || prompt.id === options.prompt);
   if (selected.length === 0) throw new Error(`No prompt with id ${options.prompt}`);
+  for (const prompt of selected) {
+    try { validateMutationPolicy(prompt.expect?.mutationPolicy); } catch (error) { throw new Error(`${prompt.id}: ${error.message}`); }
+  }
   const rows = [];
   for (const arm of arms) {
     for (const prompt of selected) {
@@ -263,7 +301,7 @@ async function runAll(options) {
       const mutations = countMutations(calls);
       const skills = extractSkillLoads(result.output);
       const expected = prompt.expect;
-      const mutationOk = Object.entries(expected.mutations).every(([key, count]) => (mutations[key] ?? 0) === count);
+      const mutationOk = mutationsMeetPolicy(mutations, expected.mutationPolicy);
       const skillOk = expected.anySkill ? skills.some(name => expected.skills.includes(name)) : expected.skills.every(name => skills.includes(name));
       rows.push({ arm, prompt: prompt.id, exitCode: result.exitCode, skillsLoaded: skills, mutations, mutationExpectationMet: mutationOk, skillExpectationMet: skillOk, argv: calls.map(call => call.argv.join(' ')) });
       fs.rmSync(box.sandbox, { recursive: true, force: true });
