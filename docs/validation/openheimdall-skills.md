@@ -248,6 +248,130 @@ the start skill asks whenever the request and the file disagree.
 These runs are automated tests. They do not exercise a model, the OpenChamber UI or a
 live coordinator started by the owner.
 
+## Git environment and evaluator mutation fixes
+
+Two defects found in the delivered skills were fixed after the verification above. This
+section records the reproductions, the regression coverage, the review and the final
+results. It supersedes the helper and evaluator results above wherever they differ; the
+host discovery results are unaffected because skill frontmatter and file layout did not
+change.
+
+### Defect 1: helper Git commands followed ambient Git overrides
+
+The helper ran `git -C <directory>` with a copy of the caller's environment. When
+`GIT_DIR` and `GIT_WORK_TREE` were set (for example inside a Git hook or a wrapper), Git
+ignored `-C` and reported the repository named by the variables, so the helper could
+describe, select runs for, or submit a run for the wrong repository.
+
+Reproduction on synthetic repositories `repo-a` (selected with `--cwd`) and `repo-b`
+(named by the variables), with a fake `HEIMDALL_BIN`:
+
+| Command with `GIT_DIR=<repo-b>/.git`, `GIT_WORK_TREE=<repo-b>` | Before (`0ef74b0`) | After (`0c89582`) |
+| --- | --- | --- |
+| `context --cwd <repo-a>` | `topLevel` and `head` of `repo-b` | `topLevel`, `commonGitDirectory` and `head` of `repo-a` |
+| `snapshot --cwd <repo-a>` with one active run in each repository | selected the run of `repo-b` | selected the run of `repo-a`; an explicit run ID still wins |
+| `start` from `repo-a` (fake command line) | `run submit` for the project of `repo-b` | one `run submit` for the project of `repo-a`, absolute specification path and full base OID |
+| `start --register` from `repo-a` | no `project add` recorded for `repo-a` | proposes the main worktree of `repo-a`; nothing registered for `repo-b` |
+
+The fix adds an exported `gitEnvironment(env)` to the helper. It returns a copy of the
+supplied environment with `GIT_OPTIONAL_LOCKS=0`, without `GIT_DIR`, `GIT_WORK_TREE`,
+`GIT_COMMON_DIR`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
+`GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_NAMESPACE`, `GIT_CONFIG`, `GIT_CONFIG_COUNT`,
+`GIT_CONFIG_PARAMETERS` and every `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`. It is
+applied only inside the helper's single `git()` function; `GIT_CONFIG_GLOBAL`,
+`GIT_CONFIG_NOSYSTEM`, `HEIMDALL_BIN`, `HEIMDALL_COORDINATOR_CONFIG` and the environment
+handed to the coordinator command line are unchanged. The three skill copies remain
+byte-identical and import only `node:` built-ins.
+
+### Defect 2: the evaluator ignored unlisted mutating calls
+
+`run-eval.mjs` compared recorded mutation counts only for keys listed in a scenario's
+`expect.mutations`. A `start` attempt (which the fake command line rejects but still
+records) during a snapshot scenario therefore left `mutationExpectationMet` true.
+
+Reproduction through `run-eval.mjs run` with an explicit fake OpenCode that calls
+`heimdall coordinator start` and prints an `openheimdall-monitor` skill marker
+(`--model fake/model`, a synthetic `--pass-env` variable, prompt `snapshot-status`):
+
+| Row in `results.json` | Before (`ad166c8`) | After (`b9c9a38`) |
+| --- | --- | --- |
+| `mutations` | `{ "start": 1 }` | `{ "start": 1 }` |
+| `skillExpectationMet` | `true` | `true` |
+| `mutationExpectationMet` | `true` (false pass) | `false` |
+
+The process exit status is 0 in both cases; the verdict is only in the row. `prompts.json`
+now states `expect.mutationPolicy` per scenario instead of `expect.mutations`: a map
+from mutation key to an exact count or a `{ "min", "max" }` range, and every key that is
+not listed is allowed zero times. Policies: start `{"run submit":1}`; snapshot and watch
+`{}`; resume `{"run resume":1}`; boundary `{"run resume":{"min":0,"max":1}}`. Result row
+fields are unchanged. The kit's README describes the policy shape.
+
+### Regression coverage
+
+All of it runs inside `npm test` with synthetic repositories and an explicit fake host;
+no model, credential or real OpenCode is used.
+
+| Test file | Coverage |
+| --- | --- |
+| `test/skills-helper-readonly.test.mjs` | `context` and `snapshot`/`watch`/explicit run ID under a poisoned environment; the `gitEnvironment` policy (every listed variable, indexed config entries, retained variables, no mutation of the input or `process.env`) |
+| `test/skills-helper-mutations.test.mjs` | `start` under a poisoned environment: fake command line, coordinator-backed, linked worktree, `--register` |
+| `test/skills-eval-policy.test.mjs` | policy unit cases: zero-mutation scenarios with each injected mutation, start 0/1/2/extra, resume 0/1/2/extra, ambiguous 0/1/2/other, unknown key, malformed policy |
+| `test/skills-eval-runner.test.mjs` | end-to-end `results.json` rows for start, resume, ambiguous and watch, plus the false-pass reproduction and a clean control |
+
+Failing-before evidence, from running the new tests against the unmodified code:
+
+- Helper (`0ef74b0`): the `context` test failed with `topLevel` equal to `repo-b`
+  instead of `repo-a`; the monitor test failed with `'run-b' !== 'run-a'`; all four
+  `start` tests failed (a submission for the project of `repo-b`, a run created for the
+  wrong project, and a missing `project add` for `--register`).
+- Evaluator (`ad166c8`): the start-attempt runner test failed with
+  `true !== false` on `mutationExpectationMet`.
+
+After the fixes all of them pass.
+
+### Review
+
+An independent review of `0ef74b0..5e9ad4e` exercised both real paths (the helper
+command line under a poisoned environment and the runner with a fake OpenCode attempting
+a coordinator start) and ran the focused suites (97 tests, 97 pass) and the selftest.
+
+| Finding | Classification | Disposition |
+| --- | --- | --- |
+| Removal of `GIT_CONFIG_COUNT`/`KEY_<n>`/`VALUE_<n>` and `GIT_INDEX_FILE` is proven by the unit-level `gitEnvironment` test, not by an end-to-end helper run | Benched | Left unchanged; the reviewer confirmed by hand that `context` still reports the selected repository with those variables set |
+| `key in policy` in `run-eval.mjs` would also match inherited `Object.prototype` names | Benched | Left unchanged; unreachable because recorded keys come only from the fake command line's fixed mutating set |
+
+No material finding was reported, so the correction step made no change and no commit.
+The benched items remain open as optional polish.
+
+### Final results
+
+Run on the settled code at `5e9ad4e` (`test(skills-eval): cover each mutation policy
+through the runner`), the last code change; this record is the only later edit. Code
+commits since `0ef74b0`: `0c89582` (helper fix), `ad166c8` (start regressions),
+`b9c9a38` (evaluator fix), `5e9ad4e` (runner regressions and README).
+
+| Item | Value |
+| --- | --- |
+| Date | 2026-10-19 |
+| OS | macOS 27.0.1 (Darwin, arm64) |
+| Node.js / npm / Git | v22.22.3 / 10.9.8 / 2.54.0 (Apple Git-157); minimum Node.js is 22.19 |
+| Isolation | each command ran in the foreground with `HOME`, `TMPDIR` and `XDG_*` inside a short temporary root |
+
+| Check | Result |
+| --- | --- |
+| `npm run check` | exit 0, no type errors |
+| `npm test` | exit 0; 1550 tests, 1550 pass, 0 fail, 0 cancelled, 0 skipped; the new helper, policy and runner tests appear by name |
+| `npm run build:extension` | exit 0 |
+| `npm run test:package` | exit 0; 74 tests, 74 pass, 0 fail, 0 cancelled, 0 skipped |
+| `node scripts/live/skills-eval/run-eval.mjs selftest` | exit 0, `"selftest": "passed"` |
+| `npm pack --dry-run --ignore-scripts` | 215 files; `skills/` holds exactly the six expected files (`SKILL.md` and `scripts/openheimdall.mjs` for each of the three skills) |
+| Helper copies | `cmp` identical across the three skills |
+| `git diff 0ef74b0..HEAD -- src` | empty: no coordinator, CLI or service change |
+
+Limits of this evidence: the regressions use a fake command line, a coordinator-backed
+fixture and a fake host. They show the helper and the evaluator, not model behavior or
+host and UI behavior. The temporary root and its logs were removed after the runs.
+
 ## Unverified
 
 - Owner dogfood: the end-to-end start, monitor, pause, resume and monitor sequence in
@@ -257,6 +381,10 @@ live coordinator started by the owner.
 - Model-backed behavior of the skills in either arm (see the evaluation kit above):
   whether the right skill loads for each prompt, whether the without-skill arm differs,
   and the boundary prompt outcome.
+
+- The Git environment and evaluator fixes are covered by fake-host and synthetic
+  fixture regressions only; they are not model-backed acceptance. The two benched review
+  observations above remain open.
 
 - Loading any of the skills in a model-backed OpenCode or OpenChamber session: the
   `skill` tool call, the printed base directory, running the helper from it, `@skill-id`
