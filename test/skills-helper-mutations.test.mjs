@@ -1014,6 +1014,134 @@ test('start registers an unregistered repository only with --register, adds it o
   assert.equal(f.service.store.listRuns().length, 2);
 });
 
+// --- start under inherited Git overrides ------------------------------------------------------------------
+
+/** A copy of `env` that points Git at another repository, as a hook or wrapper process might. */
+const poisonedFor = (env, other) => ({ ...env, GIT_DIR: path.join(other, '.git'), GIT_WORK_TREE: other });
+
+test('start under inherited GIT_DIR and GIT_WORK_TREE submits once for the selected repository and never touches the other one', async t => {
+  const f = await fakeFixture(t);
+  const a = await makeRepository(f.env, f.root, 'repo a');
+  const b = await makeRepository(f.env, f.root, 'repo b');
+  await fs.writeFile(path.join(b, 'extra.txt'), 'b\n');
+  await gitIn(f.env, b, 'add', '.');
+  await gitIn(f.env, b, 'commit', '-q', '-m', 'b only');
+  await fs.writeFile(path.join(a, 'spec file.md'), '# Feature A\n\nBuild it in A.\n');
+  await gitIn(f.env, a, 'add', 'spec file.md');
+  await gitIn(f.env, a, 'commit', '-q', '-m', 'spec');
+  const headA = await gitIn(f.env, a, 'rev-parse', 'HEAD');
+  const headB = await gitIn(f.env, b, 'rev-parse', 'HEAD');
+  assert.notEqual(headA, headB);
+  const projectA = await projectRecord(a, 'project-a');
+  const projectB = await projectRecord(b, 'project-b');
+  const queued = runRecord({ id: 'run-a', projectId: 'project-a', status: 'queued', baseCommit: headA, checkpoint: null, version: 0, reason: null, launchAction: 'start', branch: 'heimdall/run/run-a', worktreePath: '/synthetic/worktrees/run-a/checkout' });
+  await f.script({ 'status --json': RUNNING, 'project list': { json: [projectA, projectB] }, 'run submit project-a *': { json: queued } });
+  await f.reset();
+
+  const env = poisonedFor(f.env, b);
+  const result = await runHelper(['start', '--cwd', a, '--spec', 'spec file.md'], env);
+  assert.equal(result.exitCode, 0, result.stderr + result.text);
+  assert.equal(result.report.outcome, 'submitted');
+  assert.equal(result.report.project.id, 'project-a');
+  assert.equal(result.report.base.oid, headA);
+  assert.match(result.report.base.oid, /^[0-9a-f]{40}$/);
+
+  const calls = await f.calls();
+  assert.deepEqual(mutations(calls), ['run submit'], 'exactly one mutation, and it is the submission');
+  const submit = calls.find(argv => verbOf(argv) === 'run submit');
+  assert.deepEqual(subcommand(submit), ['run', 'submit', 'project-a', '--feature', path.join(a, 'spec file.md'), '--base', headA]);
+  assert.ok(path.isAbsolute(submit[submit.indexOf('--feature') + 1]));
+  assert.equal(submit[submit.indexOf('--base') + 1], headA);
+  assert.ok(!calls.some(argv => argv.includes('project-b') || argv.some(word => word.includes(b))), 'nothing names the other project or repository');
+  assert.equal(countOf(calls, 'project add'), 0);
+});
+
+test('start under inherited Git overrides runs only in the selected repository and registers nothing for the other one', async t => {
+  const f = await coordinatorFixture(t);
+  const b = await makeRepository(f.env, f.root, 'unrelated repository');
+  await fs.writeFile(path.join(b, 'extra.txt'), 'b\n');
+  await gitIn(f.env, b, 'add', '.');
+  await gitIn(f.env, b, 'commit', '-q', '-m', 'b only');
+  await fs.writeFile(path.join(b, '.heimdall.toml'), PROJECT_CONFIGURATION);
+  const projectB = f.registerRepository(b);
+  const headA = await gitIn(f.env, f.repository, 'rev-parse', 'HEAD');
+  const headB = await gitIn(f.env, b, 'rev-parse', 'HEAD');
+  assert.notEqual(headA, headB);
+  const specText = '# Feature A\n\nBuild it in A.\n';
+  await fs.writeFile(path.join(f.repository, 'spec.md'), specText);
+  const projectsBefore = f.service.store.listProjects();
+  assert.equal(projectsBefore.length, 2);
+  await f.reset();
+
+  const result = await runHelper(['start', '--cwd', f.repository, '--spec', 'spec.md', '--coordinator-config', f.configFile], poisonedFor(f.env, b));
+  assert.equal(result.exitCode, 0, result.stderr + result.text);
+  assert.equal(result.report.outcome, 'submitted');
+  assert.equal(result.report.project.id, f.project.id);
+  assert.equal(result.report.base.oid, headA);
+
+  const runs = f.service.store.listRuns();
+  assert.equal(runs.length, 1, 'exactly one new run');
+  assert.equal(runs[0].projectId, f.project.id);
+  assert.equal(runs[0].baseCommit, headA);
+  assert.equal(runs[0].feature, specText);
+  assert.ok(!runs.some(run => run.projectId === projectB.id), 'no run for the other repository');
+  assert.deepEqual(f.service.store.listProjects(), projectsBefore, 'no project was added or changed');
+  assert.deepEqual(mutations(await f.calls()), ['run submit']);
+});
+
+test('start from a linked worktree under inherited Git overrides keeps the project identity and the linked HEAD', async t => {
+  const f = await coordinatorFixture(t);
+  const b = await makeRepository(f.env, f.root, 'unrelated repository');
+  await fs.writeFile(path.join(b, 'extra.txt'), 'b\n');
+  await gitIn(f.env, b, 'add', '.');
+  await gitIn(f.env, b, 'commit', '-q', '-m', 'b only');
+  await fs.writeFile(path.join(b, '.heimdall.toml'), PROJECT_CONFIGURATION);
+  f.registerRepository(b);
+  const mainHead = await gitIn(f.env, f.repository, 'rev-parse', 'HEAD');
+  const linkedHead = await gitIn(f.env, f.linked, 'rev-parse', 'HEAD');
+  const headB = await gitIn(f.env, b, 'rev-parse', 'HEAD');
+  assert.notEqual(linkedHead, mainHead);
+  assert.notEqual(linkedHead, headB);
+  const specText = '# Linked feature\n\nBuild it from the linked worktree.\n';
+  await fs.writeFile(path.join(f.linked, 'spec.md'), specText);
+  const projectsBefore = f.service.store.listProjects();
+  await f.reset();
+
+  const result = await runHelper(['start', '--cwd', f.linked, '--spec', 'spec.md', '--coordinator-config', f.configFile], poisonedFor(f.env, b));
+  assert.equal(result.exitCode, 0, result.stderr + result.text);
+  assert.equal(result.report.outcome, 'submitted');
+  assert.equal(result.report.project.id, f.project.id);
+  assert.equal(result.report.base.oid, linkedHead);
+
+  const runs = f.service.store.listRuns();
+  assert.equal(runs.length, 1);
+  assert.equal(runs[0].projectId, f.project.id);
+  assert.equal(runs[0].baseCommit, linkedHead);
+  assert.equal(runs[0].feature, specText);
+  assert.deepEqual(f.service.store.listProjects(), projectsBefore);
+  assert.deepEqual(mutations(await f.calls()), ['run submit']);
+});
+
+test('start --register under inherited Git overrides proposes the main worktree of the selected repository', async t => {
+  const f = await coordinatorFixture(t);
+  const b = await makeRepository(f.env, f.root, 'unrelated repository');
+  await fs.writeFile(path.join(b, '.heimdall.toml'), PROJECT_CONFIGURATION);
+  f.registerRepository(b);
+  const other = await makeRepository(f.env, f.root, 'third repository');
+  await fs.writeFile(path.join(other, '.heimdall.toml'), PROJECT_CONFIGURATION);
+  const linked = path.join(f.root, 'third linked worktree');
+  await gitIn(f.env, other, 'worktree', 'add', '-q', '-b', 'third-linked', linked, 'HEAD~1');
+  await fs.writeFile(path.join(linked, 'spec.md'), '# Third\n\nBuild it.\n');
+  await f.reset();
+
+  const result = await runHelper(['start', '--cwd', linked, '--spec', 'spec.md', '--register', '--coordinator-config', f.configFile], poisonedFor(f.env, b));
+  assert.equal(result.report.outcome, 'submitted', result.text);
+  const calls = await f.calls();
+  assert.deepEqual(mutations(calls), ['project add', 'run submit']);
+  assert.deepEqual(calls.find(argv => verbOf(argv) === 'project add'), ['coordinator', 'project', 'add', other, '--coordinator-config', f.configFile]);
+  assert.ok(!f.service.store.listProjects().some(project => project.directory === linked));
+});
+
 test('a registration conflict reported by the coordinator is surfaced verbatim and nothing is replaced or submitted', async t => {
   const fake = await fakeFixture(t);
   const text = 'Project already registered with different paths, configuration, or concurrency';
