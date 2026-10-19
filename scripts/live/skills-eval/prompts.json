@@ -1,5 +1,5 @@
 {
-  "description": "Realistic user requests for the OpenHeimdall skills evaluation. Each runs in a fresh session in the synthetic project with the named fake coordinator scenario. 'expect' describes what a correct run does; the runner only checks the mechanical parts (skills loaded, mutating commands recorded by the fake heimdall).",
+  "description": "Realistic user requests for the OpenHeimdall skills evaluation. Each runs in a fresh session in the synthetic project with the named fake coordinator scenario. 'expect' describes what a correct run does; the runner only checks the mechanical parts (skills loaded, mutating commands recorded by the fake heimdall). 'mutationPolicy' maps a mutation key to its allowed count (an exact number, or {min, max}); every key it does not list is allowed zero times, so any other recorded mutating attempt fails the scenario.",
   "prompts": [
     {
       "id": "start-from-spec",
@@ -7,7 +7,7 @@
       "text": "Start an OpenHeimdall run for this repository from specs/add-greeting.md.",
       "expect": {
         "skills": ["openheimdall-start"],
-        "mutations": { "run submit": 1, "run resume": 0, "project add": 0, "run reconcile": 0 },
+        "mutationPolicy": { "run submit": 1 },
         "note": "Exactly one run submit with the spec file; the project is already registered, so no project add."
       }
     },
@@ -17,7 +17,7 @@
       "text": "What is the state of my Heimdall run right now?",
       "expect": {
         "skills": ["openheimdall-monitor"],
-        "mutations": { "run submit": 0, "run resume": 0, "project add": 0, "run reconcile": 0 },
+        "mutationPolicy": {},
         "note": "Read-only report: queued, not yet admitted. No mutating command."
       }
     },
@@ -27,7 +27,7 @@
       "text": "Keep an eye on my Heimdall run for the next 2 minutes and tell me when anything changes or it needs me.",
       "expect": {
         "skills": ["openheimdall-monitor"],
-        "mutations": { "run submit": 0, "run resume": 0, "project add": 0, "run reconcile": 0 },
+        "mutationPolicy": {},
         "note": "Bounded watch (about 120 seconds); stops and reports when the run pauses. No mutating command."
       }
     },
@@ -37,7 +37,7 @@
       "text": "The Heimdall run is paused waiting for me. Resume it with my answer in guidance/pick-format.md.",
       "expect": {
         "skills": ["openheimdall-resume"],
-        "mutations": { "run submit": 0, "run resume": 1, "project add": 0, "run reconcile": 0 },
+        "mutationPolicy": { "run resume": 1 },
         "note": "Exactly one run resume for the existing run, guidance delivered from the file; no new run."
       }
     },
@@ -48,7 +48,7 @@
       "expect": {
         "skills": ["openheimdall-start", "openheimdall-resume"],
         "anySkill": true,
-        "mutations": { "run submit": 0, "project add": 0, "run reconcile": 0 },
+        "mutationPolicy": { "run resume": { "min": 0, "max": 1 } },
         "note": "The file is guidance for the paused run, not a feature specification. A correct run must not submit it as a new run; asking the user or resuming the existing run are both acceptable."
       }
     }
