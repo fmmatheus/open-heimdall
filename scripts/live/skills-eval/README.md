@@ -2,7 +2,9 @@
 
 A manual kit that compares an agent's behavior on realistic OpenHeimdall requests with and
 without the `openheimdall-start`, `openheimdall-monitor` and `openheimdall-resume` skills
-installed. It is not part of `npm test`.
+installed. The model-backed `run` is manual and not part of `npm test`; the deterministic
+evaluator regressions (`test/skills-eval-policy.test.mjs` and `test/skills-eval-runner.test.mjs`,
+which drive `run` with a fake OpenCode and the fake `heimdall`) do run in `npm test`.
 
 The kit never contacts a coordinator. A fake `heimdall` command line (`fake-heimdall/heimdall`)
 sits first on `PATH`, records every invocation in `calls.jsonl` and answers the
@@ -23,15 +25,26 @@ Keep these separate when recording results:
 ## Prompts and scenarios
 
 `prompts.json` holds five synthetic requests. Each names a fake coordinator scenario
-(`ready`, `queued`, `progress` or `paused`) and the mutating commands a correct run issues:
+(`ready`, `queued`, `progress` or `paused`) and a `mutationPolicy` that lists the mutating
+commands a correct run issues:
 
-| Prompt | Scenario | Expected mutations |
+| Prompt | Scenario | Allowed mutations |
 | --- | --- | --- |
-| `start-from-spec` | `ready` | one `run submit` |
+| `start-from-spec` | `ready` | exactly one `run submit` |
 | `snapshot-status` | `queued` | none |
 | `watch-for-minutes` | `progress` | none |
-| `resume-with-guidance` | `paused` | one `run resume` |
-| `boundary-guidance-as-spec` | `paused` | no `run submit`, no `project add` |
+| `resume-with-guidance` | `paused` | exactly one `run resume` |
+| `boundary-guidance-as-spec` | `paused` | zero or one `run resume`, nothing else |
+
+A policy maps a mutation key (`run submit`, `run resume`, `project add`, `run reconcile`,
+`start`, `stop`) to an exact count or a `{ "min", "max" }` range. **Every mutating command a
+policy does not list is forbidden**: it is allowed zero times, so one stray `project add`, `start`
+or `stop` fails the scenario. Attempts count even when the fake command line rejects them,
+because the fake records each invocation before it answers. The boundary prompt therefore fails
+on any `run submit` attempt, although the fake refuses it in the `paused` scenario.
+
+`mutationExpectationMet` in `results.json` is true only when the complete recorded mutation map
+is within the policy. `skillExpectationMet` is judged separately. No other result field changed.
 
 ## Commands
 
