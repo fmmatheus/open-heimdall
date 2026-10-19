@@ -10,7 +10,7 @@ import { startCoordinatorService } from '../dist/coordinator/service.js';
 import { loadCoordinatorConfiguration } from '../dist/coordinator/config.js';
 import {
   ACTIVE_STATUSES, DEFAULT_WATCH_BUDGET_SECONDS, DEFAULT_WATCH_INTERVAL_SECONDS, MAX_WATCH_BUDGET_SECONDS,
-  chooseActiveRun, countStatus, limitText, main, parseArguments, parseRunList, projectRun, stateKey, stopReasonFor, UsageError, watchRun, watchTiming,
+  chooseActiveRun, countStatus, gitEnvironment, limitText, main, parseArguments, parseRunList, projectRun, stateKey, stopReasonFor, UsageError, watchRun, watchTiming,
 } from '../skills/openheimdall-start/scripts/openheimdall.mjs';
 
 const exec = promisify(execFile);
@@ -517,6 +517,109 @@ test('project matching and run selection report zero, one and many instead of gu
   assert.equal(result.report.ok, false);
   assert.equal(result.report.error.kind, 'unavailable');
   assertReadOnly(await f.calls());
+});
+
+// --- Ambient Git environment -------------------------------------------------------------------------------
+
+/** Two unrelated repositories with different HEADs, plus an environment that points Git at the second one. */
+async function ambientRepositories(t) {
+  const f = await fakeFixture(t);
+  const a = await makeRepository(f.env, f.root, 'repo-a');
+  const b = await makeRepository(f.env, f.root, 'repo-b');
+  await fs.writeFile(path.join(b, 'file.txt'), 'three\n');
+  await gitIn(f.env, b, 'add', '.');
+  await gitIn(f.env, b, 'commit', '-q', '-m', 'three');
+  const headA = await gitIn(f.env, a, 'rev-parse', 'HEAD');
+  const headB = await gitIn(f.env, b, 'rev-parse', 'HEAD');
+  assert.notEqual(headA, headB);
+  const poisoned = { ...f.env, GIT_DIR: path.join(b, '.git'), GIT_WORK_TREE: b };
+  return { f, a, b, headA, headB, poisoned };
+}
+
+test('context reports the selected repository even when the environment points Git at another one', async t => {
+  const { f, a, b, headA, poisoned } = await ambientRepositories(t);
+  const status = { json: { schemaVersion: 1, service: 'heimdall-coordinator', status: 'running', acceptingNewRuns: true, queuedRuns: 0, reservedRuns: 0 } };
+  await f.script({ 'status --json': status, 'project list': { json: [await projectRecord(b, 'project-b'), await projectRecord(a, 'project-a')] } });
+  const result = await runHelper(['context', '--cwd', a], poisoned);
+  assert.equal(result.exitCode, 0, result.stderr);
+  const { report } = result;
+  assert.equal(report.repository.topLevel, a);
+  assert.equal(report.repository.commonGitDirectory, await fs.realpath(path.join(a, '.git')));
+  assert.equal(report.repository.head, headA);
+  assert.equal(report.project.match, 'one');
+  assert.deepEqual(report.project.projects.map(entry => entry.id), ['project-a']);
+  assertReadOnly(await f.calls());
+});
+
+test('monitor selection follows the selected repository, and an explicit run ID still wins, under an ambient Git override', async t => {
+  const { f, a, b, poisoned } = await ambientRepositories(t);
+  const runA = 'run-a';
+  const runB = 'run-b';
+  const list = [
+    { id: runA, projectId: 'project-a', status: 'running', updatedAt: 3 },
+    { id: runB, projectId: 'project-b', status: 'running', updatedAt: 4 },
+  ];
+  await f.script({
+    'project list': { json: [await projectRecord(a, 'project-a'), await projectRecord(b, 'project-b')] },
+    'run list': { json: list },
+    [`run show ${runA}`]: { json: runRecord({ id: runA, projectId: 'project-a', branch: `heimdall/run/${runA}` }) },
+    [`run show ${runB}`]: { json: runRecord({ id: runB, projectId: 'project-b', branch: `heimdall/run/${runB}` }) },
+  });
+  await f.reset();
+
+  let result = await runHelper(['snapshot', '--cwd', a], poisoned);
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.report.outcome, 'snapshot', result.text);
+  assert.equal(result.report.selection.via, 'sole-active-run');
+  assert.equal(result.report.run.runId, runA);
+  assert.ok(!result.text.includes(runB), 'the other repository run is never shown');
+
+  result = await runHelper(['watch', '--cwd', a, '--budget-seconds', '0.3', '--interval-seconds', '0.1'], poisoned);
+  assert.equal(result.exitCode, 0, result.stderr);
+  const events = result.lines.map(line => JSON.parse(line));
+  assert.equal(events[0].event, 'watching');
+  assert.equal(events[0].via, 'sole-active-run');
+  assert.equal(events[0].runId, runA);
+  assert.ok(events.filter(event => event.event === 'state').every(event => event.run.runId === runA));
+  assert.ok(!result.text.includes(runB));
+
+  const calls = await f.calls();
+  assertReadOnly(calls);
+  assert.ok(calls.every(argv => argv.at(-1) !== runB || argv.at(-2) !== 'show'), 'run show never reads the other repository run before an explicit ID');
+
+  await f.reset();
+  result = await runHelper(['snapshot', runB, '--cwd', a], poisoned);
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.report.selection.via, 'explicit');
+  assert.equal(result.report.run.runId, runB);
+  assert.deepEqual(await f.calls(), [['coordinator', 'run', 'show', runB]]);
+});
+
+const LISTED_GIT_VARIABLES = [
+  'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+  'GIT_NAMESPACE', 'GIT_CONFIG', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS',
+];
+
+test('the helper Git environment drops repository-redirecting overrides and keeps everything else', () => {
+  const indexed = { GIT_CONFIG_KEY_0: 'core.worktree', GIT_CONFIG_VALUE_0: '/elsewhere', GIT_CONFIG_KEY_1: 'a.b', GIT_CONFIG_VALUE_1: 'c', GIT_CONFIG_KEY_12: 'x.y', GIT_CONFIG_VALUE_12: 'z' };
+  const kept = {
+    PATH: '/usr/bin', HOME: '/synthetic/home', HEIMDALL_BIN: '/synthetic/bin/heimdall', HEIMDALL_COORDINATOR_CONFIG: '/synthetic/coordinator.toml',
+    GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_AUTHOR_NAME: 'Synthetic', GIT_OPTIONAL_LOCKS: '1',
+  };
+  const input = { ...kept, ...Object.fromEntries(LISTED_GIT_VARIABLES.map(name => [name, 'ambient'])), ...indexed };
+  const snapshot = structuredClone(input);
+  const processBefore = { ...process.env };
+
+  const result = gitEnvironment(input);
+
+  assert.notEqual(result, input);
+  assert.deepEqual(input, snapshot, 'the supplied environment is not modified');
+  assert.deepEqual({ ...process.env }, processBefore, 'process.env is not modified');
+  for (const name of [...LISTED_GIT_VARIABLES, ...Object.keys(indexed)]) assert.ok(!(name in result), `${name} is removed`);
+  assert.deepEqual(result, { ...kept, GIT_OPTIONAL_LOCKS: '0' });
+
+  assert.deepEqual(gitEnvironment({}), { GIT_OPTIONAL_LOCKS: '0' });
+  assert.equal(gitEnvironment({ GIT_CONFIG_KEY_x: 'kept', GIT_CONFIG_VALUE_: 'kept' }).GIT_CONFIG_KEY_x, 'kept', 'only numerically indexed entries are removed');
 });
 
 test('a managed run branch selects its run, and a different run record is not accepted for it', async t => {

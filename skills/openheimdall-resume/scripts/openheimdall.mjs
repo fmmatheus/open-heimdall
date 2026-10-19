@@ -192,8 +192,27 @@ function createCoordinator({ env, configFile, signal }) {
   };
 }
 
+const GIT_REDIRECTING_VARIABLES = [
+  'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+  'GIT_NAMESPACE', 'GIT_CONFIG', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS',
+];
+
+/**
+ * The environment for a Git subprocess. Ambient overrides such as GIT_DIR or GIT_WORK_TREE take precedence over
+ * `git -C`, so inherited ones would make the helper inspect a different repository than the selected directory.
+ * Returns a new object; the supplied environment is not modified. Other variables, including GIT_CONFIG_GLOBAL and
+ * GIT_CONFIG_NOSYSTEM, are kept.
+ */
+export function gitEnvironment(env) {
+  const result = { ...env, GIT_OPTIONAL_LOCKS: '0' };
+  for (const name of Object.keys(result)) {
+    if (GIT_REDIRECTING_VARIABLES.includes(name) || /^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(name)) delete result[name];
+  }
+  return result;
+}
+
 function git(directory, args, env) {
-  return run('git', ['-C', directory, ...args], { env: { ...env, GIT_OPTIONAL_LOCKS: '0' } });
+  return run('git', ['-C', directory, ...args], { env: gitEnvironment(env) });
 }
 
 const firstLine = text => text.replace(/\r?\n[\s\S]*$/, '');
