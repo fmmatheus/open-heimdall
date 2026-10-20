@@ -331,6 +331,10 @@ test('a typed request is unresolved until its decision is consumed or it is supe
   assert.equal(unresolved(approvalWait({ state: 'answered', continuation: 'queued' })), true);
   assert.equal(unresolved(approvalWait({ state: 'answered', continuation: 'consumed' })), false);
   assert.equal(unresolved(approvalWait({ state: 'superseded', continuation: 'superseded' })), false);
+  // A withdrawn decision is owed delivery until a fresh attempt carries it; afterwards it is history.
+  for (const progress of ['recorded', 'waiting-for-idle', 'queued', 'executing', 'none']) assert.equal(unresolved(approvalWait({ state: 'answered', continuation: 'superseded', progress })), true, progress);
+  assert.equal(unresolved(approvalWait({ state: 'answered', continuation: 'superseded', progress: 'superseded' })), false);
+  assert.equal(unresolved(approvalWait({ state: 'answered', continuation: 'superseded', progress: 'junk' })), true, 'an unreadable progress is not assumed to be delivered');
   assert.equal(unresolved({ kind: 'mystery' }), true, 'an unreadable wait is not assumed to be harmless');
   assert.equal(unresolved({ kind: 'generic', pauseId: PAUSE }), false);
   assert.equal(unresolved(null), false);

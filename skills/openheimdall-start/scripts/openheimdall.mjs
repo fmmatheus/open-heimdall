@@ -450,12 +450,21 @@ export function projectWait(value) {
   };
 }
 
-/** Whether a projected wait is a typed request that still has to be answered, or an answer whose continuation is not consumed. */
+/**
+ * Whether an answered decision was withdrawn (the reviewed material changed) and its feedback has not been carried by a fresh
+ * attempt yet. The coordinator delivers it by itself; until then it is neither history nor an ordinary pause.
+ */
+export const withdrawnDeliveryOwed = wait => wait?.kind === 'approval' && wait.state === 'answered' && wait.continuation === 'superseded' && wait.progress !== 'superseded';
+
+/**
+ * Whether a projected wait is a typed request that still has to be answered, an answer whose continuation is not consumed, or a
+ * withdrawn decision whose feedback is still owed to the agent.
+ */
 export function approvalUnresolved(wait) {
   if (!wait) return false;
   if (wait.kind === 'unrecognized') return true;
   if (wait.kind !== 'approval') return false;
-  return wait.state === 'pending' || (wait.state === 'answered' && (wait.continuation === 'pending' || wait.continuation === 'queued'));
+  return wait.state === 'pending' || (wait.state === 'answered' && (wait.continuation === 'pending' || wait.continuation === 'queued')) || withdrawnDeliveryOwed(wait);
 }
 
 /**
@@ -1161,6 +1170,9 @@ function resumeNextAction(projection) {
 
 /** What to do about a typed request that is still open. Generic resume or guidance is never a way to answer it. */
 function approvalNextAction(wait) {
+  if (withdrawnDeliveryOwed(wait)) {
+    return { action: 'wait', detail: 'The owner decision was withdrawn because the reviewed material changed, and its feedback is being delivered to the agent; nothing is authorized. Guidance cannot replace the delivery and the old request cannot be approved. Monitor the run: the agent keeps its work and files a fresh approval request.' };
+  }
   if (wait.kind === 'approval' && wait.state === 'answered') {
     return { action: 'wait', detail: 'The owner decision is recorded and the run continues from it automatically. Guidance cannot replace it. Monitor the run.' };
   }

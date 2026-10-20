@@ -1377,6 +1377,7 @@ test('respond reads the run again and sends nothing unless it still shows exactl
   // A pause response is checked against the displayed pause, and never answers a typed request.
   const pauseCases = [
     ['a typed request', { wait: approvalWait() }, 'approval-pending'],
+    ['a withdrawn decision whose feedback is owed', { wait: answeredWait('request-changes', { continuation: 'superseded', progress: 'queued' }) }, 'approval-pending'],
     ['a different pause', { wait: genericWait({ pauseId: 'pau_ffffffffffffffffffffffffffffffff' }) }, 'pause-mismatch'],
     ['no wait', { wait: null }, 'no-generic-pause'],
     ['reserved capacity', { wait: genericWait(), overrides: { capacityReserved: true } }, 'not-paused-and-released'],
@@ -1389,7 +1390,12 @@ test('respond reads the run again and sends nothing unless it still shows exactl
     assert.equal(result.report.reason, reason, name);
     assertNoMutation(await f.calls());
     assert.deepEqual(callNames(await f.calls()), ['run show'], name);
-    if (reason === 'approval-pending') assert.match(result.report.next.detail, /respond RUN_ID --request apr_run-1_0001/);
+    if (name === 'a typed request') assert.match(result.report.next.detail, /respond RUN_ID --request apr_run-1_0001/);
+    if (name.startsWith('a withdrawn')) {
+      assert.equal(result.report.next.action, 'wait', name);
+      assert.match(result.report.next.detail, /withdrawn because the reviewed material changed.*nothing is authorized/, name);
+      assert.doesNotMatch(result.report.next.detail, /respond RUN_ID/, 'no decision is offered for a withdrawn request');
+    }
   }
   const missing = await respondScenario(t, { extra: { 'run show run-1': { stderr: 'Heimdall: Run not found\n' } } });
   const result = await missing.respond(undefined, ...APPROVE);
@@ -1594,6 +1600,8 @@ test('resume refuses a run with an unresolved typed approval and never turns res
     ['a pending request', approvalWait(), 'owner-decision'],
     ['a recorded decision whose continuation is queued', answeredWait('approve'), 'wait'],
     ['a recorded decision waiting for idle proof', answeredWait('approve', { continuation: 'pending', progress: 'waiting-for-idle' }), 'wait'],
+    ['a withdrawn decision whose feedback is being delivered', answeredWait('request-changes', { continuation: 'superseded', progress: 'waiting-for-idle' }), 'wait'],
+    ['a withdrawn approval that was dispatched but not yet carried', answeredWait('approve', { continuation: 'superseded', progress: 'executing' }), 'wait'],
     ['a wait the helper cannot read', { kind: 'mystery' }, 'monitor'],
   ];
   for (const [name, wait, action] of waits) {
@@ -1610,6 +1618,10 @@ test('resume refuses a run with an unresolved typed approval and never turns res
         assert.equal(result.report.next.action, action, name);
         assert.deepEqual(result.report.mutationsAttempted, []);
         if (action === 'owner-decision') assert.match(result.report.next.detail, /explicit approval, or explicit change feedback.*A request to resume or continue is not a decision/);
+        if (wait.continuation === 'superseded') {
+          assert.match(result.report.next.detail, /withdrawn because the reviewed material changed.*nothing is authorized/, name);
+          assert.doesNotMatch(result.report.next.detail, /continues from it automatically/, 'distinct from an ordinary recorded decision');
+        }
       }
       const calls = await f.calls();
       assertNoMutation(calls);

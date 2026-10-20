@@ -1109,7 +1109,7 @@ test('report presentation never contains raw reply or secret strings, only allow
 
 // ----- approval and response card -----
 
-import { waitCard, PROGRESS_TEXT, canRequestChanges, canRespond } from '../dist/extension/panel/view-model.js';
+import { waitCard, PROGRESS_TEXT, WITHDRAWN_OWED_TEXT, canRequestChanges, canRespond } from '../dist/extension/panel/view-model.js';
 import { EMPTY_ACTION } from '../dist/extension/panel/store.js';
 
 const approval = (overrides = {}) => ({
@@ -1186,6 +1186,25 @@ test('the card shows the answered, superseded and withdrawn states from the coor
   assert.match(withdrawn.status, /authorizes nothing/);
   assert.match(withdrawn.status, /ask again/);
   assert.equal(withdrawn.controls, null);
+
+  // While the feedback of a withdrawn decision is still owed, the card says so distinctly and offers nothing to press or type.
+  for (const progress of ['recorded', 'waiting-for-idle', 'queued', 'executing']) {
+    for (const decision of ['approve', 'request-changes']) {
+      const owed = cardOf(approval({ state: 'answered', continuation: 'superseded', progress, response: { decision, feedback: decision === 'approve' ? null : 'Keep the tenant variable', answeredAt: 1700000000000 } }));
+      const label = `${decision} ${progress}`;
+      assert.match(owed.status, /^Decision withdrawn; feedback being delivered, nothing authorized\./, label);
+      assert.equal(owed.status, WITHDRAWN_OWED_TEXT, label);
+      assert.equal(owed.title, 'Decision withdrawn', label);
+      assert.deepEqual(owed.badge, { label: 'Withdrawn', tone: 'warning' }, label);
+      assert.equal(owed.controls, null, `${label}: no approve, request-changes or respond control`);
+      assert.equal(owed.fullRequest, null, label);
+      assert.doesNotMatch(owed.status, /Approved at|Changes requested at|queued|resumed with it|guidance/i, `${label}: not the ordinary decision text`);
+      assert.notEqual(owed.status, withdrawn.status, 'distinct from the carried withdrawn text');
+      if (decision === 'request-changes') assert.deepEqual(owed.fields.at(-1), { label: 'Your feedback', text: 'Keep the tenant variable' }, 'the feedback stays visible');
+    }
+  }
+  // It is not a generic pause: a generic wait still offers its response, and the owed card never does.
+  assert.equal(cardOf({ kind: 'generic', pauseId: 'pau_a', reason: 'x', reasonClipped: false }).controls.kind, 'respond');
 });
 
 test('buttons are disabled while a response is in flight or unconfirmed, and the acknowledgement closes the card until the run is read again', () => {

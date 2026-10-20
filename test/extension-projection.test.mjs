@@ -930,6 +930,20 @@ test('the run detail carries the run version and a bounded approval wait with no
   assert.equal(detailRun(makeRun({ status: 'paused', wait: null }), project).wait, null);
 });
 
+test('a withdrawn decision whose feedback is still owed stays an approval wait, distinct from a generic pause, until a fresh attempt carries it', () => {
+  for (const progress of ['waiting-for-idle', 'queued', 'executing']) {
+    const wait = detailRun(makeRun({ status: 'paused', wait: coordinatorWait({
+      state: 'answered', continuation: 'superseded', progress, response: { decision: 'request-changes', feedback: 'Keep LEDGER_TENANT', answeredAt: 9 },
+    }) }), project).wait;
+    assert.deepEqual({ kind: wait.kind, state: wait.state, continuation: wait.continuation, progress: wait.progress, requestId: wait.requestId }, { kind: 'approval', state: 'answered', continuation: 'superseded', progress, requestId: 'apr_1' });
+    assert.deepEqual(wait.response, { decision: 'request-changes', feedback: 'Keep LEDGER_TENANT', answeredAt: 9 });
+    assert.equal('pauseId' in wait, false, 'it is not a pause the owner can answer');
+    assert.equal(JSON.stringify(wait).includes('ATTEMPT-SECRET'), false);
+  }
+  // Once a fresh attempt carries the context the coordinator reports no wait, and the projection invents none.
+  assert.equal(detailRun(makeRun({ status: 'paused', wait: null }), project).wait, null);
+});
+
 test('the wait is cleaned, clipped and counted again here, and anything malformed leaves the run without a wait', () => {
   const long = 'q'.repeat(5000);
   const wait = detailRun(makeRun({ status: 'paused', wait: coordinatorWait({

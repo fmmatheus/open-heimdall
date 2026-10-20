@@ -856,6 +856,12 @@ export const PROGRESS_TEXT: Record<ApprovalProgress, string> = {
   superseded: 'Decision recorded, but the reviewed material changed before it took effect, so it authorizes nothing. The agent keeps its work and is told to ask again.',
 };
 
+/**
+ * Shown while the feedback of a withdrawn decision is still owed to the agent. It is the only text that applies until a fresh
+ * attempt carries it; afterwards `PROGRESS_TEXT.superseded` describes the finished delivery.
+ */
+export const WITHDRAWN_OWED_TEXT = 'Decision withdrawn; feedback being delivered, nothing authorized. The reviewed material changed after you answered, so your decision approves nothing. The coordinator hands your feedback to the agent when the run is idle, and the agent keeps its work and asks again. There is nothing to approve or answer here.';
+
 const DECISION_LABEL = { approve: 'Approved', 'request-changes': 'Changes requested' } as const;
 
 export const canRequestChanges = (feedback: string): boolean => feedback.trim() !== '' && feedback.length <= APPROVAL_LIMITS.input;
@@ -878,6 +884,16 @@ function approvalStatus(wait: ApprovalWaitView, ackRetried: boolean | null): { b
   if (decision === 'request-changes' && wait.response?.feedback) fields.push({ label: 'Your feedback', text: wait.response.feedback });
   const when = wait.response ? ` at ${formatLocalTime(wait.response.answeredAt)}` : '';
   const retried = ackRetried === true ? ' An identical response had already been recorded.' : '';
+  if (wait.continuation === 'superseded' && wait.progress !== 'superseded') {
+    // The decision was withdrawn because the reviewed material changed, and no attempt has carried its feedback yet. The
+    // coordinator delivers it without any owner action, so this is neither an approval nor a generic pause.
+    return {
+      badge: { label: 'Withdrawn', tone: 'warning' },
+      title: 'Decision withdrawn',
+      status: `${WITHDRAWN_OWED_TEXT}${retried}`,
+      fields,
+    };
+  }
   return {
     badge: { label: decision ? DECISION_LABEL[decision] : 'Answered', tone: decision === 'approve' ? 'success' : 'info' },
     title: 'Your decision',
