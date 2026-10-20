@@ -372,6 +372,50 @@ Limits of this evidence: the regressions use a fake command line, a coordinator-
 fixture and a fake host. They show the helper and the evaluator, not model behavior or
 host and UI behavior. The temporary root and its logs were removed after the runs.
 
+## Combined OpenCode 2.0.32 integration
+
+Checked on 2026-10-19 on macOS arm64 with Node.js 22.22.3 and npm 10.9.8.
+The verified code is merge `156bea2`, combining the skills fixes at `a088fcf`
+with the OpenCode 2.0.32 compatibility and ownership protections at `f009743`.
+Later integration edits only clarify this record and the skills guide.
+
+The integration leaves `src/` and `package-lock.json` unchanged from `f009743`.
+Both SDK dependency pins remain 2.0.32, the ownership-guard export is retained,
+and all three skill helpers remain byte-identical to `a088fcf`. Two independent
+reviews found no material integration issue. The benched observations above
+remain unchanged.
+
+Commands used isolated temporary HOME, XDG and temporary directories, with host
+Git signing settings excluded. No existing coordinator or run was changed.
+
+| Check | Result |
+| --- | --- |
+| `npm ci --ignore-scripts` | exit 0, locked dependencies installed |
+| `npm run check` | exit 0 |
+| `npm test` with default parallelism | 1584 pass, 1 fail, 1 skip; the coordinator-service launch-settling test failed and the process later required termination; not counted as a passing run |
+| `node --test --test-concurrency=2 test/*.test.mjs` after the successful package build | exit 0; 1586 tests, 1585 pass, 0 fail, 1 skip |
+| Focused `test/coordinator-service.test.mjs` | 10 pass, 0 fail |
+| `npm run build:extension` | exit 0 |
+| `node scripts/live/skills-eval/run-eval.mjs selftest` | exit 0, passed |
+| `node --test --test-concurrency=1 test/package/*.test.mjs` after the successful package build | exit 0; 74 pass, 0 fail or skip; no concurrent rebuild of the checkout |
+| Real OpenCode 2.0.32 compatibility fixture | passed with a synthetic local model and quota; native continuation, two accepted tasks, pause, same-run resume and five archived messages; server stopped and fixture removed |
+
+The default-suite failure exceeded the existing fixture's launch-settling budget
+in `test/coordinator-service.test.mjs`. The exact cleanup wait was not established.
+Earlier parallel-run instability is recorded in the
+[coordinator lifecycle validation](coordinator-lifecycle.md#npm-test-on-the-macos-host-recorded-instability).
+The focused pass and reduced-concurrency pass do not establish that default
+parallelism is reliable; that existing issue remains benched. The single skipped
+core case requires a usable Bun and sandbox-exec guard-wrapper environment.
+
+Package checks used ordinary consumer and temporary global npm installations,
+freshly built tarballs, all four export imports, SDK 2.0.32 and Effect 4.0.1 API
+probes, changed/removed dependency refusal, and the six packaged skill files.
+The native-host fixture used no real provider credentials or model requests.
+These checks do not reverify skill discovery on OpenCode 2.0.32 or model-backed
+skill behavior. Linux and additional Node versions remain CI checks; owner
+dogfood remains pending.
+
 ## Unverified
 
 - Owner dogfood: the end-to-end start, monitor, pause, resume and monitor sequence in
@@ -392,4 +436,7 @@ host and UI behavior. The temporary root and its logs were removed after the run
 - OpenChamber 2.1.0 printing the base directory; its UI; overwrite semantics.
 - `.claude/skills` and `.agents/skills` locations, `opencode debug config` output,
   and native Windows.
-- Behavior of any OpenCode or OpenChamber version other than 2.0.22 and 2.1.0.
+- Skill discovery and model-backed skill behavior on OpenCode versions other than
+  2.0.22, including the currently supported 2.0.32. The separate
+  [native compatibility check](opencode-2.0.32.md) exercises workflow execution,
+  rather than skill loading. OpenChamber versions other than 2.1.0 are unverified.
