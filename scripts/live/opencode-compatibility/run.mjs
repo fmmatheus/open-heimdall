@@ -1,5 +1,8 @@
 // Real OpenCode host, synthetic local model: exercise native planning, receipts, pause and same-run resume.
-// Usage: node scripts/live/opencode-compatibility/run.mjs --opencode /path/to/opencode [--out report.json]
+// Usage: node scripts/live/opencode-compatibility/run.mjs --opencode /path/to/opencode [--out report.json] [--scenario blocked|approval]
+// `approval` makes the second task submit a typed approval-required result through the real native tool schema.
+// The standalone runner has no coordinator, so the pause is the runner's semantic wait and the resume is the ordinary
+// free-text resume; owner decisions and the continuation need a coordinator and are not part of this harness.
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -12,13 +15,15 @@ import { connect, snapshot, createMessageHistory, supportedOpenCodeVersion } fro
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const args = process.argv.slice(2);
 const options = {};
-for (let i = 0; i < args.length; i++) { assert.ok(['--opencode', '--out'].includes(args[i])); options[args[i].slice(2)] = args[++i]; }
+for (let i = 0; i < args.length; i++) { assert.ok(['--opencode', '--out', '--scenario'].includes(args[i])); options[args[i].slice(2)] = args[++i]; }
 assert.ok(options.opencode, '--opencode BINARY is required');
+options.scenario ??= 'blocked';
+assert.ok(['blocked', 'approval'].includes(options.scenario), 'Unknown --scenario');
 const binary = path.resolve(options.opencode);
 const root = await fs.mkdtemp('/private/tmp/hc32-');
 const project = path.join(root, 'project');
 const password = randomUUID();
-const env = { PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin`, LANG: 'en_US.UTF-8', HOME: path.join(root, 'home'), XDG_CONFIG_HOME: path.join(root, 'config'), XDG_DATA_HOME: path.join(root, 'data'), XDG_CACHE_HOME: path.join(root, 'cache'), XDG_STATE_HOME: path.join(root, 'state'), TMPDIR: path.join(root, 'tmp'), OPENCODE_CONFIG_DIR: path.join(root, 'host'), OPENCODE_DB: path.join(root, 'opencode.db'), OPENCODE_DISABLE_AUTOUPDATE: '1', OPENCODE_DISABLE_MODELS_FETCH: '1', OPENCODE_DISABLE_FFF: '1', OPENCODE_DISABLE_FILEWATCHER: '1', OPENCODE_SERVER_PASSWORD: password, HEIMDALL_COMPAT_PASSWORD: password, HEIMDALL_COMPAT_ROOT: root, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+const env = { PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin`, LANG: 'en_US.UTF-8', HOME: path.join(root, 'home'), XDG_CONFIG_HOME: path.join(root, 'config'), XDG_DATA_HOME: path.join(root, 'data'), XDG_CACHE_HOME: path.join(root, 'cache'), XDG_STATE_HOME: path.join(root, 'state'), TMPDIR: path.join(root, 'tmp'), OPENCODE_CONFIG_DIR: path.join(root, 'host'), OPENCODE_DB: path.join(root, 'opencode.db'), OPENCODE_DISABLE_AUTOUPDATE: '1', OPENCODE_DISABLE_MODELS_FETCH: '1', OPENCODE_DISABLE_FFF: '1', OPENCODE_DISABLE_FILEWATCHER: '1', OPENCODE_SERVER_PASSWORD: password, HEIMDALL_COMPAT_PASSWORD: password, HEIMDALL_COMPAT_ROOT: root, HEIMDALL_COMPAT_SCENARIO: options.scenario, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
 let version, child, closed;
 let hostClosed = true;
 let output = '', failure;
@@ -93,12 +98,19 @@ try {
   assert.equal(paused.results.length, 1); assert.equal(paused.results[0].taskId, 'T1');
   assert.equal(await fs.readFile(path.join(project, 'compatibility-marker.txt'), 'utf8'), 'verified\n');
   checks.nativePause = true;
+  if (options.scenario === 'approval') {
+    assert.deepEqual({ kind: paused.wait?.kind, taskId: paused.wait?.taskId, index: paused.wait?.index }, { kind: 'approval', taskId: 'T2', index: 1 });
+    assert.match(paused.reason, /^Approval required for T2: Apply the fixture change\?/);
+    assert.equal(paused.results.length, 1, 'the request did not complete the task');
+    checks.nativeApprovalPause = { waitKind: paused.wait.kind, taskId: paused.wait.taskId, resultsAtPause: paused.results.length };
+  }
   const original = { id: paused.id, parent: paused.parent, firstResult: JSON.stringify(paused.results[0]) };
   await prompt('Resume this compatibility fixture with COMPAT_RESUME.');
   const complete = await wait('completed');
   assert.equal(complete.id, original.id); assert.equal(complete.parent, original.parent);
   assert.equal(JSON.stringify(complete.results[0]), original.firstResult);
   assert.deepEqual(complete.results.map(result => result.taskId), ['T1', 'T2']);
+  if (options.scenario === 'approval') assert.equal(complete.wait, undefined, 'advancement cleared the wait');
   checks.sameRunResume = true; checks.acceptedTasks = complete.results.length;
   const history = createMessageHistory({ directory: project, baseUrl, authentication: 'basic', passwordEnvironmentVariable: 'HEIMDALL_COMPAT_PASSWORD', environment: env, fetchImpl, pageSize: 2 });
   let messages = 0;
