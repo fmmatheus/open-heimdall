@@ -15,9 +15,11 @@ dependency-free Node helper (identical in all three directories) that calls the
 you copy the directories into a skills location that your host reads.
 
 > **Status:** pre-alpha, like the rest of Heimdall. Automated tests cover the
-> helper, the skill files and the packaged copies. Discovery of the copied skills
-> by OpenCode 2.0.22, and catalog installation by OpenChamber 2.1.0, were observed
+> helper, the skill files and the packaged copies. The coordinator requires
+> OpenCode 2.0.32. Earlier discovery of the copied skills by OpenCode 2.0.22,
+> and catalog installation by OpenChamber 2.1.0, were observed
 > in isolated hosts ([validation record](validation/openheimdall-skills.md)).
+> Skill discovery on OpenCode 2.0.32 has not been reverified.
 > Loading and following the skills inside a model-backed OpenCode or OpenChamber
 > session has not been observed yet; see [Verification status](#verification-status)
 > for which statements about hosts come from documentation or source and which are
@@ -325,10 +327,12 @@ pinned sources.
 
 **Unverified:**
 
-- Loading the skills and following them in a model-backed OpenCode 2.0.22 or
+- Loading the skills and following them in a model-backed OpenCode 2.0.32 or
   OpenChamber 2.1.0 session (the `skill` tool call, the printed base directory,
-  running the helper). Discovery was observed without a model; see the
+  running the helper). Earlier OpenCode 2.0.22 discovery was observed without a model; see the
   [validation record](validation/openheimdall-skills.md).
+- Skill discovery on OpenCode 2.0.32; the source references and discovery evidence
+  above describe OpenCode 2.0.22.
 - OpenChamber 2.1.0 printing the skill's base directory to the model.
 - A skill picker in OpenCode V2 (only the `@skill-id` mention is documented).
 - Whether `opencode debug config` lists skills. The server API `GET /api/skill`
