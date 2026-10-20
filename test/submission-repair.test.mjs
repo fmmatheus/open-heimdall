@@ -613,6 +613,70 @@ test('a format-only failure with no explicit negative outcome is still repairabl
   assert.equal((await f.start()).status, 'completed');
 });
 
+const approvalPayload = (extra = {}) => ({
+  status: 'approval-required', question: 'Approve the rename?', scope: 'Rename the export only', completedWork: 'Prepared the rename', verification: ['unit tests passed'],
+  artifacts: ['src/index.ts'], onApprove: ['Rename the export'], onRequestChanges: ['Adjust within scope and submit a fresh request'], ...extra,
+});
+
+test('a valid approval request is a semantic wait: no repair is spent, no restriction is taken and nothing is rerun', async t => {
+  const answers = [];
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool }) => {
+    answers.push(await call(submitTool, approvalPayload()));
+    const replacement = await call(submitTool, completed());
+    assert.deepEqual([replacement.accepted, replacement.code], [false, 'conflict'], 'the recorded request cannot be replaced');
+    return SPOKEN;
+  }, submitOk(completed())]);
+  const result = await f.start();
+  assert.equal(result.status, 'paused');
+  assert.equal(result.reason, 'Approval required for T1: Approve the rename?');
+  assert.deepEqual([answers[0].accepted, answers[0].outcome], [true, 'approval-required']);
+  const state = await f.state();
+  assert.equal(state.wait.kind, 'approval');
+  assert.equal(state.results.length, 0);
+  assert.equal(state.submissionRepair?.repairs ?? 0, 0, 'no repair was consumed');
+  assert.equal(state.reportRecovery.corrections, 0);
+  assert.equal(state.reportRecovery.diagnostic.code, 'approval_required');
+  assert.deepEqual(f.checks, [], 'repair enforcement was never needed');
+  assert.equal(f.dispatches.length, 2, 'no automatic rerun');
+  assert.equal(checkpointReportInfo(state).code, 'approval_required');
+});
+
+test('a malformed approval request follows the normal format-repair path and never becomes a wait', async t => {
+  const answers = [];
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool }) => {
+    answers.push(await call(submitTool, approvalPayload({ question: '' })));
+    // Stray completion fields cannot turn a malformed approval into an unfinished outcome.
+    answers.push(await call(submitTool, approvalPayload({ scope: undefined, evidence: [{ gateId: 'G1', passed: false, detail: 'no' }] })));
+    answers.push(await call(submitTool, approvalPayload()));
+    return SPOKEN;
+  }]);
+  const result = await f.start();
+  assert.equal(result.status, 'paused');
+  assert.deepEqual(answers.map(answer => answer.code ?? 'accepted'), ['format', 'format', 'accepted']);
+  assert.deepEqual(answers.slice(0, 2).map(answer => [answer.repairable, answer.repairsRemaining]), [[true, 1], [true, 0]]);
+  assert.match(answers[0].message, /\$\.question/);
+  const state = await f.state();
+  assert.equal(state.submissionRepair.repairs, 2, 'each malformed call spent one repair');
+  assert.equal(state.submissionRepair.negative, undefined);
+  assert.equal(state.wait.kind, 'approval', 'only the valid request waits');
+  assert.equal(state.results.length, 0);
+});
+
+test('a malformed approval request alone is repairable and leaves no wait when it is never fixed', async t => {
+  const f = await fixture(t, [submitOk(plan('T1')), async ({ call, submitTool }) => {
+    const response = await call(submitTool, { status: 'approval-required', question: 'Approve?' });
+    assert.deepEqual([response.accepted, response.code, response.repairable], [false, 'format', true]);
+    return SPOKEN;
+  }]);
+  const result = await f.start();
+  assert.equal(result.status, 'paused');
+  assert.match(result.reason, /No valid submission was recorded for T1/);
+  const state = await f.state();
+  assert.equal(state.wait, undefined);
+  assert.equal(state.reportRecovery.diagnostic.code, 'submission_missing');
+  assert.equal(state.submissionRepair.repairs, 1);
+});
+
 test('negativeSignal reads only explicit outcomes and carries field names, never submitted text', () => {
   const rule = { kind: 'executor-result', dodCount: 2 };
   const errors = [{ path: '$.handoff', code: 'missing_field', message: 'x' }, { path: '$.evidence[0].detail', code: 'missing_field', message: 'x' }, { path: '$.secret', code: 'unknown_field', message: 'x' }, { path: '$.runId', code: 'identity_field', message: 'x' }];

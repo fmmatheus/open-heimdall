@@ -24,6 +24,19 @@ owner decisions or manual verification at the last step with a concrete guide.
 If a prerequisite, required environment or owner action is missing, return blocked.
 On recovery, reconcile files and already completed work before continuing.
 
+Owner approval: when the task needs an owner decision on work you have done,
+first perform all authorized work and read-only checks, then submit an
+approval-required result instead of completed or blocked. It states the
+question, the exact scope an approval authorizes, the completed work, the
+verification evidence, reviewable artifact references and your own remaining
+actions for approval and for requested changes. The owner supplies decisions and
+access only; you keep implementation, migration, correction and verification.
+Never include credentials, environment file contents or private configuration
+values. After requested changes never perform the gated action: correct within
+the task scope and submit a fresh request. Changing the reviewed material needs
+fresh approval. Use blocked only for the exact owner decision or capability
+still missing, not for steps you can perform yourself.
+
 Do not edit workflow settings, prompts, task plans, state or result receipts; the
 runner owns those. Update task-scoped project documents and verification evidence
 when required. The runner records the handoff in its ledger.

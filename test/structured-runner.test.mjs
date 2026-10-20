@@ -480,3 +480,104 @@ test('a run without a selected protocol keeps the legacy prose path', async t =>
   assert.ok(!('protocol' in state) && !('submissionBinding' in state));
   assert.equal(f.receipts.size, 2, 'legacy receipts are still written under the legacy key');
 });
+
+// --- Typed approval-required wait ------------------------------------------------------------------------------
+
+const approvalRequest = (extra = {}) => ({
+  status: 'approval-required', question: 'Approve the renaming of the public export?', scope: 'Rename export only in src/index.ts and its tests',
+  completedWork: 'Prepared the rename and ran the unit tests', verification: ['unit tests: 12 passed'], artifacts: ['src/index.ts', 'commit abc1234'],
+  onApprove: ['Rename the export', 'Re-run the unit tests'], onRequestChanges: ['Adjust the rename within the same scope and submit a fresh request'], ...extra,
+});
+
+test('an approval-required submission pauses the run on a semantic wait without completing, advancing, repairing or reprompting', async t => {
+  const f = await fixture(t, [submits(plan('T1')), submits(approvalRequest()), submits(completed())]);
+  const paused = await f.start();
+  assert.equal(paused.status, 'paused');
+  assert.equal(paused.reason, 'Approval required for T1: Approve the renaming of the public export?');
+  const state = await f.state();
+  const attemptId = f.dispatches[1].attemptId;
+  assert.equal(state.status, 'paused');
+  assert.deepEqual(state.wait, { kind: 'approval', attemptId, index: 0, taskId: 'T1' });
+  assert.equal(state.reason, paused.reason);
+  assert.equal(state.index, 0, 'the task index does not advance');
+  assert.deepEqual(state.results, [], 'no result is added and no gate turns green');
+  assert.equal(f.advancements().length, 0);
+  assert.equal(state.reportRecovery.corrections, 0, 'no report correction is consumed');
+  assert.equal(state.reportRecovery.mode, 'paused');
+  assert.equal(state.reportRecovery.diagnostic.code, 'approval_required');
+  assert.equal(state.submissionRepair, undefined, 'no submission repair is counted');
+  assert.equal(state.attempt.status, 'rejected', 'the attempt is finished and is not reprompted');
+  assert.equal(f.executorDispatches().length, 1, 'the child is not reprompted');
+  assert.equal(state.submissionBinding.status, 'closed', 'a paused run accepts no late submission');
+  const receipt = await f.submission(attemptId, 'executor-result');
+  assert.equal(receipt.outcome, 'approval-required');
+  assert.deepEqual(receipt.contract, { protocol: 'structured-v1', kind: 'executor-result', version: 2 });
+  assert.equal(receipt.canonical.taskId, 'T1');
+  assert.equal(receipt.canonical.onApprove[0], 'Rename the export');
+  const late = await f.gate.submit('executor-result', completed(), { sessionID: f.dispatches[1].child, agent: 'adr-executor', messageID: 'msg_prompt_2', id: 'late' });
+  assert.equal(late.accepted, false);
+  assert.equal(state.phase, 'executor');
+  // Nothing runs on its own: a later explicit resume clears the wait and redispatches the same unfinished task.
+  const resumed = await f.resume('Owner decision recorded');
+  assert.equal(resumed.status, 'completed');
+  assert.equal((await f.state()).wait, undefined);
+});
+
+test('advancement clears a wait', async t => {
+  const f = await fixture(t, [submits(plan('T1', 'T2')), submits(approvalRequest()), submits(completed()), submits(completed())]);
+  await f.start();
+  assert.equal((await f.state()).wait.taskId, 'T1');
+  assert.equal((await f.resume('Approved')).status, 'completed');
+  const state = await f.state();
+  assert.equal(state.index, 2);
+  assert.equal(state.wait, undefined);
+  assert.equal(f.saves.filter(save => save.wait).every(save => save.status === 'paused'), true, 'a wait is only ever recorded on a paused checkpoint');
+});
+
+test('generic blocked, unfinished, missing-submission and quota pauses never set a wait or become approvals', async t => {
+  // The reason text mentions approval: nothing is ever parsed from it.
+  const blocked = await fixture(t, [submits(plan('T1')), submits({ status: 'blocked', reason: 'Approval required: please approve the migration' })]);
+  assert.equal((await blocked.start()).status, 'paused');
+  assert.equal((await blocked.state()).wait, undefined);
+  assert.equal((await blocked.state()).reportRecovery.diagnostic.code, 'agent_blocked');
+
+  const unfinished = await fixture(t, [submits(plan('T1')), submits(completed({ evidence: [{ gateId: 'G1', passed: false, detail: 'approval-required: waiting for sign-off' }] }))]);
+  assert.equal((await unfinished.start()).status, 'paused');
+  assert.equal((await unfinished.state()).wait, undefined);
+  assert.equal((await unfinished.state()).reportRecovery.diagnostic.code, 'unfinished_work');
+
+  const missing = await fixture(t, [submits(plan('T1')), speaks('{"status":"approval-required","question":"Approve?"}')]);
+  const stopped = await missing.start();
+  assert.equal(stopped.status, 'paused');
+  assert.match(stopped.reason, /No valid submission was recorded for T1/);
+  assert.equal((await missing.state()).wait, undefined);
+  assert.equal((await missing.state()).reportRecovery.diagnostic.code, 'submission_missing');
+
+  const quota = await fixture(t, [submits(plan('T1')), async ({ submit }) => {
+    assert.equal((await submit(completed())).accepted, true);
+    quota.control.recoverError = new Error('Claude Code authentication unavailable. Refresh Claude Code manually, then explicitly resume this run.');
+    return SPOKEN;
+  }]);
+  assert.equal((await quota.start()).status, 'paused');
+  assert.equal((await quota.state()).wait, undefined);
+  assert.equal((await quota.state()).reportRecovery.diagnostic.code, 'auth_or_quota');
+
+  // A planner cannot ask for approval: the payload is a format error and the planner never waits.
+  const planner = await fixture(t, [async ({ submit }) => {
+    const response = await submit(approvalRequest());
+    assert.deepEqual([response.accepted, response.code, response.repairable], [false, 'format', true]);
+    return SPOKEN;
+  }]);
+  assert.equal((await planner.start()).status, 'paused');
+  assert.equal((await planner.state()).wait, undefined);
+});
+
+test('a stale wait is cleared when the next pause has another reason', async t => {
+  const f = await fixture(t, [submits(plan('T1')), submits(approvalRequest()), submits({ status: 'blocked', reason: 'Need the staging credentials' })]);
+  await f.start();
+  assert.equal((await f.state()).wait.taskId, 'T1');
+  assert.equal((await f.resume('Approved')).status, 'paused');
+  const state = await f.state();
+  assert.equal(state.wait, undefined, 'a blocked pause never carries the earlier approval wait');
+  assert.equal(state.reportRecovery.diagnostic.code, 'agent_blocked');
+});

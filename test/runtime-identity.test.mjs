@@ -482,3 +482,35 @@ async function fakeBackup(f) {
   const saved = await Promise.all(targets.map(async directory => [directory, await fs.readFile(path.join(directory, 'package.json'), 'utf8')]));
   return async () => { for (const [directory, content] of saved) { await fs.mkdir(directory, { recursive: true }); await fs.writeFile(path.join(directory, 'package.json'), content); } };
 }
+
+const contractsModule = (planner, executor) => `export const plannerPlanContract = {\n    kind: 'planner-plan',\n    version: ${planner},\n};\nexport const executorResultContract = {\n    kind: 'executor-result',\n    version: ${executor},\n};\n`;
+
+test('the contract map follows the contracts the measured package declares: executor-result v2 changes the build, v1 packages keep theirs', async t => {
+  const f = await fakePackage(t);
+  const legacy = computeRuntimeIdentity(f.source);
+  assert.deepEqual(legacy.build.contracts, { 'planner-plan': 1, 'executor-result': 1 }, 'a package without a contracts module reports the first published versions');
+  await f.write('dist/workflow/contracts.js', contractsModule(1, 1));
+  const v1 = computeRuntimeIdentity(f.source);
+  assert.deepEqual(v1.build.contracts, { 'planner-plan': 1, 'executor-result': 1 });
+  await f.write('dist/workflow/contracts.js', contractsModule(1, 2));
+  const v2 = computeRuntimeIdentity(f.source);
+  assert.deepEqual(v2.build.contracts, { 'planner-plan': 1, 'executor-result': 2 });
+  assert.notEqual(v2.build.digest, v1.build.digest);
+  assert.match(runtimeMismatch(v1, v2), /\(dist\) content changed|protocol or contract versions changed/);
+  assert.equal(runtimeMismatch(v1, { ...v2, build: { ...v2.build, dist: v1.build.dist } }), 'Runtime protocol or contract versions changed', 'the map alone is a mismatch');
+  // A snapshot of the v1 package keeps measuring as v1 after the executing code moved to v2.
+  await f.write('dist/workflow/contracts.js', contractsModule(1, 1));
+  const run = await admittedRun(f);
+  assert.deepEqual(run.specification.runtime.identity.build.contracts, { 'planner-plan': 1, 'executor-result': 1 });
+  const root = await createRuntimeSnapshot(run, f.source);
+  assert.deepEqual(computeRuntimeIdentity(root).build.contracts, { 'planner-plan': 1, 'executor-result': 1 });
+  assert.equal(computeRuntimeIdentity(root).build.digest, run.specification.runtime.identity.build.digest);
+  // A contracts module that declares no recognizable version fails closed.
+  await f.write('dist/workflow/contracts.js', 'export const nothing = 1;\n');
+  assert.throws(() => computeRuntimeIdentity(f.source), /declares no version for planner-plan/);
+});
+
+test('the loaded runtime of this repository reports executor-result v2', () => {
+  assert.deepEqual(computeRuntimeIdentity(repository).build.contracts, { 'planner-plan': 1, 'executor-result': 2 });
+  assert.deepEqual(runtimeIdentity().build.contracts, { 'planner-plan': 1, 'executor-result': 2 });
+});

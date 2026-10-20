@@ -160,3 +160,25 @@ test('recoverResponse binds the attempt marker when the contract follows it', as
   assert.equal(await backend.recoverResponse('child', 'parent', { id: 'attempt-1', startedAt: 10 }), '{"status":"completed"}');
   await assert.rejects(backend.recoverResponse('child', 'parent', { id: 'different', startedAt: 10 }), /bind completed/);
 });
+
+test('executor instructions state the approval request shape and the responsibilities the agent keeps', async () => {
+  const { structuredExecutorContract } = await import('../dist/workflow/runner.js');
+  const { submissionToolDescription } = await import('../dist/workflow/contracts.js');
+  const contract = structuredExecutorContract({ id: 'T9', title: 'Nine', brief: 'b', dependsOn: [], dod: ['gate nine'] });
+  for (const text of [
+    '"status":"approval-required"', 'onApprove', 'onRequestChanges', 'do all work and read-only checks you are already authorized to do',
+    'supplies decisions and access, never implementation chores', 'you keep every remaining action', 'credentials, environment file contents or private configuration values',
+    'never perform the gated action', 'submit a fresh approval request', 'request fresh approval', '"reason":"<the exact owner decision or capability still needed>"',
+  ]) assert.ok(contract.includes(text), text);
+  assert.ok(!contract.includes('owner steps'), 'blocked no longer asks for owner steps');
+  assert.match(submissionToolDescription('executor-result'), /blocked: status \("blocked"\), reason \(non-empty string\)/);
+  const description = submissionToolDescription('executor-result');
+  assert.ok(description.includes('executor-result v2') && description.includes('"approval-required"'));
+  // The planner keeps its own blocked wording and has no approval shape.
+  assert.ok(submissionToolDescription('planner-plan').includes('planner-plan v1'));
+  const root = new URL('../', import.meta.url);
+  for (const file of ['prompts/executor.md', 'examples/opencode/agents/adr-executor.md']) {
+    const instructions = (await fs.readFile(new URL(file, root), 'utf8')).replace(/\s+/g, ' ');
+    for (const text of ['approval', 'read-only checks', 'decisions and access only', 'credentials', 'fresh', 'gated action']) assert.ok(instructions.includes(text), `${file}: ${text}`);
+  }
+});

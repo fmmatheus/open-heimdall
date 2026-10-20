@@ -371,7 +371,7 @@ for (const [name, make] of backends) {
     assert.deepEqual({ protocol: stored.protocol, kind: stored.kind, phase: stored.phase, index: stored.index, taskId: stored.taskId, attemptId: stored.attemptId, dispatch: stored.dispatch, child: stored.child, receiptVersion: stored.receiptVersion }, { protocol: 'structured-v1', kind: 'executor-result', phase: 'executor', index: 0, taskId: 'T1', attemptId: 'attempt_1', dispatch: 1, child: CHILD, receiptVersion: 1 });
     assert.equal(stored.parent, backend.state.parent);
     assert.deepEqual(stored.caller, { sessionID: CHILD, agent: 'executor', messageID: 'msg_1', callId: 'call_1' });
-    assert.deepEqual(stored.contract, { protocol: 'structured-v1', kind: 'executor-result', version: 1 });
+    assert.deepEqual(stored.contract, { protocol: 'structured-v1', kind: 'executor-result', version: 2 });
     assert.equal(typeof stored.runtime.packageVersion, 'string');
     assert.match(stored.runtime.build.digest, /^[0-9a-f]{64}$/, 'the receipt carries the loaded build identity');
     assert.equal(stored.runtime.protocol, 'structured-v1');
