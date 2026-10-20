@@ -822,3 +822,25 @@ test('a checkpoint keeps the decision the coordinator delivered, and a new reque
   carrier.save(carrier.state);
   assert.equal(f.store.getRun('run').checkpoint.approval, undefined);
 });
+
+test('a decision the runner dropped for a fresh request cannot be written back into the checkpoint', async t => {
+  const f = await fixture(t, { executor: { inspect: async run => run.launchAction === 'resume' ? activeOn() : idleOn() }, revision: async () => R0 });
+  f.enqueue(await f.project(), 'run');
+  await f.tick();
+  const asked = ask(f.store, 'run');
+  await f.tick();
+  f.store.decideApproval('run', asked.request.requestId, { decision: 'approve' }, R0, f.store.getRun('run').version);
+  await f.tick();
+  const resumed = f.store.getRun('run');
+  const delivered = parseApprovalContext(resumed.resolution);
+  const claimed = { sessionID: resumed.parentSessionId, id: 'call-resume', messageID: 'msg-resume', agent: 'adr-orchestrator' };
+  f.store.bindResume('run', resumed.ownerToken, claimed);
+  const carrier = structured(f.store, 'run', 2, claimed);
+  carrier.save({ ...carrier.state, approval: delivered });
+  // The runner drops the approval when a fresh request for changed material is admitted. The coordinator still holds the delivered
+  // text as the run's resolution, but a checkpoint may no longer bring the earlier approval back.
+  carrier.save(carrier.state);
+  assert.equal(f.store.getRun('run').checkpoint.approval, undefined);
+  assert.throws(() => carrier.save({ ...carrier.state, approval: delivered }), /approval/i);
+  assert.equal(f.store.getRun('run').checkpoint.approval, undefined);
+});

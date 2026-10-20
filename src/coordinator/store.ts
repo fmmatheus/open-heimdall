@@ -650,7 +650,10 @@ export class CoordinatorStore {
       const stored = delivered ? this.getApproval(run.id, delivered.requestId) : null;
       const genuine = !!delivered && !!stored && isDeepStrictEqual(state.approval, delivered)
         && stored.state === 'answered' && stored.decision === delivered.decision && ['consumed', 'superseded'].includes(stored.continuation)
-        && stored.continuationMessageId === run.promptMessageId && delivered.index === state.index && state.tasks[state.index]?.id === delivered.taskId;
+        && stored.continuationMessageId === run.promptMessageId && delivered.index === state.index && state.tasks[state.index]?.id === delivered.taskId
+        // It is first recorded by the resume that leaves the wait this request asked for. Once the runner has dropped it (a fresh
+        // request was filed) or moved on, the same text, which stays the run's stored resolution, cannot be written back.
+        && previous?.wait?.kind === 'approval' && previous.wait.attemptId === stored.attemptId;
       if (!genuine) throw new Error('Checkpoint carries an approval decision that the coordinator did not deliver for this admission');
     }
     if (state.wait !== undefined && !isDeepStrictEqual(state.wait, previous?.wait)) {

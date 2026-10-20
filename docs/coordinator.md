@@ -181,7 +181,9 @@ task through the ordinary resume path, at most once per decision:
   the next attempt pauses.
 - A checkpoint written by the run's process cannot create, alter or erase an
   owner decision. The coordinator accepts a checkpoint's `approval` only when it
-  is unchanged or exactly the context it delivered for that admission, and its
+  is unchanged or exactly the context it delivered for that admission (and then
+  only as the resume leaves the wait that asked, so a dropped approval cannot be
+  written back), and its
   `wait` only when it is unchanged or names a request published for that attempt;
   anything else is refused (400) and nothing is stored. A newer approval request
   from the agent removes an earlier approval from the checkpoint, so a later
