@@ -5,8 +5,10 @@
  * textContent only. Nothing here infers a result: a missing value is reported as missing.
  */
 import type { ContentEntry, PanelState } from './store.js';
-import { RUN_STATUSES } from '../shared/protocol.js';
+import { APPROVAL_LIMITS, RUN_STATUSES } from '../shared/protocol.js';
 import type {
+  ApprovalProgress,
+  ApprovalWaitView,
   Blocker,
   BlockerContentResponse,
   EvidenceView,
@@ -797,4 +799,148 @@ export function detailPlaceholder(state: StateForDetail): string | null {
   if (state.selectedRunId === null) return 'Select a run to see its details.';
   if (state.detail !== null && state.detail.id === state.selectedRunId) return null;
   return state.detailError ?? 'Loading run…';
+}
+
+/*
+ * The approval and response card. Everything here is derived from the wait the coordinator reported and from the
+ * panel's own action state; no sentence claims more than the coordinator holds. In particular a decision that is only
+ * queued is never described as running or finished.
+ */
+
+export interface ButtonView { label: string; disabled: boolean }
+
+export type CardControls =
+  | { kind: 'decide'; approve: ButtonView; requestChanges: ButtonView; feedbackLabel: string; feedbackHint: string }
+  | { kind: 'respond'; respond: ButtonView; inputLabel: string; inputHint: string };
+
+export interface WaitCardView {
+  kind: 'approval' | 'generic';
+  /** Identifies the card; a draft typed into it belongs to this key only. */
+  key: string;
+  title: string;
+  badge: Badge;
+  task: string | null;
+  fields: Array<{ label: string; text: string }>;
+  lists: Array<{ label: string; items: string[] }>;
+  /** Reviewable references named by the request; plain text, offered to the review navigation when they are files. */
+  artifacts: string[];
+  revision: string | null;
+  /** What the coordinator holds for this request, in plain words. */
+  status: string | null;
+  /** Why the last click did nothing, or what happened to it. */
+  notice: string | null;
+  /** Shown while the data on screen cannot be trusted; the card is re-checked before anything is sent. */
+  unverified: string | null;
+  clippedNote: string | null;
+  controls: CardControls | null;
+  inFlight: boolean;
+}
+
+/** Where a recorded decision stands. The words match the coordinator's progress and never run ahead of it. */
+export const PROGRESS_TEXT: Record<ApprovalProgress, string> = {
+  none: 'The decision is recorded.',
+  recorded: 'Decision recorded. The run continues after the coordinator proves the agent session is idle; nothing has started yet.',
+  'waiting-for-idle': 'Decision recorded. Waiting for the run to be idle; nothing has started yet.',
+  queued: 'Decision recorded. The continuation is queued and has not started.',
+  executing: 'Decision recorded and the agent has been resumed with it. The task is not done until the agent submits a verified result.',
+  consumed: 'Decision recorded and delivered to the agent.',
+  superseded: 'Decision recorded, but the reviewed material changed before it took effect, so it authorizes nothing. The agent keeps its work and is told to ask again.',
+};
+
+const DECISION_LABEL = { approve: 'Approved', 'request-changes': 'Changes requested' } as const;
+
+export const canRequestChanges = (feedback: string): boolean => feedback.trim() !== '' && feedback.length <= APPROVAL_LIMITS.input;
+export const canRespond = canRequestChanges;
+
+function approvalStatus(wait: ApprovalWaitView, runId: string, ackRetried: boolean | null): { badge: Badge; title: string; status: string; fields: Array<{ label: string; text: string }> } {
+  if (wait.state === 'pending') {
+    return { badge: { label: 'Pending', tone: 'warning' }, title: 'Approval requested', status: 'Waiting for your decision. Leaving this panel decides nothing.', fields: [] };
+  }
+  if (wait.state === 'superseded') {
+    return {
+      badge: { label: 'Superseded', tone: 'neutral' },
+      title: 'Approval request superseded',
+      status: `This request can no longer be answered: a newer request replaced it, or the reviewed material changed. The run stays paused. To continue it, resume it from the CLI so the agent can ask again: heimdall coordinator run resume ${runId} --input "guidance".`,
+      fields: [],
+    };
+  }
+  const decision = wait.response?.decision;
+  const fields: Array<{ label: string; text: string }> = [];
+  if (decision === 'request-changes' && wait.response?.feedback) fields.push({ label: 'Your feedback', text: wait.response.feedback });
+  const when = wait.response ? ` at ${formatLocalTime(wait.response.answeredAt)}` : '';
+  const retried = ackRetried === true ? ' An identical response had already been recorded.' : '';
+  return {
+    badge: { label: decision ? DECISION_LABEL[decision] : 'Answered', tone: decision === 'approve' ? 'success' : 'info' },
+    title: 'Your decision',
+    status: `${decision ? DECISION_LABEL[decision] : 'Answered'}${when}. ${PROGRESS_TEXT[wait.progress]}${retried}`,
+    fields,
+  };
+}
+
+/** The card for the loaded run, or null when the run waits on nothing. */
+export function waitCard(
+  detail: Pick<RunDetail, 'id' | 'wait'>,
+  context: { action: PanelState['action']; connection: PanelState['connection']; stale: boolean },
+): WaitCardView | null {
+  const wait = detail.wait ?? null;
+  if (wait === null) return null;
+  const { action } = context;
+  const mine = action.runId === detail.id;
+  const key = wait.kind === 'approval' ? `approval:${wait.requestId}` : `pause:${wait.pauseId}`;
+  const busy = mine && (action.inFlight || action.verifying);
+  const ack = mine && action.target === key ? action.ack : null;
+  const unverified = context.connection !== 'online' || context.stale
+    ? 'Showing the last data read from the coordinator. The card is checked again before anything is sent.' : null;
+  const notice = mine ? action.notice : null;
+
+  if (wait.kind === 'generic') {
+    const fields = [{ label: 'The run is paused', text: wait.reason === '' ? NO_REASON_TEXT : wait.reason }];
+    const status = ack
+      ? `Guidance recorded${ack.retried ? ' (an identical response had already been recorded)' : ''}. ${ack.continuation === 'queued' ? 'The continuation is queued and has not started.' : ''}`.trim()
+      : 'Waiting for your guidance. Leaving this panel sends nothing.';
+    return {
+      kind: 'generic', key, title: 'Response needed', badge: { label: 'Waiting', tone: 'warning' }, task: null,
+      fields, lists: [], artifacts: [], revision: null, status, notice, unverified,
+      clippedNote: wait.reasonClipped ? 'The recorded reason was shortened.' : null,
+      controls: ack ? null : {
+        kind: 'respond', respond: { label: 'Respond and continue', disabled: busy },
+        inputLabel: 'Your response',
+        inputHint: 'Sent to the agent as owner guidance when the run continues. The coordinator refuses it if the run is not paused and idle; nothing is recorded then.',
+      },
+      inFlight: mine && action.inFlight,
+    };
+  }
+
+  const state = approvalStatus(wait, detail.id, ack?.retried ?? null);
+  // Between the acknowledgement and the next read the card may still show the request as pending.
+  const acknowledged = wait.state === 'pending' && ack !== null;
+  const task = wait.taskTitle ? `${wait.taskId}: ${wait.taskTitle}` : wait.taskId;
+  const fields = [
+    { label: 'Question', text: wait.question },
+    { label: 'Scope of the approval', text: wait.scope },
+    { label: 'Completed work', text: wait.completedWork },
+    ...state.fields,
+  ];
+  const lists = [
+    { label: 'Verification', items: wait.verification },
+    { label: 'If you approve, the agent will', items: wait.onApprove },
+    { label: 'If you request changes, the agent will', items: wait.onRequestChanges },
+  ].filter(entry => entry.items.length > 0);
+  const pending = wait.state === 'pending' && !acknowledged;
+  return {
+    kind: 'approval', key, title: state.title, badge: acknowledged ? { label: 'Recording', tone: 'info' } : state.badge, task,
+    fields, lists, artifacts: wait.artifacts,
+    revision: wait.revision.head ? `${wait.revision.head.slice(0, 12)} · content ${wait.revision.digest}` : null,
+    status: acknowledged ? 'Your response was acknowledged. Reading the current state from the coordinator…' : state.status,
+    notice, unverified,
+    clippedNote: wait.clipped ? 'Some text of this request was shortened; the full request is available through the CLI.' : null,
+    controls: pending ? {
+      kind: 'decide',
+      approve: { label: 'Approve and continue', disabled: busy },
+      requestChanges: { label: 'Request changes', disabled: busy },
+      feedbackLabel: 'Changes you want (required to request changes)',
+      feedbackHint: 'The agent receives this text unchanged, corrects within the task scope and submits a fresh request. It does not perform the gated action.',
+    } : null,
+    inFlight: mine && action.inFlight,
+  };
 }

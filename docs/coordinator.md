@@ -178,7 +178,8 @@ capacity), `executing` (admitted), `consumed` or `superseded`. The decision
 acknowledgement reports `continuation`: `queued`, or `pending` while it waits
 for idle proof.
 
-Runs can also be watched and reviewed read-only from OpenChamber 2.1.0; see the
+Runs can also be watched and reviewed from OpenChamber 2.1.0, whose panel can
+record the same two owner responses as `run respond` and nothing else; see the
 [OpenChamber extension guide](openchamber-extension.md).
 
 ## Approvals and owner responses

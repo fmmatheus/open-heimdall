@@ -396,7 +396,7 @@ test('panel sources never assign HTML or write documents', async () => {
   }
   // Run text goes through textContent; the SDK text component (markdown links and images) is not used for it.
   const main = await readFile(join(root, 'src', 'extension', 'panel', 'main.ts'), 'utf8');
-  assert.doesNotMatch(main.replace(/\/\*[\s\S]*?\*\//g, ''), /mountText/);
+  assert.doesNotMatch(main.replace(/\/\*[\s\S]*?\*\//g, ''), /\bmountText\b/);
   assert.match(main, /textContent/);
 });
 
@@ -1105,4 +1105,146 @@ test('report presentation never contains raw reply or secret strings, only allow
   const main = await readFile(join(root, 'src', 'extension', 'panel', 'main.ts'), 'utf8');
   assert.match(main, /blockerInfo\.category\.nextStep/);
   assert.match(main, /blockerInfo\.category\.missing/);
+});
+
+// ----- approval and response card -----
+
+import { waitCard, PROGRESS_TEXT, canRequestChanges, canRespond } from '../dist/extension/panel/view-model.js';
+import { EMPTY_ACTION } from '../dist/extension/panel/store.js';
+
+const approval = (overrides = {}) => ({
+  kind: 'approval', requestId: 'apr_1', state: 'pending', continuation: 'none', progress: 'none', taskId: 'T2', taskTitle: 'Migrate data',
+  question: 'Ship the migration?', scope: 'Only the reviewed commit', completedWork: 'Migration written',
+  verification: ['unit tests pass'], artifacts: ['src/migrate.ts', 'deadbeef1234'], onApprove: ['merge it'], onRequestChanges: ['fix and ask again'],
+  revision: { head: 'a'.repeat(40), digest: 'b'.repeat(12) }, response: null, createdAt: 1, clipped: false, ...overrides,
+});
+const online = { connection: 'online', stale: false };
+const cardOf = (wait, action = EMPTY_ACTION, context = online) => waitCard({ id: 'run_1', wait }, { action, ...context });
+
+test('the card shows a pending request with its bounded data as plain text and both decision buttons', () => {
+  const view = cardOf(approval({ question: MARKUP, onApprove: ['merge', MARKUP] }));
+  assert.equal(view.kind, 'approval');
+  assert.equal(view.key, 'approval:apr_1');
+  assert.equal(view.title, 'Approval requested');
+  assert.deepEqual(view.badge, { label: 'Pending', tone: 'warning' });
+  assert.equal(view.task, 'T2: Migrate data');
+  assert.deepEqual(view.fields.map(field => field.label), ['Question', 'Scope of the approval', 'Completed work']);
+  assert.equal(view.fields[0].text, MARKUP, 'run text passes through unchanged and is rendered with textContent only');
+  assert.deepEqual(view.lists.map(list => list.label), ['Verification', 'If you approve, the agent will', 'If you request changes, the agent will']);
+  assert.deepEqual(view.artifacts, ['src/migrate.ts', 'deadbeef1234']);
+  assert.equal(view.revision, `${'a'.repeat(12)} · content ${'b'.repeat(12)}`);
+  assert.deepEqual(view.controls, {
+    kind: 'decide',
+    approve: { label: 'Approve and continue', disabled: false },
+    requestChanges: { label: 'Request changes', disabled: false },
+    feedbackLabel: view.controls.feedbackLabel, feedbackHint: view.controls.feedbackHint,
+  });
+  assert.match(view.status, /Leaving this panel decides nothing/);
+  assert.equal(view.clippedNote, null);
+  assert.equal(cardOf(approval({ clipped: true })).clippedNote !== null, true);
+  assert.equal(cardOf(approval({ verification: [] })).lists.some(list => list.label === 'Verification'), false, 'empty lists are not drawn');
+});
+
+test('a queued, recorded or waiting decision is never presented as executing or completed', () => {
+  for (const progress of ['recorded', 'waiting-for-idle', 'queued']) {
+    for (const decision of ['approve', 'request-changes']) {
+      const view = cardOf(approval({ state: 'answered', continuation: progress === 'queued' ? 'queued' : 'pending', progress, response: { decision, feedback: decision === 'approve' ? null : 'rework', answeredAt: 1700000000000 } }));
+      const sentence = view.status;
+      assert.match(sentence, decision === 'approve' ? /^Approved at / : /^Changes requested at /, progress);
+      assert.match(sentence, /has(?: not|n't)? (?:started|yet)|not started|nothing has started/i, progress);
+      assert.doesNotMatch(sentence, /executing|running|resumed|completed|finished|done/i, `${progress}: ${sentence}`);
+      assert.equal(view.controls, null, 'an answered request has no buttons');
+    }
+  }
+  assert.match(PROGRESS_TEXT.queued, /queued and has not started/);
+  // Only the coordinator's own "executing" progress says the agent was resumed, and even then the task is not called done.
+  const executing = cardOf(approval({ state: 'answered', continuation: 'queued', progress: 'executing', response: { decision: 'approve', feedback: null, answeredAt: 1 } }));
+  assert.match(executing.status, /resumed with it/);
+  assert.match(executing.status, /not done until the agent submits a verified result/);
+  for (const [progress, text] of Object.entries(PROGRESS_TEXT)) {
+    if (progress === 'executing' || progress === 'consumed') continue;
+    assert.doesNotMatch(text, /executing|resumed with|completed|finished/i, progress);
+  }
+});
+
+test('the card shows the answered, superseded and withdrawn states from the coordinator, with feedback and the way to continue', () => {
+  const answered = cardOf(approval({ state: 'answered', continuation: 'queued', progress: 'queued', response: { decision: 'request-changes', feedback: 'Add a rollback', answeredAt: 1700000000000 } }));
+  assert.equal(answered.title, 'Your decision');
+  assert.deepEqual(answered.badge, { label: 'Changes requested', tone: 'info' });
+  assert.deepEqual(answered.fields.at(-1), { label: 'Your feedback', text: 'Add a rollback' });
+  assert.deepEqual(cardOf(approval({ state: 'answered', progress: 'queued', response: { decision: 'approve', feedback: null, answeredAt: 1 } })).badge, { label: 'Approved', tone: 'success' });
+
+  const superseded = cardOf(approval({ state: 'superseded', continuation: 'none' }));
+  assert.equal(superseded.title, 'Approval request superseded');
+  assert.deepEqual(superseded.badge, { label: 'Superseded', tone: 'neutral' });
+  assert.equal(superseded.controls, null, 'a superseded request cannot be answered');
+  assert.match(superseded.status, /heimdall coordinator run resume run_1 --input/);
+
+  const withdrawn = cardOf(approval({ state: 'answered', continuation: 'superseded', progress: 'superseded', response: { decision: 'approve', feedback: null, answeredAt: 1 } }));
+  assert.match(withdrawn.status, /authorizes nothing/);
+  assert.match(withdrawn.status, /ask again/);
+  assert.equal(withdrawn.controls, null);
+});
+
+test('buttons are disabled while a response is in flight or unconfirmed, and the acknowledgement closes the card until the run is read again', () => {
+  const key = 'approval:apr_1';
+  const flying = cardOf(approval(), { ...EMPTY_ACTION, runId: 'run_1', target: key, inFlight: true });
+  assert.equal(flying.controls.approve.disabled, true);
+  assert.equal(flying.controls.requestChanges.disabled, true);
+  assert.equal(flying.inFlight, true);
+  const verifying = cardOf(approval(), { ...EMPTY_ACTION, runId: 'run_1', target: key, verifying: true, notice: 'Heimdall could not confirm whether your response was recorded.' });
+  assert.equal(verifying.controls.approve.disabled, true);
+  assert.match(verifying.notice, /could not confirm/);
+  // Another run's action state never disables or annotates this card.
+  const foreign = cardOf(approval(), { ...EMPTY_ACTION, runId: 'run_other', target: key, inFlight: true, notice: 'elsewhere' });
+  assert.equal(foreign.controls.approve.disabled, false);
+  assert.equal(foreign.notice, null);
+  const acknowledged = cardOf(approval(), { ...EMPTY_ACTION, runId: 'run_1', target: key, ack: { runId: 'run_1', requestId: 'apr_1', decision: 'approve', recordedAt: 1, retried: false, continuation: 'queued', run: { status: 'queued', version: 6 } } });
+  assert.equal(acknowledged.controls, null);
+  assert.deepEqual(acknowledged.badge, { label: 'Recording', tone: 'info' });
+  assert.match(acknowledged.status, /Reading the current state/);
+});
+
+test('an offline or stale card says so, and the generic pause card offers one response with bounded text', () => {
+  assert.match(cardOf(approval(), EMPTY_ACTION, { connection: 'offline', stale: true }).unverified, /checked again before anything is sent/);
+  assert.match(cardOf(approval(), EMPTY_ACTION, { connection: 'online', stale: true }).unverified, /last data read/);
+  assert.equal(cardOf(approval()).unverified, null);
+
+  const generic = cardOf({ kind: 'generic', pauseId: 'pau_a', reason: MARKUP, reasonClipped: true });
+  assert.equal(generic.kind, 'generic');
+  assert.equal(generic.key, 'pause:pau_a');
+  assert.equal(generic.fields[0].text, MARKUP);
+  assert.equal(generic.controls.kind, 'respond');
+  assert.deepEqual(generic.controls.respond, { label: 'Respond and continue', disabled: false });
+  assert.match(generic.clippedNote, /shortened/);
+  const empty = cardOf({ kind: 'generic', pauseId: 'pau_a', reason: '', reasonClipped: false });
+  assert.equal(empty.fields[0].text, 'No reason was recorded');
+  const recorded = cardOf({ kind: 'generic', pauseId: 'pau_a', reason: 'r', reasonClipped: false }, { ...EMPTY_ACTION, runId: 'run_1', target: 'pause:pau_a', ack: { runId: 'run_1', pauseId: 'pau_a', recordedAt: 1, retried: false, continuation: 'queued', run: { status: 'queued', version: 2 } } });
+  assert.match(recorded.status, /queued and has not started/);
+  assert.doesNotMatch(recorded.status, /executing|running|completed/i);
+  assert.equal(recorded.controls, null);
+
+  assert.equal(waitCard({ id: 'run_1', wait: null }, { action: EMPTY_ACTION, ...online }), null);
+  assert.equal(waitCard({ id: 'run_1' }, { action: EMPTY_ACTION, ...online }), null, 'an older service without a wait draws no card');
+  assert.equal(canRequestChanges('  '), false);
+  assert.equal(canRequestChanges('fix'), true);
+  assert.equal(canRespond('x'.repeat(8001)), false);
+  assert.equal(canRespond('x'.repeat(8000)), true);
+});
+
+test('panel wiring: the card is drawn from text nodes, buttons only call the store handlers, and nothing sends on draw', async () => {
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const stripped = text => text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const main = stripped(await readFile(join(root, 'src', 'extension', 'panel', 'main.ts'), 'utf8'));
+  const card = main.slice(main.indexOf('function drawCard'), main.indexOf('function drawTechnical'));
+  assert.match(card, /store\.decideApproval\(detail\.id, wait\.requestId, 'approve'\)/);
+  assert.match(card, /store\.decideApproval\(detail\.id, wait\.requestId, 'request-changes', draft\(\)\)/);
+  assert.match(card, /store\.respondToPause\(detail\.id, wait\.pauseId, draft\(\)\)/);
+  // The handlers are reached only from onClick; drawing, repainting and the text field never send.
+  assert.equal((card.match(/store\.(decideApproval|respondToPause)\(/g) ?? []).length, 3);
+  assert.equal((card.match(/onClick:/g) ?? []).length >= 3, true);
+  assert.doesNotMatch(card, /confirm\(|window\.confirm|prompt\(/);
+  assert.doesNotMatch(card, /innerHTML|insertAdjacentHTML/);
+  // Requests are never made from the panel entry directly; it only calls the store.
+  assert.doesNotMatch(main, /serviceRequest\(/);
 });

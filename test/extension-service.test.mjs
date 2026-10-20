@@ -374,7 +374,8 @@ test('adapter exposes no mutating method and issues only GET requests on allowed
       };
     },
   });
-  assert.deepEqual(Object.keys(adapter).sort(), ['events', 'projects', 'run', 'runs']);
+  // The reads, plus exactly the two narrow owner responses (covered by the approval tests); nothing else can write.
+  assert.deepEqual(Object.keys(adapter).sort(), ['decideApproval', 'events', 'projects', 'respondToPause', 'run', 'runs']);
   await adapter.projects();
   await adapter.runs();
   await adapter.run('run_1-A');
@@ -383,7 +384,10 @@ test('adapter exposes no mutating method and issues only GET requests on allowed
     ['GET', '/projects'], ['GET', '/run-list?after=0'], ['GET', '/runs/run_1-A'], ['GET', '/events?after=7'],
   ]);
   const source = await fs.readFile(path.join(root, 'src', 'extension', 'service', 'coordinator.ts'), 'utf8');
-  assert.doesNotMatch(source, /'(POST|PUT|PATCH|DELETE)'/);
+  // One POST call site, fed only by the two route builders; no other verb and no other coordinator route.
+  assert.equal((source.match(/'POST'/g) ?? []).length, 1);
+  assert.doesNotMatch(source, /'(PUT|PATCH|DELETE)'/);
+  assert.deepEqual([...source.matchAll(/post\(`([^`]*)`/g)].map(match => match[1]), ['/runs/${runId}/approvals/${requestId}/decision', '/runs/${runId}/respond']);
   assert.doesNotMatch(source, /\/reconcile|\/resume|\/checkpoint|\/binding|\/receipts?/);
 });
 
@@ -438,4 +442,297 @@ test('built service bundle has no node:sqlite, refuses to start without env, and
   assert.equal(status.json.error.kind, 'coordinator-offline');
   assert.equal(output, '');
   assert.equal(output.includes(SERVICE_TOKEN), false);
+});
+
+// ----- owner responses: the only two writes -----
+
+const FAKE_KEY = 'k'.repeat(64);
+const RUN_CAPABILITY = 'run-capability-' + 'f'.repeat(24);
+
+/** A recording adapter whose run carries a pending approval; any call the routes should not make is counted. */
+function recordingAdapter({ wait, version = 7, answer, failure } = {}) {
+  const calls = { run: 0, decide: [], respond: [], other: 0 };
+  const pending = {
+    kind: 'approval', requestId: 'apr_1', state: 'pending', continuation: 'none', progress: 'none', phase: 'executor', taskIndex: 0, taskId: 'T1', taskTitle: 'Task',
+    attemptId: 'attempt_secret', question: 'Q?', scope: 'S', completedWork: 'C', verification: [], artifacts: [], onApprove: [], onRequestChanges: [],
+    revision: { head: 'a'.repeat(40), digest: 'b'.repeat(64) }, response: null, createdAt: 1, clipped: {},
+  };
+  const adapter = {
+    async run(id) {
+      calls.run++;
+      return { id, version, status: 'paused', wait: wait === undefined ? pending : wait, ownerToken: RUN_CAPABILITY, checkpoint: { raw: 'RAW-CHECKPOINT' }, specification: { secret: FAKE_KEY } };
+    },
+    async decideApproval(...args) {
+      calls.decide.push(args);
+      if (failure) throw failure;
+      return answer ?? { runId: args[0], requestId: args[1], decision: args[2].decision, recordedAt: 5, retried: false, continuation: 'queued', run: { status: 'queued', version: version + 1 }, ownerToken: RUN_CAPABILITY, coordinatorKey: FAKE_KEY };
+    },
+    async respondToPause(...args) {
+      calls.respond.push(args);
+      if (failure) throw failure;
+      return answer ?? { runId: args[0], pauseId: args[1].pauseId, recordedAt: 5, retried: false, continuation: 'queued', run: { status: 'queued', version: version + 1 }, ownerToken: RUN_CAPABILITY };
+    },
+    async projects() { calls.other++; return []; },
+    async runs() { calls.other++; return []; },
+    async events() { calls.other++; return []; },
+  };
+  return { adapter, calls, pending };
+}
+
+const DECISION = '/runs/run_1/approvals/apr_1/decision';
+const PAUSE = '/runs/run_1/pause-response';
+const post = (server, target, body, options = {}) => call(server, { method: 'POST', path: target, body: typeof body === 'string' ? body : JSON.stringify(body), ...options });
+
+test('only the two response routes accept POST: every other POST is refused before any coordinator call', async t => {
+  const { adapter, calls } = recordingAdapter();
+  const server = await listening(t, { token: SERVICE_TOKEN, adapter });
+  const unknown = [
+    '/runs/run_1/resume', '/runs/run_1/respond', '/runs/run_1/reconcile', '/runs/run_1/stop', '/runs/run_1/cancel', '/runs/run_1/pause',
+    '/runs/run_1/approvals/apr_1', '/runs/run_1/approvals/apr_1/decision/extra', '/runs/run_1/approvals/apr_1/approve', '/runs/run_1/pause-response/x',
+    '/runs/run_1/approvals/decision', '/runs', '/runs/run_1', '/runs/run_1/blocker', '/runs/run_1/review', '/runs/run_1/review/file', '/projects',
+    '/status', '/changes', '/health', '/events', '/exec', '/shell', '/proxy', '/runs/run_1/tasks/0',
+  ];
+  for (const target of unknown) {
+    const answer = await post(server, target, '{}').catch(error => assert.fail(`${target}: ${error.message}`));
+    assert.ok(answer.status === 404 || answer.status === 405, `${target} gave ${answer.status}`);
+  }
+  for (const method of ['PUT', 'PATCH', 'DELETE']) {
+    for (const target of [DECISION, PAUSE]) assert.equal((await call(server, { method, path: target, ...(method === 'DELETE' ? {} : { body: '{}' }) }).catch(error => assert.fail(`${method} ${target}: ${error.message}`))).status, 405, `${method} ${target}`);
+  }
+  assert.equal((await call(server, { path: DECISION })).status, 405);
+  assert.equal((await call(server, { path: PAUSE })).status, 405);
+  assert.deepEqual({ ...calls, decide: calls.decide.length, respond: calls.respond.length }, { run: 0, decide: 0, respond: 0, other: 0 });
+});
+
+test('response routes require the service token', async t => {
+  const { adapter, calls } = recordingAdapter();
+  const server = await listening(t, { token: SERVICE_TOKEN, adapter });
+  const body = { decision: 'approve', displayedVersion: 7 };
+  for (const target of [DECISION, PAUSE]) {
+    for (const token of [null, 'nope', FAKE_KEY, '']) {
+      const answer = await post(server, target, body, { token });
+      assert.equal(answer.status, 401, `${target} with ${JSON.stringify(token)}`);
+      assert.equal(answer.json.error.kind, 'unauthorized');
+    }
+  }
+  assert.deepEqual({ run: calls.run, decide: calls.decide.length, respond: calls.respond.length }, { run: 0, decide: 0, respond: 0 });
+});
+
+test('response routes validate identifiers, enums, sizes and fields before the coordinator is contacted', async t => {
+  const { adapter, calls } = recordingAdapter();
+  const server = await listening(t, { token: SERVICE_TOKEN, adapter });
+  const approve = { decision: 'approve', displayedVersion: 7 };
+  const bodies = {
+    'unknown decision': { decision: 'maybe', displayedVersion: 7 },
+    'missing decision': { displayedVersion: 7 },
+    'missing version': { decision: 'approve' },
+    'fractional version': { decision: 'approve', displayedVersion: 1.5 },
+    'negative version': { decision: 'approve', displayedVersion: -1 },
+    'string version': { decision: 'approve', displayedVersion: '7' },
+    'approve with feedback': { ...approve, feedback: 'why' },
+    'request without feedback': { decision: 'request-changes', displayedVersion: 7 },
+    'blank feedback': { decision: 'request-changes', feedback: '  \n ', displayedVersion: 7 },
+    'numeric feedback': { decision: 'request-changes', feedback: 5, displayedVersion: 7 },
+    'oversize feedback': { decision: 'request-changes', feedback: 'x'.repeat(8001), displayedVersion: 7 },
+    'extra field': { ...approve, runId: 'other' },
+    'forged capability': { ...approve, ownerToken: RUN_CAPABILITY },
+    array: [approve],
+    string: 'approve',
+    null: null,
+  };
+  for (const [name, body] of Object.entries(bodies)) {
+    const answer = await post(server, DECISION, body);
+    assert.equal(answer.status, 400, name);
+    assert.equal(answer.json.error.kind, 'invalid-request', name);
+  }
+  assert.equal((await post(server, DECISION, '{not json')).status, 400);
+  assert.equal((await post(server, DECISION, '')).status, 400);
+  // Larger than the route's body cap: refused while reading, never parsed.
+  assert.equal((await post(server, DECISION, JSON.stringify({ decision: 'request-changes', feedback: 'y'.repeat(70 * 1024), displayedVersion: 7 }))).status, 413);
+  for (const target of ['/runs/..%2f/approvals/apr_1/decision', '/runs/run_1/approvals/%2e%2e/decision', `/runs/${'a'.repeat(129)}/approvals/apr_1/decision`, `/runs/run_1/approvals/${'b'.repeat(129)}/decision`, '/runs/run%201/approvals/apr_1/decision', '/runs/-run/approvals/apr_1/decision', '/runs/run_1/approvals/-apr/decision']) {
+    const answer = await post(server, target, approve);
+    assert.ok([400, 404].includes(answer.status), `${target} gave ${answer.status}`);
+  }
+
+  const pause = { pauseId: 'pau_' + 'a'.repeat(32), input: 'go ahead', displayedVersion: 7 };
+  const pauseBodies = {
+    'missing pause': { input: 'go', displayedVersion: 7 },
+    'bad pause': { ...pause, pauseId: '../x' },
+    'long pause': { ...pause, pauseId: 'p'.repeat(129) },
+    'missing input': { pauseId: pause.pauseId, displayedVersion: 7 },
+    'blank input': { ...pause, input: '   ' },
+    'oversize input': { ...pause, input: 'z'.repeat(8001) },
+    'non-string input': { ...pause, input: ['x'] },
+    'bad version': { ...pause, displayedVersion: 'x' },
+    'extra field': { ...pause, decision: 'approve' },
+  };
+  for (const [name, body] of Object.entries(pauseBodies)) {
+    const answer = await post(server, PAUSE, body);
+    assert.equal(answer.status, 400, name);
+  }
+  assert.equal((await post(server, PAUSE, JSON.stringify({ ...pause, input: 'y'.repeat(70 * 1024) }))).status, 413);
+  assert.equal((await post(server, '/runs/..%2fx/pause-response', pause)).status, 404);
+  assert.equal((await post(server, `/runs/${'r'.repeat(129)}/pause-response`, pause)).status, 404);
+  assert.deepEqual({ run: calls.run, decide: calls.decide.length, respond: calls.respond.length, other: calls.other }, { run: 0, decide: 0, respond: 0, other: 0 });
+
+  // Exactly the limit is accepted.
+  assert.equal((await post(server, DECISION, { decision: 'request-changes', feedback: 'x'.repeat(8000), displayedVersion: 7 })).status, 200);
+  assert.equal(calls.decide.length, 1);
+});
+
+test('a decision is forwarded for exactly the run and request on the card; the acknowledgement carries nothing else', async t => {
+  const { adapter, calls } = recordingAdapter();
+  const server = await listening(t, { token: SERVICE_TOKEN, adapter, now: () => new Date('2026-03-09T12:00:00Z') });
+  const feedback = 'Add a rollback.\nKeep "quotes" and --dashes.';
+  const answer = await post(server, DECISION, { decision: 'request-changes', feedback, displayedVersion: 7 });
+  assert.equal(answer.status, 200);
+  assert.deepEqual(calls.decide, [['run_1', 'apr_1', { decision: 'request-changes', feedback }]]);
+  assert.deepEqual(answer.json, {
+    ack: { runId: 'run_1', recordedAt: 5, retried: false, continuation: 'queued', run: { status: 'queued', version: 8 }, requestId: 'apr_1', decision: 'request-changes' },
+    fetchedAt: '2026-03-09T12:00:00.000Z',
+  });
+  for (const secret of [FAKE_KEY, RUN_CAPABILITY, 'coordinatorKey', 'ownerToken', 'RAW-CHECKPOINT']) assert.equal(answer.text.includes(secret), false, secret);
+
+  const approve = await post(server, DECISION, { decision: 'approve', displayedVersion: 7 });
+  assert.equal(approve.status, 200);
+  assert.deepEqual(calls.decide[1], ['run_1', 'apr_1', { decision: 'approve' }]);
+});
+
+test('a card that no longer matches the run is refused without a coordinator write', async t => {
+  const pending = recordingAdapter();
+  const server = await listening(t, { token: SERVICE_TOKEN, adapter: pending.adapter });
+  const refuse = async (target, body) => {
+    const answer = await post(server, target, body);
+    assert.equal(answer.status, 409, JSON.stringify(body));
+    assert.equal(answer.json.error.kind, 'stale-card');
+    return answer;
+  };
+  await refuse(DECISION, { decision: 'approve', displayedVersion: 6 });
+  await refuse('/runs/run_1/approvals/apr_other/decision', { decision: 'approve', displayedVersion: 7 });
+  await refuse(PAUSE, { pauseId: 'pau_x', input: 'go', displayedVersion: 7 });
+  assert.equal(pending.calls.decide.length + pending.calls.respond.length, 0);
+
+  const answered = recordingAdapter({ wait: { ...recordingAdapter().pending, state: 'answered' } });
+  const second = await listening(t, { token: SERVICE_TOKEN, adapter: answered.adapter });
+  assert.equal((await post(second, DECISION, { decision: 'approve', displayedVersion: 7 })).status, 409);
+  const none = recordingAdapter({ wait: null });
+  const third = await listening(t, { token: SERVICE_TOKEN, adapter: none.adapter });
+  assert.equal((await post(third, DECISION, { decision: 'approve', displayedVersion: 7 })).status, 409);
+  assert.equal((await post(third, PAUSE, { pauseId: 'pau_x', input: 'go', displayedVersion: 7 })).status, 409);
+  const generic = recordingAdapter({ wait: { kind: 'generic', pauseId: 'pau_a', reason: 'r', reasonClipped: false } });
+  const fourth = await listening(t, { token: SERVICE_TOKEN, adapter: generic.adapter });
+  assert.equal((await post(fourth, DECISION, { decision: 'approve', displayedVersion: 7 })).status, 409, 'a generic pause is never answered as an approval');
+  assert.equal((await post(fourth, PAUSE, { pauseId: 'pau_b', input: 'go', displayedVersion: 7 })).status, 409);
+  const ok = await post(fourth, PAUSE, { pauseId: 'pau_a', input: 'go', displayedVersion: 7 });
+  assert.equal(ok.status, 200);
+  assert.deepEqual(generic.calls.respond, [['run_1', { pauseId: 'pau_a', input: 'go' }]]);
+  assert.deepEqual(ok.json.ack, { runId: 'run_1', recordedAt: 5, retried: false, continuation: 'queued', run: { status: 'queued', version: 8 }, pauseId: 'pau_a' });
+  assert.equal([answered, none].reduce((sum, entry) => sum + entry.calls.decide.length + entry.calls.respond.length, 0), 0);
+});
+
+test('an acknowledgement for a different target or an unreadable one is reported as unconfirmed, never as success', async t => {
+  const wrong = recordingAdapter({ answer: { runId: 'run_1', requestId: 'apr_other', decision: 'approve', recordedAt: 5, retried: false, continuation: 'queued', run: { status: 'queued', version: 8 } } });
+  const server = await listening(t, { token: SERVICE_TOKEN, adapter: wrong.adapter });
+  const answer = await post(server, DECISION, { decision: 'approve', displayedVersion: 7 });
+  assert.equal(answer.status, 502);
+  assert.equal(answer.json.error.kind, 'delivery-uncertain');
+  const garbled = recordingAdapter({ answer: { nonsense: true } });
+  const second = await listening(t, { token: SERVICE_TOKEN, adapter: garbled.adapter });
+  assert.equal((await post(second, PAUSE, { pauseId: 'pau_a', input: 'go', displayedVersion: 7 })).status, 409, 'the card does not match, so nothing is sent');
+});
+
+test('coordinator refusals and failures reach the panel as fixed text without coordinator messages or secrets', async t => {
+  const secretText = `boom ${FAKE_KEY} ${RUN_CAPABILITY} /Users/someone/.local/state/heimdall/coordinator.key`;
+  const cases = [
+    [{ statusCode: 409, code: 'approval-stale' }, 409, 'approval-stale'],
+    [{ statusCode: 409, code: 'approval-conflict' }, 409, 'approval-conflict'],
+    [{ statusCode: 409, code: 'pause-stale' }, 409, 'pause-stale'],
+    [{ statusCode: 409, code: 'pause-not-ready' }, 409, 'pause-not-ready'],
+    [{ statusCode: 409, code: 'response-conflict' }, 409, 'response-conflict'],
+    [{ statusCode: 409, code: 'approval-pending' }, 409, 'approval-pending'],
+    [{ statusCode: 409, code: 'something-new' }, 409, 'response-refused'],
+    [{ statusCode: 400 }, 409, 'response-refused'],
+    [{ statusCode: 404, code: 'approval-not-found' }, 404, 'not-found'],
+    [{ statusCode: 404, message: 'Unknown coordinator route' }, 503, 'coordinator-unsupported'],
+    [{ statusCode: 503, message: 'Coordinator is draining; new work is disabled' }, 503, 'coordinator-draining'],
+    [{ statusCode: 401 }, 503, 'coordinator-unauthorized'],
+    [{ statusCode: 403 }, 503, 'coordinator-unauthorized'],
+    [{ code: 'ECONNREFUSED', message: 'Coordinator unavailable: connect ECONNREFUSED' }, 503, 'coordinator-offline'],
+    [{ code: 'ENOENT', message: 'Coordinator unavailable: connect ENOENT' }, 503, 'coordinator-offline'],
+    [{ message: 'Coordinator request timed out' }, 502, 'delivery-uncertain'],
+    [{ code: 'ECONNRESET', message: 'Coordinator unavailable: socket hang up' }, 502, 'delivery-uncertain'],
+    [{ message: 'Invalid coordinator JSON response' }, 502, 'delivery-uncertain'],
+  ];
+  const decide = { decision: 'approve', displayedVersion: 7 };
+  const respond = { pauseId: 'pau_a', input: 'go', displayedVersion: 7 };
+  for (const [failure, status, kind] of cases) {
+    const error = Object.assign(new Error(failure.message ?? secretText), failure);
+    const reads = [];
+    const adapter = createCoordinatorAdapter({
+      loadConfiguration: async () => ({ stateDirectory: '/unused', endpoint: '/unused/coordinator.sock', globalConcurrency: 1, projectConcurrency: 1 }),
+      readToken: async () => FAKE_KEY,
+      clientFactory: () => ({ request: async (method, route, body) => {
+        reads.push([method, route, body]);
+        if (method === 'POST') throw error;
+        return route === '/projects' ? [] : { id: 'run_1', version: 7, status: 'paused', wait: { kind: 'approval', requestId: 'apr_1', state: 'pending', continuation: 'none', progress: 'none' } };
+      } }),
+    });
+    const server = await listening(t, { token: SERVICE_TOKEN, adapter });
+    for (const [target, body] of [[DECISION, decide], [PAUSE, respond]]) {
+      // The pause route needs a generic wait on screen; use a coordinator that reports one.
+      const answered = target === PAUSE ? await (async () => {
+        const generic = createCoordinatorAdapter({
+          loadConfiguration: async () => ({ stateDirectory: '/unused', endpoint: '/unused/coordinator.sock', globalConcurrency: 1, projectConcurrency: 1 }),
+          readToken: async () => FAKE_KEY,
+          clientFactory: () => ({ request: async method => { if (method === 'POST') throw error; return { id: 'run_1', version: 7, status: 'paused', wait: { kind: 'generic', pauseId: 'pau_a', reason: 'r', reasonClipped: false } }; } }),
+        });
+        return post(await listening(t, { token: SERVICE_TOKEN, adapter: generic }), target, body);
+      })() : await post(server, target, body);
+      assert.equal(answered.status, status, `${target} ${JSON.stringify(failure)}`);
+      assert.equal(answered.json.error.kind, kind, `${target} ${JSON.stringify(failure)}`);
+      for (const secret of [FAKE_KEY, RUN_CAPABILITY, 'coordinator.key', '/Users/', 'boom', 'draining; new work', 'Unknown coordinator route', 'ECONN']) {
+        assert.equal(answered.text.includes(secret), false, `${secret} leaked for ${JSON.stringify(failure)}`);
+      }
+    }
+    // Only the two coordinator routes were ever posted to, with only the validated body fields.
+    for (const [method, route, body] of reads.filter(entry => entry[0] === 'POST')) {
+      assert.equal(method, 'POST');
+      assert.ok(route === '/runs/run_1/approvals/apr_1/decision' || route === '/runs/run_1/respond', route);
+      assert.deepEqual(Object.keys(body).sort(), route.endsWith('/decision') ? ['decision'] : ['input', 'pauseId']);
+    }
+  }
+});
+
+test('the adapter writes only to the two coordinator routes, with validated identifiers', async () => {
+  const calls = [];
+  const adapter = createCoordinatorAdapter({
+    loadConfiguration: async () => ({ stateDirectory: '/unused', endpoint: '/unused/coordinator.sock', globalConcurrency: 1, projectConcurrency: 1 }),
+    readToken: async () => FAKE_KEY,
+    clientFactory: () => ({ request: async (...args) => { calls.push(args); return {}; } }),
+  });
+  await adapter.decideApproval('run_1', 'apr_1', { decision: 'approve' });
+  await adapter.decideApproval('run_1', 'apr_1', { decision: 'request-changes', feedback: 'fix it' });
+  await adapter.respondToPause('run_1', { pauseId: 'pau_a', input: 'go' });
+  assert.deepEqual(calls, [
+    ['POST', '/runs/run_1/approvals/apr_1/decision', { decision: 'approve' }],
+    ['POST', '/runs/run_1/approvals/apr_1/decision', { decision: 'request-changes', feedback: 'fix it' }],
+    ['POST', '/runs/run_1/respond', { pauseId: 'pau_a', input: 'go' }],
+  ]);
+  for (const bad of ['../x', 'a/b', '', 'x'.repeat(129), '%2e%2e']) {
+    await assert.rejects(adapter.decideApproval(bad, 'apr_1', { decision: 'approve' }), error => error.kind === 'not-found');
+    await assert.rejects(adapter.decideApproval('run_1', bad, { decision: 'approve' }), error => error.kind === 'not-found');
+    await assert.rejects(adapter.respondToPause('run_1', { pauseId: bad, input: 'go' }), error => error.kind === 'not-found');
+  }
+  assert.equal(calls.length, 3);
+});
+
+test('run projections carry the bounded wait and no coordinator key, run capability or raw checkpoint', async t => {
+  const { adapter } = recordingAdapter();
+  const server = await listening(t, { token: SERVICE_TOKEN, adapter });
+  const shown = await call(server, { path: '/runs/run_1' });
+  assert.equal(shown.status, 200);
+  assert.equal(shown.json.run.version, 7);
+  assert.equal(shown.json.run.wait.kind, 'approval');
+  assert.equal(shown.json.run.wait.requestId, 'apr_1');
+  for (const secret of [FAKE_KEY, RUN_CAPABILITY, 'RAW-CHECKPOINT', 'attempt_secret', 'ownerToken', 'specification']) assert.equal(shown.text.includes(secret), false, secret);
 });

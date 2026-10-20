@@ -71,7 +71,8 @@ Use the `id` returned by `project add` as `PROJECT_ID`, and the `id` returned by
 See [installation and setup](docs/installation.md), [coordinator operation and recovery](docs/coordinator.md) and [model/authentication configuration](docs/development.md#opencode-adapter)
 for connection options, compatibility limits, and existing workflow separation.
 
-To watch and review runs inside OpenChamber 2.1.0, see the read-only
+To watch and review runs inside OpenChamber 2.1.0, and to answer approval
+requests and pauses there, see the
 [OpenChamber extension guide](docs/openchamber-extension.md). To start, monitor
 and resume runs from an OpenCode or OpenChamber session, see the
 [skills guide](docs/skills.md).

@@ -1,6 +1,6 @@
-import { CONTENT_LIMITS, MATCH_LIMITS, REVIEW_LIMITS, RUN_STATUSES } from '../shared/protocol.js';
+import { APPROVAL_LIMITS, CONTENT_LIMITS, MATCH_LIMITS, REVIEW_LIMITS, RUN_STATUSES } from '../shared/protocol.js';
 import type {
-  BlockerContentResponse, ChangeFeed, DirectoryMatch, ProjectsResponse, ReviewFileResponse, ReviewResponse, RunResponse, RunsResponse,
+  ApprovalDecisionKind, ApprovalDecisionResponse, BlockerContentResponse, PauseResponseResponse, ChangeFeed, DirectoryMatch, ProjectsResponse, ReviewFileResponse, ReviewResponse, RunResponse, RunsResponse,
   TaskContentResponse, WireRunStatus,
 } from '../shared/protocol.js';
 
@@ -20,9 +20,12 @@ export function isAllowedPath(path: string): boolean {
   return FIXED_PATHS.has(path) || RUN_PATH.test(path);
 }
 
-/** The single POST route: a pure lookup that compares directories and returns ids only. */
+/** A pure lookup that compares directories and returns ids only. */
 export const MATCH_PATH = '/directories/match';
-export const isAllowedPostPath = (path: string): boolean => path === MATCH_PATH;
+const DECISION_PATH = /^\/runs\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}\/approvals\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}\/decision$/;
+const PAUSE_RESPONSE_PATH = /^\/runs\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}\/pause-response$/;
+/** The directory lookup and the two owner responses are the only POSTs the panel may send. */
+export const isAllowedPostPath = (path: string): boolean => path === MATCH_PATH || DECISION_PATH.test(path) || PAUSE_RESPONSE_PATH.test(path);
 
 /**
  * `offline`: the coordinator (or the host link) is not answering; keep retrying.
@@ -32,6 +35,11 @@ export const isAllowedPostPath = (path: string): boolean => path === MATCH_PATH;
 export type FailureCategory = 'offline' | 'service-unavailable' | 'request';
 
 export class PanelError extends Error {
+  /**
+   * Set for a response that was sent and not answered: the owner's response may or may not have been recorded, so the
+   * only safe next step is to read the run from the coordinator. Never set for a refusal, which records nothing.
+   */
+  uncertain = false;
   constructor(
     readonly category: FailureCategory,
     /** Host error code or service error kind; fixed vocabulary, never raw response text. */
@@ -69,6 +77,18 @@ const SERVICE_ERRORS: Record<string, Mapped> = {
   'not-found': { category: 'request', message: 'That Heimdall item no longer exists.', hint: null },
   'invalid-request': { category: 'request', message: 'The Heimdall service rejected the request.', hint: null },
   'coordinator-error': { category: 'offline', message: 'The Heimdall coordinator reported an error.', hint: 'It will retry automatically.' },
+  // Owner responses: a refusal records nothing and is not a connection problem, so these stay local to the card.
+  'delivery-uncertain': { category: 'request', message: 'Heimdall could not confirm that the response was recorded.', hint: null },
+  'stale-card': { category: 'request', message: 'The run changed since this card was shown. Nothing was sent.', hint: null },
+  'approval-stale': { category: 'request', message: 'This request is no longer current. Nothing was recorded.', hint: null },
+  'approval-conflict': { category: 'request', message: 'A different decision was already recorded for this request.', hint: null },
+  'approval-pending': { category: 'request', message: 'This run waits on an approval request. Nothing was recorded.', hint: null },
+  'pause-stale': { category: 'request', message: 'The run has paused again since this card was shown. Nothing was recorded.', hint: null },
+  'pause-not-ready': { category: 'request', message: 'The run is not ready to continue yet. Nothing was recorded.', hint: null },
+  'response-conflict': { category: 'request', message: 'Different guidance was already recorded for this pause.', hint: null },
+  'response-refused': { category: 'request', message: 'The coordinator refused the response. Nothing was recorded.', hint: null },
+  'coordinator-unsupported': { category: 'request', message: 'The Heimdall coordinator does not support owner responses (likely an older version). Nothing was sent.', hint: 'Update Heimdall after active tasks finish, then retry.' },
+  'coordinator-draining': { category: 'request', message: 'The Heimdall coordinator is draining and does not accept responses. Nothing was recorded.', hint: 'Retry once the coordinator has restarted.' },
 };
 
 const GENERIC_HOST: Mapped = { category: 'offline', message: 'The Heimdall service request failed.', hint: 'It will retry automatically.' };
@@ -123,6 +143,13 @@ export interface PanelClient {
   taskContent(id: string, index: number): Promise<TaskContentResponse>;
   /** More of the recorded blocker reason and resolution. */
   blockerContent(id: string): Promise<BlockerContentResponse>;
+  /**
+   * Record the owner's decision on one approval request. `displayedVersion` is the run version of the card that was
+   * clicked. Resolves with the coordinator's acknowledgement; a failure with `uncertain` set may have been recorded.
+   */
+  decideApproval(runId: string, requestId: string, input: { decision: ApprovalDecisionKind; feedback?: string; displayedVersion: number }): Promise<ApprovalDecisionResponse>;
+  /** Send owner guidance for one generic pause. Same contract as `decideApproval`. */
+  respondToPause(runId: string, input: { pauseId: string; input: string; displayedVersion: number }): Promise<PauseResponseResponse>;
   /** A null cursor asks for the starting cursor; the service answers `resync: true`. */
   changes(cursor: string | null): Promise<ChangeFeed>;
   serviceStatus(): Promise<'stopped' | 'starting' | 'ready' | 'failed' | 'unknown'>;
@@ -149,6 +176,13 @@ function sanitizeMatch(value: unknown): DirectoryMatch {
   if (typeof entry.projectId === 'string' && IDENTIFIER.test(entry.projectId)) match.projectId = entry.projectId;
   if (match.projectId !== undefined && typeof entry.runId === 'string' && IDENTIFIER.test(entry.runId)) match.runId = entry.runId;
   return match;
+}
+
+/** An acknowledgement for a different target is never trusted: the owner must read the run to know what was recorded. */
+function uncertainFailure(): PanelError {
+  const error = toError('delivery-uncertain', SERVICE_ERRORS['delivery-uncertain']!);
+  error.uncertain = true;
+  return error;
 }
 
 function isSendableReviewPath(value: unknown): value is string {
@@ -225,17 +259,36 @@ function contentFailure(error: unknown): never {
   throw mapped;
 }
 
+/** Host failures that mean the request never left the panel. */
+const NEVER_SENT = new Set(['NO_SERVICE', 'DISABLED', 'NOT_GRANTED']);
+
+function inputWithin(value: unknown): value is string {
+  return typeof value === 'string' && value.trim() !== '' && value.length <= APPROVAL_LIMITS.input;
+}
+
 export function createPanelClient(host: PanelHost): PanelClient {
   async function send(request: { method: 'GET' | 'POST'; path: string; query?: Record<string, string>; body?: string }): Promise<Record<string, unknown>> {
     let result: { status: number; body: string };
     try {
       result = await host.serviceRequest(request);
     } catch (error) {
-      throw mapHostFailure(error);
+      const mapped = mapHostFailure(error);
+      // A POST that was handed to the host and not answered may have reached the coordinator.
+      if (request.method === 'POST' && request.path !== MATCH_PATH && !NEVER_SENT.has(mapped.code)) mapped.uncertain = true;
+      throw mapped;
     }
-    if (typeof result?.status !== 'number' || result.status < 200 || result.status >= 300) throw mapServiceFailure(result?.status, result?.body);
+    if (typeof result?.status !== 'number' || result.status < 200 || result.status >= 300) {
+      const failure = mapServiceFailure(result?.status, result?.body);
+      // A server error the service could not explain may come after the response was forwarded; a refusal or a 4xx never does.
+      if (request.method === 'POST' && request.path !== MATCH_PATH && (failure.code === 'delivery-uncertain' || (result.status >= 500 && !Object.hasOwn(SERVICE_ERRORS, failure.code)))) failure.uncertain = true;
+      throw failure;
+    }
     const parsed = parseObject(result.body);
-    if (!parsed) throw toError('invalid-response', BAD_RESPONSE);
+    if (!parsed) {
+      const unreadable = toError('invalid-response', BAD_RESPONSE);
+      if (request.method === 'POST' && request.path !== MATCH_PATH) unreadable.uncertain = true;
+      throw unreadable;
+    }
     return parsed;
   }
 
@@ -298,6 +351,26 @@ export function createPanelClient(host: PanelHost): PanelClient {
       try { body = await get(`/runs/${id}/blocker`); } catch (error) { return contentFailure(error); }
       if (!isBlockerContent(body, id)) throw toError('invalid-response', BAD_RESPONSE);
       return body as unknown as BlockerContentResponse;
+    },
+    async decideApproval(runId, requestId, input) {
+      if (!IDENTIFIER.test(runId) || !IDENTIFIER.test(requestId)) throw toError('not-found', SERVICE_ERRORS['not-found']!);
+      if (!Number.isSafeInteger(input.displayedVersion) || input.displayedVersion < 0) throw toError('invalid-request', SERVICE_ERRORS['invalid-request']!);
+      let body: string;
+      if (input.decision === 'approve' && input.feedback === undefined) body = JSON.stringify({ decision: 'approve', displayedVersion: input.displayedVersion });
+      else if (input.decision === 'request-changes' && inputWithin(input.feedback)) body = JSON.stringify({ decision: 'request-changes', feedback: input.feedback, displayedVersion: input.displayedVersion });
+      else throw toError('invalid-request', SERVICE_ERRORS['invalid-request']!);
+      const answer = await post(`/runs/${runId}/approvals/${requestId}/decision`, body);
+      const ack = answer.ack;
+      if (!isRecord(ack) || ack.runId !== runId || ack.requestId !== requestId || ack.decision !== input.decision) throw uncertainFailure();
+      return answer as unknown as ApprovalDecisionResponse;
+    },
+    async respondToPause(runId, input) {
+      if (!IDENTIFIER.test(runId) || !IDENTIFIER.test(input.pauseId)) throw toError('not-found', SERVICE_ERRORS['not-found']!);
+      if (!Number.isSafeInteger(input.displayedVersion) || input.displayedVersion < 0 || !inputWithin(input.input)) throw toError('invalid-request', SERVICE_ERRORS['invalid-request']!);
+      const answer = await post(`/runs/${runId}/pause-response`, JSON.stringify({ pauseId: input.pauseId, input: input.input, displayedVersion: input.displayedVersion }));
+      const ack = answer.ack;
+      if (!isRecord(ack) || ack.runId !== runId || ack.pauseId !== input.pauseId) throw uncertainFailure();
+      return answer as unknown as PauseResponseResponse;
     },
     async changes(cursor) {
       const body = await get('/changes', cursor === null ? undefined : { cursor });
