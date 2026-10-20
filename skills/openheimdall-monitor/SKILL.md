@@ -25,7 +25,7 @@ Single quotes keep `$(...)`, backticks and `$VAR` in a path or ref literal; doub
 - `--cwd` is the directory the user is working in, not the skill directory.
 - Pass `--coordinator-config` only when the user named a coordinator configuration, and then pass the same value on every call. Otherwise omit it.
 - Output is JSON on stdout. Exit 0 = a report, 1 = coordinator or transport failure, 2 = usage error.
-- Read commands: `snapshot [RUN_ID]`, `watch [RUN_ID] [--budget-seconds N] [--interval-seconds N]`, `context`.
+- Read commands: `snapshot [RUN_ID]`, `watch [RUN_ID] [--budget-seconds N] [--interval-seconds N]`, `request RUN_ID --request REQUEST_ID`, `context`. `request` reads one approval request in full through `heimdall coordinator run approval`; it changes nothing.
 
 ## Procedure
 
@@ -35,10 +35,11 @@ Single quotes keep `$(...)`, backticks and `$VAR` in a path or ref literal; doub
    - `queued`: accepted, waiting for a slot. `admitted` (preparing): a worktree is being prepared. `executing`: a task is in progress. `paused`: the run stopped for an owner decision. `succeeded` or `failed`: finished. `reconciliation-required`: the outcome is uncertain and needs the owner.
    - A reserved capacity slot does not prove that an agent is active. A quiet run is not proof of a stall; the record changes only when the coordinator records something.
    - Progress is completed versus total tasks; the current task exists only while the run is executing. If either is missing, say it is not available.
-   - `run.wait` says what a paused run waits for. `kind` `approval` is a request the agent submitted for an owner decision: report its `requestId`, `state`, `continuation` and `progress`, and the bounded `question`, `scope`, `completedWork`, `verification`, `artifacts`, `onApprove`, `onRequestChanges` and `revision` (say when `clippedFields` lists cut text). State `pending` waits for the owner; `answered` records the owner's `response.decision` and continues on its own, and `queued` or `waiting-for-idle` progress is not running; `superseded` means the reviewed work changed, so the request can no longer be decided and the agent has to ask again. `kind` `generic` is an ordinary pause with a `pauseId`; the reason is in `run.blocker`. `wait` null with `waitReported` false means the coordinator does not report waits (an older one); say so instead of guessing. `unrecognized` means the helper could not read it.
+   - `run.wait` says what a paused run waits for. `kind` `approval` is a request the agent submitted for an owner decision: report its `requestId`, `state`, `continuation` and `progress`, and the bounded `question`, `scope`, `completedWork`, `verification`, `artifacts`, `onApprove`, `onRequestChanges` and `revision`. The wait is a compact copy. When `wait.shortened` is true (or `clippedFields` lists cut text), some text or list entries are missing and `wait.completeRequest.command` names the read; go to step 4 before presenting the request. State `pending` waits for the owner; `answered` records the owner's `response.decision` and continues on its own, and `queued` or `waiting-for-idle` progress is not running; `superseded` means the reviewed work changed, so the request can no longer be decided and the agent has to ask again. `kind` `generic` is an ordinary pause with a `pauseId`; the reason is in `run.blocker`. `wait` null with `waitReported` false means the coordinator does not report waits (an older one); say so instead of guessing. `unrecognized` means the helper could not read it.
    - A request is information for the owner, not a decision: do not suggest that it is approved, do not paraphrase silence or earlier chat as approval, and do not call work finished because a request exists.
-4. **Watch only on request.** Run `watch RUN_ID`. Defaults are a 600 s budget and 15 s interval; a requested duration must be finite (maximum 3600 s, interval 0.1 to 300 s). If the host limits how long a command may run, choose a budget below that limit. The helper prints one line per real change (including a new, answered or superseded request) and none for unchanged state, and stops when the run pauses or reaches a terminal state, when the budget ends, on interruption, or when the coordinator is unreachable. Report the last known state and why the watch ended. Ending a watch does not affect the run.
-5. **Report** using the template below, then give the next action as information for the user, not an action taken. For a pending request the next action is: the owner approves or asks for changes through `openheimdall-resume`, in their own words.
+4. **Read the complete request when the wait is shortened.** Run `request RUN_ID --request REQUEST_ID` with the `requestId` from the snapshot, then present `request.question`, `scope`, `completedWork`, `verification`, `artifacts`, `onApprove` and `onRequestChanges` and the full `revision` from that report (`complete` is `true`), not from the shortened wait. If it fails (exit 1, `complete` `false`), say that the review information is incomplete, show only what the snapshot did give, mark it as shortened, and do not describe it as the full scope. Never present a summary or a shortened wait as the whole request, and never suggest that anything is approved: reading the complete request is still not a decision. This is a read; do not run it as a way to answer.
+5. **Watch only on request.** Run `watch RUN_ID`. Defaults are a 600 s budget and 15 s interval; a requested duration must be finite (maximum 3600 s, interval 0.1 to 300 s). If the host limits how long a command may run, choose a budget below that limit. The helper prints one line per real change (including a new, answered or superseded request) and none for unchanged state, and stops when the run pauses or reaches a terminal state, when the budget ends, on interruption, or when the coordinator is unreachable. Report the last known state and why the watch ended. Ending a watch does not affect the run.
+6. **Report** using the template below, then give the next action as information for the user, not an action taken. For a pending request the next action is: the owner approves or asks for changes through `openheimdall-resume`, in their own words.
 
 ## Rules
 
@@ -55,7 +56,7 @@ Monitoring never changes anything. Do not run any state-changing command, under 
 
 - no `run submit`, no `run resume`, no `run reconcile` (reconcile is a state-changing recovery operation, not monitoring), no `project add`;
 - no coordinator `start` or `stop`, and no installer, lock, key or state-file edit, cleanup, or session interruption;
-- no helper `start`, `resume` or `respond` command and none of their options, and no `run respond`: never record an approval, send change feedback or send guidance, even when the user seems to agree in passing.
+- no helper `start`, `resume` or `respond` command and none of their options (`request` is the only helper command for an approval request here, and it only reads), and no `run respond`: never record an approval, send change feedback or send guidance, even when the user seems to agree in passing.
 
 Reading an approval request never answers it. If the user wants a new run, wants to unblock a paused run or wants to approve or answer a request, say that `openheimdall-start` and `openheimdall-resume` do that, and stop. If the monitor finds a run needing recovery, report it; do not attempt it.
 
@@ -67,7 +68,7 @@ Use exactly these lines; write `none` or `not available` rather than guessing.
 Run: <run ID>
 Status: <status> (<queued | admitted | executing | paused | succeeded | failed | reconciliation-required | unknown>)
 Task/progress: <completed>/<total> tasks; current: <task id - title, or none>
-Waiting for: <approval request ID, state and question | generic pause | nothing | not reported>
+Waiting for: <approval request ID, state and question | generic pause | nothing | not reported; "shortened - complete request read" or "shortened - review information incomplete" when the wait was cut>
 Blocker / next action: <blocker text and what the owner must do, or "none">
 Worktree / session: <worktree path, branch; parent session if any>
 Evidence limits: <single read of the run record; reserved capacity is not activity; watch ended because ...>

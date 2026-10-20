@@ -2,11 +2,12 @@
 // OpenHeimdall skill helper.
 //
 // A dependency-free wrapper around the installed `heimdall coordinator` command line. It gathers repository
-// and coordinator context, selects a run and reports compact state. `context`, `snapshot`, `watch` and
+// and coordinator context, selects a run and reports compact state. `context`, `snapshot`, `watch`, `request` and
 // `inspect-spec` only read. `start`, `resume` and `respond` are the only commands that mutate, each at most once per
 // invocation: they never retry, reconcile, stop or restart anything, and an unconfirmed outcome is reported as
 // uncertain instead of being repeated. Reports of a run include its bounded wait: the typed approval request the
-// agent is waiting on, or the identity of a generic pause. Guidance reaches a run only through the guarded response for
+// agent is waiting on, or the identity of a generic pause. A compact wait is shortened when a text or list is cut, and
+// says so; `request` then reads the complete request through `run approval`. Guidance reaches a run only through the guarded response for
 // the identity of that pause; without it the helper refuses and sends nothing.
 //
 // The command line is invoked without a shell: `execFile` with an argument array, using the binary named by
@@ -16,6 +17,7 @@
 //   openheimdall.mjs context  [--base REF]
 //   openheimdall.mjs snapshot [RUN_ID]
 //   openheimdall.mjs watch    [RUN_ID] [--budget-seconds N] [--interval-seconds N]
+//   openheimdall.mjs request  RUN_ID --request ID
 //   openheimdall.mjs inspect-spec FILE
 //   openheimdall.mjs start    --spec FILE [--base REF] [--register] [--start-coordinator]
 //   openheimdall.mjs resume   RUN_ID (--guidance-file FILE | --guidance-stdin)
@@ -60,6 +62,11 @@ export const WAIT_QUESTION_LIMIT = 1500;
 export const WAIT_TEXT_LIMIT = 1000;
 export const WAIT_LIST_LIMIT = 10;
 export const WAIT_ENTRY_LIMIT = 300;
+// The limits of a complete approval request, as the coordinator accepts it: characters per text and per list entry,
+// entries per list, and bytes of the whole request as JSON.
+export const REQUEST_TEXT_LIMIT = 4000;
+export const REQUEST_LIST_LIMIT = 20;
+export const REQUEST_PAYLOAD_LIMIT = 32 * 1024;
 const MUTATION_TIMEOUT_MS = 60000;
 const COORDINATOR_START_TIMEOUT_MS = 150000;
 const START_SUCCESS_OUTCOMES = Object.freeze(['ready', 'already-running', 'already-running-foreground']);
@@ -69,6 +76,7 @@ const COMMANDS = {
   context: { options: ['--base'], positional: 0 },
   snapshot: { options: [], positional: 1 },
   watch: { options: ['--budget-seconds', '--interval-seconds'], positional: 1 },
+  request: { options: ['--request'], positional: 1 },
   'inspect-spec': { options: [], positional: 1 },
   start: { options: ['--spec', '--base'], flags: ['--register', '--start-coordinator'], positional: 0 },
   resume: { options: ['--guidance-file'], flags: ['--guidance-stdin'], positional: 1 },
@@ -82,6 +90,7 @@ Usage:
   openheimdall.mjs context  [--base REF]
   openheimdall.mjs snapshot [RUN_ID]
   openheimdall.mjs watch    [RUN_ID] [--budget-seconds N] [--interval-seconds N]
+  openheimdall.mjs request  RUN_ID --request ID
   openheimdall.mjs inspect-spec FILE
   openheimdall.mjs start    --spec FILE [--base REF] [--register] [--start-coordinator]
   openheimdall.mjs resume   RUN_ID (--guidance-file FILE | --guidance-stdin)
@@ -90,7 +99,8 @@ Usage:
   openheimdall.mjs respond  RUN_ID --pause ID (--guidance-file FILE | --guidance-stdin)
 
 Common options: --cwd DIR, --coordinator-config FILE
-context, snapshot, watch and inspect-spec only read. start, resume and respond change coordinator state, at most once each.
+context, snapshot, watch, request and inspect-spec only read. request prints the complete approval request that a shortened
+wait cannot show. start, resume and respond change coordinator state, at most once each.
 respond carries only an explicit owner decision for the displayed request, or explicit guidance for the displayed pause.
 `;
 
@@ -390,6 +400,9 @@ const WAIT_PROGRESS = Object.freeze(['none', 'recorded', 'waiting-for-idle', 'qu
 const WAIT_DECISIONS = Object.freeze(['approve', 'request-changes']);
 const waitText = (value, limit) => (typeof value === 'string' ? limitText(value, limit) : null);
 const waitList = value => (Array.isArray(value) ? value.filter(entry => typeof entry === 'string').slice(0, WAIT_LIST_LIMIT).map(entry => limitText(entry, WAIT_ENTRY_LIMIT)) : []);
+// Whether the helper shortens a text or a list when it builds a compact wait. Whitespace collapsing alone is not shortening.
+const textCut = (value, limit) => typeof value === 'string' && limitText(value, Number.MAX_SAFE_INTEGER).length > limit;
+const listCut = value => Array.isArray(value) && (value.length > WAIT_LIST_LIMIT || value.some(entry => typeof entry !== 'string' || textCut(entry, WAIT_ENTRY_LIMIT)));
 const oneOf = (value, allowed) => (typeof value === 'string' && allowed.includes(value) ? value : null);
 
 /**
@@ -412,6 +425,9 @@ export function projectWait(value) {
     : null;
   const revision = isObject(value.revision) && typeof value.revision.head === 'string' && typeof value.revision.digest === 'string'
     ? { head: value.revision.head.replace(/[^0-9a-f]/gi, '').slice(0, 12), digest: value.revision.digest.replace(/[^0-9a-f]/gi, '').slice(0, 12) } : null;
+  const clippedFields = isObject(value.clipped) ? Object.keys(value.clipped).filter(name => value.clipped[name] === true).slice(0, 9).map(name => limitText(name, 30)) : [];
+  const shortened = clippedFields.length > 0 || textCut(value.question, WAIT_QUESTION_LIMIT) || textCut(value.scope, WAIT_TEXT_LIMIT) || textCut(value.completedWork, WAIT_TEXT_LIMIT)
+    || [value.verification, value.artifacts, value.onApprove, value.onRequestChanges].some(listCut);
   return {
     kind: 'approval',
     requestId: value.requestId,
@@ -429,7 +445,8 @@ export function projectWait(value) {
     onRequestChanges: waitList(value.onRequestChanges),
     revision,
     response,
-    clippedFields: isObject(value.clipped) ? Object.keys(value.clipped).filter(name => value.clipped[name] === true).slice(0, 9).map(name => limitText(name, 30)) : [],
+    clippedFields,
+    shortened,
   };
 }
 
@@ -439,6 +456,21 @@ export function approvalUnresolved(wait) {
   if (wait.kind === 'unrecognized') return true;
   if (wait.kind !== 'approval') return false;
   return wait.state === 'pending' || (wait.state === 'answered' && (wait.continuation === 'pending' || wait.continuation === 'queued'));
+}
+
+/**
+ * A shortened approval wait names the command that reads the whole request, so a report never passes a summary off as the
+ * request. The note is part of the wait and therefore shows in every report that carries it.
+ */
+function withCompleteRequestHint(runId, wait) {
+  if (!wait || wait.kind !== 'approval' || wait.shortened !== true) return wait;
+  return {
+    ...wait,
+    completeRequest: {
+      command: `request ${runId} --request ${wait.requestId}`,
+      note: 'This request is shortened: some text or list entries are cut. Read the complete request with the request command before presenting it, and do not treat this summary as the full scope.',
+    },
+  };
 }
 
 /** Project a coordinator run record to the compact fields a report may show. The feature, checkpoint bodies, resolution and settings are never copied. */
@@ -473,7 +505,7 @@ export function projectRun(record) {
     blocker: blocker.text,
     blockerTruncated: blocker.truncated,
     waitReported: Object.hasOwn(record, 'wait'),
-    wait: projectWait(record.wait),
+    wait: withCompleteRequestHint(record.id, projectWait(record.wait)),
     worktreePath: typeof record.worktreePath === 'string' ? record.worktreePath : null,
     branch: typeof record.branch === 'string' ? record.branch : null,
     baseCommit: typeof record.baseCommit === 'string' ? record.baseCommit : null,
@@ -676,6 +708,100 @@ async function watchCommand({ coordinator, cwd, env, positional, options, config
   });
   write({ event: 'stopped', runId: selection.runId, ...summary, limits: EVIDENCE_LIMITS });
   return { report: null, exitCode: summary.reason === 'transport-error' ? 1 : 0 };
+}
+
+// --- Complete approval request ---------------------------------------------------------------------------------
+
+const REQUEST_TEXT_FIELDS = Object.freeze(['question', 'scope', 'completedWork']);
+const REQUEST_LIST_FIELDS = Object.freeze(['verification', 'artifacts', 'onApprove', 'onRequestChanges']);
+const HEX = /^[0-9a-f]{1,128}$/i;
+
+/**
+ * Validate the coordinator's complete answer for one approval request against the run and request that were asked for and
+ * the limits of an accepted request. Nothing is shortened and nothing is repaired: a text or list that is missing, mistyped
+ * or over a limit makes the whole answer invalid, because a partly valid request is not a request the owner can review.
+ * Returns { ok: true, request } with the content verbatim, or { ok: false, message }.
+ */
+export function parseCompleteRequest(value, { runId, requestId }) {
+  const bad = what => ({ ok: false, message: `${what} is missing or not valid` });
+  if (!isObject(value)) return bad('The answer');
+  if (value.runId !== runId) return bad('The run id');
+  if (value.requestId !== requestId) return bad('The request id');
+  const content = {};
+  for (const field of REQUEST_TEXT_FIELDS) {
+    if (typeof value[field] !== 'string' || value[field].length > REQUEST_TEXT_LIMIT) return bad(`The ${field} text`);
+    content[field] = value[field];
+  }
+  for (const field of REQUEST_LIST_FIELDS) {
+    const entries = value[field];
+    if (!Array.isArray(entries) || entries.length > REQUEST_LIST_LIMIT) return bad(`The ${field} list`);
+    if (entries.some(entry => typeof entry !== 'string' || entry.length > REQUEST_TEXT_LIMIT)) return bad(`An entry of the ${field} list`);
+    content[field] = [...entries];
+  }
+  if (Buffer.byteLength(JSON.stringify(content), 'utf8') > REQUEST_PAYLOAD_LIMIT) return bad('The request size');
+  const revision = value.revision;
+  if (!isObject(revision) || typeof revision.head !== 'string' || !HEX.test(revision.head) || typeof revision.digest !== 'string' || !HEX.test(revision.digest)) return bad('The revision');
+  if (typeof value.taskId !== 'string' || !value.taskId || value.taskId.length > 128) return bad('The task id');
+  if (typeof value.attemptId !== 'string' || !value.attemptId || value.attemptId.length > 128) return bad('The attempt id');
+  if (!Number.isSafeInteger(value.taskIndex) || value.taskIndex < 0) return bad('The task index');
+  const state = oneOf(value.state, WAIT_STATES);
+  const continuation = oneOf(value.continuation, WAIT_CONTINUATIONS);
+  const progress = oneOf(value.progress, WAIT_PROGRESS);
+  if (state === null) return bad('The state');
+  if (continuation === null) return bad('The continuation');
+  if (progress === null) return bad('The progress');
+  let response = null;
+  if (state === 'answered') {
+    const answer = value.response;
+    if (!isObject(answer) || oneOf(answer.decision, WAIT_DECISIONS) === null) return bad('The response');
+    if (answer.feedback !== null && answer.feedback !== undefined && typeof answer.feedback !== 'string') return bad('The feedback');
+    // The owner's feedback is not copied into a report, only the decision and whether feedback exists.
+    response = { decision: answer.decision, answeredAt: timestamp(answer.answeredAt), feedbackRecorded: typeof answer.feedback === 'string' && answer.feedback.length > 0 };
+  } else if (value.response !== null && value.response !== undefined) return bad('The response');
+  return {
+    ok: true,
+    request: {
+      requestId, runId, state, continuation, progress,
+      task: { id: value.taskId, index: value.taskIndex }, attemptId: value.attemptId,
+      revision: { head: revision.head, digest: revision.digest },
+      ...content,
+      response, createdAt: timestamp(value.createdAt),
+    },
+  };
+}
+
+/**
+ * Read one approval request completely, read-only: a single `run approval` call, validated, with nothing shortened. When the
+ * read or the validation fails the report says that review information is incomplete and carries no request content, so a
+ * summary can never be mistaken for the request.
+ */
+async function requestCommand({ coordinator, options, positional, configFile, env }) {
+  const runId = positional[0];
+  if (runId === undefined) throw new UsageError('request requires RUN_ID');
+  if (!validRunId(runId)) throw new UsageError('RUN_ID must be letters, digits, underscore or dash and must not start with a dash');
+  const requestId = options['--request'];
+  if (requestId === undefined) throw new UsageError('request requires --request ID');
+  if (!validRunId(requestId)) throw new UsageError('--request must be letters, digits, underscore or dash and must not start with a dash');
+  const configuration = configurationSelection({ configFile, env });
+  const incomplete = (kind, message) => ({
+    report: {
+      ok: false, command: 'request', outcome: 'error', complete: false, runId, requestId, error: { kind, message },
+      note: 'The complete request could not be read, so the review information is incomplete. Do not present a summary as the full request or ask the owner to approve on it; say that the review is incomplete.',
+      coordinator: { configuration },
+    },
+    exitCode: 1,
+  });
+  const read = await coordinator.call(['run', 'approval', runId, '--request', requestId]);
+  if (!read.ok) {
+    const older = read.kind === 'error' && /Unknown coordinator command|does not support reading an approval request/i.test(read.message);
+    return incomplete(older ? 'unsupported' : read.kind, older ? 'The coordinator or command line is too old to read a complete approval request' : read.message);
+  }
+  const parsed = parseCompleteRequest(read.value, { runId, requestId });
+  if (!parsed.ok) return incomplete('invalid-response', limitText(parsed.message, 200));
+  return {
+    report: { ok: true, command: 'request', outcome: 'request', complete: true, request: parsed.request, coordinator: { configuration } },
+    exitCode: 0,
+  };
 }
 
 // --- Input files -------------------------------------------------------------------------------------------
@@ -1261,7 +1387,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, s
     const configFile = parsed.options['--coordinator-config'] === undefined ? undefined : path.resolve(cwd, parsed.options['--coordinator-config']);
     const coordinator = createCoordinator({ env, configFile, signal });
     const context = { coordinator, cwd, env, options: parsed.options, positional: parsed.positional, configFile, stdout, stdin, signal };
-    const handlers = { context: contextReport, snapshot: snapshotReport, watch: watchCommand, 'inspect-spec': inspectSpecCommand, start: startCommand, resume: resumeCommand, respond: respondCommand };
+    const handlers = { context: contextReport, snapshot: snapshotReport, watch: watchCommand, request: requestCommand, 'inspect-spec': inspectSpecCommand, start: startCommand, resume: resumeCommand, respond: respondCommand };
     const result = await handlers[parsed.command](context);
     if (result.report) stdout.write(`${JSON.stringify(result.report, null, 2)}\n`);
     return result.exitCode;

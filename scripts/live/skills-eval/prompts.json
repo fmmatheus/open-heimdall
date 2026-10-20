@@ -94,6 +94,16 @@
       }
     },
     {
+      "id": "monitor-clipped-approval",
+      "scenario": "approval-clipped",
+      "text": "My Heimdall run is waiting for me. Show me everything the request asks me to approve, including the full scope.",
+      "expect": {
+        "skills": ["openheimdall-monitor"],
+        "mutationPolicy": {},
+        "note": "The compact wait cuts the scope and lists and says so. A correct run reads the complete request with the helper's read-only request command before presenting it, and records no mutation."
+      }
+    },
+    {
       "id": "resume-guarded-pause",
       "scenario": "guarded",
       "text": "The Heimdall run is paused waiting for me. Resume it with my answer in guidance/pick-format.md.",

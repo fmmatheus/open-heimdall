@@ -267,6 +267,51 @@ function selftest() {
       assert.deepEqual(countMutations(readCalls(box.callsFile)), {});
     });
 
+    check('request: a clipped approval wait names the read, and the read returns the complete request without any mutation', () => {
+      const box = createSandbox(root, { scenario: 'approval-clipped', withSkills: false });
+      const snapshot = helperRun(box, ['snapshot']);
+      assert.equal(snapshot.status, 0, snapshot.stderr);
+      const { wait } = snapshot.json().run;
+      assert.equal(wait.shortened, true);
+      assert.ok(!wait.scope.includes('LATE-ACTION-AFTER-1500'), 'the compact scope hides the late action');
+      assert.equal(wait.verification.length, 10);
+      assert.equal(wait.completeRequest.command, `request ${RUN_ID} --request ${REQUEST_ID}`);
+      const result = helperRun(box, ['request', RUN_ID, '--request', REQUEST_ID]);
+      assert.equal(result.status, 0, result.stderr);
+      const report = result.json();
+      assert.equal(report.complete, true);
+      assert.equal(report.outcome, 'request');
+      assert.match(report.request.scope, /LATE-ACTION-AFTER-1500: also delete greeting\.txt\.$/);
+      assert.equal(report.request.verification.length, 14);
+      assert.match(report.request.verification[12], /LATE-CHECK-ENTRY-12/);
+      assert.equal(report.request.onApprove.length, 12);
+      assert.match(report.request.onApprove[11], /^LATE-APPROVE-ENTRY-11/);
+      assert.deepEqual(report.request.revision, { head: 'a'.repeat(40), digest: 'b'.repeat(64) });
+      const calls = readCalls(box.callsFile);
+      const read = calls.find(call => call.argv.includes('approval'));
+      assert.deepEqual(read.argv, ['coordinator', 'run', 'approval', RUN_ID, '--request', REQUEST_ID]);
+      assert.equal(read.mutating, false);
+      assert.deepEqual(countMutations(calls), {});
+      assert.ok(calls.every(call => call.mutating === false));
+    });
+
+    check('request: an unknown request or an unreadable run reports incomplete review information and mutates nothing', () => {
+      const box = createSandbox(root, { scenario: 'approval', withSkills: false });
+      const other = helperRun(box, ['request', RUN_ID, '--request', 'apr_other']);
+      assert.equal(other.status, 1);
+      assert.equal(other.json().complete, false);
+      assert.equal(other.json().request, undefined);
+      assert.match(other.json().note, /review information is incomplete/);
+      const usage = helperRun(box, ['request', RUN_ID]);
+      assert.equal(usage.status, 2);
+      const queued = createSandbox(root, { scenario: 'queued', withSkills: false });
+      const none = helperRun(queued, ['request', RUN_ID, '--request', REQUEST_ID]);
+      assert.equal(none.status, 1);
+      assert.equal(none.json().complete, false);
+      assert.deepEqual(countMutations(readCalls(box.callsFile)), {});
+      assert.deepEqual(countMutations(readCalls(queued.callsFile)), {});
+    });
+
     check('approve: one explicit respond for the displayed request, and nothing else', () => {
       const box = createSandbox(root, { scenario: 'approval', withSkills: false });
       const result = helperRun(box, ['respond', RUN_ID, '--request', REQUEST_ID, '--decision', 'approve']);

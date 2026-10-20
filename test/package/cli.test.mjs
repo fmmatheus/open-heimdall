@@ -131,6 +131,7 @@ describe('installed heimdall setup and doctor', () => {
       assert.equal(help.status, 0);
       assert.match(help.stdout, /heimdall coordinator run respond RUN_ID --request REQUEST_ID --decision request-changes --input FEEDBACK/);
       assert.match(help.stdout, /heimdall coordinator run respond RUN_ID --pause PAUSE_ID --input GUIDANCE/);
+      assert.ok(help.stdout.includes('heimdall coordinator run approval RUN_ID --request REQUEST_ID'), 'the installed help lists run approval');
 
       const invalid = await runBinary(install, ['coordinator', 'run', 'respond', 'run-1', '--request', 'apr_1', '--decision', 'approve', '--input', 'x', '--coordinator-config', configFile], options);
       assert.equal(invalid.status, 1);
@@ -143,6 +144,12 @@ describe('installed heimdall setup and doctor', () => {
       assert.equal(unsupported.stdout, '');
       assert.match(unsupported.stderr, /does not support this response operation/);
       assert.deepEqual(seen, ['POST /runs/run-1/respond'], 'one guarded request and no fallback to run resume');
+
+      const unreadable = await runBinary(install, ['coordinator', 'run', 'approval', 'run-1', '--request', 'apr_1', '--coordinator-config', configFile], options);
+      assert.equal(unreadable.status, 1, unreadable.stderr);
+      assert.equal(unreadable.stdout, '');
+      assert.match(unreadable.stderr, /does not support reading an approval request/);
+      assert.deepEqual(seen.slice(1), ['GET /runs/run-1/approvals/apr_1'], 'one read and nothing else');
 
       mode = 'drop';
       const uncertain = await runBinary(install, ['coordinator', 'run', 'respond', 'run-1', '--request', 'apr_1', '--decision', 'approve', '--coordinator-config', configFile], options);

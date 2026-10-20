@@ -6,7 +6,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  buildTarball, installConsumer, installGlobal, isolatedEnvironment, removeTarballBuild, runBinary, runProcess, toolVersions,
+  buildTarball, checkout, installConsumer, installGlobal, isolatedEnvironment, removeTarballBuild, runBinary, runProcess, toolVersions,
 } from './helpers.mjs';
 
 /*
@@ -49,6 +49,11 @@ async function tree(directory) {
 
 const REQUEST = 'apr_pkg_0001';
 const PAUSE = 'pau_0123456789abcdef0123456789abcdef';
+// A request longer than the compact wait shows: a scope action after character 1,500 and list entries after the tenth.
+const LATE_SCOPE = `Authorizes the reviewed commit only. ${'Nothing else is touched. '.repeat(70)}LATE-ACTION-AFTER-1500: also drop the legacy table.`;
+const LATE_CHECKS = Array.from({ length: 14 }, (_, index) => `check-${index}: passed${index === 12 ? ' LATE-CHECK-ENTRY-12' : ''}`);
+const LATE_APPROVE = Array.from({ length: 12 }, (_, index) => (index === 11 ? 'LATE-APPROVE-ENTRY-11: purge the cache' : `approve-step-${index}`));
+const FULL_REVISION = { head: 'a'.repeat(40), digest: 'b'.repeat(64) };
 
 /**
  * A stand-in coordinator on a Unix socket, with the coordinator key file the installed command line reads. It records every
@@ -81,6 +86,17 @@ async function stubCoordinator(root, name, { kind = 'approval', drop = false } =
       requests.push(entry);
       const reply = (status, value) => { response.writeHead(status, { 'content-type': 'application/json' }); response.end(JSON.stringify(value)); };
       if (request.method === 'GET' && request.url === '/runs/run-1') { reply(200, record()); return; }
+      if (request.method === 'GET' && request.url === `/runs/run-1/approvals/${REQUEST}`) {
+        if (kind !== 'approval') { reply(404, { error: 'Approval request not found', code: 'approval-not-found' }); return; }
+        // The coordinator's own wire shape: the request content nested, the decision and feedback beside it.
+        reply(200, {
+          requestId: REQUEST, runId: 'run-1', state: answered ? 'answered' : 'pending', continuation: answered ? 'queued' : 'none', progress: answered ? 'queued' : 'none',
+          taskId: 'T2', taskIndex: 1, attemptId: 'attempt_pkg_1', revision: FULL_REVISION, createdAt: 1700000000000,
+          request: { question: 'Ship the migration?', scope: LATE_SCOPE, completedWork: 'Migration written', verification: LATE_CHECKS, artifacts: ['src/migrate.ts'], onApprove: LATE_APPROVE, onRequestChanges: ['fix'] },
+          decision: answered ? answered.decision ?? null : null, feedback: answered ? answered.feedback ?? null : null, answeredAt: answered ? 2 : null,
+        });
+        return;
+      }
       if (request.method === 'POST' && (request.url === `/runs/run-1/approvals/${REQUEST}/decision` || request.url === '/runs/run-1/respond')) {
         if (drop) { request.socket.destroy(); return; }
         answered = request.url.endsWith('/decision') ? { decision: entry.body.decision, feedback: entry.body.feedback } : { input: entry.body.input };
@@ -141,7 +157,7 @@ describe('installed skills', () => {
   });
 
   test('the tarball ships the modules behind run respond that the installed skills call', () => {
-    for (const file of ['dist/coordinator/respond.js', 'dist/coordinator/pause.js', 'dist/coordinator/cli.js']) assert.ok(build.files.includes(file), `${file} is packed`);
+    for (const file of ['dist/coordinator/respond.js', 'dist/coordinator/pause.js', 'dist/coordinator/cli.js', 'dist/coordinator/approval-read.js', 'dist/coordinator/approval-view.js']) assert.ok(build.files.includes(file), `${file} is packed`);
     assert.equal(build.files.filter(file => file.startsWith('skills/')).length, 6, 'no skill gained a file');
   });
 
@@ -201,6 +217,7 @@ describe('installed skills', () => {
           'heimdall coordinator run respond RUN_ID --request REQUEST_ID --decision approve',
           'heimdall coordinator run respond RUN_ID --request REQUEST_ID --decision request-changes --input FEEDBACK',
           'heimdall coordinator run respond RUN_ID --pause PAUSE_ID --input GUIDANCE',
+          'heimdall coordinator run approval RUN_ID --request REQUEST_ID',
         ]) assert.ok(cli.stdout.includes(line), line);
         for (const name of skillNames) {
           const helper = path.join(install().root, 'skills', name, 'scripts', 'openheimdall.mjs');
@@ -210,6 +227,7 @@ describe('installed skills', () => {
             'openheimdall.mjs respond  RUN_ID --request ID --decision approve',
             'openheimdall.mjs respond  RUN_ID --request ID --decision request-changes (--feedback-file FILE | --feedback-stdin)',
             'openheimdall.mjs respond  RUN_ID --pause ID (--guidance-file FILE | --guidance-stdin)',
+            'openheimdall.mjs request  RUN_ID --request ID',
           ]) assert.ok(help.stdout.includes(line), `${name}: ${line}`);
           // Incomplete or ambiguous arguments are a usage error, never a request.
           const usage = await runProcess(process.execPath, [helper, 'respond', 'run-1', '--request', REQUEST, '--cwd', work], { cwd: work, env: env() });
@@ -291,6 +309,51 @@ describe('installed skills', () => {
         assert.equal(report.outcome, 'uncertain');
         assert.equal(report.inspection.confirmed, false);
         assert.deepEqual(lossy.lines(), ['GET /runs/run-1', `POST /runs/run-1/approvals/${REQUEST}/decision`, 'GET /runs/run-1'], 'one response, then only a read');
+      });
+
+      test('the installed helper request reads the complete request outside the checkout, through the installed command line and the selected coordinator, and only reads', async t => {
+        const stubs = await shortDirectory();
+        t.after(() => fs.rm(stubs, { recursive: true, force: true }));
+        const selected = await stubCoordinator(stubs, 'selected');
+        const ambient = await stubCoordinator(stubs, 'ambient');
+        t.after(async () => { await selected.close(); await ambient.close(); });
+        const empty = path.join(stubs, 'empty cwd');
+        await fs.mkdir(empty);
+        assert.ok(!empty.startsWith(checkout), 'the working directory is outside the checkout');
+        assert.ok(path.relative(install().root, empty).startsWith('..'), 'the working directory is outside the installation');
+        for (const name of ['openheimdall-monitor', 'openheimdall-resume']) {
+          const helper = path.join(install().root, 'skills', name, 'scripts', 'openheimdall.mjs');
+          selected.requests.length = 0;
+          const read = await runProcess(process.execPath, [helper, 'request', 'run-1', '--cwd', empty, '--request', REQUEST, '--coordinator-config', selected.configFile], { cwd: empty, env: env({ HEIMDALL_COORDINATOR_CONFIG: ambient.configFile }) });
+          assert.equal(read.status, 0, read.stderr + read.stdout);
+          const report = JSON.parse(read.stdout);
+          assert.equal(report.complete, true, name);
+          assert.equal(report.request.scope, LATE_SCOPE, 'the whole scope, including the late action');
+          assert.deepEqual(report.request.verification, LATE_CHECKS);
+          assert.deepEqual(report.request.onApprove, LATE_APPROVE);
+          assert.deepEqual(report.request.revision, FULL_REVISION);
+          assert.deepEqual(selected.lines(), [`GET /runs/run-1/approvals/${REQUEST}`], `${name}: one read, no other request`);
+          assert.deepEqual(ambient.requests, [], 'the coordinator named by the environment is not contacted when a flag is given');
+        }
+        assert.deepEqual(await fs.readdir(empty), [], 'nothing was written');
+
+        // The installed command line itself prints the same complete request.
+        const direct = await runBinary(install(), ['coordinator', 'run', 'approval', 'run-1', '--request', REQUEST, '--coordinator-config', selected.configFile], { cwd: empty, env: env() });
+        assert.equal(direct.status, 0, direct.stderr);
+        assert.equal(JSON.parse(direct.stdout).scope, LATE_SCOPE);
+
+        // A request the coordinator does not have is reported as incomplete review information, never as a summary.
+        const generic = await stubCoordinator(stubs, 'generic', { kind: 'generic' });
+        t.after(() => generic.close());
+        const helper = path.join(install().root, 'skills', 'openheimdall-monitor', 'scripts', 'openheimdall.mjs');
+        const missing = await runProcess(process.execPath, [helper, 'request', 'run-1', '--cwd', empty, '--request', REQUEST, '--coordinator-config', generic.configFile], { cwd: empty, env: env() });
+        assert.equal(missing.status, 1);
+        const failed = JSON.parse(missing.stdout);
+        assert.equal(failed.complete, false);
+        assert.equal(failed.request, undefined);
+        assert.match(failed.note, /review information is incomplete/);
+        assert.ok(generic.requests.every(entry => entry.method === 'GET'), 'only reads');
+        t.diagnostic(`${layout}: the installed request command read the complete request from the flagged coordinator only`);
       });
 
       test('the installed monitor helper shows a pending request and only reads', async t => {

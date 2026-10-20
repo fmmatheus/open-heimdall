@@ -232,8 +232,13 @@ test('every helper subcommand and option named in a SKILL.md exists in the helpe
 test('the monitor skill names no state-changing command outside its prohibitions', () => {
   const { text } = loaded.get('openheimdall-monitor');
   const found = sections(parseFrontmatter(text).body);
-  const outside = text.replace(/^## Prohibitions[\s\S]*?(?=^## |(?![\s\S]))/m, '');
-  assert.ok(outside.length < text.length, 'Prohibitions section not removed');
+  const withoutProhibitions = text.replace(/^## Prohibitions[\s\S]*?(?=^## |(?![\s\S]))/m, '');
+  assert.ok(withoutProhibitions.length < text.length, 'Prohibitions section not removed');
+  // The one place the monitor may name --request is the read-only command that reads a complete approval request; any other
+  // use of the option (a response target) is still a state-changing mention.
+  const READ_REQUEST = 'request RUN_ID --request REQUEST_ID';
+  assert.ok(withoutProhibitions.includes(READ_REQUEST), 'the monitor names the read-only request command');
+  const outside = withoutProhibitions.replaceAll(READ_REQUEST, 'request RUN_ID');
   const mutating = [
     /\bsubmit\b/i, /\breconcile\b/i, /\bproject add\b/i, /\bregister\b/i,
     /\brun (?:resume|submit)\b/i, /\bcoordinator (?:start|stop)\b/i, /\bheimdall (?:start|stop)\b/i,

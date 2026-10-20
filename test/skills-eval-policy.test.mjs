@@ -18,13 +18,13 @@ const MUTATION_KEYS = ['start', 'stop', 'run reconcile', 'run submit', 'run resu
 test('every scenario states an explicit mutation policy', () => {
   assert.deepEqual(prompts.map(prompt => prompt.id), [
     'start-from-spec', 'snapshot-status', 'watch-for-minutes', 'resume-with-guidance', 'boundary-guidance-as-spec',
-    'approve-pending-request', 'request-changes-feedback', 'no-invented-approval', 'monitor-approval-readonly', 'resume-guarded-pause',
+    'approve-pending-request', 'request-changes-feedback', 'no-invented-approval', 'monitor-approval-readonly', 'monitor-clipped-approval', 'resume-guarded-pause',
   ]);
   for (const prompt of prompts) assert.equal(typeof prompt.expect.mutationPolicy, 'object', prompt.id);
   assert.deepEqual(policyOf('boundary-guidance-as-spec'), {});
 });
 
-for (const id of ['snapshot-status', 'watch-for-minutes', 'monitor-approval-readonly', 'no-invented-approval']) {
+for (const id of ['snapshot-status', 'watch-for-minutes', 'monitor-approval-readonly', 'monitor-clipped-approval', 'no-invented-approval']) {
   test(`${id}: only a read-only run passes`, () => {
     const policy = policyOf(id);
     assert.equal(mutationsMeetPolicy({}, policy), true);
@@ -88,10 +88,12 @@ test('the explicit response command is permitted only in the resume scenarios th
 });
 
 test('a scenario about inventing approval or monitoring permits no mutation at all', () => {
-  for (const id of ['no-invented-approval', 'monitor-approval-readonly']) assert.deepEqual(policyOf(id), {}, id);
+  for (const id of ['no-invented-approval', 'monitor-approval-readonly', 'monitor-clipped-approval']) assert.deepEqual(policyOf(id), {}, id);
   const approval = prompts.filter(prompt => prompt.scenario === 'approval');
   assert.deepEqual(approval.map(prompt => prompt.id), ['approve-pending-request', 'request-changes-feedback', 'no-invented-approval', 'monitor-approval-readonly']);
   assert.deepEqual(approval.find(prompt => prompt.id === 'monitor-approval-readonly').expect.skills, ['openheimdall-monitor']);
+  assert.deepEqual(prompts.filter(prompt => prompt.scenario === 'approval-clipped').map(prompt => prompt.id), ['monitor-clipped-approval']);
+  assert.deepEqual(prompts.find(prompt => prompt.id === 'monitor-clipped-approval').expect.skills, ['openheimdall-monitor']);
 });
 
 test('a recorded key outside every policy fails each scenario', () => {

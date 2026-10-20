@@ -6,7 +6,7 @@ OpenCode or OpenChamber session, using the installed `heimdall` CLI:
 | Skill (ID) | Use it to | Changes coordinator state |
 | --- | --- | --- |
 | `openheimdall-start` | Submit a new run from a task-spec Markdown file. | Yes: at most one `run submit` per use; optionally registers the project and starts the coordinator when asked. |
-| `openheimdall-monitor` | Read the state of a run once, or watch it for a bounded time. It shows what the run waits for, including an approval request, and never answers it. | Never. |
+| `openheimdall-monitor` | Read the state of a run once, or watch it for a bounded time. It shows what the run waits for, including an approval request (in full when the compact copy is shortened), and never answers it. | Never. |
 | `openheimdall-resume` | Send the owner's guidance to a paused run, or the owner's explicit approval or requested changes for an approval request, so the same run continues. | Yes: at most one `run respond` per use. |
 
 Each skill is a directory with a `SKILL.md` and `scripts/openheimdall.mjs`, a
@@ -263,7 +263,10 @@ A paused run reports what it waits for as `run.wait`:
   an abbreviated `revision`, plus the recorded `response.decision` once answered.
   Text is limited to 1500 characters (1000 for scope and completed work), lists to
   10 entries of 300 characters, and `clippedFields` names text the coordinator cut.
-  The feedback an owner gave is never copied into a report.
+  `shortened` is `true` when the coordinator or the helper cut any text or list
+  entry; the wait then carries `completeRequest`, which names the `request` command
+  that reads the whole request (see below). The feedback an owner gave is never
+  copied into a report.
 - **Generic pause** (`kind` `generic`). Any other pause. It carries the `pauseId`
   the owner response must name; the reason is the existing `blocker` field.
 - `wait` is `null` for a run that waits for nothing, and `waitReported` is `false`
@@ -275,11 +278,38 @@ not running, and approval never completes a task: the agent still finishes its w
 and submits ordinary evidence. A `superseded` request cannot be decided any more
 because the reviewed work changed; the agent has to ask again.
 
+## Reading the complete approval request
+
+A report's `wait` is a compact copy of the request, bounded so that run lists and
+watches stay small. The coordinator accepts longer requests (4000 characters per
+text, 20 entries per list, 32 KiB in all), so a shortened wait can leave out a late
+part of the scope or later list entries. The helper's `request` command reads the
+whole request, read-only:
+
+```text
+openheimdall.mjs request RUN_ID --request ID
+```
+
+It sends one `heimdall coordinator run approval RUN_ID --request ID` (with the
+selected `--coordinator-config`), checks the answer against the run, the request and
+the accepted limits, and reports the `question`, `scope`, `completedWork`,
+`verification`, `artifacts`, `onApprove`, `onRequestChanges`, the full `revision`
+and the request's state with `complete: true`. Nothing is shortened. It changes no
+state, so the monitor skill uses it freely; reading a request is not a decision.
+
+When the request cannot be read in full (an older coordinator or command line, an
+unknown request, an invalid answer or an unavailable coordinator), the report has
+`complete: false`, no request content and exit status 1. The skills then say that the
+review information is incomplete. They never present the shortened wait as the full
+scope, never offer approval of content the owner has not been shown, and never
+invent an approval.
+
 ## Answering an approval request
 
 Only the owner decides, and only in the owner's own explicit words. The monitor
-skill shows a request and stops. The resume skill sends a response only when you
-clearly approve the displayed request, or clearly ask for changes and give the text:
+skill shows a request, reading it in full with `request` when the wait is
+shortened, and stops. The resume skill sends a response only when you
+clearly approve the displayed request, which it has shown you in full, or clearly ask for changes and give the text:
 
 ```text
 openheimdall.mjs respond RUN_ID --request ID --decision approve
@@ -363,7 +393,8 @@ that it does not exist; `run show RUN_ID` is authoritative.
 ## What monitoring never does
 
 `openheimdall-monitor` reads only. It runs `status --json`, `project list`,
-`run list` and `run show`, and read-only Git inspection. It never runs
+`run list`, `run show` and `run approval` (the helper's `request`), and read-only Git
+inspection. It never runs
 `run submit`, `run resume`, `run respond`, `run reconcile`, `project add`,
 `coordinator start` or `stop`, the helper's `start`, `resume` or `respond`, and never
 edits locks, keys, state files or sessions. It can show you an approval request

@@ -24,11 +24,12 @@ Keep these separate when recording results:
 
 ## Prompts and scenarios
 
-`prompts.json` holds ten synthetic requests. Each names a fake coordinator scenario
-(`ready`, `queued`, `progress`, `paused`, `guarded` or `approval`) and a `mutationPolicy` that
+`prompts.json` holds eleven synthetic requests. Each names a fake coordinator scenario
+(`ready`, `queued`, `progress`, `paused`, `guarded`, `approval` or `approval-clipped`) and a `mutationPolicy` that
 lists the mutating commands a correct run issues. `paused` is a coordinator that reports no
 waits and so gives the helper no pause identity; `guarded` reports a generic pause with a pause ID; `approval` has a pending approval
-request:
+request; `approval-clipped` has one whose scope and lists are longer than the compact wait shows, so only the read-only
+`run approval` (the helper's `request` command) returns them in full:
 
 | Prompt | Scenario | Allowed mutations |
 | --- | --- | --- |
@@ -41,6 +42,7 @@ request:
 | `request-changes-feedback` | `approval` | exactly one `run respond` (request changes) |
 | `no-invented-approval` | `approval` | none: a bare "resume" is not an approval |
 | `monitor-approval-readonly` | `approval` | none: the monitor never answers a request |
+| `monitor-clipped-approval` | `approval-clipped` | none: the monitor reads the complete request with `request` and answers nothing |
 | `resume-guarded-pause` | `guarded` | exactly one `run respond` for the pause |
 
 A policy maps a mutation key (`run submit`, `run resume`, `run respond`, `project add`,
