@@ -57,7 +57,7 @@ function ownerDecisionIn(prompt) {
   if (!header) return undefined;
   const decision = /^Decision: (.+)$/m.exec(prompt)?.[1];
   const feedback = /<<<OWNER FEEDBACK\n([\s\S]*?)\nOWNER FEEDBACK>>>/.exec(prompt)?.[1];
-  return { requestId: header[1], taskId: header[2], decision, feedback, scope: /^Scope you asked approval for: (.+)$/m.exec(prompt)?.[1] };
+  return { requestId: header[1], taskId: header[2], decision, superseded: decision?.startsWith('SUPERSEDED') ?? false, original: /^Original owner decision: (.+)$/m.exec(prompt)?.[1], feedback, scope: /^Scope you asked approval for: (.+)$/m.exec(prompt)?.[1] };
 }
 const taskIn = prompt => JSON.parse(/^Task: (\{.*\})$/m.exec(prompt)[1]);
 
@@ -78,10 +78,13 @@ function createNativeStandIn({ coordinator, agent }) {
   const failures = [];
   const dispatches = [];
   const finished = new Map();
+  /** `beforeLaunch` may throw to simulate a launch that fails after the coordinator's dispatch boundary and before any attempt exists. */
+  const hooks = { beforeLaunch: undefined };
   let calls = 0;
   let children = 0;
   const executor = {
     async launch(expected) {
+      await hooks.beforeLaunch?.(expected);
       const worktree = expected.worktreePath;
       const metadata = await readManagedMetadata(worktree);
       const managed = createManagedPersistence(worktree, metadata);
@@ -149,7 +152,7 @@ function createNativeStandIn({ coordinator, agent }) {
       return { idle: true, status: 'failed', reason: 'The stand-in session ended without a checkpoint outcome' };
     },
   };
-  return { executor, dispatches, failures, active };
+  return { executor, dispatches, failures, active, hooks };
 }
 
 // --- The isolated environment ---------------------------------------------------------------------------------------
@@ -271,6 +274,14 @@ function scriptedAgent({ log, corrections = [] }) {
     assert.equal(task.id, 'T2');
     if (!owner) return proposal({ worktree, submit }, 1);
     assert.equal(owner.taskId, 'T2');
+    if (owner.superseded) {
+      // The authorization was withdrawn: keep the work, perform no gated action and ask again for the material as it stands.
+      const configNow = await fs.readFile(path.join(worktree, 'integrations/ledger/config.json'), 'utf8');
+      assert.equal(configNow, originalConfiguration, 'the migration must not be applied under a withdrawn decision');
+      assert.match(await fs.readFile(path.join(worktree, 'migrations/ledger-v2.mjs'), 'utf8'), /--apply/, 'the earlier work is kept');
+      corrections.push(owner.feedback ?? null);
+      return proposal({ worktree, submit }, 2, 'the worktree changed after your decision; this is the material as it stands now');
+    }
     if (owner.decision === 'request-changes') {
       // The gated action is not performed. The agent corrects its own proposal and asks again.
       const configNow = await fs.readFile(path.join(worktree, 'integrations/ledger/config.json'), 'utf8');
@@ -500,6 +511,142 @@ test('request changes: the feedback reaches the agent, nothing is applied, the c
   assert.deepEqual(await e.secretsIn(), []);
   assert.deepEqual(e.standIn.failures, []);
 });
+
+const DRIFTS = {
+  'request-changes': {
+    label: 'a commit made after the decision',
+    apply: async worktree => {
+      await fs.writeFile(path.join(worktree, 'OWNER-NOTE.md'), 'A note committed after the owner answered.\n');
+      git(worktree, ['add', 'OWNER-NOTE.md']);
+      git(worktree, ['commit', '-m', 'docs: note added after the decision']);
+    },
+  },
+  approve: {
+    label: 'an uncommitted edit made after the decision',
+    apply: async worktree => { await fs.appendFile(path.join(worktree, 'README.md'), '\nAn edit made after the owner approved.\n'); },
+  },
+};
+
+for (const decision of ['request-changes', 'approve']) {
+  test(`${decision === 'approve' ? 'an' : 'a'} ${decision} decision withdrawn by ${DRIFTS[decision].label} and a failed launch reaches the fresh attempt as superseded feedback; nothing is applied and a fresh request is filed`, async t => {
+    const log = [];
+    const corrections = [];
+    const e = await environment(t, scriptedAgent({ log, corrections }));
+    const runId = await e.submit();
+    await e.until(e.pendingRequest(runId), 'the first approval request');
+    const paused = e.store.getRun(runId);
+    const first = e.store.latestApproval(runId);
+    const worktree = paused.worktreePath;
+    const resultsAtPause = structuredClone(paused.checkpoint.results);
+    const taskOneCommit = git(worktree, ['log', '--format=%H', '--grep=add the ledger client']);
+    const feedback = 'Keep LEDGER_TENANT as it is: other services read it.\nAlso add a way to roll the change back.\n"Do not" apply this version.';
+    const input = decision === 'approve' ? ['--decision', 'approve'] : ['--decision', 'request-changes', `--input=${feedback}`];
+
+    const answered = await e.ownerCli(['run', 'respond', runId, '--request', first.requestId, ...input]);
+    assert.equal(answered.status, 0, answered.stderr);
+    assert.equal(JSON.parse(answered.stdout).continuation, 'queued');
+    assert.equal(e.store.getRun(runId).status, 'queued', 'the decision is queued and has not been dispatched');
+
+    // The reviewed material changes before dispatch, and the launch then fails after the dispatch boundary.
+    await DRIFTS[decision].apply(worktree);
+    const launchesBefore = e.standIn.dispatches.length;
+    let failures = 0;
+    e.standIn.hooks.beforeLaunch = () => { failures++; throw new Error('Injected launch failure before any attempt exists'); };
+    await e.until(() => e.store.getRun(runId).status === 'reconciliation-required', 'the failed launch');
+    e.standIn.hooks.beforeLaunch = undefined;
+    assert.equal(failures, 1);
+    assert.equal(e.standIn.dispatches.length, launchesBefore, 'no attempt ran');
+    const withdrawn = e.store.getApproval(runId, first.requestId);
+    assert.deepEqual({ state: withdrawn.state, decision: withdrawn.decision, continuation: withdrawn.continuation, carried: withdrawn.consumedAttemptId }, { state: 'answered', decision, continuation: 'superseded', carried: null });
+
+    // The existing reconcile releases the run once it is proven idle; the coordinator then owes the feedback and presents it as such.
+    const released = await e.scheduler.reconcile(runId);
+    assert.deepEqual({ status: released.status, reserved: released.capacityReserved }, { status: 'paused', reserved: false });
+    const owed = await e.client.request('GET', `/runs/${runId}`);
+    assert.deepEqual({ kind: owed.wait.kind, requestId: owed.wait.requestId, continuation: owed.wait.continuation, progress: owed.wait.progress }, { kind: 'approval', requestId: first.requestId, continuation: 'superseded', progress: 'waiting-for-idle' });
+    await assert.rejects(e.client.request('POST', `/runs/${runId}/resume`, { input: 'carry on' }), error => error.statusCode === 409 && error.code === 'approval-pending');
+    assert.equal(e.standIn.dispatches.length, launchesBefore);
+
+    // No owner action: the coordinator redelivers the withdrawn context to one fresh attempt, which asks again.
+    const before = e.ownerCalls.length;
+    await e.until(() => { const latest = e.store.latestApproval(runId); return latest && latest.requestId !== first.requestId && e.pendingRequest(runId)(); }, 'the fresh approval request');
+    assert.equal(e.ownerCalls.length, before, 'the owner did nothing to deliver the feedback');
+    const executors = e.standIn.dispatches.filter(dispatch => dispatch.agent.includes('executor'));
+    const fresh = executors.at(-1);
+    assert.equal(executors.length, 3, 'T1, T2 request, T2 under the withdrawn decision');
+    assert.equal(executors[1].child, fresh.child, 'the same child keeps its work');
+    assert.notEqual(fresh.attemptId, executors[1].attemptId);
+
+    // The dispatch prompt carries the superseded block with the exact feedback and authorizes nothing.
+    assert.match(fresh.prompt, new RegExp(`^Owner decision on your approval request ${first.requestId} \\(task T2\\):$`, 'm'));
+    assert.match(fresh.prompt, /^Decision: SUPERSEDED - the owner decision no longer applies$/m);
+    assert.match(fresh.prompt, new RegExp(`^Original owner decision: ${decision}$`, 'm'));
+    assert.match(fresh.prompt, /do NOT perform the gated action, and submit a fresh approval request/);
+    if (decision === 'request-changes') assert.ok(fresh.prompt.includes(`<<<OWNER FEEDBACK\n${feedback}\nOWNER FEEDBACK>>>`), 'exact feedback');
+    else assert.doesNotMatch(fresh.prompt, /OWNER FEEDBACK/);
+    for (const action of [...first.request.onApprove, ...first.request.onRequestChanges]) assert.ok(!fresh.prompt.includes(action), `no authorized action: ${action}`);
+    assert.doesNotMatch(fresh.prompt, /The owner approved exactly that scope|The owner requested changes|You keep (?:these|every remaining) actions/);
+    assert.deepEqual(corrections, [decision === 'approve' ? null : feedback]);
+    assert.deepEqual(log.filter(entry => entry.sawDecision).map(entry => entry.sawDecision.superseded), [true], 'the agent saw one withdrawn decision');
+
+    // The checkpoint the fresh attempt saved carries the context, and the coordinator recorded it as carried by that attempt.
+    const second = e.store.latestApproval(runId);
+    const now = e.store.getRun(runId);
+    assert.equal(now.checkpoint.approval.requestId, first.requestId);
+    assert.deepEqual(now.checkpoint.approval.superseded, { reason: 'The reviewed worktree changed after the decision was recorded' });
+    assert.equal(now.checkpoint.approval.feedback, decision === 'approve' ? null : feedback);
+    const stored = e.sql('SELECT state, decision, continuation, consumed_attempt_id FROM approval_requests WHERE request_id = ?', first.requestId)[0];
+    assert.deepEqual({ ...stored }, { state: 'answered', decision, continuation: 'superseded', consumed_attempt_id: fresh.attemptId });
+    assert.equal(e.store.approvalWait(now)?.requestId, second.requestId);
+
+    // Nothing gated happened under the withdrawn decision, and the old request stays withdrawn beside a fresh one.
+    assert.equal(await read(worktree, 'integrations/ledger/config.json'), originalConfiguration);
+    assert.equal(await read(worktree, ENV_FILE), originalEnvironmentFile);
+    assert.ok(!log.some(entry => entry.applied), 'the agent applied nothing');
+    assert.notEqual(second.requestId, first.requestId);
+    assert.equal(second.state, 'pending');
+    assert.equal(second.attemptId, fresh.attemptId);
+    assert.notDeepEqual(second.revision, first.revision, 'the changed material needs fresh review');
+    assert.equal(e.store.getApproval(runId, first.requestId).continuation, 'superseded');
+    const eventsBefore = e.store.events().length;
+    const opposite = await e.ownerCli(['run', 'respond', runId, '--request', first.requestId, ...(decision === 'approve' ? ['--decision', 'request-changes', '--input=Different feedback'] : ['--decision', 'approve'])]);
+    assert.equal(opposite.status, 1, 'the withdrawn request cannot be answered differently');
+    const repeated = await e.ownerCli(['run', 'respond', runId, '--request', first.requestId, ...input]);
+    assert.equal(repeated.status, 0, repeated.stderr);
+    assert.equal(JSON.parse(repeated.stdout).retried, true, 'an identical retry is only acknowledged');
+    assert.equal(e.store.events().length, eventsBefore, 'neither attempt recorded or delivered anything');
+    assert.equal(e.store.getApproval(runId, first.requestId).continuation, 'superseded');
+    assert.equal(e.store.getApproval(runId, second.requestId).state, 'pending');
+    assert.equal(e.store.getRun(runId).status, 'paused');
+
+    // Same run, same task, earlier work intact.
+    assert.deepEqual([now.id, now.parentSessionId, now.branch, now.worktreePath, now.checkpoint.index, now.checkpoint.status], [runId, paused.parentSessionId, paused.branch, worktree, 1, 'paused']);
+    assert.deepEqual(now.checkpoint.results, resultsAtPause);
+    assert.deepEqual(now.checkpoint.tasks, paused.checkpoint.tasks);
+    git(worktree, ['merge-base', '--is-ancestor', taskOneCommit, 'HEAD']);
+    assert.match(await read(worktree, 'migrations/ledger-v2.mjs'), /--rollback/, 'the fresh proposal is committed');
+
+    // Only the fresh request authorizes anything, and it finishes the same run.
+    const approved = await e.ownerCli(['run', 'respond', runId, '--request', second.requestId, '--decision', 'approve']);
+    assert.equal(approved.status, 0, approved.stderr);
+    await e.until(() => e.store.getRun(runId).status === 'succeeded', 'the run to succeed');
+    const done = e.store.getRun(runId);
+    assert.deepEqual([done.id, done.branch, done.parentSessionId], [runId, paused.branch, paused.parentSessionId]);
+    assert.equal(done.checkpoint.results.length, 2);
+    assert.deepEqual(done.checkpoint.results[0], resultsAtPause[0]);
+    assert.equal(JSON.parse(await read(worktree, 'integrations/ledger/config.json')).apiVersion, 'v2');
+    const finalPrompt = e.standIn.dispatches.filter(dispatch => dispatch.agent.includes('executor')).at(-1).prompt;
+    assert.match(finalPrompt, new RegExp(`Owner decision on your approval request ${second.requestId}`));
+    assert.match(finalPrompt, /^Decision: approve$/m);
+    assert.doesNotMatch(finalPrompt, /SUPERSEDED/);
+    assert.equal(e.store.getApproval(runId, first.requestId).continuation, 'superseded', 'the withdrawn request never authorized anything');
+    const types = eventTypes(e);
+    assert.equal(types.filter(entry => entry === 'approval.requested').length, 2);
+    assert.equal(types.filter(entry => entry === 'approval.consumed').length, 1, 'only the fresh request was consumed');
+    assert.equal(types.filter(entry => entry === 'run.response_recorded').length, 0);
+    assert.deepEqual(e.standIn.failures, []);
+  });
+}
 
 test('the example project and spec are synthetic and self-consistent', async () => {
   const files = [];
