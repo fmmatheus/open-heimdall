@@ -83,16 +83,21 @@ test('start: an extra project add fails the policy even though the fake rejects 
   assertRow(row, { mutations: { 'run submit': 1, 'project add': 1 }, skills: ['openheimdall-start'], met: false });
 });
 
-test('resume: one run resume meets the policy', t => {
-  const row = runEvaluation(t, [RESUME], 'resume-with-guidance', 'openheimdall-resume');
-  assertRow(row, { mutations: { 'run resume': 1 }, skills: ['openheimdall-resume'], met: true });
+const PAUSE_RESPOND = `coordinator run respond ${RUN_ID} --pause pau_0123456789abcdef0123456789abcdef '--input=${GUIDANCE}'`;
+
+test('resume: one guarded run respond meets the policy', t => {
+  const row = runEvaluation(t, [PAUSE_RESPOND], 'resume-with-guidance', 'openheimdall-resume');
+  assertRow(row, { mutations: { 'run respond': 1 }, skills: ['openheimdall-resume'], met: true });
 });
 
-test('resume: two run resumes fail the policy', t => {
-  const row = runEvaluation(t, [RESUME, RESUME], 'resume-with-guidance', 'openheimdall-resume');
-  assert.equal(row.mutations['run resume'], 2);
-  assert.equal(row.skillExpectationMet, true);
-  assert.equal(row.mutationExpectationMet, false);
+test('resume: two guarded responses, or the unguarded run resume, fail the policy', t => {
+  const twice = runEvaluation(t, [PAUSE_RESPOND, PAUSE_RESPOND], 'resume-with-guidance', 'openheimdall-resume');
+  assert.equal(twice.mutations['run respond'], 2);
+  assert.equal(twice.skillExpectationMet, true);
+  assert.equal(twice.mutationExpectationMet, false);
+  const legacy = runEvaluation(t, [RESUME], 'resume-with-guidance', 'openheimdall-resume');
+  assert.deepEqual(legacy.mutations, { 'run resume': 1 });
+  assert.equal(legacy.mutationExpectationMet, false);
 });
 
 test('ambiguous guidance: zero mutations meet the policy', t => {
@@ -100,9 +105,9 @@ test('ambiguous guidance: zero mutations meet the policy', t => {
   assertRow(row, { mutations: {}, skills: ['openheimdall-start'], met: true });
 });
 
-test('ambiguous guidance: one run resume meets the policy', t => {
+test('ambiguous guidance: a run resume fails the policy', t => {
   const row = runEvaluation(t, [RESUME], 'boundary-guidance-as-spec', 'openheimdall-resume');
-  assertRow(row, { mutations: { 'run resume': 1 }, skills: ['openheimdall-resume'], met: true });
+  assertRow(row, { mutations: { 'run resume': 1 }, skills: ['openheimdall-resume'], met: false });
 });
 
 test('ambiguous guidance: a rejected run submit attempt fails the policy', t => {

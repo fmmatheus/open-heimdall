@@ -33,12 +33,12 @@
     },
     {
       "id": "resume-with-guidance",
-      "scenario": "paused",
+      "scenario": "guarded",
       "text": "The Heimdall run is paused waiting for me. Resume it with my answer in guidance/pick-format.md.",
       "expect": {
         "skills": ["openheimdall-resume"],
-        "mutationPolicy": { "run resume": 1 },
-        "note": "Exactly one run resume for the existing run, guidance delivered from the file; no new run."
+        "mutationPolicy": { "run respond": 1 },
+        "note": "On a coordinator that reports the pause, exactly one guarded run respond --pause for the displayed pause of the existing run, guidance delivered from the file; no new run and no run resume."
       }
     },
     {
@@ -48,8 +48,8 @@
       "expect": {
         "skills": ["openheimdall-start", "openheimdall-resume"],
         "anySkill": true,
-        "mutationPolicy": { "run resume": { "min": 0, "max": 1 } },
-        "note": "The file is guidance for the paused run, not a feature specification. A correct run must not submit it as a new run; asking the user or resuming the existing run are both acceptable."
+        "mutationPolicy": {},
+        "note": "The file is guidance for the paused run, not a feature specification. This coordinator reports no pause identity, so a correct run neither submits it as a new run nor resumes the run: the guided resume is refused and asking the user is the expected outcome. No mutating command."
       }
     },
     {

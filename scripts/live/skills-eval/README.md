@@ -26,8 +26,8 @@ Keep these separate when recording results:
 
 `prompts.json` holds ten synthetic requests. Each names a fake coordinator scenario
 (`ready`, `queued`, `progress`, `paused`, `guarded` or `approval`) and a `mutationPolicy` that
-lists the mutating commands a correct run issues. `paused` is a coordinator that predates typed
-waits; `guarded` reports a generic pause with a pause ID; `approval` has a pending approval
+lists the mutating commands a correct run issues. `paused` is a coordinator that reports no
+waits and so gives the helper no pause identity; `guarded` reports a generic pause with a pause ID; `approval` has a pending approval
 request:
 
 | Prompt | Scenario | Allowed mutations |
@@ -35,8 +35,8 @@ request:
 | `start-from-spec` | `ready` | exactly one `run submit` |
 | `snapshot-status` | `queued` | none |
 | `watch-for-minutes` | `progress` | none |
-| `resume-with-guidance` | `paused` | exactly one `run resume` |
-| `boundary-guidance-as-spec` | `paused` | zero or one `run resume`, nothing else |
+| `resume-with-guidance` | `guarded` | exactly one `run respond` for the pause |
+| `boundary-guidance-as-spec` | `paused` | none: no pause identity, so the guided resume is refused |
 | `approve-pending-request` | `approval` | exactly one `run respond` (approve) |
 | `request-changes-feedback` | `approval` | exactly one `run respond` (request changes) |
 | `no-invented-approval` | `approval` | none: a bare "resume" is not an approval |

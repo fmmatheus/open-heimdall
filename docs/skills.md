@@ -7,7 +7,7 @@ OpenCode or OpenChamber session, using the installed `heimdall` CLI:
 | --- | --- | --- |
 | `openheimdall-start` | Submit a new run from a task-spec Markdown file. | Yes: at most one `run submit` per use; optionally registers the project and starts the coordinator when asked. |
 | `openheimdall-monitor` | Read the state of a run once, or watch it for a bounded time. It shows what the run waits for, including an approval request, and never answers it. | Never. |
-| `openheimdall-resume` | Send the owner's guidance to a paused run, or the owner's explicit approval or requested changes for an approval request, so the same run continues. | Yes: at most one `run respond` or `run resume` per use. |
+| `openheimdall-resume` | Send the owner's guidance to a paused run, or the owner's explicit approval or requested changes for an approval request, so the same run continues. | Yes: at most one `run respond` per use. |
 
 Each skill is a directory with a `SKILL.md` and `scripts/openheimdall.mjs`, a
 dependency-free Node helper (identical in all three directories) that calls the
@@ -267,8 +267,8 @@ A paused run reports what it waits for as `run.wait`:
 - **Generic pause** (`kind` `generic`). Any other pause. It carries the `pauseId`
   the owner response must name; the reason is the existing `blocker` field.
 - `wait` is `null` for a run that waits for nothing, and `waitReported` is `false`
-  when the coordinator is an older one that does not report waits. A shape the
-  helper does not know is shown as `unrecognized` and is never acted on.
+  when the coordinator does not report waits. A shape the helper does not know is
+  shown as `unrecognized` and is never acted on.
 
 An approval that is `answered` and queued, or `waiting-for-idle`, is recorded but
 not running, and approval never completes a task: the agent still finishes its work
@@ -302,11 +302,17 @@ What the skills never do:
   request is pending or its decision has not been consumed, and it never sends a
   decision.
 - They never choose a decision for you and never retry a refused one with another.
-- For a generic pause on a coordinator that reports pauses, `resume` sends the
-  guidance as the guarded response for exactly that pause. It is labelled as owner
-  guidance, not as an approval. An older coordinator keeps the labelled
-  `run resume` message. A coordinator that does not know the operation is reported
-  as unsupported; the helper does not fall back to another command.
+- For a generic pause, `resume` sends the guidance as the guarded response for
+  exactly the pause the run showed, with one `run respond RUN_ID --pause ID`. It is
+  labelled as owner guidance, not as an approval. When the run does not show a valid
+  pause identity (no wait reported, a null or unrecognized wait, a malformed pause
+  identity, or a superseded request), `resume` refuses with
+  `pause-identity-unavailable` and sends nothing: guidance cannot be tied to a pause,
+  so it could land on a later one. Use coordinator and client versions that both
+  support the guarded response, then read the run again.
+- A guarded response that is unsupported, stale or refused is reported as such after
+  exactly one attempt. The helper never falls back to the unguarded `run resume`
+  command, which stays available to the owner as the explicit coordinator command.
 
 Results of `respond`:
 
@@ -315,7 +321,7 @@ Results of `respond`:
 | `queued` | The response is recorded and the same run is queued to continue. It is not running until admitted, and the task is not complete. |
 | `waiting-for-idle` | The response is recorded. The coordinator continues the run once it has proof that the run is idle. |
 | `recorded` | The response is recorded; read the run for how it continues. |
-| `refused` | Nothing was recorded. `reason` says why: for example `request-mismatch`, `already-answered`, `request-superseded`, `approval-pending`, `pause-mismatch`, `wait-not-reported`, `coordinator-refused`, `coordinator-unsupported` or `not-sent`. `sent` says whether a request left. |
+| `refused` | Nothing was recorded. `reason` says why: for example `request-mismatch`, `already-answered`, `request-superseded`, `approval-pending`, `pause-mismatch`, `pause-identity-unavailable` (for `resume`), `wait-not-reported`, `coordinator-refused`, `coordinator-unsupported` or `not-sent`. `sent` says whether a request left. |
 | `uncertain` | A request was sent and no answer could be read. See [Uncertain outcomes](#uncertain-outcomes). |
 
 The agent keeps the work. The owner supplies decisions and access, never

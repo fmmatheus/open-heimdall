@@ -13,7 +13,7 @@
 //   queued    one queued run
 //   progress  one run whose `run show` answers advance per call: queued, preparing, running, then paused
 //   paused    one paused run (capacity released) whose first task has a result; `run resume` queues it again. The record
-//             has no `wait` field, like a coordinator that predates typed waits.
+//             has no `wait` field, like a coordinator that does not report waits, so the helper's guided resume refuses.
 //   guarded   the same paused run on a coordinator that reports waits: a generic wait with a pause ID. `run respond --pause`
 //             queues it again; `run resume` is still accepted as the unguarded legacy operation.
 //   approval  a paused run with a pending typed approval request. `run respond --request` records the decision and queues

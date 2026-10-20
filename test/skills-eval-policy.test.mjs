@@ -21,7 +21,7 @@ test('every scenario states an explicit mutation policy', () => {
     'approve-pending-request', 'request-changes-feedback', 'no-invented-approval', 'monitor-approval-readonly', 'resume-guarded-pause',
   ]);
   for (const prompt of prompts) assert.equal(typeof prompt.expect.mutationPolicy, 'object', prompt.id);
-  assert.deepEqual(policyOf('boundary-guidance-as-spec'), { 'run resume': { min: 0, max: 1 } });
+  assert.deepEqual(policyOf('boundary-guidance-as-spec'), {});
 });
 
 for (const id of ['snapshot-status', 'watch-for-minutes', 'monitor-approval-readonly', 'no-invented-approval']) {
@@ -45,29 +45,29 @@ test('start-from-spec: exactly one run submit and nothing else', () => {
   }
 });
 
-test('resume-with-guidance: exactly one run resume and nothing else', () => {
+test('resume-with-guidance: exactly one guarded run respond and nothing else, never the unguarded run resume', () => {
   const policy = policyOf('resume-with-guidance');
-  assert.equal(mutationsMeetPolicy({ 'run resume': 1 }, policy), true);
+  assert.equal(prompts.find(prompt => prompt.id === 'resume-with-guidance').scenario, 'guarded');
+  assert.equal(mutationsMeetPolicy({ 'run respond': 1 }, policy), true);
   assert.equal(mutationsMeetPolicy({}, policy), false);
-  assert.equal(mutationsMeetPolicy({ 'run resume': 2 }, policy), false);
-  for (const key of MUTATION_KEYS.filter(item => item !== 'run resume')) {
-    assert.equal(mutationsMeetPolicy({ 'run resume': 1, [key]: 1 }, policy), false, key);
+  assert.equal(mutationsMeetPolicy({ 'run respond': 2 }, policy), false);
+  assert.equal(mutationsMeetPolicy({ 'run resume': 1 }, policy), false);
+  for (const key of MUTATION_KEYS.filter(item => item !== 'run respond')) {
+    assert.equal(mutationsMeetPolicy({ 'run respond': 1, [key]: 1 }, policy), false, key);
   }
 });
 
-test('boundary-guidance-as-spec: zero or one run resume, nothing else', () => {
+test('boundary-guidance-as-spec: no mutation at all, including the unguarded run resume', () => {
   const policy = policyOf('boundary-guidance-as-spec');
   assert.equal(mutationsMeetPolicy({}, policy), true);
-  assert.equal(mutationsMeetPolicy({ 'run resume': 1 }, policy), true);
-  assert.equal(mutationsMeetPolicy({ 'run resume': 2 }, policy), false);
-  for (const key of MUTATION_KEYS.filter(item => item !== 'run resume')) {
+  for (const key of MUTATION_KEYS) {
     assert.equal(mutationsMeetPolicy({ [key]: 1 }, policy), false, key);
-    assert.equal(mutationsMeetPolicy({ 'run resume': 1, [key]: 1 }, policy), false, key);
+    assert.deepEqual(mutationViolations({ [key]: 1 }, policy), [key]);
   }
 });
 
 test('the explicit response command is permitted only in the resume scenarios that list it', () => {
-  const permitted = ['approve-pending-request', 'request-changes-feedback', 'resume-guarded-pause'];
+  const permitted = ['approve-pending-request', 'request-changes-feedback', 'resume-with-guidance', 'resume-guarded-pause'];
   for (const id of permitted) {
     const policy = policyOf(id);
     assert.deepEqual(policy, { 'run respond': 1 }, id);

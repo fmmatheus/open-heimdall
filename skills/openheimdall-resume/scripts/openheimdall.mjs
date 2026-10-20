@@ -6,7 +6,8 @@
 // `inspect-spec` only read. `start`, `resume` and `respond` are the only commands that mutate, each at most once per
 // invocation: they never retry, reconcile, stop or restart anything, and an unconfirmed outcome is reported as
 // uncertain instead of being repeated. Reports of a run include its bounded wait: the typed approval request the
-// agent is waiting on, or the identity of a generic pause.
+// agent is waiting on, or the identity of a generic pause. Guidance reaches a run only through the guarded response for
+// the identity of that pause; without it the helper refuses and sends nothing.
 //
 // The command line is invoked without a shell: `execFile` with an argument array, using the binary named by
 // HEIMDALL_BIN or `heimdall` on PATH. Every option value is data, so paths may contain spaces, quotes or a
@@ -59,7 +60,6 @@ export const WAIT_QUESTION_LIMIT = 1500;
 export const WAIT_TEXT_LIMIT = 1000;
 export const WAIT_LIST_LIMIT = 10;
 export const WAIT_ENTRY_LIMIT = 300;
-export const GUIDANCE_HEADER = 'Owner guidance for resuming this run, delivered verbatim by the OpenHeimdall resume skill. Everything after this line is the guidance:';
 const MUTATION_TIMEOUT_MS = 60000;
 const COORDINATOR_START_TIMEOUT_MS = 150000;
 const START_SUCCESS_OUTCOMES = Object.freeze(['ready', 'already-running', 'already-running-foreground']);
@@ -1044,13 +1044,15 @@ function approvalNextAction(wait) {
       detail: `The run waits for an owner decision on request ${wait.requestId}. Show the owner the request. Only an explicit approval, or explicit change feedback, sent with \`respond RUN_ID --request ${wait.requestId} --decision approve|request-changes\` answers it. A request to resume or continue is not a decision.`,
     };
   }
-  return { action: 'monitor', detail: 'The coordinator reports a wait this helper does not recognize, so nothing was sent. Inspect the run with the owner.' };
+  return { action: 'monitor', detail: 'The coordinator reports a wait this helper does not recognize, so nothing was sent. Inspect the run with the owner. Guidance is delivered only with a valid pause identity, which needs a coordinator and client of matching versions that support the guarded response.' };
 }
 
 /**
- * Resume a paused run with the owner's guidance. The guidance is data: it is read from a file or stdin and sent once. A
- * coordinator that reports a generic pause gets the guarded response for exactly that pause; one that reports no waits gets
- * the labeled `run resume` message (so text beginning with a dash never reaches the command line as an option). A typed
+ * Resume a paused run with the owner's guidance. The guidance is data: it is read from a file or stdin and sent once, only
+ * as the guarded response for exactly the generic pause the coordinator reports (so text beginning with a dash never
+ * reaches the command line as an option). A run whose record does not carry a valid pause identity (no wait reported, no
+ * wait, a typed request that is no longer open, or a shape this helper does not know) is refused with nothing sent: the
+ * unguarded `run resume` is never used here, because it cannot tell which pause the guidance was written for. A typed
  * approval request that is still open is never answered, replaced or bypassed from here.
  */
 async function resumeCommand({ coordinator, cwd, env, options, positional, configFile, stdin, signal }) {
@@ -1067,6 +1069,12 @@ async function resumeCommand({ coordinator, cwd, env, options, positional, confi
     exitCode: ok ? 0 : 1,
   });
 
+  const pauseIdentityRefusal = run => done('refused', {
+    reason: 'pause-identity-unavailable', run,
+    message: 'The coordinator does not report a valid pause identity for this run, so no guidance was sent. Guidance is delivered only as a guarded response to the exact pause it was written for, which needs a coordinator and an OpenHeimdall client of matching versions that support the guarded response. The unguarded resume is not used instead.',
+    next: { action: 'owner-decision', detail: 'Use matching coordinator and client versions that support the guarded response, then read the run again. If the run then shows a pause identity, send the guidance again; otherwise nothing was changed.' },
+  });
+
   let guidance = fromStdin ? await readStdin(stdin, MAX_GUIDANCE_BYTES) : await readTextFile(path.resolve(cwd, guidanceFile), MAX_GUIDANCE_BYTES);
   if (guidance.ok && guidance.text.includes('\0')) guidance = { ok: false, reason: 'contains-nul', bytes: guidance.bytes };
   if (!guidance.ok) return done('refused', { reason: `guidance-${guidance.reason}`, message: PROBLEM_MESSAGES[guidance.reason], guidance: { source: fromStdin ? 'stdin' : 'file', ...(guidance.bytes === undefined ? {} : { bytes: guidance.bytes }), maxBytes: MAX_GUIDANCE_BYTES } });
@@ -1078,56 +1086,37 @@ async function resumeCommand({ coordinator, cwd, env, options, positional, confi
     return done('error', { error: { kind: before.kind, message: before.message } });
   }
   const { wait } = before.projection;
+  if (wait?.kind === 'unrecognized' && before.record.wait?.kind === 'generic') return pauseIdentityRefusal(before.projection);
   if (approvalUnresolved(wait)) {
     return done('refused', { reason: 'approval-pending', run: before.projection, next: approvalNextAction(wait), message: 'The run has a typed approval request that is not resolved, so no guidance was sent. Guidance cannot answer or replace it.' });
   }
   if (before.record.status !== 'paused' || before.record.capacityReserved === true) {
     return done('not-resumable', { run: before.projection, next: resumeNextAction(before.projection), message: 'The run is not a confirmed idle paused run, so nothing was sent.' });
   }
-  const guarded = wait?.kind === 'generic';
-  if (guarded && guidance.text.length > RESPONSE_INPUT_LIMIT) {
+  if (wait?.kind !== 'generic') return pauseIdentityRefusal(before.projection);
+  if (guidance.text.length > RESPONSE_INPUT_LIMIT) {
     return done('refused', { reason: 'guidance-too-long', message: PROBLEM_MESSAGES['too-long'], guidance: { ...guidanceSummary, maxCharacters: RESPONSE_INPUT_LIMIT } });
   }
   if (signal?.aborted) return done('interrupted', { reason: 'interrupted-before-mutation' });
 
   const known = { guidance: guidanceSummary, before: { status: before.projection.status, version: before.record.version ?? null, completedResults: before.projection.progress?.completed ?? null } };
-  let acknowledgement = null;
-  let accepted = null;
-  if (guarded) {
-    // The guarded response names this pause and is checked again by the coordinator. It is never replaced by `run resume`.
-    attempted.push('run respond');
-    const sent = await deliverResponse(coordinator, [runId, '--pause', wait.pauseId, `--input=${guidance.text}`], { runId, pauseId: wait.pauseId });
-    if (sent.kind === 'not-sent') return done('not-resumed', { message: sent.message, via: 'respond', ...known });
-    if (sent.kind === 'rejected' || sent.kind === 'unsupported') return done('rejected', { message: sent.message, via: 'respond', ...(sent.kind === 'unsupported' ? { unsupported: true } : { refusal: sent.refusal }), ...known });
-    if (sent.kind === 'uncertain') return done('uncertain', { message: sent.message, via: 'respond', rule: UNCERTAIN_RULE, ...known, inspection: await inspectRun(coordinator, runId) });
-    if (sent.ack.continuation !== 'queued' || sent.ack.run.status !== 'queued') {
-      return done('uncertain', { message: 'The coordinator acknowledged the response, but not as a queued resume.', via: 'respond', acknowledgement: sent.ack, rule: UNCERTAIN_RULE, ...known, inspection: await inspectRun(coordinator, runId) });
-    }
-    acknowledgement = sent.ack;
-  } else {
-    const message = `${GUIDANCE_HEADER}\n${guidance.text}`;
-    attempted.push('run resume');
-    const resumed = await coordinator.raw(['run', 'resume', runId, '--input', message], { timeoutMs: MUTATION_TIMEOUT_MS });
-    if (!resumed.ok) {
-      const kind = classifyMutationFailure(resumed);
-      const text = failureText(resumed);
-      if (kind === 'not-sent') return done('not-resumed', { message: text, ...known });
-      if (kind === 'rejected') return done('rejected', { message: text, ...known });
-      return done('uncertain', { message: text, rule: UNCERTAIN_RULE, ...known, inspection: await inspectRun(coordinator, runId) });
-    }
-    const answer = parseJson(resumed.stdout);
-    try { accepted = isObject(answer) && answer.id === runId ? projectRun(answer) : null; } catch { accepted = null; }
-    if (!accepted || accepted.status !== 'queued') {
-      return done('uncertain', { message: 'The coordinator answered, but the answer is not a queued run record.', rule: UNCERTAIN_RULE, ...known, inspection: await inspectRun(coordinator, runId) });
-    }
+  // The guarded response names this pause and is checked again by the coordinator. It is never replaced by `run resume`.
+  attempted.push('run respond');
+  const sent = await deliverResponse(coordinator, [runId, '--pause', wait.pauseId, `--input=${guidance.text}`], { runId, pauseId: wait.pauseId });
+  if (sent.kind === 'not-sent') return done('not-resumed', { message: sent.message, via: 'respond', ...known });
+  if (sent.kind === 'rejected' || sent.kind === 'unsupported') return done('rejected', { message: sent.message, via: 'respond', ...(sent.kind === 'unsupported' ? { unsupported: true } : { refusal: sent.refusal }), ...known });
+  if (sent.kind === 'uncertain') return done('uncertain', { message: sent.message, via: 'respond', rule: UNCERTAIN_RULE, ...known, inspection: await inspectRun(coordinator, runId) });
+  if (sent.ack.continuation !== 'queued' || sent.ack.run.status !== 'queued') {
+    return done('uncertain', { message: 'The coordinator acknowledged the response, but not as a queued resume.', via: 'respond', acknowledgement: sent.ack, rule: UNCERTAIN_RULE, ...known, inspection: await inspectRun(coordinator, runId) });
   }
+  const acknowledgement = sent.ack;
   const after = await showRun(coordinator, runId);
-  // When the follow-up read fails, the acceptance still stands: report what the coordinator itself answered.
-  const current = after.ok ? after.projection : accepted;
+  // When the follow-up read fails, the acceptance still stands: report what the coordinator itself acknowledged.
+  const current = after.ok ? after.projection : null;
   const original = before.projection;
   return done('resumed', {
     accepted: true, status: current ? current.status : acknowledgement.run.status,
-    via: guarded ? 'respond' : 'run resume',
+    via: 'respond',
     note: 'The coordinator accepted the resume and queued the same run again. It is not running until it is admitted; monitor it.',
     ...(current ? {
       run: current,
@@ -1137,7 +1126,7 @@ async function resumeCommand({ coordinator, cwd, env, options, positional, confi
       },
       completedResults: { before: original.progress?.completed ?? null, after: current.progress?.completed ?? null },
     } : {}),
-    ...(acknowledgement ? { acknowledgement } : {}),
+    acknowledgement,
     ...(after.ok ? {} : { confirmation: { available: false, reason: after.kind, message: after.message } }),
     guidance: guidanceSummary,
   }, true);

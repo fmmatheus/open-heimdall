@@ -211,20 +211,30 @@ function selftest() {
       assert.deepEqual(countMutations(readCalls(box.callsFile)), {});
     });
 
-    check('resume-with-guidance: helper resumes the same run once with the labeled guidance', () => {
-      const box = createSandbox(root, { scenario: 'paused', withSkills: false });
+    check('resume-with-guidance: helper resumes the same run once through the guarded response for its pause', () => {
+      const box = createSandbox(root, { scenario: 'guarded', withSkills: false });
       const result = helperRun(box, ['resume', RUN_ID, '--guidance-file', 'guidance/pick-format.md']);
       assert.equal(result.status, 0, result.stderr);
       const report = result.json();
       assert.equal(report.outcome, 'resumed');
+      assert.equal(report.via, 'respond');
       assert.equal(report.preserved.runId, true);
       assert.deepEqual(report.completedResults, { before: 1, after: 1 });
-      assert.deepEqual(countMutations(readCalls(box.callsFile)), { 'run resume': 1 });
-      const resume = readCalls(box.callsFile).find(call => call.mutating);
-      assert.equal(resume.argv[2], 'resume');
-      assert.equal(resume.argv[3], RUN_ID);
-      assert.equal(resume.argv[4], '--input');
-      assert.match(resume.argv[5], /^Owner guidance for resuming this run/);
+      assert.deepEqual(countMutations(readCalls(box.callsFile)), { 'run respond': 1 });
+      const sent = readCalls(box.callsFile).find(call => call.mutating);
+      assert.deepEqual(sent.argv.slice(0, 6), ['coordinator', 'run', 'respond', RUN_ID, '--pause', PAUSE_ID]);
+      assert.equal(sent.argv[6], `--input=${GUIDANCE}`);
+    });
+
+    check('resume without a pause identity: a coordinator that reports no waits is refused and nothing is mutated', () => {
+      const box = createSandbox(root, { scenario: 'paused', withSkills: false });
+      const result = helperRun(box, ['resume', RUN_ID, '--guidance-file', 'guidance/pick-format.md']);
+      assert.equal(result.status, 1);
+      const report = result.json();
+      assert.equal(report.outcome, 'refused');
+      assert.equal(report.reason, 'pause-identity-unavailable');
+      assert.deepEqual(report.mutationsAttempted, []);
+      assert.deepEqual(countMutations(readCalls(box.callsFile)), {});
     });
 
     check('boundary-guidance-as-spec: inspect-spec flags the guidance file and nothing is mutated', () => {

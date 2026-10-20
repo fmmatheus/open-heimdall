@@ -12,7 +12,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { startCoordinatorService } from '../dist/coordinator/service.js';
 import { loadCoordinatorConfiguration } from '../dist/coordinator/config.js';
 import {
-  GUIDANCE_HEADER, MAX_GUIDANCE_BYTES, MAX_SPEC_BYTES, RESPONSE_INPUT_LIMIT, UsageError, classifyMutationFailure, classifyRespondFailure, main, parseArguments, runIdCandidates,
+  MAX_GUIDANCE_BYTES, MAX_SPEC_BYTES, RESPONSE_INPUT_LIMIT, UsageError, classifyMutationFailure, classifyRespondFailure, main, parseArguments, runIdCandidates,
 } from '../skills/openheimdall-start/scripts/openheimdall.mjs';
 
 const exec = promisify(execFile);
@@ -601,9 +601,10 @@ async function resumeScenario(t, extra = {}) {
   const f = await fakeFixture(t);
   const cwd = path.join(f.root, 'work dir');
   await fs.mkdir(cwd);
-  const paused = runRecord();
-  const queued = runRecord({ status: 'queued', launchAction: 'resume', reason: null, version: 4 });
-  const scenario = { 'run show run-1': [{ json: paused }, { json: queued }], 'run resume run-1 *': { json: queued }, ...extra };
+  const paused = runRecord({ wait: genericWait() });
+  const queued = runRecord({ status: 'queued', launchAction: 'resume', reason: null, version: 4, wait: null });
+  // `run resume` is scripted to succeed so that any use of it would be visible as a recorded call and a reported success.
+  const scenario = { 'run show run-1': [{ json: paused }, { json: queued }], 'run respond run-1 *': { json: pauseAck() }, 'run resume run-1 *': { json: queued }, ...extra };
   await f.script(scenario);
   await f.reset();
   const resume = (guidance, ...args) => runHelper(['resume', 'run-1', '--cwd', cwd, ...args], f.env, guidance === undefined ? {} : { stdin: Readable.from([Buffer.from(guidance)]) });
@@ -661,7 +662,7 @@ test('unusable guidance is refused before any coordinator call', async t => {
   assert.deepEqual(await f.calls(), []);
 });
 
-test('resume sends guidance verbatim in one labeled message, however awkward the text', async t => {
+test('resume sends guidance verbatim in one guarded response for the displayed pause, however awkward the text', async t => {
   const f = await resumeScenario(t);
   const marker = path.join(f.root, 'shell-ran');
   const texts = [
@@ -675,19 +676,22 @@ test('resume sends guidance verbatim in one labeled message, however awkward the
     const viaFile = index % 2 === 0;
     if (viaFile) await fs.writeFile(path.join(f.cwd, 'guidance with "quotes" and spaces.txt'), text);
     const result = viaFile ? await f.resume(undefined, '--guidance-file', 'guidance with "quotes" and spaces.txt') : await f.resume(text, '--guidance-stdin');
+    if (text.length > RESPONSE_INPUT_LIMIT) {
+      assert.equal(result.report.reason, 'guidance-too-long');
+      assert.deepEqual(mutations(await f.calls()), []);
+      continue;
+    }
     assert.equal(result.exitCode, 0, `${JSON.stringify(text.slice(0, 40))}: ${result.stderr}${result.text}`);
     assert.equal(result.report.outcome, 'resumed');
+    assert.equal(result.report.via, 'respond');
     assert.equal(result.report.guidance.bytes, Buffer.byteLength(text));
     assert.ok(!result.text.includes(text.slice(0, 30)) || text.length < 30, `the guidance is not echoed: ${JSON.stringify(text.slice(0, 40))}`);
     const calls = await f.calls();
-    assert.equal(countOf(calls, 'run resume'), 1);
-    assert.deepEqual(mutations(calls), ['run resume']);
-    const resume = calls.find(argv => verbOf(argv) === 'run resume');
-    assert.deepEqual(resume.slice(0, 5), ['coordinator', 'run', 'resume', 'run-1', '--input']);
-    assert.equal(resume[5], `${GUIDANCE_HEADER}\n${text}`, 'header line, then the guidance byte for byte');
-    assert.ok(!resume[5].startsWith('-'), 'the value can never be read as an option');
-    assert.equal(resume.length, 6);
-    assert.deepEqual(calls.map(argv => subcommand(argv).slice(0, 2).join(' ')), ['run show', 'run resume', 'run show']);
+    assert.equal(countOf(calls, 'run resume'), 0);
+    assert.deepEqual(mutations(calls), ['run respond']);
+    assert.deepEqual(sentRespond(calls), [['coordinator', 'run', 'respond', 'run-1', '--pause', PAUSE, `--input=${text}`]], 'the displayed pause is named and the guidance arrives byte for byte');
+    assert.ok(sentRespond(calls)[0][6].startsWith('--input='), 'the value can never be read as an option');
+    assert.deepEqual(calls.map(argv => subcommand(argv).slice(0, 2).join(' ')), ['run show', 'run respond', 'run show']);
   }
   await assert.rejects(fs.access(marker), 'no shell evaluated the guidance');
 });
@@ -702,8 +706,9 @@ test('resume reads guidance from a real stdin pipe', async t => {
   child.stdin.end(guidance);
   assert.equal(await exited, 0);
   assert.equal(JSON.parse(output).outcome, 'resumed');
-  const resume = (await f.calls()).find(argv => verbOf(argv) === 'run resume');
-  assert.equal(resume[5], `${GUIDANCE_HEADER}\n${guidance}`);
+  const calls = await f.calls();
+  assert.deepEqual(sentRespond(calls), [['coordinator', 'run', 'respond', 'run-1', '--pause', PAUSE, `--input=${guidance}`]]);
+  assert.equal(countOf(calls, 'run resume'), 0);
 });
 
 test('resume reports the same run after acceptance: identity, completed results and new status', async t => {
@@ -718,22 +723,26 @@ test('resume reports the same run after acceptance: identity, completed results 
   assert.deepEqual(report.completedResults, { before: 1, after: 1 });
   assert.equal(report.run.worktreePath, '/synthetic/worktrees/run-1/checkout');
   assert.equal(report.run.parentSessionId, 'ses_parent');
+  assert.equal(report.acknowledgement.pauseId, PAUSE);
   assert.match(report.note, /not running until it is admitted/);
   for (const secret of SECRETS) assert.ok(!result.text.includes(secret), secret);
 
-  // The follow-up read failing does not undo the acceptance; the answer to the resume itself is reported.
+  // The follow-up read failing does not undo the acceptance; the acknowledgement of the response itself is reported.
   await f.script({ ...f.scenario, 'run show run-1': [{ json: f.paused }, { stderr: 'Heimdall: Coordinator unavailable: read ECONNRESET\n' }] });
   await f.reset();
   const degraded = await f.resume('Pick option B.', '--guidance-stdin');
   assert.equal(degraded.report.outcome, 'resumed');
+  assert.equal(degraded.report.status, 'queued');
   assert.equal(degraded.report.confirmation.available, false);
-  assert.equal((await f.calls()).filter(argv => verbOf(argv) === 'run resume').length, 1);
+  const calls = await f.calls();
+  assert.equal(sentRespond(calls).length, 1);
+  assert.equal(countOf(calls, 'run resume'), 0);
 });
 
-test('a lost resume response is uncertain: one resume, read-only inspection, no retry', async t => {
+test('a lost guarded resume response is uncertain: one respond, read-only inspection, no retry and no unguarded resume', async t => {
   const f = await resumeScenario(t);
   for (const stderr of ['Heimdall: Coordinator unavailable: read ECONNRESET\n', 'Heimdall: Coordinator unavailable: Coordinator request timed out\n', 'Heimdall: Invalid coordinator JSON response\n', 'Heimdall: Something unexpected\n']) {
-    await f.script({ ...f.scenario, 'run resume run-1 *': { stderr }, 'run show run-1': [{ json: f.paused }, { json: f.queued }] });
+    await f.script({ ...f.scenario, 'run respond run-1 *': { stderr }, 'run show run-1': [{ json: f.paused }, { json: f.queued }] });
     await f.reset();
     const result = await f.resume('Owner says: go ahead.', '--guidance-stdin');
     assert.equal(result.exitCode, 1, stderr);
@@ -745,31 +754,37 @@ test('a lost resume response is uncertain: one resume, read-only inspection, no 
     assert.equal(result.report.before.version, 3);
     assert.equal(result.report.inspection.version, 4);
     const calls = await f.calls();
-    assertReadsAfter(calls, 'run resume');
-    assert.deepEqual(calls.map(argv => subcommand(argv).slice(0, 2).join(' ')), ['run show', 'run resume', 'run show']);
+    assertReadsAfter(calls, 'run respond');
+    assert.equal(countOf(calls, 'run resume'), 0);
+    assert.deepEqual(calls.map(argv => subcommand(argv).slice(0, 2).join(' ')), ['run show', 'run respond', 'run show']);
     assert.ok(!result.text.includes('go ahead'), 'the guidance is not echoed');
   }
-  await f.script({ ...f.scenario, 'run resume run-1 *': { stdout: 'accepted\n' } });
+  await f.script({ ...f.scenario, 'run respond run-1 *': { stdout: 'accepted\n' } });
   await f.reset();
   assert.equal((await f.resume('x', '--guidance-stdin')).report.outcome, 'uncertain');
-  assertReadsAfter(await f.calls(), 'run resume');
+  const calls = await f.calls();
+  assertReadsAfter(calls, 'run respond');
+  assert.equal(countOf(calls, 'run resume'), 0);
 });
 
-test('a resume that never left, or that the coordinator refused, is reported as such', async t => {
+test('a guarded resume that never left, or that the coordinator refused, is reported as such and nothing else is sent', async t => {
   const f = await resumeScenario(t);
-  await f.script({ ...f.scenario, 'run resume run-1 *': { stderr: 'Heimdall: Coordinator unavailable: connect ECONNREFUSED /x\n' } });
+  await f.script({ ...f.scenario, 'run respond run-1 *': { stderr: 'Heimdall: The coordinator at /x/coordinator.sock is unavailable: connect ECONNREFUSED /x/coordinator.sock. Nothing was sent.\n' } });
   await f.reset();
   let result = await f.resume('go', '--guidance-stdin');
   assert.equal(result.report.outcome, 'not-resumed');
-  assert.deepEqual((await f.calls()).map(argv => subcommand(argv).slice(0, 2).join(' ')), ['run show', 'run resume']);
+  assert.deepEqual((await f.calls()).map(argv => subcommand(argv).slice(0, 2).join(' ')), ['run show', 'run respond']);
 
-  const guard = 'Only a confirmed idle paused run may be resumed';
-  await f.script({ ...f.scenario, 'run resume run-1 *': { stderr: `Heimdall: ${guard}\n` } });
+  const refusal = 'Heimdall: The coordinator refused the response (409 pause-stale): This is not the current pause of the run. Nothing was recorded.\n';
+  await f.script({ ...f.scenario, 'run respond run-1 *': { stderr: refusal } });
   await f.reset();
   result = await f.resume('go', '--guidance-stdin');
   assert.equal(result.report.outcome, 'rejected');
-  assert.equal(result.report.message, guard);
-  assert.equal(countOf(await f.calls(), 'run resume'), 1);
+  assert.deepEqual(result.report.refusal, { status: 409, code: 'pause-stale' });
+  const calls = await f.calls();
+  assert.equal(sentRespond(calls).length, 1);
+  assert.equal(countOf(calls, 'run resume'), 0);
+  assert.deepEqual(calls.map(argv => subcommand(argv).slice(0, 2).join(' ')), ['run show', 'run respond']);
 });
 
 // --- Helper against an in-process coordinator --------------------------------------------------------------
@@ -1189,55 +1204,31 @@ test('a registration conflict reported by the coordinator is surfaced verbatim a
   assert.deepEqual(mutations(await fake.calls()), ['project add']);
 });
 
-test('resume through the real coordinator keeps the run, checkout, parent session and completed results', async t => {
+test('resume of a paused run without a pause identity is refused by the real coordinator record and changes nothing', async t => {
   const f = await coordinatorFixture(t);
   const paused = f.savePaused('run-paused');
   assert.equal(paused.status, 'paused');
   assert.equal(paused.capacityReserved, false);
-  const checkpoint = structuredClone(paused.checkpoint);
-  assert.equal(checkpoint.results.length, 1);
-  assert.ok(paused.binding);
   await fs.writeFile(path.join(f.linked, 'guidance.txt'), '--use the second approach\nand keep $(cwd) literal "quoted"\n');
-  const message = `${GUIDANCE_HEADER}\n--use the second approach\nand keep $(cwd) literal "quoted"\n`;
+  const before = f.state();
   await f.reset();
 
+  const shown = await runHelper(['snapshot', 'run-paused', '--cwd', f.linked, '--coordinator-config', f.configFile], f.env);
+  assert.notEqual(shown.report.run.wait?.kind, 'generic', 'this paused run carries no generic pause identity');
+  await f.reset();
   const result = await runHelper(['resume', 'run-paused', '--cwd', f.linked, '--guidance-file', 'guidance.txt', '--coordinator-config', f.configFile], f.env);
-  assert.equal(result.exitCode, 0, result.stderr + result.text);
-  const { report } = result;
-  assert.equal(report.outcome, 'resumed');
-  assert.equal(report.runId, 'run-paused');
-  assert.equal(report.status, 'queued');
-  assert.deepEqual(report.preserved, { runId: true, worktreePath: true, branch: true, parentSessionId: true });
-  assert.deepEqual(report.completedResults, { before: 1, after: 1 });
+  assert.equal(result.exitCode, 1, result.stderr + result.text);
+  assert.equal(result.report.outcome, 'refused');
+  assert.equal(result.report.reason, 'pause-identity-unavailable');
+  assert.deepEqual(result.report.mutationsAttempted, []);
+  assert.match(result.report.message, /matching versions/);
   for (const secret of [...SECRETS, 'PRIVATE-PLANNER-PROMPT']) assert.ok(!result.text.includes(secret), secret);
-
-  const after = f.service.store.getRun('run-paused');
-  assert.equal(after.id, paused.id);
-  assert.equal(after.worktreePath, paused.worktreePath);
-  assert.equal(after.branch, paused.branch);
-  assert.equal(after.parentSessionId, paused.parentSessionId);
-  assert.equal(after.status, 'queued');
-  assert.equal(after.launchAction, 'resume');
-  assert.equal(after.resolution, message, 'the labeled message arrives verbatim as the resolution');
-  assert.deepEqual(after.checkpoint, checkpoint, 'the checkpoint and its completed results are untouched');
-  assert.deepEqual(after.binding, paused.binding);
-  assert.equal(after.version, paused.version + 1);
-  assert.equal(f.service.store.listRuns().length, 1);
-  assert.equal(f.launches.length, 0);
-
   const calls = await f.calls();
-  assert.deepEqual(calls.map(argv => subcommand(argv).slice(0, 2).join(' ')), ['run show', 'run resume', 'run show']);
-  assert.equal(countOf(calls, 'run resume'), 1);
-  const resume = calls.find(argv => verbOf(argv) === 'run resume');
-  assert.equal(resume[5], message);
-
-  // The run is queued now, so a second resume is refused locally and sends nothing.
-  await f.reset();
-  const again = await runHelper(['resume', 'run-paused', '--cwd', f.linked, '--guidance-file', 'guidance.txt', '--coordinator-config', f.configFile], f.env);
-  assert.equal(again.report.outcome, 'not-resumable');
-  assert.equal(again.report.run.status, 'queued');
-  assertNoMutation(await f.calls());
-  assert.equal(f.service.store.getRun('run-paused').version, after.version);
+  assertNoMutation(calls);
+  assert.deepEqual(calls.map(subcommand), [['run', 'show', 'run-paused']]);
+  assert.deepEqual(f.state(), before, 'the coordinator state is untouched');
+  assert.equal(f.service.store.getRun('run-paused').version, paused.version);
+  assert.equal(f.service.store.getRun('run-paused').status, 'paused');
 });
 
 test('resume of runs that are not confirmed idle paused runs sends nothing, against the real coordinator', async t => {
@@ -1264,20 +1255,22 @@ test('resume of runs that are not confirmed idle paused runs sends nothing, agai
   assert.deepEqual(f.state(), before);
 });
 
-test('a guard rejection from the real coordinator is reported verbatim and nothing is retried', async t => {
+test('a guard rejection from the real coordinator for a guarded response is reported verbatim and nothing is retried or replaced', async t => {
   const f = await coordinatorFixture(t);
-  const paused = f.savePaused('run-busy');
+  const { run: paused } = f.saveWaiting('run-busy', { approval: false });
   f.observe({ idle: false, status: 'running' });
   await fs.writeFile(path.join(f.linked, 'guidance.txt'), 'Go ahead.');
   const before = f.state();
   await f.reset();
   const result = await runHelper(['resume', 'run-busy', '--cwd', f.linked, '--guidance-file', 'guidance.txt', '--coordinator-config', f.configFile], f.env);
-  assert.equal(result.exitCode, 1);
+  assert.equal(result.exitCode, 1, result.text);
   assert.equal(result.report.outcome, 'rejected');
-  assert.equal(result.report.message, 'Native parent and children must be confirmed idle before resume');
+  assert.equal(result.report.via, 'respond');
+  assert.equal(result.report.refusal.status >= 400, true);
   const calls = await f.calls();
-  assert.equal(countOf(calls, 'run resume'), 1);
-  assert.deepEqual(calls.map(argv => subcommand(argv).slice(0, 2).join(' ')), ['run show', 'run resume']);
+  assert.equal(countOf(calls, 'run resume'), 0, 'no unguarded resume after a refusal');
+  assert.equal(countOf(calls, 'run respond'), 1);
+  assert.deepEqual(calls.map(argv => subcommand(argv).slice(0, 2).join(' ')), ['run show', 'run respond']);
   assert.deepEqual(f.state(), before);
   assert.equal(f.service.store.getRun('run-busy').version, paused.version);
 });
@@ -1627,22 +1620,77 @@ test('resume refuses a run with an unresolved typed approval and never turns res
   }
 });
 
-test('resume continues after a superseded or consumed request through the labeled legacy resume, which the coordinator guards', async t => {
-  for (const wait of [approvalWait({ state: 'superseded', continuation: 'superseded', progress: 'superseded' }), null]) {
-    const f = await respondScenario(t, { wait });
-    const result = await f.resume('Ask again with the corrected plan.', '--guidance-stdin');
-    assert.equal(result.exitCode, 0, result.stderr + result.text);
-    assert.equal(result.report.outcome, 'resumed');
-    assert.equal(result.report.via, 'run resume');
-    const calls = await f.calls();
-    assert.deepEqual(mutations(calls), ['run resume']);
-    assert.equal(calls.find(argv => verbOf(argv) === 'run resume')[5], `${GUIDANCE_HEADER}\nAsk again with the corrected plan.`);
+const PAUSE_B = 'pau_fedcba9876543210fedcba9876543210';
+
+/** The helper read the run, refused, and the recorded argv holds one read and nothing that could carry the guidance anywhere. */
+function assertRefusedBeforeAnyMutation(result, calls, reason, guidance) {
+  assert.equal(result.exitCode, 1, result.text);
+  assert.equal(result.report.outcome, 'refused');
+  assert.equal(result.report.reason, reason);
+  assert.equal(result.report.ok, false);
+  assert.deepEqual(result.report.mutationsAttempted, []);
+  assertNoMutation(calls);
+  assert.deepEqual(calls.map(subcommand), [['run', 'show', 'run-1']]);
+  assert.equal(countOf(calls, 'run resume'), 0);
+  assert.equal(countOf(calls, 'run respond'), 0);
+  assert.ok(!JSON.stringify(calls).includes(guidance), 'no guidance was sent anywhere');
+  assert.ok(!result.text.includes(guidance), 'the guidance is not echoed');
+}
+
+test('resume refuses without a valid guarded pause identity: missing, null, superseded, unknown and malformed waits send nothing', async t => {
+  const guidance = 'Use the second approach; GUIDANCE-MARKER.';
+  const missing = (({ wait, ...rest }) => rest)(runRecord({ wait: genericWait() }));
+  const cases = [
+    ['no wait reported (an older coordinator)', missing, 'pause-identity-unavailable'],
+    ['a null wait', runRecord({ wait: null }), 'pause-identity-unavailable'],
+    ['a superseded request', runRecord({ wait: approvalWait({ state: 'superseded', continuation: 'superseded', progress: 'superseded' }) }), 'pause-identity-unavailable'],
+    ['an unknown wait kind', runRecord({ wait: { kind: 'mystery' } }), 'approval-pending'],
+    ['a wait that is not an object', runRecord({ wait: 'generic' }), 'approval-pending'],
+    ['a generic pause without an identity', runRecord({ wait: { kind: 'generic' } }), 'pause-identity-unavailable'],
+    ['a generic pause with a number as identity', runRecord({ wait: genericWait({ pauseId: 7 }) }), 'pause-identity-unavailable'],
+    ['a generic pause with an empty identity', runRecord({ wait: genericWait({ pauseId: '' }) }), 'pause-identity-unavailable'],
+    ['a generic pause with an identity that looks like an option', runRecord({ wait: genericWait({ pauseId: '--pause' }) }), 'pause-identity-unavailable'],
+    ['a generic pause with a spaced identity', runRecord({ wait: genericWait({ pauseId: 'pau one' }) }), 'pause-identity-unavailable'],
+  ];
+  for (const [name, record, reason] of cases) {
+    const f = await resumeScenario(t, { 'run show run-1': { json: record } });
+    const result = await f.resume(guidance, '--guidance-stdin');
+    assertRefusedBeforeAnyMutation(result, await f.calls(), reason, 'GUIDANCE-MARKER');
+    if (reason === 'pause-identity-unavailable') {
+      assert.match(result.report.message, /matching versions/, name);
+      assert.match(result.report.message, /guarded response/, name);
+      assert.match(result.report.message, /unguarded resume is not used/, name);
+    }
   }
-  // A resume that races a newly published request is refused by the coordinator and reported as a refusal, once.
-  const f = await respondScenario(t, { wait: null, extra: { 'run resume run-1 *': { stderr: 'Heimdall: An approval request is waiting for an owner decision; answer it with the approval decision operation instead of resuming\n' } } });
-  const raced = await f.resume('continue', '--guidance-stdin');
-  assert.equal(raced.report.outcome, 'rejected');
-  assert.equal(countOf(await f.calls(), 'run resume'), 1);
+});
+
+test('resume does not apply guidance written for one pause to another when the run advances after it was read', async t => {
+  // The first read shows pause A at version 1 with no usable identity; the run then advances to pause B at version 3.
+  // Both a resume and a respond are scripted to succeed, so any mutation would be recorded and reported as success.
+  const pauseA = runRecord({ version: 1, reason: 'Pause A' });
+  const pauseB = runRecord({ version: 3, reason: 'Pause B', wait: genericWait({ pauseId: PAUSE_B }) });
+  const f = await resumeScenario(t, { 'run show run-1': [{ json: pauseA }, { json: pauseB }] });
+  const result = await f.resume('Guidance written for pause A. GUIDANCE-MARKER', '--guidance-stdin');
+  assertRefusedBeforeAnyMutation(result, await f.calls(), 'pause-identity-unavailable', 'GUIDANCE-MARKER');
+  assert.equal(result.report.run.version, undefined, 'the report is of the pause that was read, not a later one');
+});
+
+test('resume with a guarded route sends the guidance only to the pause it read; a pause that advanced is left to the coordinator to refuse once', async t => {
+  const stale = 'Heimdall: The coordinator refused the response (409 pause-stale): This is not the current pause of the run. Nothing was recorded.\n';
+  const pauseA = runRecord({ version: 1, reason: 'Pause A', wait: genericWait() });
+  const pauseB = runRecord({ version: 3, reason: 'Pause B', wait: genericWait({ pauseId: PAUSE_B }) });
+  const unsupported = 'Heimdall: The coordinator at /x does not support this response operation (likely an older version). Nothing was sent to resume the run; Heimdall does not fall back to the unguarded "run resume".\n';
+  for (const [stderr, outcome] of [[stale, 'rejected'], [unsupported, 'rejected']]) {
+    const f = await resumeScenario(t, { 'run show run-1': [{ json: pauseA }, { json: pauseB }], 'run respond run-1 *': { stderr } });
+    const result = await f.resume('Guidance for pause A.', '--guidance-stdin');
+    assert.equal(result.report.outcome, outcome);
+    assert.deepEqual(result.report.mutationsAttempted, ['run respond']);
+    const calls = await f.calls();
+    assert.deepEqual(sentRespond(calls), [['coordinator', 'run', 'respond', 'run-1', '--pause', PAUSE, '--input=Guidance for pause A.']], 'exactly one attempt, aimed at the pause that was read');
+    assert.ok(!JSON.stringify(calls).includes(PAUSE_B), 'pause B is never targeted');
+    assert.equal(countOf(calls, 'run resume'), 0, 'no unguarded resume after a refusal');
+    assert.deepEqual(callNames(calls), ['run show', 'run respond']);
+  }
 });
 
 test('resume answers a generic pause through the guarded response for exactly that pause, never as an approval', async t => {
@@ -1682,23 +1730,19 @@ test('a guarded resume that fails is reported without falling back to the unguar
     assert.equal(result.report.outcome, outcome, stderr);
     const calls = await f.calls();
     assert.equal(countOf(calls, 'run respond'), 1);
+    assert.deepEqual(sentRespond(calls), [['coordinator', 'run', 'respond', 'run-1', '--pause', PAUSE, '--input=Use json.']]);
     assert.equal(countOf(calls, 'run resume'), 0, 'no fallback to the unguarded resume');
     if (outcome === 'uncertain') { assert.match(result.report.rule, /Do not repeat it/); assertReadsAfter(calls, 'run respond'); }
     else assert.deepEqual(callNames(calls), ['run show', 'run respond']);
   }
-  // A coordinator that does not report waits keeps the labeled legacy resume, whatever the length.
+  // Long guidance is refused locally, before anything is sent.
   const long = 'g'.repeat(RESPONSE_INPUT_LIMIT + 1);
   const guarded = await respondScenario(t, { wait: genericWait() });
   const refused = await guarded.resume(long, '--guidance-stdin');
   assert.equal(refused.report.outcome, 'refused');
   assert.equal(refused.report.reason, 'guidance-too-long');
   assert.deepEqual(callNames(await guarded.calls()), ['run show']);
-  const legacy = await respondScenario(t, { overrides: { wait: undefined } });
-  await legacy.script({ ...legacy.scenario, 'run show run-1': [{ json: (({ wait, ...rest }) => rest)(legacy.paused) }, { json: legacy.queued }] });
-  const resumed = await legacy.resume(long, '--guidance-stdin');
-  assert.equal(resumed.report.outcome, 'resumed');
-  assert.equal(resumed.report.via, 'run resume');
-  assert.deepEqual(mutations(await legacy.calls()), ['run resume']);
+  assert.deepEqual(refused.report.mutationsAttempted, []);
 });
 
 // --- respond against a real coordinator ----------------------------------------------------------------------
