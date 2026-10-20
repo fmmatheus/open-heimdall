@@ -638,6 +638,21 @@ test('an approval decision continues the same task with a fresh attempt and bind
   assert.equal((await f.submission(asked.attemptId, 'executor-result')).outcome, 'approval-required');
 });
 
+test('a new approval request withdraws the earlier decision, so a later plain resume is never presented as that approval', async t => {
+  const f = await fixture(t, [submits(plan('T1')), submits(approvalRequest()), submits(approvalRequest({ question: 'Approve the changed rename?' })), submits(completed())]);
+  assert.equal((await f.start()).status, 'paused');
+  // The owner approved the first request; the agent changed the reviewed material and asked again.
+  assert.equal((await f.resume(decisionEnvelope({ taskId: 'T1', index: 0 }))).status, 'paused');
+  const waiting = await f.state();
+  assert.equal(waiting.wait.taskId, 'T1');
+  assert.equal(waiting.approval, undefined, 'the earlier approval does not survive a fresh request');
+  assert.equal((await f.resume('Carry on')).status, 'completed');
+  const prompt = f.dispatches.at(-1).prompt;
+  assert.match(prompt, /Owner resolution: Carry on/);
+  assert.equal(prompt.includes('The owner approved exactly that scope'), false);
+  assert.equal(prompt.includes('Owner decision on your approval request'), false);
+});
+
 test('requested changes reach the child verbatim, forbid the gated action, and a corrected proposal asks again', async t => {
   const feedback = '  Do not rename it yet.\n\n"Quote": keep `src/index.ts` as is\n--decision approve --input=x\n\ttabbed  \n';
   let corrected;

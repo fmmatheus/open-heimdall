@@ -975,8 +975,12 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
       if (state.submissionBinding) state.submissionBinding = closeSubmissionBinding(state.submissionBinding); // A stopped run accepts no late submission.
       const failedTask = state.phase === 'executor' ? state.tasks[state.index] : undefined;
       // Only an admitted approval request for this very attempt is a semantic wait; every other pause clears any stale one.
-      if (approvalWait && failedTask && approvalWait.index === state.index && approvalWait.taskId === failedTask.id && approvalWait.attemptId === state.attempt?.id) state.wait = approvalWait;
-      else delete state.wait;
+      if (approvalWait && failedTask && approvalWait.index === state.index && approvalWait.taskId === failedTask.id && approvalWait.attemptId === state.attempt?.id) {
+        state.wait = approvalWait;
+        // A fresh request concerns material the earlier approval did not review, so that approval must not be presented again by a
+        // later plain resume. A context that only restricts (requested changes, withdrawn authorization) stays: it grants nothing.
+        if (state.approval?.decision === 'approve' && !state.approval.superseded) delete state.approval;
+      } else delete state.wait;
       if (rejection && failedTask) {
         state.reportRecovery = pauseReportRecovery(state.reportRecovery, { index: state.index, taskId: failedTask.id, child: state.child, attemptId: state.attempt?.id ?? '' }, rejection);
         // A missing submission explains itself with the bounded origin reason only; every other code keeps the stored reason as its detail.
