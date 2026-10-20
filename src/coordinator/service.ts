@@ -8,6 +8,8 @@ import { createManagedExecutor, credentialSourceFor } from './executor.js';
 import type { CredentialSource } from './executor.js';
 import { inspectProject, planManagedWorktree, resolveBaseCommit } from './worktrees.js';
 import { CoordinatorError } from './errors.js';
+import { PAUSE_RESPONSE_LIMIT } from './pause.js';
+import type { GenericWait } from './pause.js';
 import { checkRuntimeConflicts, snapshotSpecification } from './runtime.js';
 import { canonicalPlannedDirectory, positiveInteger } from './config.js';
 import { COORDINATOR_SERVICE_ID, COORDINATOR_STATUS_SCHEMA_VERSION, parseCoordinatorStatus } from './status.js';
@@ -36,7 +38,7 @@ const id = (value: string) => {
   return value;
 };
 /** `wait` is the bounded approval projection; the owner token, binding and specification never leave the coordinator. */
-function publicRun(run: RunRecord, wait: ApprovalWait | null) {
+function publicRun(run: RunRecord, wait: ApprovalWait | GenericWait | null) {
   const { ownerToken: _ownerToken, specification, binding: _binding, ...visible } = run;
   return { ...visible, settings: specification.settings, wait };
 }
@@ -54,6 +56,16 @@ function parseDecision(input: Record<string, unknown>): { decision: ApprovalDeci
   if (typeof feedback !== 'string' || !feedback.trim()) throw new Error('Requesting changes requires nonempty feedback');
   if (feedback.length > FEEDBACK_LIMIT || Buffer.byteLength(feedback) > 4 * FEEDBACK_LIMIT) throw new Error(`Feedback exceeds ${FEEDBACK_LIMIT} characters`);
   return { decision, feedback };
+}
+
+/** The owner's guidance for one pause: a closed set of fields, bounded, nonblank and delivered verbatim. */
+function parsePauseResponse(input: Record<string, unknown>): { pauseId: string; input: string } {
+  for (const key of Object.keys(input)) if (key !== 'pauseId' && key !== 'input') throw new Error(`Unknown response field: ${key}`);
+  const { pauseId, input: guidance } = input;
+  if (typeof pauseId !== 'string' || !pauseId.trim() || pauseId.length > 128) throw new Error('pauseId must be nonempty text of at most 128 characters');
+  if (typeof guidance !== 'string' || !guidance.trim()) throw new Error('input must be nonempty text');
+  if (guidance.length > PAUSE_RESPONSE_LIMIT || Buffer.byteLength(guidance) > 4 * PAUSE_RESPONSE_LIMIT) throw new Error(`input exceeds ${PAUSE_RESPONSE_LIMIT} characters`);
+  return { pauseId, input: guidance };
 }
 
 /** Full inspection of one approval request for resolving a lost response; the request text is bounded by its contract. */
@@ -160,7 +172,7 @@ async function startOwnedService(options: ServiceOptions, root: string, ownershi
   const store = new CoordinatorStore({ databasePath, globalConcurrency: configuration.globalConcurrency });
   const executor = options.executor ?? createManagedExecutor({ getRun: runId => store.getRun(runId)!, credentialSource: options.credentialSource ?? credentialSourceFor({ credentials: options.credentials, managed: options.lifecycle?.mode === 'managed' }) });
   const scheduler = new CoordinatorScheduler({ ...options.scheduler, store, executor, endpoint: configuration.endpoint });
-  const visible = (run: RunRecord) => publicRun(run, store.approvalWait(run));
+  const visible = (run: RunRecord) => publicRun(run, store.runWait(run));
   /** Measures the run's managed worktree with read-only git; fails without a result when it is not the reserved checkout. */
   const reviewRevision = (current: RunRecord): Promise<ApprovalRevision> => scheduler.reviewRevision(current);
   let ready = false;
@@ -296,6 +308,8 @@ async function startOwnedService(options: ServiceOptions, root: string, ownershi
       if (method === 'GET' && segments.length === 2 && run) { send(200, visible(run)); return; }
       if (method === 'POST' && segments.length === 3 && run) {
         if (segments[2] === 'reconcile') { send(200, visible(await scheduler.reconcile(run.id))); return; }
+        // Guarded: names the pause the owner saw, refuses typed approvals, and revalidates idle proof before recording.
+        if (segments[2] === 'respond') { const input = parsePauseResponse(await body(request)); send(200, await scheduler.respond(run.id, input.pauseId, input.input)); return; }
         if (segments[2] === 'resume') { send(200, visible(await scheduler.resume(run.id, text((await body(request)).input, 'input')))); return; }
       }
       if (segments.length >= 4 && segments[2] === 'approvals' && run) {

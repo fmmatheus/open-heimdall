@@ -2,9 +2,11 @@ import { createManagedWorktree, verifyManagedWorktree } from './worktrees.js';
 import { prepareRuntime } from './runtime.js';
 import { computeReviewRevision } from './review-revision.js';
 import { parseApprovalContext } from '../workflow/approval-context.js';
+import { CoordinatorError } from './errors.js';
+import { currentPauseId } from './pause.js';
 import { verifyRuntimeSnapshot } from './runtime-snapshot.js';
 import type { CoordinatorStore } from './store.js';
-import type { ApprovalRevision, ManagedExecutor, ProjectRecord, RunRecord } from './types.js';
+import type { ApprovalRevision, ManagedExecutor, PauseResponseAck, ProjectRecord, RunRecord } from './types.js';
 
 export interface SchedulerOptions {
   store: CoordinatorStore;
@@ -120,6 +122,25 @@ export class CoordinatorScheduler {
     if (!run || run.status !== 'paused' || run.capacityReserved) throw new Error('Only a confirmed idle paused run may be resumed');
     await this.proveIdle(run);
     return this.options.store.queueResume(id, input);
+  }
+
+  /**
+   * The guarded response to a generic pause: owner guidance that continues the run through the existing resume, for exactly
+   * the pause the owner saw. A stored acknowledgement is answered first, so an identical retry never depends on the run's
+   * current state. Otherwise a typed approval request refuses, the pause must still be the run's current one, and worktree,
+   * runtime snapshot and fresh native idle proof must hold before the response and the queued resume are recorded together.
+   */
+  async respond(id: string, pauseId: string, input: string): Promise<PauseResponseAck> {
+    const { store } = this.options;
+    const stored = store.getPauseResponse(id, pauseId);
+    if (stored) return store.recordPauseResponse(id, pauseId, input, store.getRun(id)?.version ?? 0);
+    store.assertNoUnresolvedApproval(id);
+    const run = store.getRun(id);
+    if (!run || run.status !== 'paused' || run.capacityReserved) throw new CoordinatorError(409, 'pause-not-ready', 'The run is not paused with released capacity; a response can only continue a confirmed idle pause');
+    if (currentPauseId(run) !== pauseId) throw new CoordinatorError(409, 'pause-stale', 'This pause is no longer the run\'s current pause');
+    try { await this.proveIdle(run); }
+    catch (error) { throw new CoordinatorError(409, 'pause-not-ready', error instanceof Error ? error.message : 'The run could not be proven idle'); }
+    return store.recordPauseResponse(id, pauseId, input, run.version);
   }
 
   /** Worktree, runtime and native idle proof for a paused, released run; throws unless every part holds. */

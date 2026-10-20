@@ -61,8 +61,14 @@ node dist/cli.js coordinator project list
 node dist/cli.js coordinator run submit PROJECT_ID --feature /path/to/feature.md
 node dist/cli.js coordinator run list
 node dist/cli.js coordinator run show RUN_ID
+node dist/cli.js coordinator run respond RUN_ID --request REQUEST_ID --decision approve
+node dist/cli.js coordinator run respond RUN_ID --request REQUEST_ID --decision request-changes --input FEEDBACK
+node dist/cli.js coordinator run respond RUN_ID --pause PAUSE_ID --input GUIDANCE
 node dist/cli.js coordinator events --after 0
 ```
+
+`run respond` answers an approval request or a generic pause; see
+[Approvals and owner responses](#approvals-and-owner-responses).
 
 All commands accept `--coordinator-config`; alternatively set
 `HEIMDALL_COORDINATOR_CONFIG`. Without either, configuration is read from
@@ -126,7 +132,9 @@ node dist/cli.js coordinator run resume RUN_ID --input "Owner's resolution"
 ```
 
 Reconciliation observes existing execution and never resubmits a prompt. Resume
-requires an idle paused checkpoint and an explicit resolution. Ambiguous child
+requires an idle paused checkpoint and an explicit resolution. It is the
+unguarded operation: it is refused while an approval request is unresolved, and
+`run respond` is the guarded way to answer a pause the owner has seen. Ambiguous child
 creation, unfinished checkpoints or stale local locks still need manual
 inspection; this version does not guess or repair them. Existing IPC endpoints
 are never replaced automatically.
@@ -172,6 +180,153 @@ for idle proof.
 
 Runs can also be watched and reviewed read-only from OpenChamber 2.1.0; see the
 [OpenChamber extension guide](openchamber-extension.md).
+
+## Approvals and owner responses
+
+A paused run reports what it waits for in `wait`, on `run show`, `run list` and the
+bounded `/run-list` page. There are two kinds, and a run never has both:
+
+- **Approval request** (`"kind": "approval"`). An executor task asked for an owner
+  decision with the typed `approval-required` result, which the coordinator
+  stored as a request. Only executor tasks can do this. The planner has no such
+  outcome; planner clarification, generic blocked and unfinished results, quota
+  and authentication stops and native permission or form waits stay on the
+  `blocked` path and are never converted into approval requests by reading their
+  text. `run show` carries the full bounded view (question, scope, completed
+  work, verification, artifact references, the reviewed revision, the retained
+  actions, `state`, `continuation` and `progress`); `run list` and `/run-list`
+  carry `requestId`, `state`, `continuation` and `taskId`.
+- **Generic pause** (`"kind": "generic"`). Any other paused checkpoint of a run
+  that is released and has no unresolved request, including every pause of a run
+  started by an older runtime. It carries `pauseId`, the recorded blocker as
+  `reason` (at most 1500 characters, with `reasonClipped`). The `pauseId` is a
+  digest of the run, its version, the parent session, phase, task index, attempt
+  and blocker, so a later pause of the same run has a different one. A superseded
+  request that left the run paused is still reported as an approval wait; use
+  `run resume` for that run.
+
+A generic `wait` exists only while the run is paused with its capacity released.
+An approval `wait` lasts while its request or decision is unresolved (including
+while the resume is queued or executing) and is `null` once the decision was
+consumed. A run with neither has `wait: null`. The run `status` values are unchanged: no public status
+was added. `coordinator status` is unchanged too, because its schema-1 document is
+validated strictly (an unknown field is rejected as an invalid response), so adding
+a field would make newer coordinators unreadable by the current CLI.
+
+### Syntax
+
+```sh
+heimdall coordinator run respond RUN_ID --request REQUEST_ID --decision approve
+heimdall coordinator run respond RUN_ID --request REQUEST_ID --decision request-changes --input FEEDBACK
+heimdall coordinator run respond RUN_ID --pause PAUSE_ID --input GUIDANCE
+```
+
+Every command also accepts `--coordinator-config FILE`. `--input=VALUE`,
+`--request=ID`, `--decision=VALUE` and `--pause=ID` are equivalent spellings. Use
+`--input=VALUE` when the text begins with `-` or `--`: the separate form
+(`--input VALUE`) refuses a value that begins with `--` rather than guess. The text
+is sent unchanged as data, so multiline text, quotes and option-like words are safe.
+Feedback and guidance are required to be non-blank and at most 8000 characters.
+
+Incomplete or ambiguous arguments fail with usage help before the configuration is
+read or any request is made, and the command never prompts: both `--request` and
+`--pause`; neither; `--request` without `--decision`; `--input` with `approve`;
+`request-changes` without `--input`; `--decision` with `--pause`; `--pause`
+without `--input`; and a missing or malformed `RUN_ID`.
+
+Both forms need the administrator key and call fixed coordinator routes:
+`POST /runs/RUN_ID/approvals/REQUEST_ID/decision` with `{"decision", "feedback"?}`
+and `POST /runs/RUN_ID/respond` with `{"pauseId", "input"}`. A run capability
+receives 403.
+
+### Output and exit statuses
+
+On success the coordinator's acknowledgement is printed as JSON on stdout and
+nothing is written to stderr. Diagnostics start with `Heimdall: ` and go to stderr
+with nothing on stdout.
+
+Approval decision acknowledgement:
+
+```json
+{ "runId": "RUN_ID", "requestId": "REQUEST_ID", "decision": "approve", "recordedAt": 1760000000000,
+  "retried": false, "continuation": "queued", "run": { "status": "queued", "version": 7 } }
+```
+
+Guarded response acknowledgement:
+
+```json
+{ "runId": "RUN_ID", "pauseId": "pau_0123456789abcdef0123456789abcdef", "recordedAt": 1760000000000,
+  "retried": false, "continuation": "queued", "run": { "status": "queued", "version": 7 } }
+```
+
+`retried` is `true` when an identical repeat of an earlier call received the stored
+acknowledgement; `run` and `continuation` describe the moment of recording. A
+refusal is `{"error": MESSAGE, "code": CODE}` with the HTTP status below, and the CLI
+prints it as `The coordinator refused the response (STATUS CODE): MESSAGE. Nothing was recorded.`
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | The response was recorded, or an identical retry returned the stored acknowledgement. |
+| 1 | Invalid arguments, or the response was refused or could not be sent, and nothing was recorded. This includes an unavailable coordinator, a refused key, a draining coordinator (503) and an older coordinator without the operation. |
+| 2 | Delivery is uncertain: the request was sent but no answer was read (connection dropped, timeout, unreadable answer). It may have been recorded. |
+
+After exit status 2 inspect with `heimdall coordinator run show RUN_ID` before doing
+anything else; do not retry blindly. An identical retry is answered from the stored
+record and is never applied twice, but inspection shows whether the response was
+recorded and how the run continues.
+
+| HTTP | Code | Meaning |
+| --- | --- | --- |
+| 404 | `approval-not-found` | The request does not exist for this run. An unknown run is a plain 404 `Run not found`. |
+| 409 | `approval-conflict` | The request was already answered with a different decision. |
+| 409 | `approval-stale` | The task moved on or the reviewed worktree changed; the request is superseded and nothing was recorded. |
+| 409 | `approval-pending` | The guarded response, or `run resume`, would bypass an unresolved request or an unconsumed decision. |
+| 409 | `pause-stale` | The `pauseId` is not the run's current pause (a later pause, or the run moved while it was verified). |
+| 409 | `pause-not-ready` | The run is not paused with released capacity, or worktree, runtime snapshot or native idle proof failed. |
+| 409 | `response-conflict` | This pause was already answered with a different input. |
+| 400 | none | Invalid body, such as a blank or oversized `input`. |
+| 503 | none | The coordinator is draining or starting. |
+
+A 404 whose message is `Unknown coordinator route` means an older coordinator
+that has no such operation. The CLI reports it as unsupported, states that nothing
+was sent to resume the run, and never falls back to `run resume`.
+
+### Continuation states
+
+An approval decision continues the same unfinished task automatically, as described in
+[Continuing after an owner decision](#continuing-after-an-owner-decision). The
+acknowledgement's `continuation` is `queued` when the run was paused, released and
+proven idle at that moment, or `pending` when the decision is recorded and waits for
+the scheduler's idle proof. `run show` then reports `progress`: `recorded`,
+`waiting-for-idle`, `queued` (waiting for capacity), `executing`, `consumed` or
+`superseded` (the reviewed worktree changed after the decision, so the agent
+keeps its work and must ask again). Approval does not advance the task or complete
+its gates; the agent still submits ordinary evidence-backed completion.
+
+A guarded response to a generic pause always queues the ordinary resume in the
+same transaction that records it (`continuation` is `queued`), so it has no pending
+state: it requires, at that moment, a paused run with released capacity, the current
+`pauseId`, no unresolved approval request, an intact managed worktree, an unchanged
+runtime snapshot and fresh complete native idle proof. The run keeps its ID, parent,
+branch, worktree, runtime snapshot, protocol, task index and accepted results. The
+guidance is delivered to the resumed task labelled as owner guidance
+(`Owner guidance (response to pause PAUSE_ID; this is not a typed approval ...)`); it
+is not an approval and grants nothing beyond the original task scope. A different
+input for the same pause conflicts, and a response meant for an earlier pause can
+only return its own stored acknowledgement, never act on a later pause.
+
+### Draining and older runs
+
+While the coordinator is draining every non-GET request, including a decision or a
+guarded response, is answered 503; run `respond` again after it restarts. Nothing is
+queued while admission is stopped. A coordinator is never started or restarted by
+these commands.
+
+A run started by an older runtime keeps that runtime: its immutable snapshot and
+protocol are verified, never rebuilt or upgraded, and it cannot produce a typed
+approval request because it has no `approval-required` outcome. Its pauses are generic.
+The guidance may tell the agent to continue the remaining authorized work, but the old
+runtime keeps its own behavior and may interpret it differently from a typed decision.
 
 ## Background service: start, stop and logs
 

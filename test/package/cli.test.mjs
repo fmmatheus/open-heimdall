@@ -100,6 +100,60 @@ describe('installed heimdall setup and doctor', () => {
   });
 
   for (const layout of ['consumer', 'global']) {
+    test(`${layout} install: coordinator run respond validates first, reports an older coordinator as unsupported and distinguishes uncertain delivery`, async t => {
+      const install = installs[layout];
+      const sandbox = path.join(work, `respond-${layout}`);
+      const home = path.join(sandbox, 'home');
+      const state = path.join(sandbox, 's');
+      await fs.mkdir(home, { recursive: true, mode: 0o700 });
+      await fs.mkdir(state, { recursive: true, mode: 0o700 });
+      await fs.writeFile(path.join(state, 'coordinator.key'), 'd'.repeat(64), { mode: 0o600 });
+      const configFile = path.join(sandbox, 'old.toml');
+      await fs.writeFile(configFile, '[coordinator]\nstateDirectory = "s"\n');
+      const env = { ...environment.env, HOME: home, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+      for (const name of ['HEIMDALL_CONFIG', 'HEIMDALL_COORDINATOR_CONFIG']) delete env[name];
+      const options = { cwd: sandbox, env };
+      const seen = [];
+      let mode = 'unsupported';
+      const server = http.createServer((request, response) => {
+        request.resume();
+        request.on('end', () => {
+          seen.push(`${request.method} ${request.url}`);
+          if (mode === 'drop') { request.socket.destroy(); return; }
+          response.writeHead(404, { 'content-type': 'application/json' });
+          response.end(JSON.stringify({ error: 'Unknown coordinator route' }));
+        });
+      });
+      await new Promise(resolve => server.listen(path.join(state, 'coordinator.sock'), resolve));
+      t.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
+
+      const help = await runBinary(install, ['coordinator', '--help'], options);
+      assert.equal(help.status, 0);
+      assert.match(help.stdout, /heimdall coordinator run respond RUN_ID --request REQUEST_ID --decision request-changes --input FEEDBACK/);
+      assert.match(help.stdout, /heimdall coordinator run respond RUN_ID --pause PAUSE_ID --input GUIDANCE/);
+
+      const invalid = await runBinary(install, ['coordinator', 'run', 'respond', 'run-1', '--request', 'apr_1', '--decision', 'approve', '--input', 'x', '--coordinator-config', configFile], options);
+      assert.equal(invalid.status, 1);
+      assert.equal(invalid.stdout, '');
+      assert.match(invalid.stderr, /Approving takes no --input/);
+      assert.deepEqual(seen, [], 'invalid arguments fail before any request');
+
+      const unsupported = await runBinary(install, ['coordinator', 'run', 'respond', 'run-1', '--pause', 'pau_1', '--input=--use the other database', '--coordinator-config', configFile], options);
+      assert.equal(unsupported.status, 1, unsupported.stderr);
+      assert.equal(unsupported.stdout, '');
+      assert.match(unsupported.stderr, /does not support this response operation/);
+      assert.deepEqual(seen, ['POST /runs/run-1/respond'], 'one guarded request and no fallback to run resume');
+
+      mode = 'drop';
+      const uncertain = await runBinary(install, ['coordinator', 'run', 'respond', 'run-1', '--request', 'apr_1', '--decision', 'approve', '--coordinator-config', configFile], options);
+      assert.equal(uncertain.status, 2, uncertain.stderr);
+      assert.match(uncertain.stderr, /may or may not have been recorded/);
+      assert.match(uncertain.stderr, /heimdall coordinator run show run-1/);
+      t.diagnostic(`${layout}: installed ${install.bin} run respond exit statuses 1, 1 and 2 as documented`);
+    });
+  }
+
+  for (const layout of ['consumer', 'global']) {
     test(`${layout} install: setup --no-input --json, offline doctor and doctor --connect`, async t => {
       const install = installs[layout];
       t.diagnostic(`environment: ${await toolVersions(environment.env)}`);

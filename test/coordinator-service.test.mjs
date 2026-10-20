@@ -814,3 +814,219 @@ test('requested changes are delivered verbatim, the superseded request cannot be
   assert.equal(context(p.store.getRun(p.run.id)).requestId, second.requestId);
   assert.equal(p.store.events().filter(event => event.type === 'approval.continuation_queued').length, 2);
 });
+
+// --- Guarded responses to generic pauses -------------------------------------------------------------------------------
+
+const GUIDANCE = 'Use the agreed approach.\nKeep "quotes" and --option-like text as data.';
+/**
+ * A run paused by a generic blocker the way an older runtime pauses: no structured protocol, a recorded older package version,
+ * one accepted result and an unfinished second task. `pinned: false` also removes the run's admitted runtime snapshot, as
+ * on a run submitted before snapshots existed.
+ */
+async function legacyPause(t, { reason = 'Blocked: which database should the migration target?', pinned = true } = {}) {
+  const f = await fixture(t);
+  const project = await f.client.request('POST', '/projects', { directory: f.project });
+  const queued = await f.client.request('POST', '/runs', { projectId: project.id, feature: 'Legacy feature' });
+  await f.service().scheduler.tick();
+  const run = await settled(f.service().store, queued.id);
+  const caller = { sessionID: run.parentSessionId, id: 'native_call', messageID: 'assistant_message', agent: 'adr-orchestrator' };
+  await f.client.request('POST', `/runs/${run.id}/binding`, caller, run.ownerToken);
+  const state = {
+    id: run.id, status: 'paused', adr: '.heimdall/feature.md', parent: run.parentSessionId, caller, branch: run.branch, baseline: '', index: 1,
+    tasks: [{ id: 'T1', title: 'First', brief: 'B', dependsOn: [], dod: ['gate'] }, { id: 'T2', title: 'Second', brief: 'B', dependsOn: ['T1'], dod: ['gate'] }],
+    results: [{ taskId: 'T1', status: 'completed', summary: 'Accepted first task', handoff: 'Go on', evidence: [], model: 'anthropic/x', sessionId: 'ses_old' }],
+    phase: 'executor', child: 'ses_child', settings: run.specification.settings, runtime: { packageVersion: '0.0.1', protocol: 'structured-v1' },
+    attempt: { id: 'attempt_old', phase: 'executor', index: 1, child: 'ses_child', status: 'rejected', startedAt: 1, model: 'anthropic/x' }, reason,
+  };
+  await f.client.request('PUT', `/runs/${run.id}/checkpoint`, state, run.ownerToken);
+  const store = f.service().store;
+  const sql = (statement, ...values) => {
+    const database = new DatabaseSync(path.join(f.state, 'coordinator.sqlite'));
+    try { return database.prepare(statement).all(...values); } finally { database.close(); }
+  };
+  if (!pinned) {
+    await f.service().close();
+    sql("UPDATE runs SET specification_json = json_remove(specification_json, '$.runtime') WHERE id = ?", run.id);
+    await f.restart();
+  }
+  f.observation({ idle: true, status: 'paused', reason });
+  // A restart retains the run for reconciliation; otherwise the scheduler observes it.
+  if (pinned) await f.service().scheduler.tick(); else await f.client.request('POST', `/runs/${run.id}/reconcile`, {});
+  const paused = f.service().store.getRun(run.id);
+  assert.equal(paused.status, 'paused');
+  assert.equal(paused.capacityReserved, false);
+  const wait = (await f.client.request('GET', `/runs/${run.id}`)).wait;
+  const respond = (body, id = run.id) => f.client.request('POST', `/runs/${id}/respond`, body);
+  return { f, run, state, wait, sql, respond, store: () => f.service().store, guidance: () => ({ pauseId: wait.pauseId, input: GUIDANCE }), project, caller };
+}
+const comparable = run => ({ checkpoint: run.checkpoint, runtime: run.specification.runtime ?? null, branch: run.branch, worktree: run.worktreePath, parent: run.parentSessionId, binding: run.binding });
+
+test('a generic pause is projected with a stable identity and continues through the guarded response with its run unchanged', async t => {
+  for (const pinned of [true, false]) {
+    const p = await legacyPause(t, { pinned });
+    assert.equal(p.wait.kind, 'generic');
+    assert.match(p.wait.pauseId, /^pau_[0-9a-f]{32}$/);
+    assert.equal(p.wait.reason, 'Blocked: which database should the migration target?');
+    assert.equal(p.wait.reasonClipped, false);
+    assert.equal((await p.f.client.request('GET', `/runs/${p.run.id}`)).wait.pauseId, p.wait.pauseId, 'the identity is stable between reads');
+    assert.equal((await p.f.client.request('GET', '/run-list')).runs.find(run => run.id === p.run.id).wait.pauseId, p.wait.pauseId);
+    const before = comparable(p.store().getRun(p.run.id));
+    assert.equal(before.checkpoint.protocol, undefined);
+    assert.equal(Boolean(before.runtime), pinned);
+
+    const ack = await p.respond(p.guidance());
+    assert.deepEqual({ ...ack, recordedAt: undefined }, {
+      runId: p.run.id, pauseId: p.wait.pauseId, recordedAt: undefined, retried: false, continuation: 'queued', run: { status: 'queued', version: p.store().getRun(p.run.id).version },
+    });
+    assert.equal(typeof ack.recordedAt, 'number');
+    const queued = p.store().getRun(p.run.id);
+    assert.equal(queued.status, 'queued');
+    assert.equal(queued.launchAction, 'resume');
+    assert.equal(queued.capacityReserved, false);
+    assert.match(queued.resolution, /^Owner guidance \(response to pause pau_[0-9a-f]{32}; this is not a typed approval/);
+    assert.ok(queued.resolution.endsWith('\n' + GUIDANCE), 'the guidance is delivered verbatim');
+    assert.deepEqual(comparable(queued), before, 'snapshot, protocol, task index, accepted results, branch and worktree are unchanged');
+    assert.equal(p.sql('SELECT count(*) AS n FROM run_responses WHERE run_id = ?', p.run.id)[0].n, 1);
+
+    // An identical retry returns the stored acknowledgement, also after the run advanced; a different input conflicts.
+    const retry = await p.respond(p.guidance());
+    assert.deepEqual(retry, { ...ack, retried: true });
+    await assert.rejects(p.respond({ pauseId: p.wait.pauseId, input: GUIDANCE + ' ' }), status(409, 'response-conflict'));
+    await p.f.service().scheduler.tick();
+    const running = await settled(p.store(), p.run.id);
+    await p.f.waitForLaunch(2);
+    assert.equal(p.f.launches.at(-1).resolution, queued.resolution);
+    assert.equal(p.f.launches.at(-1).id, p.run.id);
+    assert.equal(running.parentSessionId, p.run.parentSessionId);
+    assert.deepEqual(p.store().getRun(p.run.id).checkpoint, before.checkpoint, 'the checkpoint is untouched until the resumed runner saves its own');
+    assert.deepEqual(await p.respond(p.guidance()), { ...ack, retried: true }, 'a retry after the run advanced still returns the stored acknowledgement');
+    await assert.rejects(p.respond({ pauseId: p.wait.pauseId, input: 'Something else' }), status(409, 'response-conflict'));
+    assert.equal(p.sql('SELECT count(*) AS n FROM run_responses WHERE run_id = ?', p.run.id)[0].n, 1);
+    assert.equal(p.sql("SELECT count(*) AS n FROM events WHERE run_id = ? AND type = 'run.resume_queued'", p.run.id)[0].n, 1, 'exactly one resume was queued');
+    assert.ok(!JSON.stringify(p.sql('SELECT payload_json FROM events WHERE run_id = ?', p.run.id)).includes('agreed approach'), 'events never carry the guidance text');
+  }
+});
+
+test('a guarded response is refused for a stale pause, an active run, retained capacity or missing idle proof, recording nothing', async t => {
+  const p = await legacyPause(t);
+  const nothing = () => {
+    assert.equal(p.sql('SELECT count(*) AS n FROM run_responses').length, 1);
+    assert.equal(p.sql('SELECT count(*) AS n FROM run_responses')[0].n, 0, 'no response is recorded');
+    const run = p.store().getRun(p.run.id);
+    assert.equal(run.status, 'paused');
+    assert.equal(run.launchAction, 'start');
+  };
+  // Not the run's current pause.
+  await assert.rejects(p.respond({ pauseId: 'pau_' + '0'.repeat(32), input: GUIDANCE }), status(409, 'pause-stale'));
+  nothing();
+  // No fresh complete native idle proof.
+  p.f.observation({ idle: false, status: 'unknown' });
+  await assert.rejects(p.respond(p.guidance()), status(409, 'pause-not-ready'));
+  p.f.observation({ idle: true, status: 'unknown' });
+  await assert.rejects(p.respond(p.guidance()), status(409, 'pause-not-ready'));
+  p.f.observation({ idle: true, status: 'succeeded' });
+  await assert.rejects(p.respond(p.guidance()), status(409, 'pause-not-ready'));
+  nothing();
+  // A worktree that is not the reserved checkout.
+  await fs.rename(p.run.worktreePath, p.run.worktreePath + '.moved');
+  p.f.observation({ idle: true, status: 'paused' });
+  await assert.rejects(p.respond(p.guidance()), status(409, 'pause-not-ready'));
+  await fs.rename(p.run.worktreePath + '.moved', p.run.worktreePath);
+  nothing();
+  // Retained capacity.
+  p.sql('UPDATE runs SET capacity_reserved = 1 WHERE id = ?', p.run.id);
+  await assert.rejects(p.respond(p.guidance()), status(409, 'pause-not-ready'));
+  p.sql('UPDATE runs SET capacity_reserved = 0 WHERE id = ?', p.run.id);
+  // An active run.
+  p.sql("UPDATE runs SET status = 'running', capacity_reserved = 1 WHERE id = ?", p.run.id);
+  await assert.rejects(p.respond(p.guidance()), status(409, 'pause-not-ready'));
+  p.sql("UPDATE runs SET status = 'paused', capacity_reserved = 0 WHERE id = ?", p.run.id);
+  nothing();
+  // Invalid requests are 400 and unknown runs 404.
+  for (const body of [{}, { pauseId: p.wait.pauseId }, { input: GUIDANCE }, { pauseId: p.wait.pauseId, input: '   ' }, { pauseId: p.wait.pauseId, input: 5 }, { pauseId: '', input: GUIDANCE },
+    { pauseId: p.wait.pauseId, input: GUIDANCE, extra: 1 }, { pauseId: p.wait.pauseId, input: 'x'.repeat(8001) }]) {
+    await assert.rejects(p.respond(body), status(400), JSON.stringify(body).slice(0, 60));
+  }
+  await assert.rejects(p.respond(p.guidance(), 'missing-run'), status(404));
+  nothing();
+  // After every refusal the same pause still accepts the response.
+  assert.equal((await p.respond(p.guidance())).continuation, 'queued');
+});
+
+test('a response for an earlier pause cannot be applied to a later pause of the same run', async t => {
+  const p = await legacyPause(t);
+  const first = p.wait;
+  await p.respond(p.guidance());
+  await p.f.service().scheduler.tick();
+  const resumed = await settled(p.store(), p.run.id);
+  // The resumed attempt pauses again with another blocker.
+  const caller = { ...p.caller, id: 'native_call_2', messageID: 'assistant_message_2' };
+  await p.f.client.request('POST', `/runs/${p.run.id}/resume-binding`, caller, resumed.ownerToken);
+  const second = { ...p.state, caller, reason: 'Blocked again: which schema version?', attempt: { ...p.state.attempt, id: 'attempt_new' } };
+  await p.f.client.request('PUT', `/runs/${p.run.id}/checkpoint`, second, resumed.ownerToken);
+  p.f.observation({ idle: true, status: 'paused', reason: second.reason });
+  await p.f.waitForLaunch(2);
+  for (let turn = 0; turn < 200 && p.store().getRun(p.run.id).status !== 'paused'; turn++) { await p.f.service().scheduler.tick(); await new Promise(resolve => setTimeout(resolve, 5)); }
+  assert.equal(p.store().getRun(p.run.id).status, 'paused');
+  const later = (await p.f.client.request('GET', `/runs/${p.run.id}`)).wait;
+  assert.equal(later.kind, 'generic');
+  assert.notEqual(later.pauseId, first.pauseId);
+  assert.equal(later.reason, second.reason);
+  // The earlier identity only returns its own stored acknowledgement or conflicts; it never queues a second resume.
+  assert.equal((await p.respond({ pauseId: first.pauseId, input: GUIDANCE })).retried, true);
+  await assert.rejects(p.respond({ pauseId: first.pauseId, input: 'New guidance for the new pause' }), status(409, 'response-conflict'));
+  assert.equal(p.store().getRun(p.run.id).status, 'paused');
+  assert.equal((await p.respond({ pauseId: later.pauseId, input: 'Use schema 4' })).retried, false);
+  assert.equal(p.store().getRun(p.run.id).status, 'queued');
+});
+
+test('the guarded response is administrator only, survives a restart and is refused while draining', async t => {
+  const p = await legacyPause(t);
+  await assert.rejects(p.f.client.request('POST', `/runs/${p.run.id}/respond`, p.guidance(), p.run.ownerToken), status(403));
+  await assert.rejects(p.f.client.request('POST', `/runs/${p.run.id}/respond`, p.guidance(), 'wrong'), status(401));
+  assert.equal(p.sql('SELECT count(*) AS n FROM run_responses')[0].n, 0);
+  const ack = await p.respond(p.guidance());
+  await p.f.restart();
+  assert.deepEqual(await p.respond(p.guidance()), { ...ack, retried: true });
+  assert.equal(p.sql('SELECT count(*) AS n FROM run_responses')[0].n, 1);
+  assert.equal(p.sql("SELECT count(*) AS n FROM events WHERE type = 'run.resume_queued'")[0].n, 1);
+  // While draining nothing is recorded or queued, as for every other mutation; the stored acknowledgement remains unavailable too.
+  const q = await legacyPause(t);
+  await q.f.service().drain();
+  await assert.rejects(q.respond(q.guidance()), status(503));
+  assert.equal(q.sql('SELECT count(*) AS n FROM run_responses')[0].n, 0);
+  assert.equal(q.store().getRun(q.run.id).status, 'paused');
+  await q.f.close();
+});
+
+test('the guarded response refuses a typed approval wait while its request is pending or its decision is unconsumed', async t => {
+  const p = await published(t);
+  await p.pause({ idle: true });
+  const wait = (await p.f.client.request('GET', `/runs/${p.run.id}`)).wait;
+  assert.equal(wait.kind, 'approval', 'a typed request is never projected as a generic pause');
+  const respond = body => p.f.client.request('POST', `/runs/${p.run.id}/respond`, body);
+  // Whatever pause identity a client presents, a pending request refuses.
+  await assert.rejects(respond({ pauseId: 'pau_' + '1'.repeat(32), input: 'approve' }), status(409, 'approval-pending'));
+  await p.decide({ decision: 'request-changes', feedback: 'Revise it' });
+  assert.equal(p.store.getRun(p.run.id).status, 'queued', 'the decision queued its own continuation');
+  await assert.rejects(respond({ pauseId: 'pau_' + '1'.repeat(32), input: 'approve' }), status(409, 'approval-pending'));
+  p.sql("UPDATE approval_requests SET continuation = 'pending' WHERE request_id = ?", p.request.requestId);
+  await assert.rejects(respond({ pauseId: 'pau_' + '1'.repeat(32), input: 'approve' }), status(409, 'approval-pending'));
+  assert.equal(p.sql('SELECT count(*) AS n FROM run_responses')[0].n, 0);
+  assert.equal(p.sql("SELECT count(*) AS n FROM events WHERE type = 'run.response_recorded'")[0].n, 0);
+});
+
+test('an altered runtime snapshot refuses the guarded response; the snapshot is never rebuilt or upgraded', async t => {
+  const p = await legacyPause(t);
+  const root = path.join(path.dirname(p.run.worktreePath), 'runtime');
+  const marker = (await fs.readdir(root)).find(name => /marker|snapshot/i.test(name)) ?? (await fs.readdir(root)).find(name => name.startsWith('.'));
+  assert.ok(marker, 'the run owns a snapshot marker');
+  const before = comparable(p.store().getRun(p.run.id));
+  await fs.chmod(path.join(root, marker), 0o600);
+  await fs.rm(path.join(root, marker));
+  await assert.rejects(p.respond(p.guidance()), error => error.statusCode === 409 && error.code === 'pause-not-ready' && /Runtime snapshot refused/.test(error.message));
+  assert.equal(p.sql('SELECT count(*) AS n FROM run_responses')[0].n, 0);
+  assert.equal(p.store().getRun(p.run.id).status, 'paused');
+  assert.deepEqual(comparable(p.store().getRun(p.run.id)), before);
+  assert.deepEqual(await fs.readdir(root).then(names => names.includes(marker)), false, 'nothing recreated the marker');
+});

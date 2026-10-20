@@ -10,6 +10,8 @@ import { CoordinatorShutdownError } from './lifecycle.js';
 import type { ServiceOptions } from './service.js';
 import { loadCredentialFile } from './credentials.js';
 import { createOutputSanitizer, sanitizeProcessOutput } from './output.js';
+import { parseRespondArguments, sendResponse } from './respond.js';
+import type { RespondRequest } from './respond.js';
 
 const STATUS_DEADLINE_MS = 10000;
 
@@ -26,6 +28,9 @@ Usage:
   heimdall coordinator run list
   heimdall coordinator run show RUN_ID
   heimdall coordinator run resume RUN_ID --input RESOLUTION
+  heimdall coordinator run respond RUN_ID --request REQUEST_ID --decision approve
+  heimdall coordinator run respond RUN_ID --request REQUEST_ID --decision request-changes --input FEEDBACK
+  heimdall coordinator run respond RUN_ID --pause PAUSE_ID --input GUIDANCE
   heimdall coordinator run reconcile RUN_ID
   heimdall coordinator events [--after SEQUENCE]
   heimdall coordinator status [--json] [--coordinator-config FILE]
@@ -48,7 +53,26 @@ draining) and 1 with a diagnostic on stderr and nothing on stdout otherwise, for
 coordinator is unavailable, refuses the key, is an older version without status, or answers
 with an invalid response.
 
+run show and run list report what a paused run waits for in "wait": an approval request
+({"kind":"approval","requestId":...}) or a generic pause ({"kind":"generic","pauseId":...,"reason":...}).
+
+run respond answers exactly one wait through a guarded coordinator operation and never prompts:
+  --request REQUEST_ID --decision approve|request-changes   answer a typed approval request; request-changes
+                            requires --input FEEDBACK and approve takes none
+  --pause PAUSE_ID --input GUIDANCE   continue a generic pause with owner guidance (not an approval); it is
+                            refused while an approval request is pending or its decision is unconsumed
+  --input=VALUE, --request=ID, --decision=VALUE and --pause=ID also work. Use --input=VALUE for text that
+  begins with "-" or "--"; the value is passed unchanged as data (multiline text and quotes included).
+Incomplete or ambiguous arguments (both --request and --pause, a missing decision, feedback with approve,
+no feedback for request-changes) fail before any request is sent. On success the coordinator's JSON
+acknowledgement is printed on stdout; diagnostics go to stderr. Exit status: 0 when the response was
+recorded or an identical retry returned the stored acknowledgement; 1 when it was refused or invalid
+(nothing recorded, including an older coordinator without the operation and a draining coordinator); 2 when
+delivery is uncertain (the request may have been recorded): inspect with "run show" before doing anything else.
+run resume is the unguarded operation for older generic pauses and is refused while an approval is unresolved.
+
 Examples:
+  heimdall coordinator run respond RUN_ID --request REQUEST_ID --decision request-changes --input="--keep scope"
   heimdall coordinator status
   heimdall coordinator status --json --coordinator-config ./coordinator.toml
 `;
@@ -139,7 +163,7 @@ export async function coordinatorMain(args: string[], internals: CoordinatorMain
   const positional: string[] = [];
   const options = new Map<string, string>();
   let json = false;
-  const allowed = new Set(['--coordinator-config', '--project-config', '--limit', '--feature', '--base', '--input', '--after', '--env-file']);
+  const allowed = new Set(['--coordinator-config', '--project-config', '--limit', '--feature', '--base', '--input', '--after', '--env-file', '--request', '--decision', '--pause']);
   while (args.length) {
     const argument = args.shift()!;
     if (!argument.startsWith('-')) { positional.push(argument); continue; }
@@ -148,10 +172,13 @@ export async function coordinatorMain(args: string[], internals: CoordinatorMain
       json = true;
       continue;
     }
-    if (!allowed.has(argument) || options.has(argument)) throw new Error(`Unknown or repeated option: ${argument}`);
-    const value = args.shift();
-    if (!value || value.startsWith('--')) throw new Error(`${argument} requires a value`);
-    options.set(argument, value);
+    // `--option=value` carries the value inside one argument, so text that begins with "-" or "--" is still data.
+    const separator = argument.startsWith('--') ? argument.indexOf('=') : -1;
+    const name = separator > 0 ? argument.slice(0, separator) : argument;
+    if (!allowed.has(name) || options.has(name)) throw new Error(`Unknown or repeated option: ${name}`);
+    const value = separator > 0 ? argument.slice(separator + 1) : args.shift();
+    if (!value || (separator < 0 && value.startsWith('--'))) throw new Error(`${name} requires a value${name === '--input' ? ' (write --input=VALUE for text that begins with "--")' : ''}`);
+    options.set(name, value);
   }
   const [command, action, identifier] = positional;
   const check = (count: number, names: string[]) => {
@@ -160,6 +187,13 @@ export async function coordinatorMain(args: string[], internals: CoordinatorMain
     for (const name of options.keys()) if (name !== '--coordinator-config' && !names.includes(name)) throw new Error(`${name} does not apply to this command`);
   };
   if (json && command !== 'status') check(positional.length, []);
+  // Everything about a response is validated here, before the configuration is read or any request is made.
+  let response: RespondRequest | undefined;
+  if (command === 'run' && action === 'respond') {
+    if (positional.length > 3) throw new Error('Invalid coordinator arguments; see --help');
+    check(positional.length, ['--request', '--decision', '--pause', '--input']);
+    response = parseRespondArguments(identifier, options);
+  }
   const configurationFlag = options.get('--coordinator-config');
   // A native service definition passes the resolved default file and marks it as implicitly selected.
   const configuration = await loadCoordinatorConfiguration(configurationFlag, { implicitDefault: command === 'serve' && implicitDefaultMarkerApplies(configurationFlag) });
@@ -226,6 +260,8 @@ export async function coordinatorMain(args: string[], internals: CoordinatorMain
     const input = options.get('--input');
     if (!input) throw new Error('run resume requires --input RESOLUTION');
     result = await client.request('POST', `/runs/${encodeURIComponent(identifier)}/resume`, { input });
+  } else if (response) {
+    result = await sendResponse(client, configuration.endpoint, response);
   } else if (command === 'events') {
     check(1, ['--after']);
     const after = Number(options.get('--after') ?? 0);

@@ -6,7 +6,13 @@ export type CoordinatorErrorCode =
   | 'approval-stale'
   /** A generic operation would bypass an unresolved approval request or an unconsumed owner decision. */
   | 'approval-pending'
-  | 'approval-not-found';
+  | 'approval-not-found'
+  /** A guarded response names a pause that is no longer the run's current one, or the run moved while it was verified. */
+  | 'pause-stale'
+  /** The run is not a released paused run whose worktree, runtime and native sessions are proven idle. Nothing was recorded. */
+  | 'pause-not-ready'
+  /** The pause was already answered with a different response. */
+  | 'response-conflict';
 
 /**
  * A refusal that clients are meant to distinguish. The service maps it to its status and `code`; any other error keeps the

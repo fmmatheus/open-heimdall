@@ -86,5 +86,7 @@ async function main(args: string[]): Promise<void> {
 
 main(process.argv.slice(2)).catch((error: unknown) => {
   process.stderr.write(`Heimdall: ${error instanceof Error ? error.message : 'Command failed'}\n`);
-  process.exitCode = 1;
+  // A command may report its own status (for example uncertain delivery of an owner response); every other failure is 1.
+  const status = (error as { exitCode?: unknown } | null)?.exitCode;
+  process.exitCode = typeof status === 'number' && Number.isInteger(status) && status > 0 && status < 256 ? status : 1;
 });

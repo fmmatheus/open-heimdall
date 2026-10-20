@@ -1,3 +1,4 @@
+import type { GenericWait } from './pause.js';
 import type { RunnerSettings, RunState, RuntimeIdentity, WorkflowAttempt } from '../workflow/types.js';
 
 export interface ProjectRecord {
@@ -167,6 +168,28 @@ export interface ApprovalWait {
   createdAt: number;
   clipped: Record<'question' | 'scope' | 'completedWork' | 'verification' | 'artifacts' | 'onApprove' | 'onRequestChanges' | 'taskTitle' | 'feedback', boolean>;
 }
+
+/**
+ * The acknowledgement of a recorded guarded response to a generic pause. `retried` is false when this call recorded the
+ * response and true when an identical retry received the stored acknowledgement. `run` describes the moment of recording.
+ */
+export interface PauseResponseAck {
+  runId: string;
+  pauseId: string;
+  recordedAt: number;
+  retried: boolean;
+  continuation: 'queued';
+  run: { status: RunStatus; version: number };
+}
+/** Bounded wait summary of a run list entry. A typed request is summarised by identity and state; `run show` has the full view. */
+export interface ApprovalWaitSummary {
+  kind: 'approval';
+  requestId: string;
+  state: ApprovalState;
+  continuation: ApprovalContinuation;
+  taskId: string;
+}
+export type RunWaitSummary = ApprovalWaitSummary | GenericWait;
 
 export interface WorktreePlan { namespacePath: string; worktreePath: string; branch: string }
 export interface ProjectIdentity { directory: string; commonGitDirectory: string }

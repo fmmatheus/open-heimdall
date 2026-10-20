@@ -16,8 +16,10 @@ import { parseApprovalContext, renderApprovalContext, supersedeApprovalContext }
 import { CoordinatorError } from './errors.js';
 import type {
   ApprovalAck, ApprovalContinuation, ApprovalDecision, ApprovalProgress, ApprovalRecord, ApprovalRequestContent, ApprovalRevision, ApprovalState, ApprovalWait,
-  CoordinatorEvent, ProjectRecord, Receipt, RunRecord, RunStatus, StartBinding,
+  CoordinatorEvent, PauseResponseAck, ProjectRecord, Receipt, RunRecord, RunStatus, RunWaitSummary, StartBinding,
 } from './types.js';
+import { clipText, currentPauseId, genericWaitOf, labelledGuidance, pauseIdFor, PAUSE_REASON_IDENTITY_BYTES, PAUSE_REASON_LIMIT } from './pause.js';
+import type { GenericWait } from './pause.js';
 import { RUN_LIST_FEATURE_HEAD, RUN_LIST_MAX_BYTES, RUN_LIST_PAGE_SIZE } from './run-list.js';
 import type { RunListEntry, RunListPage } from './run-list.js';
 
@@ -115,6 +117,13 @@ function clip(value: string, limit: number): { text: string; clipped: boolean } 
   const last = value.charCodeAt(end - 1);
   if (last >= 0xd800 && last <= 0xdbff) end -= 1;
   return { text: value.slice(0, end), clipped: true };
+}
+/** Whether a run's latest request is still part of what it is waiting for, or only history. */
+function approvalShown(request: Pick<ApprovalRecord, 'state' | 'continuation'>, status: RunStatus): boolean {
+  if (request.state === 'answered' && request.continuation === 'consumed') return false;
+  if (request.state === 'superseded' && status !== 'paused') return false;
+  if (request.continuation === 'superseded' && (status === 'succeeded' || status === 'failed')) return false;
+  return true;
 }
 function sameBinding(left: StartBinding, right: StartBinding): boolean {
   return left.sessionID === right.sessionID && left.id === right.id && left.messageID === right.messageID && left.agent === right.agent;
@@ -373,7 +382,15 @@ export class CoordinatorStore {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > RUN_LIST_PAGE_SIZE) throw new Error('Invalid run list page size');
     const fence = through ?? Number(this.db.prepare('SELECT coalesce(max(rowid), 0) AS cursor FROM runs').get()!.cursor);
     const total = Number(this.db.prepare('SELECT count(*) AS count FROM runs WHERE rowid <= ?').get(fence)!.count);
-    const rows = this.db.prepare(`SELECT rowid AS cursor, id, project_id, worktree_path, status, created_at, updated_at,
+    const paused = `status = 'paused' AND capacity_reserved = 0 AND json_extract(checkpoint_json, '$.status') = 'paused'`;
+    const rows = this.db.prepare(`SELECT rowid AS cursor, id, project_id, worktree_path, status, created_at, updated_at, version,
+      CASE WHEN ${paused} THEN 1 ELSE 0 END AS generic_candidate,
+      CASE WHEN ${paused} THEN substr(CAST(json_extract(checkpoint_json, '$.parent') AS BLOB), 1, 512) END AS pause_parent,
+      CASE WHEN ${paused} THEN json_extract(checkpoint_json, '$.phase') END AS pause_phase,
+      CASE WHEN ${paused} AND json_type(checkpoint_json, '$.index') = 'integer' THEN json_extract(checkpoint_json, '$.index') END AS pause_index,
+      CASE WHEN ${paused} THEN substr(CAST(json_extract(checkpoint_json, '$.attempt.id') AS BLOB), 1, 512) END AS pause_attempt,
+      CASE WHEN ${paused} THEN substr(CAST(json_extract(checkpoint_json, '$.reason') AS BLOB), 1, ${PAUSE_REASON_IDENTITY_BYTES}) END AS pause_reason,
+      CASE WHEN ${paused} THEN length(CAST(json_extract(checkpoint_json, '$.reason') AS BLOB)) END AS pause_reason_bytes,
       substr(CAST(feature AS BLOB), 1, ? * 4) AS feature_head,
       CASE json_extract(checkpoint_json, '$.phase') WHEN 'planner' THEN 'planner' WHEN 'executor' THEN 'executor' END AS phase,
       coalesce(json_array_length(checkpoint_json, '$.tasks'), 0) AS task_count,
@@ -410,6 +427,7 @@ export class CoordinatorStore {
           currentTask: row.phase === 'executor' && row.status !== 'succeeded' && row.task_index !== null
             ? { id: row.task_id === null ? `task-${Number(row.task_index) + 1}` : head(row.task_id!, 121), title: row.task_title === null ? '' : head(row.task_title!, 201) } : null,
         },
+        wait: this.listWait(row, head),
       };
       const size = Buffer.byteLength(JSON.stringify(entry)) + 1;
       if (bytes + size > RUN_LIST_MAX_BYTES) {
@@ -422,6 +440,24 @@ export class CoordinatorStore {
     }
     if (this.db.prepare('SELECT 1 FROM runs WHERE rowid > ? AND rowid <= ? LIMIT 1').get(cursor, fence)) page.nextCursor = cursor;
     return page;
+  }
+  /** The bounded wait summary of one list row: the current typed request, else a generic pause, else null. */
+  private listWait(row: Row, head: (value: SQLOutputValue, length: number) => string): RunWaitSummary | null {
+    const status = row.status as RunStatus;
+    const request = this.db.prepare('SELECT request_id, state, continuation, task_id FROM approval_requests WHERE run_id = ? ORDER BY rowid DESC LIMIT 1').get(row.id!);
+    if (request && approvalShown({ state: request.state as ApprovalState, continuation: request.continuation as ApprovalContinuation }, status)) {
+      return { kind: 'approval', requestId: String(request.request_id), state: request.state as ApprovalState, continuation: request.continuation as ApprovalContinuation, taskId: head(request.task_id!, 121) };
+    }
+    if (row.generic_candidate !== 1) return null;
+    const bytes = (value: SQLOutputValue): Uint8Array | null => value === null ? null : Buffer.from(value as Uint8Array);
+    const reasonHead = bytes(row.pause_reason) ?? new Uint8Array();
+    const reasonBytes = row.pause_reason_bytes === null ? 0 : Number(row.pause_reason_bytes);
+    const pauseId = pauseIdFor({
+      runId: String(row.id), version: Number(row.version), parent: bytes(row.pause_parent), phase: typeof row.pause_phase === 'string' ? row.pause_phase : null,
+      index: row.pause_index === null ? null : Number(row.pause_index), attemptId: bytes(row.pause_attempt), reasonHead, reasonBytes,
+    });
+    const shown = clipText(Buffer.from(reasonHead).toString('utf8'), PAUSE_REASON_LIMIT);
+    return { kind: 'generic', pauseId, reason: shown.text, reasonClipped: shown.clipped || reasonBytes > reasonHead.length };
   }
   getRun(id: string): RunRecord | null {
     const row = this.db.prepare('SELECT * FROM runs WHERE id = ?').get(id);
@@ -688,11 +724,53 @@ export class CoordinatorStore {
       this.assertNoUnresolvedApproval(id);
       const run = this.requireRun(id);
       if (run.status !== 'paused' || run.capacityReserved || !run.checkpoint || !run.binding) throw new Error('Resume requires a released paused run with a bound checkpoint');
-      this.db.prepare("UPDATE runs SET status = 'queued', owner_token = NULL, prompt_message_id = ?, launch_action = 'resume', resolution = ?, resume_binding_json = NULL, launch_intent = 0, reason = NULL, queue_sequence = ?, version = version + 1, updated_at = ? WHERE id = ?")
-        .run('msg_' + randomUUID(), input, this.nextQueueSequence(), Date.now(), id);
-      const queued = this.requireRun(id);
-      this.event('run.resume_queued', queued, null, { version: queued.version, messageID: queued.promptMessageId });
-      return queued;
+      return this.queueResolution(id, input);
+    });
+  }
+
+  /** Queues the existing resume admission of a released paused run. The caller holds the transaction and has validated the run. */
+  private queueResolution(id: string, resolution: string): RunRecord {
+    this.db.prepare("UPDATE runs SET status = 'queued', owner_token = NULL, prompt_message_id = ?, launch_action = 'resume', resolution = ?, resume_binding_json = NULL, launch_intent = 0, reason = NULL, queue_sequence = ?, version = version + 1, updated_at = ? WHERE id = ?")
+      .run('msg_' + randomUUID(), resolution, this.nextQueueSequence(), Date.now(), id);
+    const queued = this.requireRun(id);
+    this.event('run.resume_queued', queued, null, { version: queued.version, messageID: queued.promptMessageId });
+    return queued;
+  }
+
+  // --- Guarded responses to generic pauses --------------------------------------------------------------------------------
+
+  /** The stored acknowledgement of a guarded response to this pause, with the input it was recorded with. */
+  getPauseResponse(runId: string, pauseId: string): { input: string; ack: PauseResponseAck } | null {
+    const row = this.db.prepare('SELECT input, ack_json FROM run_responses WHERE run_id = ? AND pause_id = ?').get(runId, pauseId);
+    return row ? { input: String(row.input), ack: JSON.parse(String(row.ack_json)) as PauseResponseAck } : null;
+  }
+
+  /**
+   * Records owner guidance for one generic pause and queues the existing resume with it, in one transaction. The operation's
+   * identity is the run and the pause: an identical retry returns the stored acknowledgement (also after the run advanced),
+   * a different input for the same pause conflicts, and a pause that is no longer the run's current one is stale. The caller
+   * proved worktree, runtime and native idle at `expectedVersion`; any other version, an unresolved typed request or a run
+   * that is not paused and released refuses without changing anything.
+   */
+  recordPauseResponse(runId: string, pauseId: string, input: string, expectedVersion: number): PauseResponseAck {
+    nonempty(input, 'Response input');
+    if (parseApprovalContext(input)) throw new Error('A response cannot be an approval continuation');
+    return this.transaction(() => {
+      const stored = this.getPauseResponse(runId, pauseId);
+      if (stored) {
+        if (stored.input === input) return { ...stored.ack, retried: true };
+        throw new CoordinatorError(409, 'response-conflict', 'This pause was already answered with a different response');
+      }
+      this.assertNoUnresolvedApproval(runId);
+      const run = this.requireRun(runId);
+      if (run.status !== 'paused' || run.capacityReserved || !run.checkpoint || !run.binding) throw new CoordinatorError(409, 'pause-not-ready', 'Only a released paused run on a bound checkpoint accepts a response');
+      if (currentPauseId(run) !== pauseId) throw new CoordinatorError(409, 'pause-stale', 'This pause is no longer the run\'s current pause');
+      if (run.version !== expectedVersion) throw new CoordinatorError(409, 'pause-stale', 'The run changed while its idle state was being verified');
+      const queued = this.queueResolution(runId, labelledGuidance(pauseId, input));
+      const ack: PauseResponseAck = { runId, pauseId, recordedAt: Date.now(), retried: false, continuation: 'queued', run: { status: queued.status, version: queued.version } };
+      this.db.prepare('INSERT INTO run_responses(run_id, pause_id, input, ack_json, created_at) VALUES (?, ?, ?, ?, ?)').run(runId, pauseId, input, serialize(ack), ack.recordedAt);
+      this.event('run.response_recorded', queued, null, { pauseId, inputLength: input.length, version: queued.version, messageID: queued.promptMessageId });
+      return ack;
     });
   }
 
@@ -934,16 +1012,18 @@ export class CoordinatorStore {
     }
   }
 
+  /** What the run is waiting for: its current typed request, else a generic pause, else nothing. Bounded in both cases. */
+  runWait(run: RunRecord): ApprovalWait | GenericWait | null {
+    return this.approvalWait(run) ?? genericWaitOf(run);
+  }
+
   /**
    * The bounded projection of a run's current request, or null. An answered request whose continuation was consumed is
    * history, and a superseded one is shown only while the run is still paused on it.
    */
   approvalWait(run: RunRecord): ApprovalWait | null {
     const request = this.latestApproval(run.id);
-    if (!request) return null;
-    if (request.state === 'answered' && request.continuation === 'consumed') return null;
-    if (request.state === 'superseded' && run.status !== 'paused') return null;
-    if (request.continuation === 'superseded' && (run.status === 'succeeded' || run.status === 'failed')) return null;
+    if (!request || !approvalShown(request, run.status)) return null;
     const task = run.checkpoint?.tasks[request.taskIndex];
     const clipped = { question: false, scope: false, completedWork: false, verification: false, artifacts: false, onApprove: false, onRequestChanges: false, taskTitle: false, feedback: false };
     const text = (name: keyof typeof clipped, value: string, limit: number): string => {
