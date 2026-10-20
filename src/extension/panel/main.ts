@@ -11,6 +11,7 @@ import {
   mountTabs,
   mountTextField,
 } from '@openchamber/sdk/ui';
+import { mountCardControls } from './card-controls.js';
 import { createPanelClient } from './client.js';
 import { createNavigation, sessionTargets } from './navigation.js';
 import type { HeimdallProjectRef, NavigationView } from './navigation.js';
@@ -459,39 +460,17 @@ function mountPanel(): void {
     box.append(info, controls);
     container.append(box);
 
-    const fieldSlot = node('div');
-    fieldSlot.dataset.cardField = 'true';
-    const actions = node('div', 'hm-actions');
-    controls.append(fieldSlot, actions);
-    const hint = node('p', 'hm-meta');
-    controls.append(hint);
+    const controlsHandle = mountCardControls({
+      ui: { mountButton, mountTextField, element: tag => node(tag) },
+      store, detail, drafts, container: controls,
+      repaint: () => paintCard(store.getState()),
+    });
+    detailHandles.push(controlsHandle);
     let cardBadge: { dispose: () => void } | null = null;
     const cardHandles: Array<{ dispose: () => void }> = [];
-    const field = mountTextField(fieldSlot, {
-      label: '', value: drafts.get(first.key) ?? '', multiline: true, rows: 4,
-      onChange: value => { drafts.set(first.key, value); field.update({ value }); paintCard(store.getState()); },
-    });
-    detailHandles.push(field);
-    const slots = { approve: node('span'), changes: node('span'), respond: node('span') };
-    actions.append(slots.approve, slots.changes, slots.respond);
-    const draft = (): string => drafts.get(first.key) ?? '';
-    const finished = (outcome: Promise<string>): void => { void outcome.then(result => { if (result === 'recorded') { drafts.delete(first.key); field.update({ value: '' }); } }); };
-    const approve = mountButton(slots.approve, {
-      label: 'Approve and continue', variant: 'default', size: 'sm',
-      onClick: () => { if (wait.kind === 'approval') finished(store.decideApproval(detail.id, wait.requestId, 'approve')); },
-    });
-    const changes = mountButton(slots.changes, {
-      label: 'Request changes', variant: 'outline', size: 'sm',
-      onClick: () => { if (wait.kind === 'approval') finished(store.decideApproval(detail.id, wait.requestId, 'request-changes', draft())); },
-    });
-    const respond = mountButton(slots.respond, {
-      label: 'Respond and continue', variant: 'default', size: 'sm',
-      onClick: () => { if (wait.kind === 'generic') finished(store.respondToPause(detail.id, wait.pauseId, draft())); },
-    });
-    detailHandles.push(approve, changes, respond);
 
     function paintCard(state: PanelState): void {
-      const view = waitCard(detail, state);
+      const view = controlsHandle.paint(state);
       if (view === null) return;
       cardBadge?.dispose();
       cardBadge = null;
@@ -534,28 +513,13 @@ function mountPanel(): void {
       }
       if (view.revision) body.push(node('p', 'hm-meta', `Reviewed revision ${view.revision}`));
       if (view.clippedNote) body.push(node('p', 'hm-meta', view.clippedNote));
+      if (view.fullRequest?.status) { const loading = node('p', 'hm-text', view.fullRequest.status); loading.setAttribute('role', 'status'); body.push(loading); }
       if (view.status) { const status = node('p', 'hm-text', view.status); status.setAttribute('role', 'status'); body.push(status); }
       const artifactNote = feedbackNode('card');
       body.push(artifactNote);
       if (view.notice) { const notice = node('p', 'hm-text', view.notice); notice.setAttribute('role', 'status'); notice.setAttribute('aria-live', 'assertive'); body.push(notice); }
       info.replaceChildren(...body);
       cardBadge = badgeHandle;
-
-      const controlsView = view.controls;
-      controls.hidden = controlsView === null;
-      if (controlsView === null) return;
-      const decide = controlsView.kind === 'decide';
-      slots.approve.hidden = !decide;
-      slots.changes.hidden = !decide;
-      slots.respond.hidden = decide;
-      field.update({ label: decide ? controlsView.feedbackLabel : controlsView.inputLabel, disabled: view.inFlight, value: draft() });
-      hint.textContent = decide ? controlsView.feedbackHint : controlsView.inputHint;
-      if (decide) {
-        approve.update({ label: controlsView.approve.label, disabled: controlsView.approve.disabled });
-        changes.update({ label: controlsView.requestChanges.label, disabled: controlsView.requestChanges.disabled || !canRequestChanges(draft()) });
-      } else {
-        respond.update({ label: controlsView.respond.label, disabled: controlsView.respond.disabled || !canRespond(draft()) });
-      }
     }
     detailHandles.push({ dispose: () => { cardBadge?.dispose(); cardBadge = null; for (const handle of cardHandles.splice(0)) handle.dispose(); } });
     cardPainter = paintCard;
@@ -989,7 +953,7 @@ function mountPanel(): void {
       updatedPainter?.();
       reviewPainter?.(state);
       // The approval card follows the owner's action state and the connection without a redraw.
-      const cardKey = JSON.stringify([state.action, state.connection, state.stale]);
+      const cardKey = JSON.stringify([state.action, state.connection, state.stale, state.approvalDetails]);
       if (cardPainter !== null && cardKey !== paintedCard) { paintedCard = cardKey; cardPainter(state); }
       // Text is rebuilt only when the on-demand content changed, not on every poll.
       if (state.content !== paintedContent) {

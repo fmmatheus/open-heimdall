@@ -1,4 +1,5 @@
 import { APPROVAL_FULL_LIMITS, APPROVAL_LIMITS, CONTENT_LIMITS, MATCH_LIMITS, REVIEW_LIMITS, RUN_STATUSES } from '../shared/protocol.js';
+import type { ReviewedBinding } from '../shared/approval-digest.js';
 import type {
   ApprovalDecisionKind, ApprovalDecisionResponse, ApprovalRequestResponse, BlockerContentResponse, PauseResponseResponse, ChangeFeed, DirectoryMatch, ProjectsResponse, ReviewFileResponse, ReviewResponse, RunResponse, RunsResponse,
   TaskContentResponse, WireRunStatus,
@@ -91,6 +92,8 @@ const SERVICE_ERRORS: Record<string, Mapped> = {
   'coordinator-draining': { category: 'request', message: 'The Heimdall coordinator is draining and does not accept responses. Nothing was recorded.', hint: 'Retry once the coordinator has restarted.' },
   'approval-unreadable': { category: 'request', message: 'Heimdall could not read the complete approval request. Nothing was changed.', hint: 'Check the request with: heimdall coordinator run approval RUN_ID --request REQUEST_ID' },
   'approval-unsupported': { category: 'request', message: 'The Heimdall coordinator cannot return the complete approval request (likely an older version).', hint: 'Update Heimdall after active tasks finish, then retry.' },
+  'review-required': { category: 'request', message: 'This card shows a shortened request. Load the full request before approving. Nothing was recorded.', hint: null },
+  'review-mismatch': { category: 'request', message: 'The full request you reviewed is not the request the coordinator holds now. Nothing was recorded.', hint: null },
 };
 
 const GENERIC_HOST: Mapped = { category: 'offline', message: 'The Heimdall service request failed.', hint: 'It will retry automatically.' };
@@ -154,7 +157,7 @@ export interface PanelClient {
    * Record the owner's decision on one approval request. `displayedVersion` is the run version of the card that was
    * clicked. Resolves with the coordinator's acknowledgement; a failure with `uncertain` set may have been recorded.
    */
-  decideApproval(runId: string, requestId: string, input: { decision: ApprovalDecisionKind; feedback?: string; displayedVersion: number }): Promise<ApprovalDecisionResponse>;
+  decideApproval(runId: string, requestId: string, input: { decision: ApprovalDecisionKind; feedback?: string; displayedVersion: number; reviewed?: ReviewedBinding }): Promise<ApprovalDecisionResponse>;
   /** Send owner guidance for one generic pause. Same contract as `decideApproval`. */
   respondToPause(runId: string, input: { pauseId: string; input: string; displayedVersion: number }): Promise<PauseResponseResponse>;
   /** A null cursor asks for the starting cursor; the service answers `resync: true`. */
@@ -405,7 +408,11 @@ export function createPanelClient(host: PanelHost): PanelClient {
       if (!IDENTIFIER.test(runId) || !IDENTIFIER.test(requestId)) throw toError('not-found', SERVICE_ERRORS['not-found']!);
       if (!Number.isSafeInteger(input.displayedVersion) || input.displayedVersion < 0) throw toError('invalid-request', SERVICE_ERRORS['invalid-request']!);
       let body: string;
-      if (input.decision === 'approve' && input.feedback === undefined) body = JSON.stringify({ decision: 'approve', displayedVersion: input.displayedVersion });
+      if (input.decision === 'approve' && input.feedback === undefined) {
+        body = JSON.stringify(input.reviewed === undefined
+          ? { decision: 'approve', displayedVersion: input.displayedVersion }
+          : { decision: 'approve', displayedVersion: input.displayedVersion, reviewed: { requestId: input.reviewed.requestId, revision: { head: input.reviewed.revision.head, digest: input.reviewed.revision.digest }, contentDigest: input.reviewed.contentDigest } });
+      }
       else if (input.decision === 'request-changes' && inputWithin(input.feedback)) body = JSON.stringify({ decision: 'request-changes', feedback: input.feedback, displayedVersion: input.displayedVersion });
       else throw toError('invalid-request', SERVICE_ERRORS['invalid-request']!);
       const answer = await post(`/runs/${runId}/approvals/${requestId}/decision`, body);

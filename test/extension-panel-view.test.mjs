@@ -1238,15 +1238,96 @@ test('panel wiring: the card is drawn from text nodes, buttons only call the sto
   const root = fileURLToPath(new URL('..', import.meta.url));
   const stripped = text => text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
   const main = stripped(await readFile(join(root, 'src', 'extension', 'panel', 'main.ts'), 'utf8'));
-  const card = main.slice(main.indexOf('function drawCard'), main.indexOf('function drawTechnical'));
+  const drawn = main.slice(main.indexOf('function drawCard'), main.indexOf('function drawTechnical'));
+  // The controls (field and buttons) live in a module that takes the SDK mounts, so a test can click the same handlers.
+  assert.match(drawn, /mountCardControls\(\{\s*ui: \{ mountButton, mountTextField,/);
+  assert.doesNotMatch(drawn, /store\.(decideApproval|respondToPause|loadApprovalDetails)\(/);
+  const card = stripped(await readFile(join(root, 'src', 'extension', 'panel', 'card-controls.ts'), 'utf8'));
   assert.match(card, /store\.decideApproval\(detail\.id, wait\.requestId, 'approve'\)/);
   assert.match(card, /store\.decideApproval\(detail\.id, wait\.requestId, 'request-changes', draft\(\)\)/);
   assert.match(card, /store\.respondToPause\(detail\.id, wait\.pauseId, draft\(\)\)/);
   // The handlers are reached only from onClick; drawing, repainting and the text field never send.
   assert.equal((card.match(/store\.(decideApproval|respondToPause)\(/g) ?? []).length, 3);
   assert.equal((card.match(/onClick:/g) ?? []).length >= 3, true);
+  assert.equal((card.match(/store\.loadApprovalDetails\(/g) ?? []).length, 1);
   assert.doesNotMatch(card, /confirm\(|window\.confirm|prompt\(/);
-  assert.doesNotMatch(card, /innerHTML|insertAdjacentHTML/);
+  assert.doesNotMatch(card + drawn, /innerHTML|insertAdjacentHTML/);
   // Requests are never made from the panel entry directly; it only calls the store.
   assert.doesNotMatch(main, /serviceRequest\(/);
+});
+
+// ----- a shortened approval card and its complete request -----
+
+import { approvalDetailsKey, completeRequestProblem, EMPTY_APPROVAL_DETAILS } from '../dist/extension/panel/approval-details.js';
+
+const fullRequest = (overrides = {}) => ({
+  requestId: 'apr_1', runId: 'run_1', state: 'pending', continuation: 'none', progress: 'none', taskId: 'T2', taskIndex: 1, attemptId: 'attempt_1',
+  revision: { head: 'a'.repeat(40), digest: 'b'.repeat(12) + 'c'.repeat(52) },
+  question: 'Ship the migration?', scope: 'Only the reviewed commit. FULL-SCOPE-TAIL', completedWork: 'Migration written',
+  verification: ['unit tests pass', 'FULL-ENTRY-ELEVEN'], artifacts: ['src/migrate.ts'], onApprove: ['merge it'], onRequestChanges: ['fix and ask again'],
+  response: null, createdAt: 1, ...overrides,
+});
+const shortened = () => ({ id: 'run_1', version: 7, wait: approval({ clipped: true }) });
+const slice = (detail, overrides = {}) => ({ ...EMPTY_APPROVAL_DETAILS, key: approvalDetailsKey(detail), status: 'loaded', data: fullRequest(), contentDigest: 'd'.repeat(64), ...overrides });
+const cardWith = (detail, approvalDetails, action = EMPTY_ACTION) => waitCard(detail, { action, ...online, approvalDetails });
+
+test('a shortened pending card offers Load full request and keeps Approve off; request changes stays available', () => {
+  const detail = shortened();
+  const view = cardWith(detail, EMPTY_APPROVAL_DETAILS);
+  assert.deepEqual(view.fullRequest, { label: 'Load full request', disabled: false, status: null });
+  assert.equal(view.controls.approve.disabled, true);
+  assert.equal(view.controls.requestChanges.disabled, false);
+  assert.equal(view.complete, false);
+  assert.match(view.clippedNote, /heimdall coordinator run approval run_1 --request apr_1/);
+  assert.doesNotMatch(view.clippedNote, /available through the CLI/);
+  // Without a version the details cannot be bound to the card, so nothing counts as loaded.
+  assert.equal(waitCard({ id: 'run_1', wait: detail.wait }, { action: EMPTY_ACTION, ...online, approvalDetails: slice(detail) }).controls.approve.disabled, true);
+  assert.equal(cardWith(detail, slice(detail, { status: 'loading', data: null })).fullRequest.label, 'Loading the full request…');
+  assert.equal(cardWith(detail, slice(detail, { status: 'loading', data: null })).fullRequest.disabled, true);
+  const failed = cardWith(detail, slice(detail, { status: 'error', data: null, error: 'Heimdall could not load the full text.' }));
+  assert.deepEqual(failed.fullRequest, { label: 'Try loading the full request again', disabled: false, status: 'Heimdall could not load the full text.' });
+  assert.equal(failed.controls.approve.disabled, true);
+});
+
+test('the loaded complete request replaces the shortened text and enables Approve only while it belongs to this card', () => {
+  const detail = shortened();
+  const view = cardWith(detail, slice(detail));
+  assert.equal(view.complete, true);
+  assert.equal(view.fullRequest, null);
+  assert.equal(view.controls.approve.disabled, false);
+  assert.equal(view.fields.find(field => field.label === 'Scope of the approval').text, 'Only the reviewed commit. FULL-SCOPE-TAIL');
+  assert.deepEqual(view.lists.find(list => list.label === 'Verification').items, ['unit tests pass', 'FULL-ENTRY-ELEVEN']);
+  assert.match(view.clippedNote, /complete request/);
+
+  // Another version, request, revision or run: the same loaded data no longer counts.
+  for (const other of [{ ...detail, version: 8 }, { ...detail, id: 'run_2' }, { ...detail, wait: approval({ clipped: true, requestId: 'apr_2' }) }, { ...detail, wait: approval({ clipped: true, revision: { head: 'c'.repeat(40), digest: 'b'.repeat(12) } }) }]) {
+    const stale = cardWith(other, slice(detail));
+    assert.equal(stale.complete, false);
+    assert.equal(stale.controls.approve.disabled, true);
+    assert.equal(stale.fullRequest.label, 'Load full request');
+  }
+  // Data that does not validate against the card is not used even under the right key.
+  for (const bad of [fullRequest({ requestId: 'apr_2' }), fullRequest({ runId: 'run_2' }), fullRequest({ state: 'answered' }), fullRequest({ taskId: 'T9' }), fullRequest({ revision: { head: 'c'.repeat(40), digest: 'b'.repeat(64) } })]) {
+    assert.equal(cardWith(detail, slice(detail, { data: bad })).controls.approve.disabled, true);
+    assert.notEqual(completeRequestProblem(bad, detail), null);
+  }
+  assert.equal(completeRequestProblem(fullRequest(), detail), null);
+  // A card whose revision is unknown cannot be bound.
+  const unknown = { ...detail, wait: approval({ clipped: true, revision: { head: '', digest: '' } }) };
+  assert.notEqual(completeRequestProblem(fullRequest(), unknown), null);
+  // The buttons stay off while an answer is in flight.
+  assert.equal(cardWith(detail, slice(detail), { ...EMPTY_ACTION, runId: 'run_1', inFlight: true }).controls.approve.disabled, true);
+});
+
+test('an unshortened or answered request has no load action and is unaffected by loaded data', () => {
+  const plain = { id: 'run_1', version: 7, wait: approval() };
+  const view = cardWith(plain, EMPTY_APPROVAL_DETAILS);
+  assert.equal(view.fullRequest, null);
+  assert.equal(view.controls.approve.disabled, false);
+  assert.equal(view.clippedNote, null);
+  assert.equal(approvalDetailsKey({ ...plain, wait: approval({ state: 'answered', response: { decision: 'approve', feedback: null, answeredAt: 1 } }) }), null);
+  const answered = cardWith({ id: 'run_1', version: 7, wait: approval({ clipped: true, state: 'answered', progress: 'queued', response: { decision: 'approve', feedback: null, answeredAt: 1 } }) }, EMPTY_APPROVAL_DETAILS);
+  assert.equal(answered.fullRequest, null);
+  assert.equal(answered.controls, null);
+  assert.match(answered.clippedNote, /heimdall coordinator run approval run_1 --request apr_1/);
 });

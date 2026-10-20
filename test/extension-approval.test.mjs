@@ -11,11 +11,14 @@ import { loadCoordinatorConfiguration } from '../dist/coordinator/config.js';
 import { startCoordinatorService } from '../dist/coordinator/service.js';
 import { createCoordinatorAdapter } from '../dist/extension/service/coordinator.js';
 import { createExtensionServer, listenExtensionServer } from '../dist/extension/service/server.js';
-import { createPanelStore } from '../dist/extension/panel/store.js';
+import { ACTION_NOTICES, createPanelStore } from '../dist/extension/panel/store.js';
 import { waitCard } from '../dist/extension/panel/view-model.js';
 import { createPanelClient } from '../dist/extension/panel/client.js';
 import { readCoordinatorToken } from '../dist/coordinator/token.js';
 import { APPROVAL_FULL_LIMITS } from '../dist/extension/shared/protocol.js';
+import { approvalContentDigest } from '../dist/extension/shared/approval-digest.js';
+import { APPROVAL_DETAIL_NOTICES } from '../dist/extension/panel/approval-details.js';
+import { mountCard } from './fixtures/fake-card-dom.mjs';
 import { CANONICAL, COMPACT, hiddenTailRequest, nearLimitRequest } from './fixtures/approval-requests.mjs';
 
 /*
@@ -88,7 +91,7 @@ async function fixture(t) {
     return { id, requestId };
   };
   /** What the agent does after the owner's answer: it resumes, corrects and pauses again with a new request. */
-  const republish = (runId, previousRequestId, number, { supersede = false } = {}) => {
+  const republish = (runId, previousRequestId, number, { supersede = false, request = REQUEST } = {}) => {
     const requestId = `apr_${runId}_${number}`;
     const attemptId = `attempt_${runId}_${number}`;
     const row = sql('SELECT checkpoint_json FROM runs WHERE id = ?', runId)[0];
@@ -99,7 +102,7 @@ async function fixture(t) {
     sql("UPDATE runs SET status = 'paused', capacity_reserved = 0, checkpoint_json = ?, version = version + 1 WHERE id = ?", JSON.stringify(checkpoint), runId);
     if (supersede) sql("UPDATE approval_requests SET state = 'superseded', superseded_at = 2, superseded_reason = 'replaced' WHERE run_id = ? AND request_id = ?", runId, previousRequestId);
     else sql("UPDATE approval_requests SET continuation = 'consumed', consumed_attempt_id = ? WHERE run_id = ? AND request_id = ?", attemptId, runId, previousRequestId);
-    insertRequest(runId, requestId, attemptId, 1000 + number);
+    insertRequest(runId, requestId, attemptId, 1000 + number, request);
     return requestId;
   };
   const approvalRow = requestId => sql('SELECT request_id, state, decision, feedback, continuation FROM approval_requests WHERE request_id = ?', requestId)[0];
@@ -127,6 +130,9 @@ function hostFor(f, behavior = {}) {
     async serviceRequest(request) {
       requests.push({ method: request.method, path: request.path, body: request.body === undefined ? undefined : JSON.parse(request.body) });
       if (behavior.offline) throw Object.assign(new Error('offline'), { code: 'HOST_UNAVAILABLE' });
+      const completeRead = request.method === 'GET' && /\/approvals\/[^/]+$/.test(request.path);
+      // A read of a complete request that waits for the test to release it (read at that moment) or is rewritten on the way back.
+      if (completeRead && behavior.gateRead) await behavior.gateRead;
       const write = request.method === 'POST' && request.path !== '/directories/match';
       if (write && behavior.dropBefore) throw Object.assign(new Error('lost'), { code: 'HOST_TIMEOUT' });
       if (write && behavior.gate) await behavior.gate;
@@ -141,6 +147,7 @@ function hostFor(f, behavior = {}) {
         outgoing.end(request.body);
       });
       if (write && behavior.dropAfter) throw Object.assign(new Error('lost'), { code: 'HOST_TIMEOUT' });
+      if (completeRead && behavior.rewrite) return behavior.rewrite(request, result) ?? result;
       return result;
     },
   };
@@ -474,4 +481,310 @@ test('the approval read requires the service token', async t => {
     });
     assert.equal(status, 401, String(authorization));
   }
+});
+
+// --- a shortened card is approved only after its complete request was loaded --------------------------------------------
+
+const TAILS = ['ACTION-AFTER-1500', 'WORK-TAIL-1600', 'EVIDENCE-TAIL-700', 'EVIDENCE-ENTRY-12', 'ARTIFACT-ENTRY-11', 'ACTION-ENTRY-TAIL-500', 'PROPOSED-ACTION-13', 'CHANGES-ENTRY-10'];
+const cardText = view => JSON.stringify([view.fields, view.lists, view.artifacts]);
+const loadedAs = (store, requestId) => store.getState().approvalDetails.status === 'loaded' && store.getState().approvalDetails.data?.requestId === requestId;
+const approvalReads = host => host.requests.filter(request => request.method === 'GET' && /\/approvals\/[^/]+$/.test(request.path));
+
+test('a shortened card: Approve stays off and sends nothing until the complete request is loaded; then one decision names exactly this run and request', async t => {
+  const f = await fixture(t);
+  const target = f.seed({ request: hiddenTailRequest() });
+  const other = f.seed({ request: hiddenTailRequest() });
+  const { host, store } = await open(f, target.id);
+  const screen = mountCard(store);
+  t.after(() => screen.dispose());
+  const approve = screen.button('Approve and continue');
+  const load = screen.button('Load full request');
+
+  // The compact card hides the tail, offers the load action, and Approve is off.
+  assert.equal(store.getState().detail.wait.clipped, true);
+  const compact = card(store);
+  assert.equal(TAILS.some(marker => cardText(compact).includes(marker)), false, 'the compact card hides content beyond its limits');
+  assert.equal(compact.complete, false);
+  assert.match(compact.clippedNote, /Approve and continue stays off until you load and read the full request/);
+  assert.match(compact.clippedNote, new RegExp(`heimdall coordinator run approval ${target.id} --request ${target.requestId}`));
+  assert.doesNotMatch(compact.clippedNote, /available through the CLI/);
+  assert.equal(load.visible, true);
+  assert.equal(approve.props.disabled, true);
+
+  // A click on the disabled button does nothing; the store also refuses the very handler when it is forced.
+  assert.equal(approve.click(), false);
+  approve.forceClick();
+  await sleep(80);
+  assert.deepEqual(posts(host), [], 'no decision was sent before the complete request was loaded');
+  assert.equal(store.getState().action.notice, ACTION_NOTICES.loadFirst);
+  assert.equal(f.approvalRow(target.requestId).state, 'pending');
+  assert.deepEqual(approvalReads(host), []);
+
+  // Loading reads exactly this request, then enables Approve.
+  assert.equal(load.click(), true);
+  assert.equal(load.props.label, 'Loading the full request…');
+  await until(() => loadedAs(store, target.requestId), 'the complete request');
+  assert.deepEqual(approvalReads(host).map(request => request.path), [`/runs/${target.id}/approvals/${target.requestId}`]);
+  const full = card(store);
+  assert.equal(full.complete, true);
+  for (const marker of TAILS) assert.equal(cardText(full).includes(marker), true, `${marker} is shown in full`);
+  const request = hiddenTailRequest();
+  assert.equal(full.fields.find(field => field.label === 'Scope of the approval').text, request.scope);
+  assert.deepEqual(full.lists.find(list => list.label === 'Verification').items, request.verification);
+  assert.deepEqual(full.lists.find(list => list.label === 'If you approve, the agent will').items, request.onApprove);
+  assert.deepEqual(full.artifacts, request.artifacts);
+  assert.equal(full.fullRequest, null);
+  assert.equal(load.visible, false);
+  assert.equal(approve.props.disabled, false);
+  assert.equal(approve.clickable, true);
+
+  const version = store.getState().detail.version;
+  assert.equal(approve.click(), true);
+  await until(() => store.getState().action.ack !== null || store.getState().detail.wait.state === 'answered', 'the decision');
+  const expected = await approvalContentDigest(request);
+  assert.deepEqual(posts(host), [{
+    method: 'POST', path: `/runs/${target.id}/approvals/${target.requestId}/decision`,
+    body: { decision: 'approve', displayedVersion: version, reviewed: { requestId: target.requestId, revision: REVISION, contentDigest: expected } },
+  }]);
+  assert.equal(f.approvalRow(target.requestId).decision, 'approve');
+  assert.equal(f.approvalRow(other.requestId).state, 'pending', 'no other run or request was touched');
+  assert.equal(store.getState().detail.wait.state, 'answered');
+  assert.equal(store.getState().detail.wait.progress, 'queued');
+  assert.equal(JSON.stringify(host.requests).includes(SERVICE_TOKEN), false);
+});
+
+test('an untruncated request keeps the ordinary flow: no load action, no reviewed material, one decision', async t => {
+  const f = await fixture(t);
+  const { id, requestId } = f.seed();
+  const { host, store } = await open(f, id);
+  const screen = mountCard(store);
+  t.after(() => screen.dispose());
+  assert.equal(store.getState().detail.wait.clipped, false);
+  assert.equal(card(store).fullRequest, null);
+  assert.equal(card(store).clippedNote, null);
+  assert.equal(screen.button('Load full request').visible, false);
+  const approve = screen.button('Approve and continue');
+  assert.equal(approve.props.disabled, false);
+  const version = store.getState().detail.version;
+  assert.equal(approve.click(), true);
+  await until(() => f.approvalRow(requestId).decision === 'approve', 'the decision');
+  assert.deepEqual(posts(host), [{ method: 'POST', path: `/runs/${id}/approvals/${requestId}/decision`, body: { decision: 'approve', displayedVersion: version } }]);
+  assert.deepEqual(approvalReads(host), [], 'the complete request was not read');
+});
+
+test('request changes on a shortened card is available without loading and reaches the same operation with its exact identities', async t => {
+  const f = await fixture(t);
+  const target = f.seed({ request: hiddenTailRequest() });
+  const { host, store } = await open(f, target.id);
+  const screen = mountCard(store);
+  t.after(() => screen.dispose());
+  const changes = screen.button('Request changes');
+  assert.equal(changes.props.disabled, true, 'needs feedback first, as before');
+  const feedback = 'Drop the legacy_users table from the scope.';
+  screen.field.type(feedback);
+  assert.equal(changes.clickable, true);
+  assert.equal(screen.button('Approve and continue').props.disabled, true, 'approval is still off');
+  const version = store.getState().detail.version;
+  changes.click();
+  await until(() => f.approvalRow(target.requestId).decision === 'request-changes', 'the decision');
+  assert.deepEqual(posts(host), [{ method: 'POST', path: `/runs/${target.id}/approvals/${target.requestId}/decision`, body: { decision: 'request-changes', feedback, displayedVersion: version } }]);
+  assert.deepEqual({ ...f.approvalRow(target.requestId) }, { request_id: target.requestId, state: 'answered', decision: 'request-changes', feedback, continuation: 'queued' });
+  assert.deepEqual(approvalReads(host), []);
+});
+
+test('details that fail, are unreadable or do not match the card never enable Approve', async t => {
+  const f = await fixture(t);
+  const target = f.seed({ request: hiddenTailRequest() });
+  const wrong = f.seed({ request: hiddenTailRequest() });
+  const otherCopy = JSON.parse((await hostFor(f).serviceRequest({ method: 'GET', path: `/runs/${wrong.id}/approvals/${wrong.requestId}` })).body);
+  const { host, store } = await open(f, target.id);
+  const screen = mountCard(store);
+  t.after(() => screen.dispose());
+  // The card is drawn again after each read of the run, so the buttons are looked up when they are used.
+  const approve = { get props() { return screen.button('Approve and continue').props; }, click: () => screen.button('Approve and continue').click(), forceClick: () => screen.button('Approve and continue').forceClick() };
+  const load = { get props() { return screen.button('Load full request').props; }, click: () => screen.button('Load full request').click() };
+  const attempts = [];
+  const attempt = async (name, setup, check) => {
+    Object.assign(host.behavior, { offline: false, rewrite: undefined });
+    setup();
+    const before = host.requests.length;
+    assert.equal(load.click(), true, `${name}: the load action is offered`);
+    await until(() => store.getState().approvalDetails.status === 'error', `${name}: the failure`);
+    assert.equal(store.getState().approvalDetails.data, null, name);
+    assert.equal(store.getState().approvalDetails.contentDigest, null, name);
+    assert.equal(card(store).complete, false, name);
+    assert.equal(approve.props.disabled, true, `${name}: Approve stays off`);
+    assert.equal(approve.click(), false, name);
+    approve.forceClick();
+    await sleep(60);
+    assert.deepEqual(posts(host), [], `${name}: nothing was sent`);
+    assert.equal(TAILS.some(marker => cardText(card(store)).includes(marker)), false, `${name}: no unvalidated content on the card`);
+    assert.equal(load.props.label, 'Try loading the full request again', name);
+    check?.();
+    attempts.push([name, host.requests.slice(before).filter(request => request.method === 'GET' && /approvals/.test(request.path)).length]);
+    // A fresh read of the run starts again without any details.
+    Object.assign(host.behavior, { offline: false, rewrite: undefined });
+    store.select(null);
+    store.select(target.id);
+    await until(() => store.getState().detail?.id === target.id, `${name}: the run again`);
+    assert.equal(store.getState().approvalDetails.status, 'idle', name);
+  };
+
+  await attempt('offline', () => { host.behavior.offline = true; });
+  await attempt('malformed answer', () => { host.behavior.rewrite = (request, result) => ({ status: 200, body: JSON.stringify({ request: { requestId: target.requestId } }) }); });
+  await attempt('oversized text', () => { host.behavior.rewrite = (request, result) => { const body = JSON.parse(result.body); body.request.scope = 'x'.repeat(APPROVAL_FULL_LIMITS.text + 1); return { status: 200, body: JSON.stringify(body) }; }; });
+  await attempt('another request id', () => { host.behavior.rewrite = (request, result) => { const body = JSON.parse(result.body); body.request.requestId = wrong.requestId; return { status: 200, body: JSON.stringify(body) }; }; });
+  await attempt('another run', () => { host.behavior.rewrite = () => ({ status: 200, body: JSON.stringify(otherCopy) }); });
+  await attempt('another task', () => { host.behavior.rewrite = (request, result) => { const body = JSON.parse(result.body); body.request.taskId = 'T9'; return { status: 200, body: JSON.stringify(body) }; }; }, () => assert.equal(store.getState().approvalDetails.error, APPROVAL_DETAIL_NOTICES.mismatch));
+  await attempt('a request that is no longer pending', () => { host.behavior.rewrite = (request, result) => { const body = JSON.parse(result.body); body.request.state = 'superseded'; return { status: 200, body: JSON.stringify(body) }; }; }, () => assert.equal(store.getState().approvalDetails.error, APPROVAL_DETAIL_NOTICES.mismatch));
+  await attempt('another revision', () => { host.behavior.rewrite = (request, result) => { const body = JSON.parse(result.body); body.request.revision = { head: 'd'.repeat(40), digest: 'e'.repeat(64) }; return { status: 200, body: JSON.stringify(body) }; }; }, () => assert.equal(store.getState().approvalDetails.error, APPROVAL_DETAIL_NOTICES.mismatch));
+  assert.ok(attempts.every(([, reads]) => reads === 1), JSON.stringify(attempts));
+  assert.equal(f.approvalRow(target.requestId).state, 'pending');
+  assert.equal(f.approvalRow(wrong.requestId).state, 'pending');
+
+  // The coordinator's own copy changed after the card was drawn: its revision no longer matches the card.
+  f.sql('UPDATE approval_requests SET revision_json = ? WHERE request_id = ?', JSON.stringify({ head: 'd'.repeat(40), digest: 'e'.repeat(64) }), target.requestId);
+  Object.assign(host.behavior, { rewrite: undefined });
+  load.click();
+  await until(() => store.getState().approvalDetails.status === 'error', 'the changed revision');
+  assert.equal(store.getState().approvalDetails.error, APPROVAL_DETAIL_NOTICES.mismatch);
+  assert.equal(approve.props.disabled, true);
+  approve.forceClick();
+  await sleep(60);
+  assert.deepEqual(posts(host), []);
+});
+
+test('details never attach to another card: a selection change, a changed request, a new version and late or out-of-order answers', async t => {
+  const f = await fixture(t);
+  const a = f.seed({ request: hiddenTailRequest() });
+  const b = f.seed({ request: hiddenTailRequest() });
+  const { host, store } = await open(f, a.id);
+  const screen = mountCard(store);
+  t.after(() => screen.dispose());
+  const keys = [];
+  store.subscribe(state => keys.push([state.selectedRunId, state.approvalDetails.key, state.approvalDetails.status, state.approvalDetails.data?.requestId ?? null]));
+
+  // 1. A selection change while the answer for A is on its way: nothing of A reaches B's card.
+  let release;
+  host.behavior.gateRead = new Promise(resolve => { release = resolve; });
+  screen.button('Load full request').click();
+  await until(() => approvalReads(host).length === 1, 'the read for A');
+  store.select(b.id);
+  await until(() => store.getState().detail?.id === b.id, 'the run B');
+  assert.equal(store.getState().approvalDetails.status, 'idle');
+  host.behavior.gateRead = null;
+  release();
+  await sleep(120);
+  assert.equal(store.getState().approvalDetails.status, 'idle', 'the late answer for A was dropped');
+  assert.equal(store.getState().approvalDetails.data, null);
+  assert.equal(keys.some(([run, , status, request]) => run === b.id && (status === 'loaded' || request === a.requestId)), false, 'B never held A\'s details');
+  assert.equal(card(store).complete, false);
+  assert.equal(screen.button('Approve and continue').props.disabled, true);
+  screen.button('Approve and continue').forceClick();
+  await sleep(60);
+  assert.deepEqual(posts(host), [], 'B cannot be approved with A\'s details');
+
+  // 2. Loaded details are dropped when the card moves to another version: the late answer for the old version is ignored.
+  host.behavior.gateRead = new Promise(resolve => { release = resolve; });
+  screen.button('Load full request').click();
+  await until(() => approvalReads(host).length === 2, 'the read for B');
+  const oldKey = store.getState().approvalDetails.key;
+  f.sql('UPDATE runs SET version = version + 1 WHERE id = ?', b.id);
+  store.refreshDetail();
+  await until(() => store.getState().approvalDetails.key === null, 'the details to be dropped for the new version');
+  host.behavior.gateRead = null;
+  release();
+  await sleep(120);
+  assert.equal(store.getState().approvalDetails.status, 'idle', 'the answer for the old version did not come back');
+  assert.equal(keys.some(([, key, status]) => key === oldKey && status === 'loaded'), false);
+  assert.equal(screen.button('Approve and continue').props.disabled, true);
+  screen.button('Approve and continue').forceClick();
+  await sleep(60);
+  assert.deepEqual(posts(host), []);
+
+  // 3. Loaded for the current version: Approve works, and names that version.
+  screen.button('Load full request').click();
+  await until(() => loadedAs(store, b.requestId), 'the complete request of B');
+  assert.equal(screen.button('Approve and continue').props.disabled, false);
+
+  // 4. A newer request replaces the one the owner loaded: the details go, the new card is gated again.
+  const newer = f.republish(b.id, b.requestId, 2, { supersede: true, request: hiddenTailRequest() });
+  store.refreshDetail();
+  await until(() => store.getState().detail?.wait?.requestId === newer, 'the newer request');
+  assert.equal(store.getState().approvalDetails.status, 'idle');
+  assert.equal(card(store).complete, false);
+  assert.equal(screen.button('Approve and continue').props.disabled, true);
+  screen.button('Approve and continue').forceClick();
+  await sleep(60);
+  assert.deepEqual(posts(host), []);
+  assert.equal(f.approvalRow(b.requestId).decision, null);
+
+  // 5. The reopened panel starts without any details, and a fresh load works for the newer request.
+  const reopened = await open(f, b.id);
+  assert.equal(reopened.store.getState().approvalDetails.status, 'idle');
+  const reopenedScreen = mountCard(reopened.store);
+  t.after(() => reopenedScreen.dispose());
+  assert.equal(reopenedScreen.button('Approve and continue').props.disabled, true);
+  reopenedScreen.button('Load full request').click();
+  await until(() => loadedAs(reopened.store, newer), 'the newer request after reopening');
+  const version = reopened.store.getState().detail.version;
+  reopenedScreen.button('Approve and continue').click();
+  await until(() => f.approvalRow(newer).decision === 'approve', 'the decision');
+  assert.deepEqual(posts(reopened.host).map(request => [request.path, request.body.displayedVersion]), [[`/runs/${b.id}/approvals/${newer}/decision`, version]]);
+  assert.equal(f.approvalRow(a.requestId).state, 'pending');
+});
+
+test('the decision route refuses an approval of a shortened card without matching reviewed material, and request changes never needs it', async t => {
+  const f = await fixture(t);
+  const clipped = f.seed({ request: hiddenTailRequest() });
+  const plain = f.seed();
+  const second = f.seed({ request: hiddenTailRequest() });
+  const host = hostFor(f);
+  const raw = async (target, body) => {
+    const version = (await host.serviceRequest({ method: 'GET', path: `/runs/${target.id}` }).then(answer => JSON.parse(answer.body))).run.version;
+    const answer = await host.serviceRequest({ method: 'POST', path: `/runs/${target.id}/approvals/${target.requestId}/decision`, body: JSON.stringify({ displayedVersion: version, ...body }) });
+    return { status: answer.status, body: JSON.parse(answer.body) };
+  };
+  const contentDigest = await approvalContentDigest(hiddenTailRequest());
+  const reviewed = (override = {}) => ({ requestId: clipped.requestId, revision: REVISION, contentDigest, ...override });
+  const refused = async (name, body, status, kind) => {
+    const answer = await raw(clipped, body);
+    assert.equal(answer.status, status, name);
+    assert.equal(answer.body.error.kind, kind, name);
+    assert.equal(f.approvalRow(clipped.requestId).state, 'pending', `${name}: nothing was recorded`);
+    assert.equal(f.sql("SELECT count(*) AS n FROM events WHERE type = 'approval.answered'")[0].n, 0, name);
+  };
+
+  await refused('no reviewed material', { decision: 'approve' }, 409, 'review-required');
+  await refused('another content digest', { decision: 'approve', reviewed: reviewed({ contentDigest: 'f'.repeat(64) }) }, 409, 'review-mismatch');
+  await refused('digest of the compact text', { decision: 'approve', reviewed: reviewed({ contentDigest: await approvalContentDigest({ ...hiddenTailRequest(), scope: hiddenTailRequest().scope.slice(0, 1500) }) }) }, 409, 'review-mismatch');
+  await refused('another revision', { decision: 'approve', reviewed: reviewed({ revision: { head: 'd'.repeat(40), digest: REVISION.digest } }) }, 409, 'review-mismatch');
+  await refused('another request', { decision: 'approve', reviewed: reviewed({ requestId: plain.requestId }) }, 409, 'review-mismatch');
+  await refused('extra field', { decision: 'approve', reviewed: { ...reviewed(), extra: 1 } }, 400, 'invalid-request');
+  await refused('malformed digest', { decision: 'approve', reviewed: reviewed({ contentDigest: 'nope' }) }, 400, 'invalid-request');
+  await refused('reviewed material on a request-changes decision', { decision: 'request-changes', feedback: 'x', reviewed: reviewed() }, 400, 'invalid-request');
+
+  // The request is replaced by the coordinator's copy after the review: the reviewed digest no longer matches.
+  const changed = { ...hiddenTailRequest(), scope: hiddenTailRequest().scope + ' (changed)' };
+  f.sql('UPDATE approval_requests SET request_json = ? WHERE request_id = ?', JSON.stringify(changed), clipped.requestId);
+  await refused('content changed after the review', { decision: 'approve', reviewed: reviewed() }, 409, 'review-mismatch');
+  f.sql('UPDATE approval_requests SET request_json = ? WHERE request_id = ?', JSON.stringify(hiddenTailRequest()), clipped.requestId);
+
+  // An unshortened card needs none, and a wrong one is still refused.
+  const wrongPlain = await raw(plain, { decision: 'approve', reviewed: { requestId: plain.requestId, revision: REVISION, contentDigest: 'a'.repeat(64) } });
+  assert.deepEqual([wrongPlain.status, wrongPlain.body.error.kind], [409, 'review-mismatch']);
+  assert.equal(f.approvalRow(plain.requestId).state, 'pending');
+
+  // Request changes needs no review of the complete request.
+  const changes = await raw(clipped, { decision: 'request-changes', feedback: 'Narrow the scope' });
+  assert.equal(changes.status, 200);
+  assert.equal(f.approvalRow(clipped.requestId).decision, 'request-changes');
+
+  // Matching reviewed material is accepted for a shortened card, and for an unshortened one.
+  const ok = await raw(second, { decision: 'approve', reviewed: reviewed({ requestId: second.requestId }) });
+  assert.equal(ok.status, 200, JSON.stringify(ok.body));
+  assert.equal(f.approvalRow(second.requestId).decision, 'approve');
+  const okPlain = await raw(plain, { decision: 'approve', reviewed: { requestId: plain.requestId, revision: REVISION, contentDigest: await approvalContentDigest(REQUEST) } });
+  assert.equal(okPlain.status, 200, JSON.stringify(okPlain.body));
+  assert.equal(f.approvalRow(plain.requestId).decision, 'approve');
 });

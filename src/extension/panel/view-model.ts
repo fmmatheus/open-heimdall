@@ -4,6 +4,8 @@
  * tasks, summaries, evidence, reasons, model names) passes through unchanged; main.ts renders it with
  * textContent only. Nothing here infers a result: a missing value is reported as missing.
  */
+import { approvalDetailsKey, completeRequestProblem, EMPTY_APPROVAL_DETAILS } from './approval-details.js';
+import type { ApprovalDetailsSlice } from './approval-details.js';
 import type { ContentEntry, PanelState } from './store.js';
 import { APPROVAL_LIMITS, RUN_STATUSES } from '../shared/protocol.js';
 import type {
@@ -832,6 +834,13 @@ export interface WaitCardView {
   /** Shown while the data on screen cannot be trusted; the card is re-checked before anything is sent. */
   unverified: string | null;
   clippedNote: string | null;
+  /**
+   * The control that loads the complete request. Present only while the card is a pending request whose compact text was
+   * shortened and the complete request is not loaded; `status` is the loading or failure sentence next to it.
+   */
+  fullRequest: { label: string; disabled: boolean; status: string | null } | null;
+  /** The card shows the complete, validated request bound to this card instead of the shortened text. */
+  complete: boolean;
   controls: CardControls | null;
   inFlight: boolean;
 }
@@ -879,8 +888,8 @@ function approvalStatus(wait: ApprovalWaitView, ackRetried: boolean | null): { b
 
 /** The card for the loaded run, or null when the run waits on nothing. */
 export function waitCard(
-  detail: Pick<RunDetail, 'id' | 'wait'>,
-  context: { action: PanelState['action']; connection: PanelState['connection']; stale: boolean },
+  detail: Pick<RunDetail, 'id' | 'wait'> & Partial<Pick<RunDetail, 'version'>>,
+  context: { action: PanelState['action']; connection: PanelState['connection']; stale: boolean; approvalDetails?: ApprovalDetailsSlice },
 ): WaitCardView | null {
   const wait = detail.wait ?? null;
   if (wait === null) return null;
@@ -902,6 +911,7 @@ export function waitCard(
       kind: 'generic', key, title: 'Response needed', badge: { label: 'Waiting', tone: 'warning' }, task: null,
       fields, lists: [], artifacts: [], revision: null, status, notice, unverified,
       clippedNote: wait.reasonClipped ? 'The recorded reason was shortened.' : null,
+      fullRequest: null, complete: false,
       controls: ack ? null : {
         kind: 'respond', respond: { label: 'Respond and continue', disabled: busy },
         inputLabel: 'Your response',
@@ -914,29 +924,44 @@ export function waitCard(
   const state = approvalStatus(wait, ack?.retried ?? null);
   // Between the acknowledgement and the next read the card may still show the request as pending.
   const acknowledged = wait.state === 'pending' && ack !== null;
+  const pending = wait.state === 'pending' && !acknowledged;
+  // The complete request counts only while it belongs to exactly this card (run, request, revision, version) and validates.
+  const details = context.approvalDetails ?? EMPTY_APPROVAL_DETAILS;
+  const bound = details.key !== null && details.key === approvalDetailsKey({ id: detail.id, wait, version: detail.version ?? -1 });
+  const full = pending && bound && details.status === 'loaded' && details.data !== null && completeRequestProblem(details.data, detail) === null ? details.data : null;
+  const gated = pending && wait.clipped && full === null;
   const task = wait.taskTitle ? `${wait.taskId}: ${wait.taskTitle}` : wait.taskId;
   const fields = [
-    { label: 'Question', text: wait.question },
-    { label: 'Scope of the approval', text: wait.scope },
-    { label: 'Completed work', text: wait.completedWork },
+    { label: 'Question', text: full?.question ?? wait.question },
+    { label: 'Scope of the approval', text: full?.scope ?? wait.scope },
+    { label: 'Completed work', text: full?.completedWork ?? wait.completedWork },
     ...state.fields,
   ];
   const lists = [
-    { label: 'Verification', items: wait.verification },
-    { label: 'If you approve, the agent will', items: wait.onApprove },
-    { label: 'If you request changes, the agent will', items: wait.onRequestChanges },
+    { label: 'Verification', items: full?.verification ?? wait.verification },
+    { label: 'If you approve, the agent will', items: full?.onApprove ?? wait.onApprove },
+    { label: 'If you request changes, the agent will', items: full?.onRequestChanges ?? wait.onRequestChanges },
   ].filter(entry => entry.items.length > 0);
-  const pending = wait.state === 'pending' && !acknowledged;
+  const command = `heimdall coordinator run approval ${detail.id} --request ${wait.requestId}`;
+  let clippedNote: string | null = null;
+  if (full !== null) clippedNote = 'This is the complete request, read from the coordinator for this card. Every field and list entry is shown in full.';
+  else if (gated) clippedNote = `Some text of this request is shortened here, so Approve and continue stays off until you load and read the full request. Request changes is always available. The same request can be read with: ${command}`;
+  else if (wait.clipped) clippedNote = `Some text of this request is shortened on this card. The complete request can be read with: ${command}`;
+  let fullRequest: WaitCardView['fullRequest'] = null;
+  if (gated) {
+    if (bound && details.status === 'loading') fullRequest = { label: 'Loading the full request…', disabled: true, status: null };
+    else if (bound && details.status === 'error') fullRequest = { label: 'Try loading the full request again', disabled: busy, status: details.error };
+    else fullRequest = { label: 'Load full request', disabled: busy, status: null };
+  }
   return {
     kind: 'approval', key, title: state.title, badge: acknowledged ? { label: 'Recording', tone: 'info' } : state.badge, task,
-    fields, lists, artifacts: wait.artifacts,
+    fields, lists, artifacts: full?.artifacts ?? wait.artifacts,
     revision: wait.revision.head ? `${wait.revision.head.slice(0, 12)} · content ${wait.revision.digest}` : null,
     status: acknowledged ? 'Your response was acknowledged. Reading the current state from the coordinator…' : state.status,
-    notice, unverified,
-    clippedNote: wait.clipped ? 'Some text of this request was shortened; the full request is available through the CLI.' : null,
+    notice, unverified, clippedNote, fullRequest, complete: full !== null,
     controls: pending ? {
       kind: 'decide',
-      approve: { label: 'Approve and continue', disabled: busy },
+      approve: { label: 'Approve and continue', disabled: busy || gated },
       requestChanges: { label: 'Request changes', disabled: busy },
       feedbackLabel: 'Changes you want (required to request changes)',
       feedbackHint: 'The agent receives this text unchanged, corrects within the task scope and submits a fresh request. It does not perform the gated action.',

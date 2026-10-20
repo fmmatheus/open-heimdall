@@ -37,7 +37,11 @@ export type AdapterErrorKind =
   /** An approval read the coordinator answered with something that is not a valid complete request. */
   | 'approval-unreadable'
   /** The coordinator has no operation to read one approval request (an older version). */
-  | 'approval-unsupported';
+  | 'approval-unsupported'
+  /** An approval of a shortened card that names no reviewed complete request. */
+  | 'review-required'
+  /** An approval whose reviewed complete request differs from the one the coordinator holds now. */
+  | 'review-mismatch';
 
 /** Fixed texts: nothing from the underlying failure (paths, keys, headers, stacks) reaches the panel. */
 const MESSAGES: Record<AdapterErrorKind, string> = {
@@ -62,6 +66,8 @@ const MESSAGES: Record<AdapterErrorKind, string> = {
   'coordinator-draining': 'The Heimdall coordinator is draining and does not accept responses. Nothing was recorded.',
   'approval-unreadable': 'The coordinator answered with an approval request that could not be read. Nothing is shown from it and nothing was changed.',
   'approval-unsupported': 'The Heimdall coordinator cannot return the complete approval request (likely an older version). Nothing was changed.',
+  'review-required': 'This card shows a shortened request. Load the full request before approving. Nothing was recorded.',
+  'review-mismatch': 'The full request you reviewed is not the request the coordinator holds now. Nothing was recorded.',
 };
 
 export class CoordinatorAdapterError extends Error {
