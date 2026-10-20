@@ -24,9 +24,11 @@ Keep these separate when recording results:
 
 ## Prompts and scenarios
 
-`prompts.json` holds five synthetic requests. Each names a fake coordinator scenario
-(`ready`, `queued`, `progress` or `paused`) and a `mutationPolicy` that lists the mutating
-commands a correct run issues:
+`prompts.json` holds ten synthetic requests. Each names a fake coordinator scenario
+(`ready`, `queued`, `progress`, `paused`, `guarded` or `approval`) and a `mutationPolicy` that
+lists the mutating commands a correct run issues. `paused` is a coordinator that predates typed
+waits; `guarded` reports a generic pause with a pause ID; `approval` has a pending approval
+request:
 
 | Prompt | Scenario | Allowed mutations |
 | --- | --- | --- |
@@ -35,13 +37,23 @@ commands a correct run issues:
 | `watch-for-minutes` | `progress` | none |
 | `resume-with-guidance` | `paused` | exactly one `run resume` |
 | `boundary-guidance-as-spec` | `paused` | zero or one `run resume`, nothing else |
+| `approve-pending-request` | `approval` | exactly one `run respond` (approve) |
+| `request-changes-feedback` | `approval` | exactly one `run respond` (request changes) |
+| `no-invented-approval` | `approval` | none: a bare "resume" is not an approval |
+| `monitor-approval-readonly` | `approval` | none: the monitor never answers a request |
+| `resume-guarded-pause` | `guarded` | exactly one `run respond` for the pause |
 
-A policy maps a mutation key (`run submit`, `run resume`, `project add`, `run reconcile`,
-`start`, `stop`) to an exact count or a `{ "min", "max" }` range. **Every mutating command a
+A policy maps a mutation key (`run submit`, `run resume`, `run respond`, `project add`,
+`run reconcile`, `start`, `stop`) to an exact count or a `{ "min", "max" }` range. **Every mutating command a
 policy does not list is forbidden**: it is allowed zero times, so one stray `project add`, `start`
 or `stop` fails the scenario. Attempts count even when the fake command line rejects them,
 because the fake records each invocation before it answers. The boundary prompt therefore fails
 on any `run submit` attempt, although the fake refuses it in the `paused` scenario.
+
+`run respond` is therefore forbidden in every scenario that does not list it, including each
+monitor scenario and the scenario where the owner only says "resume". The fake coordinator
+refuses `run resume` while an approval request is open, but the attempt is still recorded and
+still fails the scenario.
 
 `mutationExpectationMet` in `results.json` is true only when the complete recorded mutation map
 is within the policy. `skillExpectationMet` is judged separately. No other result field changed.

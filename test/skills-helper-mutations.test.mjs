@@ -8,10 +8,11 @@ import { execFile, spawn } from 'node:child_process';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import { DatabaseSync } from 'node:sqlite';
 import { startCoordinatorService } from '../dist/coordinator/service.js';
 import { loadCoordinatorConfiguration } from '../dist/coordinator/config.js';
 import {
-  GUIDANCE_HEADER, MAX_GUIDANCE_BYTES, MAX_SPEC_BYTES, UsageError, classifyMutationFailure, main, parseArguments, runIdCandidates,
+  GUIDANCE_HEADER, MAX_GUIDANCE_BYTES, MAX_SPEC_BYTES, RESPONSE_INPUT_LIMIT, UsageError, classifyMutationFailure, classifyRespondFailure, main, parseArguments, runIdCandidates,
 } from '../skills/openheimdall-start/scripts/openheimdall.mjs';
 
 const exec = promisify(execFile);
@@ -22,7 +23,7 @@ const helperFile = helperPath(skillDirectories[0]);
 const distCli = path.join(checkout, 'dist', 'cli.js');
 
 const READ_ONLY = /^(status --json|project list|run list|run show [A-Za-z0-9_-]+)$/;
-const MUTATING = [['project', 'add'], ['run', 'submit'], ['run', 'resume'], ['run', 'reconcile'], ['start'], ['stop']];
+const MUTATING = [['project', 'add'], ['run', 'submit'], ['run', 'resume'], ['run', 'respond'], ['run', 'reconcile'], ['start'], ['stop']];
 
 // --- Fixtures ----------------------------------------------------------------------------------------------
 
@@ -778,9 +779,11 @@ const specification = {
   plannerPrompt: 'PRIVATE-PLANNER-PROMPT', executorPrompt: 'PRIVATE-EXECUTOR-PROMPT', agents: {},
   opencode: { baseUrl: 'http://127.0.0.1:9999', passwordEnvironmentVariable: 'SYNTHETIC_PASSWORD' },
 };
+const REVISION = { head: 'a'.repeat(40), digest: 'b'.repeat(64) };
+const APPROVAL_CONTENT = { question: 'Ship the migration?', scope: 'Only the reviewed commit', completedWork: 'Migration written', verification: ['unit tests pass'], artifacts: ['src/migrate.ts'], onApprove: ['merge the migration'], onRequestChanges: ['fix and ask again'] };
 const PROJECT_CONFIGURATION = '[workflow]\nplannerModel = "anthropic/fixture"\nexecutorModel = "anthropic/fixture"\nexecutorFallbackModel = "openai/fixture"\n[opencode]\nbaseUrl = "http://127.0.0.1:4096"\n';
 
-async function coordinatorFixture(t) {
+async function coordinatorFixture(t, { admission = false } = {}) {
   const root = await temporaryRoot(t);
   const recorder = await installBinary(root);
   const configFile = path.join(root, 'coordinator.toml');
@@ -793,8 +796,8 @@ async function coordinatorFixture(t) {
     async inspect() { return observation; },
   };
   // Worktree verification is stubbed: the seeded runs have no managed checkout. Admission stays off so queued runs stay queued.
-  const service = await startCoordinatorService({ configuration, executor, pollIntervalMs: 60000, scheduler: { verifyWorktree: async () => {} } });
-  service.scheduler.pauseAdmission();
+  const service = await startCoordinatorService({ configuration, executor, pollIntervalMs: 60000, scheduler: { verifyWorktree: async () => {}, revision: async () => REVISION, prepare: async () => {} } });
+  if (!admission) service.scheduler.pauseAdmission();
   t.after(() => service.close());
   const env = isolatedEnvironment(root, { HEIMDALL_BIN: recorder.binary, HEIMDALL_TEST_LOG: recorder.log, HEIMDALL_TEST_CLI: distCli });
   const repository = await makeRepository(env, root, 'repository');
@@ -827,9 +830,39 @@ async function coordinatorFixture(t) {
     run = service.store.transition(id, run.ownerToken, run.version, 'running');
     return service.store.transition(id, run.ownerToken, run.version, 'paused', 'Needs an owner decision', release);
   };
-  const state = () => ({ runs: service.store.listRuns(), events: service.store.events(), counts: service.store.statusCounts(), projects: service.store.listProjects() });
+  const databasePath = path.join(configuration.stateDirectory, 'coordinator.sqlite');
+  const sql = (statement, ...values) => {
+    const database = new DatabaseSync(databasePath);
+    try { return statement.trimStart().toUpperCase().startsWith('SELECT') ? database.prepare(statement).all(...values) : database.prepare(statement).run(...values); }
+    finally { database.close(); }
+  };
+  // A paused, released run whose checkpoint is a paused one: `approval` publishes a pending typed request, otherwise the pause is generic.
+  const saveWaiting = (id, { approval }) => {
+    let run = admit(id);
+    const caller = { sessionID: run.parentSessionId, id: `call-${id}`, messageID: `message-${id}`, agent: 'adr-orchestrator' };
+    const attempt = { id: `attempt_${id}_1`, phase: 'executor', index: 1, child: 'ses_child', status: 'rejected', startedAt: 1, model: 'anthropic/x' };
+    const saved = {
+      id, status: 'paused', adr: 'feature.md', parent: run.parentSessionId, caller, branch: run.branch, baseline: '', index: 1,
+      tasks: [{ id: 'T1', title: 'First task', brief: 'BRIEF-SECRET', dependsOn: [], dod: [] }, { id: 'T2', title: 'Second task', brief: 'BRIEF-SECRET', dependsOn: ['T1'], dod: ['gate'] }],
+      results: [{ taskId: 'T1', status: 'completed', summary: 'CHECKPOINT-SECRET', handoff: 'next', evidence: [], model: 'anthropic/executor', sessionId: `child-${id}` }],
+      phase: 'executor', child: 'ses_child', settings: specification.settings, attempt, reason: approval ? 'Approval required for T2' : 'Blocked: choose the database', resolution: 'RESOLUTION-SECRET',
+      ...(approval ? { wait: { kind: 'approval', attemptId: attempt.id, index: 1, taskId: 'T2' }, protocol: 'structured-v1' } : {}),
+    };
+    service.store.bindStart(id, run.ownerToken, caller);
+    service.store.saveCheckpoint(id, run.ownerToken, saved);
+    run = service.store.transition(id, run.ownerToken, run.version, 'running');
+    const paused = service.store.transition(id, run.ownerToken, run.version, 'paused', saved.reason, true);
+    const requestId = approval ? `apr_${id}_1` : undefined;
+    if (approval) {
+      sql(`INSERT INTO approval_requests(run_id, request_id, phase, task_index, task_id, attempt_id, receipt_digest, request_json, revision_json, state, continuation, created_at)
+        VALUES (?, ?, 'executor', 1, 'T2', ?, 'digest', ?, ?, 'pending', 'none', 1000)`, id, requestId, attempt.id, JSON.stringify(APPROVAL_CONTENT), JSON.stringify(REVISION));
+    }
+    return { run: paused, requestId };
+  };
+  const approvalRow = requestId => sql('SELECT request_id, state, decision, feedback, continuation FROM approval_requests WHERE request_id = ?', requestId)[0];
+  const state = () => ({ runs: service.store.listRuns(), events: service.store.events(), counts: service.store.statusCounts(), projects: service.store.listProjects(), approvals: sql('SELECT * FROM approval_requests ORDER BY rowid'), responses: sql('SELECT * FROM run_responses ORDER BY rowid') });
   return {
-    root, env, configFile, repository, linked, project, service, enqueue, admit, savePaused, state, registerRepository,
+    root, env, configFile, repository, linked, project, service, enqueue, admit, savePaused, state, registerRepository, sql, saveWaiting, approvalRow,
     observe: value => { observation = value; }, launches, ...recorder,
   };
 }
@@ -1261,4 +1294,535 @@ test('start through the real coordinator rejects a draining coordinator without 
   assert.equal(result.report.outcome, 'coordinator-draining');
   assertNoMutation(await fake.calls());
   assert.deepEqual(f.state(), before);
+});
+
+// --- respond and approval-aware resume against a scripted command line -------------------------------------
+
+const REQUEST = 'apr_run-1_0001';
+const PAUSE = 'pau_0123456789abcdef0123456789abcdef';
+const approvalWait = (overrides = {}) => ({
+  kind: 'approval', requestId: REQUEST, state: 'pending', continuation: 'none', progress: 'none', phase: 'executor', taskIndex: 1, taskId: 'T2', taskTitle: 'Second task',
+  attemptId: 'attempt_1', question: 'Ship the migration?', scope: 'Only the reviewed commit', completedWork: 'Migration written', verification: ['unit tests pass'],
+  artifacts: ['src/migrate.ts'], onApprove: ['merge the migration'], onRequestChanges: ['fix and ask again'], revision: { head: 'a'.repeat(40), digest: 'b'.repeat(64) },
+  response: null, createdAt: 1, clipped: {}, ...overrides,
+});
+const genericWait = (overrides = {}) => ({ kind: 'generic', pauseId: PAUSE, reason: 'Needs an owner decision', reasonClipped: false, ...overrides });
+const answeredWait = (decision, overrides = {}) => approvalWait({ state: 'answered', continuation: 'queued', progress: 'queued', response: { decision, feedback: decision === 'request-changes' ? 'FEEDBACK-SECRET' : null, answeredAt: 2 }, ...overrides });
+const decisionAck = (decision, overrides = {}) => ({ runId: 'run-1', requestId: REQUEST, decision, recordedAt: 1760000000000, retried: false, continuation: 'queued', run: { status: 'queued', version: 4 }, ...overrides });
+const pauseAck = (overrides = {}) => ({ runId: 'run-1', pauseId: PAUSE, recordedAt: 1760000000000, retried: false, continuation: 'queued', run: { status: 'queued', version: 4 }, ...overrides });
+const sentRespond = calls => calls.filter(argv => verbOf(argv) === 'run respond');
+const callNames = calls => calls.map(argv => subcommand(argv).slice(0, 2).join(' '));
+
+async function respondScenario(t, { wait = approvalWait(), overrides = {}, ack = decisionAck('approve'), after, extra = {} } = {}) {
+  const f = await fakeFixture(t);
+  const cwd = path.join(f.root, 'work dir');
+  await fs.mkdir(cwd);
+  const paused = runRecord({ wait, ...overrides });
+  const queued = runRecord({ status: 'queued', launchAction: 'resume', reason: null, version: 4, wait: after === undefined ? answeredWait('approve') : after });
+  const scenario = { 'run show run-1': [{ json: paused }, { json: queued }], 'run respond run-1 *': { json: ack }, 'run resume run-1 *': { json: queued }, ...extra };
+  await f.script(scenario);
+  await f.reset();
+  const respond = (input, ...args) => runHelper(['respond', 'run-1', '--cwd', cwd, ...args], f.env, input === undefined ? {} : { stdin: Readable.from([Buffer.from(input)]) });
+  const resume = (input, ...args) => runHelper(['resume', 'run-1', '--cwd', cwd, ...args], f.env, input === undefined ? {} : { stdin: Readable.from([Buffer.from(input)]) });
+  return { ...f, cwd, paused, queued, scenario, respond, resume };
+}
+const APPROVE = ['--request', REQUEST, '--decision', 'approve'];
+const CHANGES = ['--request', REQUEST, '--decision', 'request-changes'];
+
+test('respond arguments: one target, an explicit decision, one text source, every value data', () => {
+  assert.deepEqual(parseArguments(['respond', 'run-1', ...APPROVE]).options, { '--request': REQUEST, '--decision': 'approve' });
+  assert.deepEqual(parseArguments(['respond', 'run-1', '--request=apr_1', '--decision=request-changes', '--feedback-file', '--odd name']).options, { '--request': 'apr_1', '--decision': 'request-changes', '--feedback-file': '--odd name' });
+  assert.deepEqual(parseArguments(['respond', 'run-1', '--pause', PAUSE, '--guidance-stdin']).options, { '--pause': PAUSE, '--guidance-stdin': true });
+  for (const bad of [['respond', 'a', 'b'], ['respond', 'a', '--input', 'x'], ['respond', 'a', '--spec', 'x'], ['respond', 'a', '--feedback-stdin=1'], ['respond', 'a', '--request', 'x', '--request', 'y'], ['respond', 'a', '--decision']]) {
+    assert.throws(() => parseArguments(bad), UsageError, JSON.stringify(bad));
+  }
+});
+
+test('respond usage mistakes exit 2 before any coordinator call', async t => {
+  const f = await respondScenario(t);
+  const cases = [
+    [], ['--request', REQUEST], ['--pause', PAUSE], [...APPROVE, '--pause', PAUSE], [...APPROVE.slice(0, 2), '--decision', 'maybe'], ['--request', REQUEST, '--decision', 'approve', '--feedback-stdin'],
+    [...CHANGES], [...CHANGES, '--feedback-stdin', '--feedback-file', 'x'], [...CHANGES, '--guidance-stdin'], ['--pause', PAUSE], ['--pause', PAUSE, '--decision', 'approve', '--guidance-stdin'],
+    ['--pause', PAUSE, '--feedback-stdin'], ['--pause', PAUSE, '--guidance-stdin', '--guidance-file', 'x'], ['--request', '-bad', '--decision', 'approve'], ['--request', 'bad id', '--decision', 'approve'],
+    ['--pause', '-bad', '--guidance-stdin'], ['--decision', 'approve'],
+  ];
+  for (const args of cases) {
+    const result = await runHelper(['respond', 'run-1', '--cwd', f.cwd, ...args], f.env, { stdin: Readable.from([Buffer.from('text')]) });
+    assert.equal(result.exitCode, 2, JSON.stringify(args));
+  }
+  for (const argv of [['respond', '--cwd', f.cwd, ...APPROVE], ['respond', '-bad', '--cwd', f.cwd, ...APPROVE], ['respond', 'bad id', '--cwd', f.cwd, ...APPROVE]]) {
+    assert.equal((await runHelper(argv, f.env)).exitCode, 2, JSON.stringify(argv));
+  }
+  assert.deepEqual(await f.calls(), []);
+});
+
+test('respond reads the run again and sends nothing unless it still shows exactly what the owner decided on', async t => {
+  const cases = [
+    ['an older coordinator that reports no waits', { overrides: { wait: undefined } }, APPROVE, 'wait-not-reported'],
+    ['a run with no wait', { wait: null }, APPROVE, 'no-approval-request'],
+    ['a generic pause', { wait: genericWait() }, APPROVE, 'no-approval-request'],
+    ['a different request', { wait: approvalWait({ requestId: 'apr_other_0002' }) }, APPROVE, 'request-mismatch'],
+    ['an answered request', { wait: answeredWait('approve') }, APPROVE, 'already-answered'],
+    ['a superseded request', { wait: approvalWait({ state: 'superseded' }) }, CHANGES, 'request-superseded'],
+    ['a wait the helper cannot read', { wait: { kind: 'mystery' } }, APPROVE, 'no-approval-request'],
+  ];
+  for (const [name, setup, args, reason] of cases) {
+    const f = await respondScenario(t, setup);
+    if ('wait' in (setup.overrides ?? {})) await f.script({ ...f.scenario, 'run show run-1': { json: (({ wait, ...rest }) => rest)(f.paused) } });
+    const result = await f.respond('Please change the plan.', ...args, ...(args === CHANGES ? ['--feedback-stdin'] : []));
+    assert.equal(result.exitCode, 1, name);
+    assert.equal(result.report.outcome, 'refused', name);
+    assert.equal(result.report.reason, reason, name);
+    assert.equal(result.report.sent, false);
+    assert.deepEqual(result.report.mutationsAttempted, []);
+    const calls = await f.calls();
+    assertNoMutation(calls);
+    assert.deepEqual(callNames(calls), ['run show'], name);
+    assert.ok(!result.text.includes('Please change the plan.'), 'the feedback is not echoed');
+  }
+  // A pause response is checked against the displayed pause, and never answers a typed request.
+  const pauseCases = [
+    ['a typed request', { wait: approvalWait() }, 'approval-pending'],
+    ['a different pause', { wait: genericWait({ pauseId: 'pau_ffffffffffffffffffffffffffffffff' }) }, 'pause-mismatch'],
+    ['no wait', { wait: null }, 'no-generic-pause'],
+    ['reserved capacity', { wait: genericWait(), overrides: { capacityReserved: true } }, 'not-paused-and-released'],
+    ['a running run', { wait: genericWait(), overrides: { status: 'running' } }, 'not-paused-and-released'],
+  ];
+  for (const [name, setup, reason] of pauseCases) {
+    const f = await respondScenario(t, setup);
+    const result = await f.respond('Use the second approach.', '--pause', PAUSE, '--guidance-stdin');
+    assert.equal(result.exitCode, 1, name);
+    assert.equal(result.report.reason, reason, name);
+    assertNoMutation(await f.calls());
+    assert.deepEqual(callNames(await f.calls()), ['run show'], name);
+    if (reason === 'approval-pending') assert.match(result.report.next.detail, /respond RUN_ID --request apr_run-1_0001/);
+  }
+  const missing = await respondScenario(t, { extra: { 'run show run-1': { stderr: 'Heimdall: Run not found\n' } } });
+  const result = await missing.respond(undefined, ...APPROVE);
+  assert.equal(result.report.reason, 'run-not-found');
+  assertNoMutation(await missing.calls());
+});
+
+test('approve sends exactly one respond for the displayed request, with no text, and reports a queued continuation without calling it done', async t => {
+  const f = await respondScenario(t);
+  const result = await f.respond(undefined, ...APPROVE);
+  assert.equal(result.exitCode, 0, result.stderr + result.text);
+  const { report } = result;
+  assert.equal(report.outcome, 'queued');
+  assert.equal(report.recorded, true);
+  assert.equal(report.retried, false);
+  assert.equal(report.sent, true);
+  assert.deepEqual(report.mutationsAttempted, ['run respond']);
+  assert.equal(report.acknowledgement.requestId, REQUEST);
+  assert.equal(report.acknowledgement.continuation, 'queued');
+  assert.equal(report.run.status, 'queued');
+  assert.equal(report.run.wait.state, 'answered');
+  assert.equal(report.run.wait.response.decision, 'approve');
+  assert.match(report.note, /not running until it is admitted, and the task is not complete/);
+  assert.ok(!result.text.includes('FEEDBACK-SECRET'));
+  const calls = await f.calls();
+  assertReadsAfter(calls, 'run respond');
+  assert.deepEqual(callNames(calls), ['run show', 'run respond', 'run show']);
+  assert.deepEqual(sentRespond(calls), [['coordinator', 'run', 'respond', 'run-1', '--request', REQUEST, '--decision', 'approve']]);
+  assert.ok(!mutations(calls).includes('run resume'), 'approval never goes through the unguarded resume');
+});
+
+test('respond reports a recorded decision waiting for idle proof, an identical retry, and an unexpected continuation', async t => {
+  let f = await respondScenario(t, { ack: decisionAck('approve', { continuation: 'pending' }) });
+  let result = await f.respond(undefined, ...APPROVE);
+  assert.equal(result.report.outcome, 'waiting-for-idle');
+  assert.match(result.report.note, /once it has proof that the run is idle/);
+  f = await respondScenario(t, { ack: decisionAck('approve', { retried: true }) });
+  result = await f.respond(undefined, ...APPROVE);
+  assert.equal(result.report.outcome, 'queued');
+  assert.equal(result.report.retried, true);
+  f = await respondScenario(t, { ack: decisionAck('approve', { continuation: 'none' }) });
+  result = await f.respond(undefined, ...APPROVE);
+  assert.equal(result.report.outcome, 'recorded');
+  assert.equal(sentRespond(await f.calls()).length, 1);
+  // An acknowledgement for another request, decision or run is not the answer to this call.
+  for (const ack of [decisionAck('request-changes'), decisionAck('approve', { requestId: 'apr_other' }), decisionAck('approve', { runId: 'run-2' }), { runId: 'run-1' }, 'accepted']) {
+    f = await respondScenario(t, typeof ack === 'string' ? { extra: { 'run respond run-1 *': { stdout: `${ack}\n` } } } : { ack });
+    result = await f.respond(undefined, ...APPROVE);
+    assert.equal(result.report.outcome, 'uncertain', JSON.stringify(ack));
+    assert.equal(sentRespond(await f.calls()).length, 1);
+    assertReadsAfter(await f.calls(), 'run respond');
+  }
+});
+
+test('requested changes and pause guidance reach the coordinator byte for byte as one --input= argument, however awkward', async t => {
+  const marker = path.join(await temporaryRoot(t), 'shell-ran');
+  const texts = [
+    '--start-over --force', '-x', '--', '--input=--also', '- bullet\n- list',
+    `Use "double" and 'single' quotes, $(touch ${marker}); \`touch ${marker}\` && rm -rf *`,
+    'line one\nline two\n\n    indented\n', 'CRLF\r\nline\r\n', 'ação ✓ — unicode', '  leading and trailing spaces  ', 'g'.repeat(RESPONSE_INPUT_LIMIT),
+  ];
+  for (const target of ['request', 'pause']) {
+    for (const [index, text] of texts.entries()) {
+      const f = await respondScenario(t, target === 'request'
+        ? { ack: decisionAck('request-changes'), after: answeredWait('request-changes') }
+        : { wait: genericWait(), ack: pauseAck(), after: null });
+      const viaFile = index % 2 === 0;
+      if (viaFile) await fs.writeFile(path.join(f.cwd, 'text with "quotes" and spaces.txt'), text);
+      const flag = target === 'request' ? 'feedback' : 'guidance';
+      const args = target === 'request' ? CHANGES : ['--pause', PAUSE];
+      const result = viaFile ? await f.respond(undefined, ...args, `--${flag}-file`, 'text with "quotes" and spaces.txt') : await f.respond(text, ...args, `--${flag}-stdin`);
+      assert.equal(result.exitCode, 0, `${target} ${JSON.stringify(text.slice(0, 40))}: ${result.stderr}${result.text}`);
+      assert.equal(result.report.outcome, 'queued');
+      assert.equal(result.report[flag].bytes, Buffer.byteLength(text));
+      if (text.length > 40) assert.ok(!result.text.includes(text.slice(0, 40)), 'the text is not echoed');
+      const calls = await f.calls();
+      assert.deepEqual(mutations(calls), ['run respond']);
+      assert.equal(sentRespond(calls).length, 1);
+      const sent = sentRespond(calls)[0];
+      assert.deepEqual(sent, target === 'request'
+        ? ['coordinator', 'run', 'respond', 'run-1', '--request', REQUEST, '--decision', 'request-changes', `--input=${text}`]
+        : ['coordinator', 'run', 'respond', 'run-1', '--pause', PAUSE, `--input=${text}`]);
+      assert.ok(sent.at(-1).startsWith('--input='), 'the value is attached to its option and can never be read as one');
+      assertReadsAfter(calls, 'run respond');
+    }
+  }
+  await assert.rejects(fs.access(marker), 'no shell evaluated the text');
+});
+
+test('respond reads a real stdin pipe', async t => {
+  const f = await respondScenario(t, { ack: decisionAck('request-changes'), after: answeredWait('request-changes') });
+  const feedback = '--- not a flag ---\nsecond line with $HOME and "quotes"\n';
+  const child = spawn(process.execPath, [helperFile, 'respond', 'run-1', '--cwd', f.cwd, ...CHANGES, '--feedback-stdin'], { env: f.env, stdio: ['pipe', 'pipe', 'pipe'] });
+  let output = '';
+  child.stdout.on('data', chunk => { output += chunk; });
+  const exited = new Promise(resolve => child.once('exit', code => resolve(code)));
+  child.stdin.end(feedback);
+  assert.equal(await exited, 0);
+  assert.equal(JSON.parse(output).outcome, 'queued');
+  assert.equal(sentRespond(await f.calls())[0].at(-1), `--input=${feedback}`);
+});
+
+test('unusable feedback or guidance is refused before any coordinator call', async t => {
+  const f = await respondScenario(t);
+  const write = (name, content) => fs.writeFile(path.join(f.cwd, name), content);
+  await write('empty.txt', '');
+  await write('blank.txt', '\n  \t\n');
+  await write('big.txt', 'f'.repeat(MAX_GUIDANCE_BYTES + 1));
+  await write('long.txt', 'f'.repeat(RESPONSE_INPUT_LIMIT + 1));
+  await write('nul.txt', 'before\0after');
+  await write('bad utf8.txt', Buffer.from([0x41, 0xff, 0xfe]));
+  await fs.mkdir(path.join(f.cwd, 'folder'));
+  for (const [name, reason] of [['empty.txt', 'empty'], ['blank.txt', 'empty'], ['big.txt', 'too-large'], ['long.txt', 'too-long'], ['nul.txt', 'contains-nul'], ['bad utf8.txt', 'not-utf8'], ['missing.txt', 'unreadable'], ['folder', 'not-a-file']]) {
+    const result = await f.respond(undefined, ...CHANGES, '--feedback-file', name);
+    assert.equal(result.exitCode, 1, name);
+    assert.equal(result.report.outcome, 'refused');
+    assert.equal(result.report.reason, `feedback-${reason}`);
+    const pause = await f.respond(undefined, '--pause', PAUSE, '--guidance-file', name);
+    assert.equal(pause.report.reason, `guidance-${reason}`);
+  }
+  for (const [text, reason] of [['', 'empty'], ['   \n', 'empty'], ['h'.repeat(RESPONSE_INPUT_LIMIT + 1), 'too-long'], ['a\0b', 'contains-nul']]) {
+    assert.equal((await f.respond(text, ...CHANGES, '--feedback-stdin')).report.reason, `feedback-${reason}`);
+  }
+  assert.deepEqual(await f.calls(), []);
+});
+
+test('a lost respond response is uncertain: one respond, read-only inspection, no retry', async t => {
+  const stderrs = [
+    ['Heimdall: The response may or may not have been recorded: read ECONNRESET. Do not retry blindly. Inspect the run with "heimdall coordinator run show run-1" to see whether the response was recorded and how the run continues.\n', 2],
+    ['Heimdall: Coordinator unavailable: read ECONNRESET\n', 1], ['Heimdall: Invalid coordinator JSON response\n', 1], ['Heimdall: Something unexpected\n', 1], ['', 1],
+  ];
+  for (const [stderr, code] of stderrs) {
+    const f = await respondScenario(t, { after: answeredWait('request-changes'), extra: { 'run respond run-1 *': { stderr, code } } });
+    await f.script({ ...f.scenario, 'run show run-1': [{ json: f.paused }, { json: f.queued }] });
+    const result = await f.respond('Owner says: change the scope.', ...CHANGES, '--feedback-stdin');
+    assert.equal(result.exitCode, 1, stderr);
+    assert.equal(result.report.outcome, 'uncertain');
+    assert.equal(result.report.accepted, undefined);
+    assert.equal(result.report.recorded, undefined);
+    assert.match(result.report.rule, /Do not repeat it/);
+    assert.equal(result.report.inspection.confirmed, false);
+    assert.equal(result.report.inspection.run.status, 'queued', 'the observation is reported without claiming it');
+    assert.equal(result.report.inspection.run.wait.response.decision, 'request-changes');
+    const calls = await f.calls();
+    assertReadsAfter(calls, 'run respond');
+    assert.deepEqual(callNames(calls), ['run show', 'run respond', 'run show']);
+    assert.ok(!result.text.includes('change the scope'), 'the feedback is not echoed');
+  }
+  const stdoutOnly = await respondScenario(t, { extra: { 'run respond run-1 *': { stdout: 'accepted\n' } } });
+  assert.equal((await stdoutOnly.respond(undefined, ...APPROVE)).report.outcome, 'uncertain');
+  assertReadsAfter(await stdoutOnly.calls(), 'run respond');
+});
+
+test('a respond that never left, or that the coordinator refused or does not know, is reported as such and never retried or replaced', async t => {
+  const cases = [
+    ['Heimdall: The coordinator at /x/coordinator.sock is unavailable: connect ENOENT /x/coordinator.sock. Nothing was sent.\n', 'not-sent'],
+    ['Heimdall: The coordinator refused the response (409 approval-stale): The reviewed work changed. Nothing was recorded.\n', 'coordinator-refused'],
+    ['Heimdall: The coordinator refused the response (503): Coordinator is draining. Nothing was recorded.\n', 'coordinator-refused'],
+    ['Heimdall: The coordinator at /x/coordinator.sock refused authorization; check the coordinator key. Nothing was recorded.\n', 'coordinator-refused'],
+    ['Heimdall: The coordinator at /x/coordinator.sock does not support this response operation (likely an older version). Nothing was sent to resume the run; Heimdall does not fall back to the unguarded "run resume".\n', 'coordinator-unsupported'],
+    ['Heimdall: Unknown or repeated option: --request\n', 'coordinator-unsupported'],
+  ];
+  for (const [stderr, reason] of cases) {
+    const f = await respondScenario(t, { extra: { 'run respond run-1 *': { stderr, code: 1 } } });
+    const result = await f.respond(undefined, ...APPROVE);
+    assert.equal(result.exitCode, 1, reason);
+    assert.equal(result.report.outcome, 'refused');
+    assert.equal(result.report.reason, reason, stderr);
+    assert.equal(result.report.sent, true);
+    assert.equal(result.report.inspection, undefined, 'nothing to look for');
+    const calls = await f.calls();
+    assert.deepEqual(callNames(calls), ['run show', 'run respond'], 'nothing follows the one respond');
+    assert.equal(countOf(calls, 'run respond'), 1);
+    assert.equal(countOf(calls, 'run resume'), 0, 'no fallback to the unguarded resume');
+  }
+  const refused = await respondScenario(t, { extra: { 'run respond run-1 *': { stderr: cases[1][0], code: 1 } } });
+  assert.deepEqual((await refused.respond(undefined, ...APPROVE)).report.refusal, { status: 409, code: 'approval-stale' });
+});
+
+test('respond failure classification trusts only the exit status and the first diagnostic line', () => {
+  const failed = (stderr, exitCode = 1, extra = {}) => ({ ok: false, kind: 'error', exitCode, stdout: '', stderr, message: `Command failed: heimdall --input=${stderr}`, ...extra });
+  assert.equal(classifyRespondFailure({ ok: false, kind: 'not-installed', stdout: '', stderr: '', message: 'spawn heimdall ENOENT' }), 'not-sent');
+  assert.equal(classifyRespondFailure(failed('Heimdall: The coordinator at /x is unavailable: connect ECONNREFUSED /x. Nothing was sent.\n')), 'not-sent');
+  assert.equal(classifyRespondFailure(failed('Heimdall: The coordinator refused the response (409 pause-stale): stale. Nothing was recorded.\n')), 'rejected');
+  assert.equal(classifyRespondFailure(failed('Heimdall: The coordinator refused the response (400): Invalid body. Nothing was recorded.\n')), 'rejected');
+  assert.equal(classifyRespondFailure(failed('Heimdall: The coordinator at /x does not support this response operation (likely an older version). Nothing was sent.\n')), 'unsupported');
+  assert.equal(classifyRespondFailure(failed('Heimdall: Unknown coordinator command; see --help\n')), 'unsupported');
+  // Exit status 2 is the command line's own uncertain-delivery status, whatever the text says.
+  assert.equal(classifyRespondFailure(failed('Heimdall: The coordinator refused the response (409 x): y. Nothing was recorded.\n', 2)), 'uncertain');
+  assert.equal(classifyRespondFailure(failed('Heimdall: The response may or may not have been recorded: x\n', 2)), 'uncertain');
+  for (const stderr of ['Heimdall: Coordinator unavailable: read ECONNRESET\n', 'Heimdall: Something new\n', '', 'Heimdall: Nothing was sent. The coordinator refused the response (409 x): y\n', 'Heimdall: The response may or may not have been recorded: x. Nothing was sent.\n']) {
+    assert.equal(classifyRespondFailure(failed(stderr)), 'uncertain', stderr);
+  }
+  for (const [kind, exitCode] of [['timeout', null], ['aborted', null], ['response-too-large', null]]) assert.equal(classifyRespondFailure({ ok: false, kind, exitCode, stdout: '', stderr: '', message: '' }), 'uncertain');
+  assert.equal(classifyRespondFailure(failed('Heimdall: The coordinator refused the response (409 x): y. Nothing was recorded.\n', null)), 'uncertain');
+  // Text inside the process error message (it repeats the command line) cannot change the verdict.
+  assert.equal(classifyRespondFailure(failed('Heimdall: Coordinator unavailable: read ECONNRESET\n', 1, { message: 'Command failed: --input=The coordinator refused the response (409 x): y. Nothing was recorded.' })), 'uncertain');
+});
+
+test('resume refuses a run with an unresolved typed approval and never turns resume or guidance into an approval', async t => {
+  const waits = [
+    ['a pending request', approvalWait(), 'owner-decision'],
+    ['a recorded decision whose continuation is queued', answeredWait('approve'), 'wait'],
+    ['a recorded decision waiting for idle proof', answeredWait('approve', { continuation: 'pending', progress: 'waiting-for-idle' }), 'wait'],
+    ['a wait the helper cannot read', { kind: 'mystery' }, 'monitor'],
+  ];
+  for (const [name, wait, action] of waits) {
+    for (const overrides of [{}, { status: 'running', capacityReserved: true }]) {
+      const f = await respondScenario(t, { wait, overrides });
+      await f.script({ ...f.scenario, 'run show run-1': { json: f.paused } });
+      await f.reset();
+      for (const words of ['continue', 'resume', 'go ahead and approve it']) {
+        await fs.writeFile(path.join(f.cwd, 'guidance.txt'), words);
+        const result = await f.resume(undefined, '--guidance-file', 'guidance.txt');
+        assert.equal(result.exitCode, 1, name);
+        assert.equal(result.report.outcome, 'refused', name);
+        assert.equal(result.report.reason, 'approval-pending');
+        assert.equal(result.report.next.action, action, name);
+        assert.deepEqual(result.report.mutationsAttempted, []);
+        if (action === 'owner-decision') assert.match(result.report.next.detail, /explicit approval, or explicit change feedback.*A request to resume or continue is not a decision/);
+      }
+      const calls = await f.calls();
+      assertNoMutation(calls);
+      assert.equal(calls.length, 3);
+      assert.ok(!JSON.stringify(calls).includes('--decision'), 'no decision was ever sent');
+      assert.ok(!JSON.stringify(calls).includes('--request'));
+    }
+  }
+});
+
+test('resume continues after a superseded or consumed request through the labeled legacy resume, which the coordinator guards', async t => {
+  for (const wait of [approvalWait({ state: 'superseded', continuation: 'superseded', progress: 'superseded' }), null]) {
+    const f = await respondScenario(t, { wait });
+    const result = await f.resume('Ask again with the corrected plan.', '--guidance-stdin');
+    assert.equal(result.exitCode, 0, result.stderr + result.text);
+    assert.equal(result.report.outcome, 'resumed');
+    assert.equal(result.report.via, 'run resume');
+    const calls = await f.calls();
+    assert.deepEqual(mutations(calls), ['run resume']);
+    assert.equal(calls.find(argv => verbOf(argv) === 'run resume')[5], `${GUIDANCE_HEADER}\nAsk again with the corrected plan.`);
+  }
+  // A resume that races a newly published request is refused by the coordinator and reported as a refusal, once.
+  const f = await respondScenario(t, { wait: null, extra: { 'run resume run-1 *': { stderr: 'Heimdall: An approval request is waiting for an owner decision; answer it with the approval decision operation instead of resuming\n' } } });
+  const raced = await f.resume('continue', '--guidance-stdin');
+  assert.equal(raced.report.outcome, 'rejected');
+  assert.equal(countOf(await f.calls(), 'run resume'), 1);
+});
+
+test('resume answers a generic pause through the guarded response for exactly that pause, never as an approval', async t => {
+  const texts = ['--use the second approach', 'line one\nline two "quoted" $(not run)\n', 'ação ✓'];
+  for (const text of texts) {
+    const f = await respondScenario(t, { wait: genericWait(), ack: pauseAck(), after: null });
+    const result = await f.resume(text, '--guidance-stdin');
+    assert.equal(result.exitCode, 0, result.stderr + result.text);
+    const { report } = result;
+    assert.equal(report.outcome, 'resumed');
+    assert.equal(report.via, 'respond');
+    assert.deepEqual(report.mutationsAttempted, ['run respond']);
+    assert.equal(report.acknowledgement.pauseId, PAUSE);
+    assert.deepEqual(report.preserved, { runId: true, worktreePath: true, branch: true, parentSessionId: true });
+    assert.deepEqual(report.completedResults, { before: 1, after: 1 });
+    const calls = await f.calls();
+    assert.deepEqual(mutations(calls), ['run respond']);
+    assert.deepEqual(callNames(calls), ['run show', 'run respond', 'run show']);
+    assert.deepEqual(sentRespond(calls), [['coordinator', 'run', 'respond', 'run-1', '--pause', PAUSE, `--input=${text}`]]);
+    assert.ok(!JSON.stringify(calls).includes('--decision') && !JSON.stringify(calls).includes('--request'), 'guidance is never sent as a decision');
+    assert.ok(!mutations(calls).includes('run resume'));
+  }
+});
+
+test('a guarded resume that fails is reported without falling back to the unguarded resume, and long guidance is refused locally', async t => {
+  const failures = [
+    ['Heimdall: The coordinator at /x is unavailable: connect ENOENT /x. Nothing was sent.\n', 1, 'not-resumed'],
+    ['Heimdall: The coordinator refused the response (409 pause-stale): This is not the current pause of the run. Nothing was recorded.\n', 1, 'rejected'],
+    ['Heimdall: The coordinator at /x does not support this response operation (likely an older version). Nothing was sent to resume the run; Heimdall does not fall back to the unguarded "run resume".\n', 1, 'rejected'],
+    ['Heimdall: The response may or may not have been recorded: read ECONNRESET. Do not retry blindly.\n', 2, 'uncertain'],
+    ['Heimdall: Something unexpected\n', 1, 'uncertain'],
+  ];
+  for (const [stderr, code, outcome] of failures) {
+    const f = await respondScenario(t, { wait: genericWait(), extra: { 'run respond run-1 *': { stderr, code }, 'run show run-1': [{ json: runRecord({ wait: genericWait() }) }, { json: runRecord({ status: 'queued', wait: null }) }] } });
+    const result = await f.resume('Use json.', '--guidance-stdin');
+    assert.equal(result.exitCode, 1, stderr);
+    assert.equal(result.report.outcome, outcome, stderr);
+    const calls = await f.calls();
+    assert.equal(countOf(calls, 'run respond'), 1);
+    assert.equal(countOf(calls, 'run resume'), 0, 'no fallback to the unguarded resume');
+    if (outcome === 'uncertain') { assert.match(result.report.rule, /Do not repeat it/); assertReadsAfter(calls, 'run respond'); }
+    else assert.deepEqual(callNames(calls), ['run show', 'run respond']);
+  }
+  // A coordinator that does not report waits keeps the labeled legacy resume, whatever the length.
+  const long = 'g'.repeat(RESPONSE_INPUT_LIMIT + 1);
+  const guarded = await respondScenario(t, { wait: genericWait() });
+  const refused = await guarded.resume(long, '--guidance-stdin');
+  assert.equal(refused.report.outcome, 'refused');
+  assert.equal(refused.report.reason, 'guidance-too-long');
+  assert.deepEqual(callNames(await guarded.calls()), ['run show']);
+  const legacy = await respondScenario(t, { overrides: { wait: undefined } });
+  await legacy.script({ ...legacy.scenario, 'run show run-1': [{ json: (({ wait, ...rest }) => rest)(legacy.paused) }, { json: legacy.queued }] });
+  const resumed = await legacy.resume(long, '--guidance-stdin');
+  assert.equal(resumed.report.outcome, 'resumed');
+  assert.equal(resumed.report.via, 'run resume');
+  assert.deepEqual(mutations(await legacy.calls()), ['run resume']);
+});
+
+// --- respond against a real coordinator ----------------------------------------------------------------------
+
+test('approve through the real command line and coordinator records the decision once and queues the same run', async t => {
+  const f = await coordinatorFixture(t, { admission: true });
+  const { requestId } = f.saveWaiting('run-approval', { approval: true });
+  const configFlag = ['--coordinator-config', f.configFile];
+  await f.reset();
+  const snapshot = await runHelper(['snapshot', 'run-approval', '--cwd', f.linked, ...configFlag], f.env);
+  assert.equal(snapshot.report.run.wait.kind, 'approval');
+  assert.equal(snapshot.report.run.wait.requestId, requestId);
+  assert.equal(snapshot.report.run.wait.state, 'pending');
+  assert.equal(snapshot.report.run.wait.question, 'Ship the migration?');
+  assertNoMutation(await f.calls());
+  const before = f.state();
+  await f.reset();
+
+  const result = await runHelper(['respond', 'run-approval', '--cwd', f.linked, '--request', requestId, '--decision', 'approve', ...configFlag], f.env);
+  assert.equal(result.exitCode, 0, result.stderr + result.text);
+  assert.equal(result.report.outcome, 'queued');
+  assert.equal(result.report.run.status, 'queued');
+  assert.equal(result.report.run.wait.response.decision, 'approve');
+  assert.equal(f.approvalRow(requestId).decision, 'approve');
+  assert.equal(f.approvalRow(requestId).state, 'answered');
+  const calls = await f.calls();
+  assert.deepEqual(mutations(calls), ['run respond']);
+  assert.deepEqual(callNames(calls), ['run show', 'run respond', 'run show']);
+  assert.equal(f.service.store.getRun('run-approval').launchAction, 'resume');
+  assert.equal(f.service.store.getRun('run-approval').version, before.runs.find(run => run.id === 'run-approval').version + 1);
+  assert.equal(f.launches.length, 0);
+
+  // The decision is recorded: another respond is refused locally and a resume cannot replace it.
+  await f.reset();
+  const again = await runHelper(['respond', 'run-approval', '--cwd', f.linked, '--request', requestId, '--decision', 'request-changes', '--feedback-stdin', ...configFlag], f.env, { stdin: Readable.from([Buffer.from('too late')]) });
+  assert.equal(again.report.reason, 'already-answered');
+  const resumed = await runHelper(['resume', 'run-approval', '--cwd', f.linked, '--guidance-stdin', ...configFlag], f.env, { stdin: Readable.from([Buffer.from('continue')]) });
+  assert.equal(resumed.report.outcome, 'refused');
+  assert.equal(resumed.report.reason, 'approval-pending');
+  assertNoMutation(await f.calls());
+  assert.equal(f.approvalRow(requestId).decision, 'approve');
+});
+
+test('requested changes reach the real coordinator verbatim, however awkward the feedback', async t => {
+  const f = await coordinatorFixture(t, { admission: true });
+  const feedbacks = ['--keep the scope small\n"quoted" and \'single\'\n- bullet $(not run)\n', 'ação ✓ — unicode\r\nCRLF line\n'];
+  const requests = feedbacks.map((_, index) => f.saveWaiting(`run-changes-${index}`, { approval: true }).requestId);
+  for (const [index, feedback] of feedbacks.entries()) {
+    const requestId = requests[index];
+    await fs.writeFile(path.join(f.linked, 'feedback.txt'), feedback);
+    await f.reset();
+    const result = await runHelper(['respond', `run-changes-${index}`, '--cwd', f.linked, '--request', requestId, '--decision', 'request-changes', '--feedback-file', 'feedback.txt', '--coordinator-config', f.configFile], f.env);
+    assert.equal(result.exitCode, 0, result.stderr + result.text);
+    assert.equal(result.report.outcome, 'queued');
+    const row = f.approvalRow(requestId);
+    assert.equal(row.decision, 'request-changes');
+    assert.equal(row.feedback, feedback, 'stored byte for byte');
+    assert.equal(countOf(await f.calls(), 'run respond'), 1);
+    assert.ok(!result.text.includes('quoted'), 'the feedback is not echoed');
+  }
+});
+
+test('a decision recorded while the coordinator does not admit work is reported as waiting for idle proof, not as queued', async t => {
+  const f = await coordinatorFixture(t);
+  const { requestId } = f.saveWaiting('run-waiting', { approval: true });
+  await f.reset();
+  const result = await runHelper(['respond', 'run-waiting', '--cwd', f.linked, '--request', requestId, '--decision', 'approve', '--coordinator-config', f.configFile], f.env);
+  assert.equal(result.exitCode, 0, result.stderr + result.text);
+  assert.equal(result.report.outcome, 'waiting-for-idle');
+  assert.equal(result.report.run.status, 'paused');
+  assert.equal(result.report.run.wait.state, 'answered');
+  assert.equal(result.report.run.wait.continuation, 'pending');
+  assert.match(result.report.note, /Nothing is running yet, and the task is not complete/);
+  assert.equal(f.approvalRow(requestId).decision, 'approve');
+  assert.equal(countOf(await f.calls(), 'run respond'), 1);
+  assert.equal(f.launches.length, 0);
+});
+
+test('respond refuses a request of another run and a stale display, and the real coordinator is unchanged', async t => {
+  const f = await coordinatorFixture(t);
+  const first = f.saveWaiting('run-first', { approval: true });
+  const second = f.saveWaiting('run-second', { approval: true });
+  const before = f.state();
+  await f.reset();
+  const configFlag = ['--coordinator-config', f.configFile];
+  const wrongRun = await runHelper(['respond', 'run-first', '--cwd', f.linked, '--request', second.requestId, '--decision', 'approve', ...configFlag], f.env);
+  assert.equal(wrongRun.report.reason, 'request-mismatch');
+  const asPause = await runHelper(['respond', 'run-first', '--cwd', f.linked, '--pause', 'pau_0123456789abcdef0123456789abcdef', '--guidance-stdin', ...configFlag], f.env, { stdin: Readable.from([Buffer.from('go')]) });
+  assert.equal(asPause.report.reason, 'approval-pending');
+  const bare = await runHelper(['resume', 'run-first', '--cwd', f.linked, '--guidance-stdin', ...configFlag], f.env, { stdin: Readable.from([Buffer.from('resume')]) });
+  assert.equal(bare.report.reason, 'approval-pending');
+  assertNoMutation(await f.calls());
+  assert.deepEqual(f.state(), before);
+  assert.equal(f.approvalRow(first.requestId).state, 'pending');
+});
+
+test('resume answers a real generic pause through the guarded response and keeps the run', async t => {
+  const f = await coordinatorFixture(t);
+  const { run: paused } = f.saveWaiting('run-generic', { approval: false });
+  const checkpoint = structuredClone(paused.checkpoint);
+  const guidance = '--use the second approach\nand keep $(cwd) literal "quoted"\n';
+  await fs.writeFile(path.join(f.linked, 'guidance.txt'), guidance);
+  const configFlag = ['--coordinator-config', f.configFile];
+  await f.reset();
+  const snapshot = await runHelper(['snapshot', 'run-generic', '--cwd', f.linked, ...configFlag], f.env);
+  assert.equal(snapshot.report.run.wait.kind, 'generic');
+  assert.match(snapshot.report.run.wait.pauseId, /^pau_[0-9a-f]{32}$/);
+  assertNoMutation(await f.calls());
+  await f.reset();
+
+  const result = await runHelper(['resume', 'run-generic', '--cwd', f.linked, '--guidance-file', 'guidance.txt', ...configFlag], f.env);
+  assert.equal(result.exitCode, 0, result.stderr + result.text);
+  assert.equal(result.report.outcome, 'resumed');
+  assert.equal(result.report.via, 'respond');
+  assert.deepEqual(result.report.preserved, { runId: true, worktreePath: true, branch: true, parentSessionId: true });
+  const after = f.service.store.getRun('run-generic');
+  assert.equal(after.status, 'queued');
+  assert.equal(after.launchAction, 'resume');
+  assert.equal(after.worktreePath, paused.worktreePath);
+  assert.equal(after.branch, paused.branch);
+  assert.deepEqual(after.checkpoint, checkpoint, 'the checkpoint and accepted results are untouched');
+  assert.ok(after.resolution.includes(guidance), 'the guidance arrives verbatim');
+  assert.match(after.resolution, /not a typed approval/);
+  const calls = await f.calls();
+  assert.deepEqual(mutations(calls), ['run respond']);
+  assert.deepEqual(f.sql('SELECT run_id FROM run_responses').map(row => row.run_id), ['run-generic']);
+  assert.equal(f.sql('SELECT COUNT(*) AS n FROM approval_requests')[0].n, 0, 'guidance never becomes an approval');
 });
