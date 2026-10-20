@@ -13,6 +13,10 @@ import { createCoordinatorAdapter } from '../dist/extension/service/coordinator.
 import { createExtensionServer, listenExtensionServer } from '../dist/extension/service/server.js';
 import { createPanelStore } from '../dist/extension/panel/store.js';
 import { waitCard } from '../dist/extension/panel/view-model.js';
+import { createPanelClient } from '../dist/extension/panel/client.js';
+import { readCoordinatorToken } from '../dist/coordinator/token.js';
+import { APPROVAL_FULL_LIMITS } from '../dist/extension/shared/protocol.js';
+import { CANONICAL, COMPACT, hiddenTailRequest, nearLimitRequest } from './fixtures/approval-requests.mjs';
 
 /*
  * The real panel store (the code behind the card's buttons) talks to the real extension service over HTTP with its service
@@ -59,10 +63,10 @@ async function fixture(t) {
     finally { database.close(); }
   };
   let counter = 0;
-  const insertRequest = (runId, requestId, attemptId, createdAt) => sql(`INSERT INTO approval_requests(run_id, request_id, phase, task_index, task_id, attempt_id, receipt_digest, request_json, revision_json, state, continuation, created_at)
-    VALUES (?, ?, 'executor', 0, 'T1', ?, 'digest', ?, ?, 'pending', 'none', ?)`, runId, requestId, attemptId, JSON.stringify(REQUEST), JSON.stringify(REVISION), createdAt);
+  const insertRequest = (runId, requestId, attemptId, createdAt, request = REQUEST) => sql(`INSERT INTO approval_requests(run_id, request_id, phase, task_index, task_id, attempt_id, receipt_digest, request_json, revision_json, state, continuation, created_at)
+    VALUES (?, ?, 'executor', 0, 'T1', ?, 'digest', ?, ?, 'pending', 'none', ?)`, runId, requestId, attemptId, JSON.stringify(request), JSON.stringify(REVISION), createdAt);
   /** A paused, released, idle run with a pending request (`approval`) or an ordinary blocker. */
-  const seed = ({ approval = true, reason = 'Blocked: choose the database' } = {}) => {
+  const seed = ({ approval = true, reason = 'Blocked: choose the database', request = REQUEST } = {}) => {
     const id = `run-${++counter}`;
     coordinator.store.enqueue({ id, projectId: project.id, feature: '# Feature\nbody', baseCommit: 'c'.repeat(40), worktreePath: path.join(root, 'worktrees', id), branch: `heimdall/${id}`, specification });
     const run = coordinator.store.admitNext();
@@ -77,7 +81,7 @@ async function fixture(t) {
     coordinator.store.bindStart(id, run.ownerToken, caller);
     // The request is published before the runner records its pause on it.
     const requestId = approval ? `apr_${id}_1` : undefined;
-    if (approval) insertRequest(id, requestId, attempt.id, 1000);
+    if (approval) insertRequest(id, requestId, attempt.id, 1000, request);
     coordinator.store.saveCheckpoint(id, run.ownerToken, state);
     const running = coordinator.store.transition(id, run.ownerToken, run.version, 'running');
     coordinator.store.transition(id, running.ownerToken, running.version, 'paused', reason, true);
@@ -110,7 +114,7 @@ async function fixture(t) {
     child.on('error', reject);
     child.on('close', status => resolve({ status, stdout: Buffer.concat(out).toString('utf8'), stderr: Buffer.concat(err).toString('utf8') }));
   });
-  return { root, coordinator, server, sql, seed, republish, approvalRow, respondCli, port: server.address().port };
+  return { root, coordinator, server, sql, seed, republish, approvalRow, respondCli, stateDirectory: configuration.stateDirectory, port: server.address().port };
 }
 
 /** The panel host: forwards a request to the service as OpenChamber does, recording every request. */
@@ -392,4 +396,82 @@ test('Respond and continue answers exactly one generic pause; a stale pause is r
   assert.ok(f.coordinator.store.getRun(id).resolution.endsWith(`\n${guidance}`));
   assert.equal(store.getState().action.ack.pauseId, wait.pauseId);
   assert.equal(store.getState().action.ack.continuation, 'queued');
+});
+
+// --- the complete approval request through the real service and the panel transport ---------------------------------------
+
+/** What a read must never change: every approval row, every run's version and status, and the event log. */
+const databaseState = f => JSON.stringify({
+  approvals: f.sql('SELECT * FROM approval_requests ORDER BY run_id, request_id'),
+  runs: f.sql('SELECT id, status, version, updated_at, resolution, launch_action FROM runs ORDER BY id'),
+  events: f.sql('SELECT * FROM events ORDER BY rowid'),
+});
+
+test('the panel service returns the complete approval request in order while the run detail still clips; the read changes nothing and exposes no secret', async t => {
+  const f = await fixture(t);
+  const key = await readCoordinatorToken(f.stateDirectory);
+  const cases = [['hidden tail', hiddenTailRequest()], ['near the payload limit', nearLimitRequest()]];
+  const seeded = cases.map(([, request]) => f.seed({ request }));
+  for (const [index, [name, request]] of cases.entries()) {
+    const { id, requestId } = seeded[index];
+    const host = hostFor(f);
+    const client = createPanelClient(host);
+    const capability = f.coordinator.store.getRun(id).ownerToken;
+    const before = databaseState(f);
+
+    // The compact detail says it was clipped and hides what lies beyond the limits.
+    const detail = (await client.run(id)).run.wait;
+    assert.equal(detail.clipped, true, name);
+    assert.ok(detail.scope.length <= COMPACT.text + 1, name);
+    assert.ok(detail.verification.length <= COMPACT.list, name);
+    assert.equal(JSON.stringify(detail).includes('ACTION-AFTER-1500') || JSON.stringify(detail).includes('SCOPE-AFTER-1500'), false, `${name}: the compact scope hides its tail`);
+
+    const answer = await client.approval(id, requestId);
+    const view = answer.request;
+    for (const field of ['question', 'scope', 'completedWork', 'verification', 'artifacts', 'onApprove', 'onRequestChanges']) assert.deepEqual(view[field], request[field], `${name}: ${field}`);
+    assert.deepEqual({ requestId: view.requestId, runId: view.runId, state: view.state, continuation: view.continuation, progress: view.progress, taskId: view.taskId, taskIndex: view.taskIndex, attemptId: view.attemptId, response: view.response, createdAt: view.createdAt },
+      { requestId, runId: id, state: 'pending', continuation: 'none', progress: 'none', taskId: 'T1', taskIndex: 0, attemptId: `attempt_${id}_1`, response: null, createdAt: 1000 });
+    assert.deepEqual(view.revision, REVISION);
+    assert.deepEqual(Object.keys(view).sort(), ['attemptId', 'artifacts', 'completedWork', 'continuation', 'createdAt', 'onApprove', 'onRequestChanges', 'progress', 'question', 'requestId', 'response', 'revision', 'runId', 'scope', 'state', 'taskId', 'taskIndex', 'verification'].sort());
+    assert.equal(typeof answer.fetchedAt, 'string');
+
+    // The raw service answer carries no key, capability or internal field.
+    const raw = await host.serviceRequest({ method: 'GET', path: `/runs/${id}/approvals/${requestId}` });
+    assert.equal(raw.status, 200);
+    for (const secret of [key, capability, SERVICE_TOKEN, 'receiptDigest', 'receipt_digest', 'ownerToken', '"ack"', 'checkpoint']) assert.equal(raw.body.includes(secret), false, `${name}: ${secret}`);
+    assert.deepEqual(host.requests.map(request => request.method), ['GET', 'GET', 'GET'], 'reads only');
+    assert.equal(databaseState(f), before, `${name}: no approval row, run version or event changed`);
+  }
+
+  // The recorded response of a decided request is part of the view.
+  const decided = f.seed({ request: hiddenTailRequest() });
+  const result = await f.respondCli(['run', 'respond', decided.id, '--request', decided.requestId, '--decision', 'request-changes', '--input=Narrow the scope']);
+  assert.equal(result.status, 0, result.stderr);
+  const afterDecision = databaseState(f);
+  const answered = (await createPanelClient(hostFor(f)).approval(decided.id, decided.requestId)).request;
+  assert.equal(answered.state, 'answered');
+  assert.deepEqual({ decision: answered.response.decision, feedback: answered.response.feedback }, { decision: 'request-changes', feedback: 'Narrow the scope' });
+  assert.equal(databaseState(f), afterDecision);
+
+  // Unknown requests, other runs' requests and bad identifiers fail with fixed texts and no coordinator detail.
+  const client = createPanelClient(hostFor(f));
+  await assert.rejects(client.approval(seeded[0].id, 'apr_missing'), error => error.code === 'not-found' && error.category === 'request');
+  await assert.rejects(client.approval(seeded[0].id, seeded[1].requestId), error => error.code === 'not-found');
+  await assert.rejects(client.approval('../x', seeded[0].requestId), error => error.code === 'not-found');
+  assert.equal(APPROVAL_FULL_LIMITS.text, CANONICAL.text);
+  assert.equal(APPROVAL_FULL_LIMITS.entries, CANONICAL.list);
+  assert.equal(APPROVAL_FULL_LIMITS.payloadBytes, CANONICAL.payload);
+});
+
+test('the approval read requires the service token', async t => {
+  const f = await fixture(t);
+  const { id, requestId } = f.seed();
+  for (const authorization of [undefined, 'Bearer nope', `Bearer ${await readCoordinatorToken(f.stateDirectory)}`]) {
+    const status = await new Promise((resolve, reject) => {
+      const request = http.request({ host: '127.0.0.1', port: f.port, method: 'GET', path: `/runs/${id}/approvals/${requestId}`, headers: authorization === undefined ? {} : { Authorization: authorization } }, response => { response.resume(); response.on('end', () => resolve(response.statusCode)); });
+      request.on('error', reject);
+      request.end();
+    });
+    assert.equal(status, 401, String(authorization));
+  }
 });

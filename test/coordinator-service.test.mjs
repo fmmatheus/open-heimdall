@@ -14,6 +14,7 @@ import { createDurableSubmissionGate } from '../dist/workflow/durable-submission
 import { contractDigest, contractRef } from '../dist/workflow/contracts.js';
 import { computeReviewRevision, ReviewRevisionError } from '../dist/coordinator/review-revision.js';
 import { DatabaseSync } from 'node:sqlite';
+import { hiddenTailRequest, nearLimitRequest } from './fixtures/approval-requests.mjs';
 import { openSubmissionBinding, recordDispatchPrompt } from '../dist/workflow/submission-store.js';
 import { computeRuntimeIdentity, runtimeIdentity } from '../dist/workflow/runtime-identity.js';
 import { sourcePackageRoot } from '../dist/coordinator/runtime-snapshot.js';
@@ -450,6 +451,27 @@ test('a decision names this run and an existing request; foreign and unknown req
   await assert.rejects(p.decide({ decision: 'approve' }, 'bad%20id'), status(400));
   assert.equal((await p.inspect()).state, 'pending');
   assert.equal(p.store.getApproval(other.id, p.request.requestId), null);
+});
+
+test('the approval read returns a legal long request in full while the run view clips it, and reading changes nothing', async t => {
+  for (const [name, content] of [['hidden tail', hiddenTailRequest()], ['near the payload limit', nearLimitRequest()]]) {
+    // The request goes through the real contract and publication path, so the stored content is what a legal agent can send.
+    const p = await published(t, { payload: approvalPayload(content) });
+    const route = `/runs/${p.run.id}/approvals/${p.request.requestId}`;
+    const view = await p.f.client.request('GET', route);
+    for (const field of ['question', 'scope', 'completedWork', 'verification', 'artifacts', 'onApprove', 'onRequestChanges']) assert.deepEqual(view.request[field], content[field], `${name}: ${field}`);
+    const compact = p.store.approvalWait(p.store.getRun(p.run.id));
+    assert.equal(compact?.clipped.scope, true, `${name}: the run projection says it clipped the scope`);
+    const run = p.store.getRun(p.run.id);
+    const before = JSON.stringify({ run: { version: run.version, status: run.status, updatedAt: run.updatedAt }, events: p.store.events(), approval: p.store.getApproval(p.run.id, p.request.requestId) });
+    await p.f.client.request('GET', route);
+    await p.f.client.request('GET', route);
+    await p.f.client.request('GET', `/runs/${p.run.id}`);
+    const after = JSON.stringify({ run: { version: run.version, status: run.status, updatedAt: run.updatedAt }, events: p.store.events(), approval: p.store.getApproval(p.run.id, p.request.requestId) });
+    const current = p.store.getRun(p.run.id);
+    assert.equal(after, before, `${name}: no event or approval row changed`);
+    assert.deepEqual({ version: current.version, status: current.status, updatedAt: current.updatedAt }, { version: run.version, status: run.status, updatedAt: run.updatedAt }, `${name}: the run did not change`);
+  }
 });
 
 test('a run capability cannot read or answer a request, and forged checkpoint or submission fields cannot create or alter a decision', async t => {

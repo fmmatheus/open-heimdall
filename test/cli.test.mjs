@@ -9,6 +9,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { loadCoordinatorConfiguration } from '../dist/coordinator/config.js';
 import { startCoordinatorService } from '../dist/coordinator/service.js';
+import { CANONICAL, COMPACT, hiddenTailRequest, nearLimitRequest, submissionBytes } from './fixtures/approval-requests.mjs';
 
 const cli = fileURLToPath(new URL('../dist/cli.js', import.meta.url));
 const call = args => spawnSync(process.execPath, [cli, ...args], { encoding: 'utf8', env: { ...process.env, HEIMDALL_CONFIG: '' } });
@@ -63,6 +64,7 @@ test('--version prints the package version without configuration', async () => {
 const runSettings = { plannerAgent: 'planner', executorAgent: 'executor', plannerModel: 'anthropic/planner', executorModel: 'anthropic/executor', executorFallbackModel: 'kimi/fallback', maxTasks: 10, minQuotaRemainingPercent: 10, tokenLimitsDisabled: true };
 const runSpecification = { settings: runSettings, plannerPrompt: 'Synthetic planner', executorPrompt: 'Synthetic executor', agents: {}, opencode: { baseUrl: 'http://127.0.0.1:9999', passwordEnvironmentVariable: 'SYNTHETIC_PASSWORD' } };
 const REVISION = { head: 'a'.repeat(40), digest: 'b'.repeat(64) };
+const DEFAULT_REQUEST = { question: 'Ship it?', scope: 'The reviewed commit', completedWork: 'Done', verification: ['tests pass'], artifacts: ['README.md'], onApprove: ['merge'], onRequestChanges: ['fix'] };
 
 function respondCli(home, args, extraEnvironment = {}) {
   const environment = { ...process.env, HOME: home, HEIMDALL_CONFIG: '' };
@@ -92,7 +94,7 @@ async function coordinatorFor(t, name) {
   await fs.writeFile(path.join(root, 'project', '.heimdall.toml'), '[workflow]\n');
   const project = service.store.registerProject({ directory: path.join(root, 'project'), commonGitDirectory: path.join(root, 'project', '.git'), configPath: path.join(root, 'project', '.heimdall.toml'), concurrency: 5 });
   let counter = 0;
-  const seed = ({ reason = 'Blocked: choose the database', approval = false } = {}) => {
+  const seed = ({ reason = 'Blocked: choose the database', approval = false, request = DEFAULT_REQUEST } = {}) => {
     const id = `${name}-run-${++counter}`;
     service.store.enqueue({ id, projectId: project.id, feature: '# Feature', baseCommit: 'c'.repeat(40), worktreePath: path.join(root, 'worktrees', id), branch: `heimdall/${id}`, specification: runSpecification });
     const run = service.store.admitNext();
@@ -113,7 +115,7 @@ async function coordinatorFor(t, name) {
       try {
         database.prepare(`INSERT INTO approval_requests(run_id, request_id, phase, task_index, task_id, attempt_id, receipt_digest, request_json, revision_json, state, continuation, created_at)
           VALUES (?, ?, 'executor', 0, 'T1', ?, 'digest', ?, ?, 'pending', 'none', 1)`)
-          .run(id, requestId, attempt.id, JSON.stringify({ question: 'Ship it?', scope: 'The reviewed commit', completedWork: 'Done', verification: ['tests pass'], artifacts: ['README.md'], onApprove: ['merge'], onRequestChanges: ['fix'] }), JSON.stringify(REVISION));
+          .run(id, requestId, attempt.id, JSON.stringify(request), JSON.stringify(REVISION));
       } finally { database.close(); }
     }
     service.store.saveCheckpoint(id, run.ownerToken, state);
@@ -370,4 +372,241 @@ test('the coordinator help documents run respond, its inline option syntax and i
     '--input=VALUE', 'Exit status: 0 when the response was', '2 when', 'run show',
   ]) assert.ok(help.stdout.includes(fragment), fragment);
   assert.match(help.stdout, /heimdall coordinator run resume RUN_ID --input RESOLUTION/);
+});
+
+// --- heimdall coordinator run approval ---------------------------------------------------------------------------------
+// One complete approval request, read through the real CLI parser and dispatcher. Compact projections (run show, run list)
+// keep clipping; the read returns the full recorded content in order. Exit status: 0 for a valid request, 1 for every failure.
+
+/** What a read must never change: every approval row, every run's version and status, and the event log. */
+const snapshot = c => JSON.stringify({
+  approvals: c.rows('SELECT * FROM approval_requests ORDER BY run_id, request_id'),
+  runs: c.rows('SELECT id, status, version, updated_at, resolution, launch_action FROM runs ORDER BY id'),
+  events: c.rows('SELECT * FROM events ORDER BY rowid'),
+});
+const VIEW_FIELDS = ['attemptId', 'completedWork', 'continuation', 'createdAt', 'onApprove', 'onRequestChanges', 'progress', 'question', 'artifacts', 'requestId', 'response', 'revision', 'runId', 'scope', 'state', 'taskId', 'taskIndex', 'verification'].sort();
+
+test('run approval returns the complete request in order while run show and run list still clip honestly, and reads change nothing', async t => {
+  const c = await coordinatorFor(t, 'read');
+  const tail = hiddenTailRequest();
+  const near = nearLimitRequest();
+  assert.equal(tail.scope.length, 1900);
+  assert.ok(tail.scope.indexOf('ACTION-AFTER-1500') > COMPACT.text, 'the distinctive action is beyond the compact text limit');
+  assert.equal(submissionBytes(near), CANONICAL.payload, 'the near-limit request is exactly at the payload limit');
+  const cases = [['hidden tail', tail], ['near the payload limit', near]];
+  const seeded = cases.map(([, request]) => c.seed({ approval: true, request }));
+  for (const [index, [name, request]] of cases.entries()) {
+    const { id, requestId } = seeded[index];
+    const before = snapshot(c);
+
+    // The compact projections clip, and say so.
+    const shown = JSON.parse((await respondCli(c.home, c.args('run', 'show', id))).stdout).wait;
+    assert.equal(shown.kind, 'approval', name);
+    assert.ok(shown.scope.length <= COMPACT.text, name);
+    assert.equal(shown.clipped.scope, true, name);
+    assert.ok(shown.verification.length <= COMPACT.list && shown.onApprove.length <= COMPACT.list, name);
+    assert.ok(shown.verification.concat(shown.artifacts, shown.onApprove, shown.onRequestChanges).every(entry => entry.length <= COMPACT.entry), name);
+    const markers = [...JSON.stringify(request).matchAll(/[A-Z]+(?:-[A-Z0-9]+)*-(?:AFTER-1500|TAIL-\d+|ENTRY-\d+|END)|PROPOSED-ACTION-13|LAST-ENTRY/g)].map(match => match[0]);
+    assert.ok(markers.length >= 3, `${name}: markers`);
+    const compact = JSON.stringify(shown);
+    assert.ok(markers.some(marker => !compact.includes(marker)), `${name}: the compact view hides at least one distinctive marker`);
+    const listed = (await respondCli(c.home, c.args('run', 'list'))).stdout;
+    const listedWait = JSON.parse(listed).find(run => run.id === id).wait;
+    assert.equal(listedWait.kind, 'approval', name);
+    assert.ok(listedWait.scope.length <= COMPACT.text, name);
+    assert.equal(listedWait.clipped.scope, true, name);
+    assert.ok(markers.some(marker => !JSON.stringify(listedWait).includes(marker)), `${name}: the listed view hides at least one marker`);
+
+    // The read returns everything, in order.
+    const read = await respondCli(c.home, c.args('run', 'approval', id, '--request', requestId));
+    assert.equal(read.status, 0, read.stderr);
+    assert.equal(read.stderr, '');
+    const view = JSON.parse(read.stdout);
+    assert.equal(read.stdout, JSON.stringify(view, null, 2) + '\n');
+    assert.deepEqual(Object.keys(view).sort(), VIEW_FIELDS, 'only text and data fields');
+    for (const field of ['question', 'scope', 'completedWork', 'verification', 'artifacts', 'onApprove', 'onRequestChanges']) assert.deepEqual(view[field], request[field], `${name}: ${field}`);
+    for (const marker of markers) assert.ok(read.stdout.includes(marker), `${name}: ${marker}`);
+    assert.deepEqual({ requestId: view.requestId, runId: view.runId, state: view.state, continuation: view.continuation, progress: view.progress, taskId: view.taskId, taskIndex: view.taskIndex, response: view.response }, { requestId, runId: id, state: 'pending', continuation: 'none', progress: 'none', taskId: 'T1', taskIndex: 0, response: null });
+    assert.deepEqual(view.revision, REVISION);
+    assert.doesNotMatch(read.stdout, /receiptDigest|"ack"|ownerToken|coordinator\.key/);
+    assert.equal(snapshot(c), before, `${name}: show, list and approval changed nothing`);
+  }
+  // A decided request reports the recorded response.
+  const decided = c.seed({ approval: true });
+  assert.equal((await respondCli(c.home, c.args('run', 'respond', decided.id, '--request', decided.requestId, '--decision', 'request-changes', '--input=Narrow the scope'))).status, 0);
+  const afterDecision = snapshot(c);
+  const answered = JSON.parse((await respondCli(c.home, c.args('run', 'approval', decided.id, '--request', decided.requestId))).stdout);
+  assert.equal(answered.state, 'answered');
+  assert.deepEqual({ decision: answered.response.decision, feedback: answered.response.feedback }, { decision: 'request-changes', feedback: 'Narrow the scope' });
+  assert.equal(snapshot(c), afterDecision);
+  // The equivalent --option=value spelling reads the same request.
+  assert.deepEqual(JSON.parse((await respondCli(c.home, c.args('run', 'approval', decided.id, `--request=${decided.requestId}`))).stdout), answered);
+});
+
+test('run approval rejects incomplete and ambiguous arguments before the configuration is read or any request is sent', async t => {
+  const idle = await standIn(t, (_request, response) => send(response, 200, {}));
+  const absent = path.join(idle.root, 'absent.toml'); // Reading it would fail first, so a usage message proves nothing was loaded.
+  const cases = {
+    'missing run id': [['run', 'approval', '--request', 'apr_1'], /requires a valid RUN_ID/],
+    'invalid run id': [['run', 'approval', '../x', '--request', 'apr_1'], /requires a valid RUN_ID/],
+    'missing request': [['run', 'approval', 'run-1'], /requires --request REQUEST_ID/],
+    'invalid request': [['run', 'approval', 'run-1', '--request', '../x'], /--request must be a valid REQUEST_ID/],
+    'overlong request': [['run', 'approval', 'run-1', `--request=${'a'.repeat(129)}`], /--request must be a valid REQUEST_ID/],
+    'empty inline request': [['run', 'approval', 'run-1', '--request='], /--request requires a value/],
+    'extra positional': [['run', 'approval', 'run-1', 'run-2', '--request', 'apr_1'], /Invalid coordinator arguments/],
+    'repeated request': [['run', 'approval', 'run-1', '--request', 'apr_1', '--request', 'apr_2'], /Unknown or repeated option: --request/],
+    'json flag': [['run', 'approval', 'run-1', '--request', 'apr_1', '--json'], /--json does not apply/],
+    'decision option': [['run', 'approval', 'run-1', '--request', 'apr_1', '--decision', 'approve'], /--decision does not apply/],
+    'input option': [['run', 'approval', 'run-1', '--request', 'apr_1', '--input', 'x'], /--input does not apply/],
+    'pause option': [['run', 'approval', 'run-1', '--request', 'apr_1', '--pause', 'pau_1'], /--pause does not apply/],
+    'unknown option': [['run', 'approval', 'run-1', '--request', 'apr_1', '--follow'], /Unknown or repeated option: --follow/],
+  };
+  for (const [name, [args, pattern]] of Object.entries(cases)) {
+    const result = await respondCli(idle.root, [...args, '--coordinator-config', absent]);
+    assert.equal(result.status, 1, `${name}: ${result.stderr}`);
+    assert.equal(result.stdout, '', name);
+    assert.match(result.stderr, pattern, name);
+    assert.doesNotMatch(result.stderr, /ENOENT/, `${name}: validated before the configuration was read`);
+  }
+  assert.match((await respondCli(idle.root, ['run', 'approval', 'run-1', '--coordinator-config', absent])).stderr, /Usage:\n {2}heimdall coordinator run approval RUN_ID --request REQUEST_ID/);
+  // Even with a reachable coordinator selected, an invalid invocation sends nothing.
+  for (const [name, [args]] of Object.entries(cases)) {
+    const result = await respondCli(idle.root, idle.args(...args));
+    assert.equal(result.status, 1, name);
+  }
+  assert.equal(idle.requests.length, 0, 'no argument error reached the coordinator');
+});
+
+test('run approval distinguishes an unknown request, an older coordinator, a refused key and an unavailable coordinator, each with exit status 1', async t => {
+  const c = await coordinatorFor(t, 'outcomes');
+  const one = c.seed({ approval: true });
+  const other = c.seed({ approval: true });
+  const before = snapshot(c);
+  const unknownRequest = await respondCli(c.home, c.args('run', 'approval', one.id, '--request', 'apr_missing'));
+  assert.equal(unknownRequest.status, 1);
+  assert.equal(unknownRequest.stdout, '');
+  assert.match(unknownRequest.stderr, /has no approval request apr_missing for run /);
+  assert.match(unknownRequest.stderr, /^Heimdall: /);
+  // A request id of another run is not found for this one.
+  const crossed = await respondCli(c.home, c.args('run', 'approval', one.id, '--request', other.requestId));
+  assert.equal(crossed.status, 1);
+  assert.equal(crossed.stdout, '');
+  assert.match(crossed.stderr, /has no approval request/);
+  const unknownRun = await respondCli(c.home, c.args('run', 'approval', 'run-nope', '--request', one.requestId));
+  assert.equal(unknownRun.status, 1);
+  assert.equal(unknownRun.stdout, '');
+  assert.match(unknownRun.stderr, /does not know run run-nope/);
+  assert.equal(snapshot(c), before);
+
+  const old = await standIn(t, (_request, response) => send(response, 404, { error: 'Unknown coordinator route' }));
+  const older = await respondCli(old.root, old.args('run', 'approval', 'run-1', '--request', 'apr_1'));
+  assert.equal(older.status, 1);
+  assert.equal(older.stdout, '');
+  assert.match(older.stderr, /does not support reading an approval request \(likely an older version\)/);
+  assert.doesNotMatch(older.stderr, /has no approval request|does not know run/);
+  assert.deepEqual(old.requests.map(request => `${request.method} ${request.url}`), ['GET /runs/run-1/approvals/apr_1']);
+  assert.equal(old.requests[0].body, '', 'a read sends no body');
+
+  for (const status of [401, 403]) {
+    const refusing = await standIn(t, (_request, response) => send(response, status, { error: 'Administrator authorization required' }));
+    const refused = await respondCli(refusing.root, refusing.args('run', 'approval', 'run-1', '--request', 'apr_1'));
+    assert.equal(refused.status, 1, String(status));
+    assert.equal(refused.stdout, '', String(status));
+    assert.match(refused.stderr, /refused authorization to read the approval request; check the coordinator key/, String(status));
+  }
+  const failing = await standIn(t, (_request, response) => send(response, 500, { error: 'Coordinator request failed' }));
+  const failed = await respondCli(failing.root, failing.args('run', 'approval', 'run-1', '--request', 'apr_1'));
+  assert.equal(failed.status, 1);
+  assert.match(failed.stderr, /refused to return the approval request \(500\)/);
+  const dropped = await standIn(t, (request, _response) => request.socket.destroy());
+  const lost = await respondCli(dropped.root, dropped.args('run', 'approval', 'run-1', '--request', 'apr_1'));
+  assert.equal(lost.status, 1, 'a read has no uncertain outcome');
+  assert.equal(lost.stdout, '');
+
+  const idle = path.join(c.root, 'idle.toml');
+  await fs.writeFile(idle, '[coordinator]\nstateDirectory = "idle-s"\n');
+  await fs.mkdir(path.join(c.root, 'idle-s'), { mode: 0o700 });
+  await fs.writeFile(path.join(c.root, 'idle-s', 'coordinator.key'), 'f'.repeat(64), { mode: 0o600 });
+  const unavailable = await respondCli(c.home, ['run', 'approval', one.id, '--request', one.requestId, '--coordinator-config', idle]);
+  assert.equal(unavailable.status, 1);
+  assert.equal(unavailable.stdout, '');
+  assert.match(unavailable.stderr, /could not be read from the coordinator/);
+});
+
+test('run approval refuses an answer that is not a valid complete request and prints nothing from it', async t => {
+  const valid = () => ({
+    runId: 'run-1', requestId: 'apr_1', phase: 'executor', taskIndex: 0, taskId: 'T1', attemptId: 'attempt_1', receiptDigest: 'SECRET-DIGEST',
+    request: { ...DEFAULT_REQUEST }, revision: REVISION, state: 'pending', decision: null, feedback: null, ack: { ownerToken: 'SECRET-TOKEN' },
+    answeredAt: null, continuation: 'none', continuationAt: null, continuationMessageId: null, consumedAttemptId: null, supersededAt: null, supersededReason: null,
+    createdAt: 1, progress: 'none',
+  });
+  const withRequest = change => ({ ...valid(), request: { ...DEFAULT_REQUEST, ...change } });
+  const over = withRequest({ scope: 'x'.repeat(CANONICAL.text + 1) });
+  const bad = {
+    'a different request id': { ...valid(), requestId: 'apr_other' },
+    'a different run id': { ...valid(), runId: 'run-other' },
+    'text beyond the limit': over,
+    'an entry beyond the limit': withRequest({ verification: ['y'.repeat(CANONICAL.text + 1)] }),
+    'too many entries': withRequest({ artifacts: Array.from({ length: CANONICAL.list + 1 }, (_, index) => `a${index}`) }),
+    'a payload beyond the limit': withRequest({ verification: Array.from({ length: 20 }, () => 'z'.repeat(CANONICAL.text)) }),
+    'a non-text entry': withRequest({ onApprove: ['ok', 7] }),
+    'a missing list': withRequest({ onRequestChanges: undefined }),
+    'an unknown state': { ...valid(), state: 'maybe' },
+    'an unknown progress': { ...valid(), progress: 'soon' },
+    'an answered state without a decision': { ...valid(), state: 'answered' },
+    'a decision on a pending request': { ...valid(), decision: 'approve' },
+    'a malformed revision': { ...valid(), revision: { head: 'not hex!', digest: 'b'.repeat(64) } },
+    'a missing request body': { ...valid(), request: null },
+    'an array': [valid()],
+    'null': null,
+  };
+  for (const [name, answer] of Object.entries(bad)) {
+    const stub = await standIn(t, (_request, response) => send(response, 200, answer));
+    const result = await respondCli(stub.root, stub.args('run', 'approval', 'run-1', '--request', 'apr_1'));
+    assert.equal(result.status, 1, name);
+    assert.equal(result.stdout, '', name);
+    assert.match(result.stderr, /returned an invalid approval request: .* is missing or not valid\. Nothing is shown from it\./, name);
+    assert.doesNotMatch(result.stderr, /SECRET|xxxxxxxx|zzzzzzzz/, name);
+    assert.equal(stub.requests.length, 1, name);
+  }
+  // A valid answer from the same stand-in is printed without the fields a view does not carry.
+  const good = await standIn(t, (_request, response) => send(response, 200, valid()));
+  const printed = await respondCli(good.root, good.args('run', 'approval', 'run-1', '--request', 'apr_1'));
+  assert.equal(printed.status, 0, printed.stderr);
+  assert.deepEqual(Object.keys(JSON.parse(printed.stdout)).sort(), VIEW_FIELDS);
+  assert.doesNotMatch(printed.stdout, /SECRET/);
+  // An unreadable body is a failure too, with nothing on stdout.
+  const garbled = await standIn(t, (_request, response) => { response.writeHead(200, { 'Content-Type': 'application/json' }); response.end('not json'); });
+  const unreadable = await respondCli(garbled.root, garbled.args('run', 'approval', 'run-1', '--request', 'apr_1'));
+  assert.equal(unreadable.status, 1);
+  assert.equal(unreadable.stdout, '');
+});
+
+test('run approval reads from the coordinator selected by --coordinator-config, and only that one', async t => {
+  const a = await coordinatorFor(t, 'sel-a');
+  const b = await coordinatorFor(t, 'sel-b');
+  const onA = a.seed({ approval: true, request: { ...DEFAULT_REQUEST, question: 'Question on A?' } });
+  const onB = b.seed({ approval: true, request: { ...DEFAULT_REQUEST, question: 'Question on B?' } });
+  const wrong = await respondCli(a.home, a.args('run', 'approval', onB.id, '--request', onB.requestId));
+  assert.equal(wrong.status, 1);
+  assert.match(wrong.stderr, /does not know run /);
+  const right = await respondCli(a.home, b.args('run', 'approval', onB.id, '--request', onB.requestId));
+  assert.equal(right.status, 0, right.stderr);
+  assert.equal(JSON.parse(right.stdout).question, 'Question on B?');
+  // The environment selector works as well, and the flag wins over it.
+  const viaEnvironment = await respondCli(a.home, ['run', 'approval', onA.id, '--request', onA.requestId], { HEIMDALL_COORDINATOR_CONFIG: a.configFile });
+  assert.equal(JSON.parse(viaEnvironment.stdout).question, 'Question on A?');
+  const flagWins = await respondCli(a.home, b.args('run', 'approval', onB.id, '--request', onB.requestId), { HEIMDALL_COORDINATOR_CONFIG: a.configFile });
+  assert.equal(JSON.parse(flagWins.stdout).question, 'Question on B?');
+  assert.equal(a.rows("SELECT count(*) AS n FROM approval_requests WHERE state = 'pending'")[0].n, 1);
+  assert.equal(b.rows("SELECT count(*) AS n FROM approval_requests WHERE state = 'pending'")[0].n, 1);
+});
+
+test('the coordinator help lists run approval, its read-only behavior and its exit statuses', () => {
+  const help = call(['coordinator', '--help']).stdout;
+  assert.ok(help.includes('heimdall coordinator run approval RUN_ID --request REQUEST_ID'));
+  assert.match(help, /run approval prints one\ncomplete request as JSON on stdout/);
+  assert.match(help, /It is read-only and honors\n--coordinator-config/);
+  assert.match(help, /Exit status: 0 when a valid request was printed; 1 with a diagnostic on stderr/);
+  assert.match(help, /heimdall coordinator run respond RUN_ID --request REQUEST_ID --decision approve/);
 });

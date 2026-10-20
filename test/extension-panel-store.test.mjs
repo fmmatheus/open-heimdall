@@ -782,6 +782,54 @@ test('the client allows only the exact content paths and checks the shape of the
   await assert.rejects(createPanelClient(answer({ ...blockerContentOf('run_1'), clipped: {} })).blockerContent('run_1'), error => error.code === 'invalid-response');
 });
 
+test('the client reads one complete approval request only from the exact path and checks the answer against the request asked for', async () => {
+  for (const path of ['/runs/run_1/approvals/apr_1', '/runs/A-b_9/approvals/x']) assert.equal(isAllowedPath(path), true, path);
+  for (const path of ['/runs/run_1/approvals', '/runs/run_1/approvals/', '/runs/run_1/approvals/apr_1/', '/runs/run_1/approvals/apr_1/decision', '/runs/run_1/approvals/apr_1/x', '/runs/run_1/approvals/-x', '/runs/run_1/approvals/%2e%2e',
+    '/runs/run_1/approvals/..', '/runs/run_1/approvals/apr_1?x=1', '/runs/../approvals/apr_1', '/runs//approvals/apr_1', `/runs/run_1/approvals/${'a'.repeat(129)}`]) {
+    assert.equal(isAllowedPath(path), false, path);
+  }
+  const content = { question: 'Q', scope: 'S', completedWork: 'C', verification: ['v'], artifacts: ['a'], onApprove: ['o'], onRequestChanges: ['r'] };
+  const view = (overrides = {}) => ({
+    request: { requestId: 'apr_1', runId: 'run_1', state: 'pending', continuation: 'none', progress: 'none', taskId: 'T1', taskIndex: 0, attemptId: 'attempt_1', revision: { head: 'a'.repeat(40), digest: 'b'.repeat(64) }, ...content, response: null, createdAt: 1, ...overrides },
+    fetchedAt: 'x',
+  });
+  const seen = [];
+  const answer = body => ({ async serviceRequest(request) { seen.push(request); return { status: 200, body: JSON.stringify(body) }; } });
+  const read = body => createPanelClient(answer(body)).approval('run_1', 'apr_1');
+
+  assert.equal((await read(view())).request.scope, 'S');
+  assert.deepEqual(seen, [{ method: 'GET', path: '/runs/run_1/approvals/apr_1' }]);
+  const long = 'x'.repeat(4000);
+  assert.equal((await read(view({ scope: long, verification: Array.from({ length: 20 }, () => long.slice(0, 1000)) }))).request.scope.length, 4000, 'canonical maxima are accepted');
+  const answered = { state: 'answered', response: { decision: 'request-changes', feedback: 'f', answeredAt: 5 } };
+  assert.equal((await read(view(answered))).request.response.decision, 'request-changes');
+  for (const [name, body] of Object.entries({
+    'another request': view({ requestId: 'apr_2' }),
+    'another run': view({ runId: 'run_2' }),
+    'text beyond the limit': view({ scope: 'x'.repeat(4001) }),
+    'too many entries': view({ artifacts: Array.from({ length: 21 }, () => 'a') }),
+    'an entry beyond the limit': view({ onApprove: ['x'.repeat(4001)] }),
+    'a payload beyond the limit': view({ verification: Array.from({ length: 20 }, () => 'z'.repeat(2000)), artifacts: Array.from({ length: 20 }, () => 'z'.repeat(2000)) }),
+    'an unknown state': view({ state: 'maybe' }),
+    'an answered request without a response': view({ state: 'answered' }),
+    'a pending request with a response': view({ response: { decision: 'approve', feedback: null, answeredAt: 1 } }),
+    'a malformed revision': view({ revision: { head: 'zz', digest: 'b' } }),
+    'no request': { fetchedAt: 'x' },
+    'an array': [],
+  })) await assert.rejects(read(body), error => error.code === 'invalid-response', name);
+  const before = seen.length;
+  for (const bad of ['../x', 'a/b', '', 'x'.repeat(129)]) {
+    await assert.rejects(createPanelClient(answer(view())).approval(bad, 'apr_1'), error => error.code === 'not-found');
+    await assert.rejects(createPanelClient(answer(view())).approval('run_1', bad), error => error.code === 'not-found');
+  }
+  assert.equal(seen.length, before, 'invalid identifiers never reach the host');
+  // Fixed service errors keep their fixed texts and stay local to the request.
+  const failing = kind => createPanelClient({ async serviceRequest() { return { status: 502, body: JSON.stringify({ error: { kind, message: SECRET } }) }; } }).approval('run_1', 'apr_1');
+  for (const kind of ['approval-unreadable', 'approval-unsupported']) {
+    await assert.rejects(failing(kind), error => error.code === kind && error.category === 'request' && !error.message.includes('RAW-SECRET') && !(error.hint ?? '').includes('RAW-SECRET'), kind);
+  }
+});
+
 // ----- approval and response controls -----
 
 const approvalWait = (overrides = {}) => ({

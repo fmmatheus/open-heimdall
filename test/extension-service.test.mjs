@@ -15,6 +15,7 @@ import { readCoordinatorToken } from '../dist/coordinator/token.js';
 import * as coordinatorIndex from '../dist/coordinator/index.js';
 import { createCoordinatorAdapter } from '../dist/extension/service/coordinator.js';
 import { createExtensionServer, listenExtensionServer, Reply } from '../dist/extension/service/server.js';
+import { CANONICAL, hiddenTailRequest, nearLimitRequest } from './fixtures/approval-requests.mjs';
 
 const execFileAsync = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -375,13 +376,14 @@ test('adapter exposes no mutating method and issues only GET requests on allowed
     },
   });
   // The reads, plus exactly the two narrow owner responses (covered by the approval tests); nothing else can write.
-  assert.deepEqual(Object.keys(adapter).sort(), ['decideApproval', 'events', 'projects', 'respondToPause', 'run', 'runs']);
+  assert.deepEqual(Object.keys(adapter).sort(), ['approval', 'decideApproval', 'events', 'projects', 'respondToPause', 'run', 'runs']);
   await adapter.projects();
   await adapter.runs();
   await adapter.run('run_1-A');
   await adapter.events(7);
+  await adapter.approval('run_1-A', 'apr_1');
   assert.deepEqual(calls, [
-    ['GET', '/projects'], ['GET', '/run-list?after=0'], ['GET', '/runs/run_1-A'], ['GET', '/events?after=7'],
+    ['GET', '/projects'], ['GET', '/run-list?after=0'], ['GET', '/runs/run_1-A'], ['GET', '/events?after=7'], ['GET', '/runs/run_1-A/approvals/apr_1'],
   ]);
   const source = await fs.readFile(path.join(root, 'src', 'extension', 'service', 'coordinator.ts'), 'utf8');
   // One POST call site, fed only by the two route builders; no other verb and no other coordinator route.
@@ -735,4 +737,137 @@ test('run projections carry the bounded wait and no coordinator key, run capabil
   assert.equal(shown.json.run.wait.kind, 'approval');
   assert.equal(shown.json.run.wait.requestId, 'apr_1');
   for (const secret of [FAKE_KEY, RUN_CAPABILITY, 'RAW-CHECKPOINT', 'attempt_secret', 'ownerToken', 'specification']) assert.equal(shown.text.includes(secret), false, secret);
+});
+
+// ----- the complete approval request: a fixed read-only route -----
+
+const APPROVAL_ROUTE = '/runs/run_1/approvals/apr_1';
+/** The coordinator's answer to the approval read, with fields the extension must never forward. */
+const coordinatorApproval = (request = hiddenTailRequest(), change = {}) => ({
+  runId: 'run_1', requestId: 'apr_1', phase: 'executor', taskIndex: 2, taskId: 'T3', attemptId: 'attempt_3', receiptDigest: 'RECEIPT-DIGEST-SECRET',
+  request, revision: { head: 'a'.repeat(40), digest: 'b'.repeat(64) }, state: 'pending', decision: null, feedback: null,
+  ack: { ownerToken: RUN_CAPABILITY, coordinatorKey: FAKE_KEY }, answeredAt: null, continuation: 'none', continuationAt: null, continuationMessageId: 'msg_secret',
+  consumedAttemptId: null, supersededAt: null, supersededReason: null, createdAt: 1234, progress: 'none', checkpoint: { raw: 'RAW-CHECKPOINT' }, ownerToken: RUN_CAPABILITY, ...change,
+});
+/** The real adapter over a recording coordinator client: `answer` is what the coordinator says to the approval GET. */
+function approvalAdapter(answer) {
+  const requests = [];
+  const adapter = createCoordinatorAdapter({
+    loadConfiguration: async () => ({ stateDirectory: '/unused', endpoint: '/unused/coordinator.sock', globalConcurrency: 1, projectConcurrency: 1 }),
+    readToken: async () => FAKE_KEY,
+    clientFactory: () => ({ request: async (method, route, body) => {
+      requests.push([method, route, body]);
+      if (typeof answer === 'function') return answer(method, route);
+      return answer;
+    } }),
+  });
+  return { adapter, requests };
+}
+
+test('GET /runs/:id/approvals/:requestId returns the complete validated request, in order, and nothing else', async t => {
+  for (const [name, request] of [['hidden tail', hiddenTailRequest()], ['near the payload limit', nearLimitRequest()]]) {
+    const { adapter, requests } = approvalAdapter(coordinatorApproval(request));
+    const server = await listening(t, { token: SERVICE_TOKEN, adapter });
+    const answer = await call(server, { path: APPROVAL_ROUTE });
+    assert.equal(answer.status, 200, name);
+    const view = answer.json.request;
+    for (const field of ['question', 'scope', 'completedWork', 'verification', 'artifacts', 'onApprove', 'onRequestChanges']) assert.deepEqual(view[field], request[field], `${name}: ${field}`);
+    const { question, scope, completedWork, verification, artifacts, onApprove, onRequestChanges, ...data } = view;
+    assert.deepEqual(data, {
+      requestId: 'apr_1', runId: 'run_1', state: 'pending', continuation: 'none', progress: 'none', taskId: 'T3', taskIndex: 2, attemptId: 'attempt_3',
+      revision: { head: 'a'.repeat(40), digest: 'b'.repeat(64) }, response: null, createdAt: 1234,
+    });
+    assert.equal(typeof answer.json.fetchedAt, 'string');
+    for (const secret of [FAKE_KEY, RUN_CAPABILITY, 'RECEIPT-DIGEST-SECRET', 'RAW-CHECKPOINT', 'msg_secret', 'ownerToken', 'coordinatorKey', 'receiptDigest', '"ack"']) assert.equal(answer.text.includes(secret), false, `${name}: ${secret}`);
+    assert.deepEqual(requests, [['GET', APPROVAL_ROUTE, undefined]], `${name}: one GET and nothing else`);
+  }
+  // A decided request carries its recorded response; control characters are replaced, not dropped, so length and order hold.
+  const decided = approvalAdapter(coordinatorApproval({ ...hiddenTailRequest(), question: 'Q\u0000?\u202e' }, { state: 'answered', decision: 'request-changes', feedback: 'Narrow it\u0007', answeredAt: 99, continuation: 'queued', progress: 'queued' }));
+  const answered = await call(await listening(t, { token: SERVICE_TOKEN, adapter: decided.adapter }), { path: APPROVAL_ROUTE });
+  assert.equal(answered.status, 200);
+  assert.equal(answered.json.request.question, 'Q ? ');
+  assert.deepEqual(answered.json.request.response, { decision: 'request-changes', feedback: 'Narrow it ', answeredAt: 99 });
+});
+
+test('the approval read requires the service token, rejects bad identifiers before the coordinator, and takes no other method', async t => {
+  const { adapter, requests } = approvalAdapter(coordinatorApproval());
+  const server = await listening(t, { token: SERVICE_TOKEN, adapter });
+  for (const token of [null, 'nope', FAKE_KEY, '']) {
+    const answer = await call(server, { path: APPROVAL_ROUTE, token });
+    assert.equal(answer.status, 401, JSON.stringify(token));
+    assert.equal(answer.json.error.kind, 'unauthorized');
+  }
+  for (const target of ['/runs/run_1/approvals/-x', '/runs/run_1/approvals/' + 'a'.repeat(129), '/runs/-x/approvals/apr_1', '/runs/run_1/approvals/..', '/runs/run_1/approvals/%2e%2e', '/runs/run_1/approvals/apr_1/extra', '/runs/run_1/approvals/']) {
+    const answer = await call(server, { path: target });
+    assert.ok(answer.status === 404, `${target} gave ${answer.status}`);
+  }
+  for (const method of ['PUT', 'PATCH', 'DELETE']) assert.equal((await call(server, { method, path: APPROVAL_ROUTE, ...(method === 'DELETE' ? {} : { body: '{}' }) })).status, 405, method);
+  assert.equal((await post(server, APPROVAL_ROUTE, '{}')).status, 405, 'the read route accepts no POST');
+  assert.deepEqual(requests, [], 'none of these reached the coordinator');
+});
+
+test('malformed, oversized and mismatched coordinator answers to the approval read fail with one fixed error and no secret-bearing text', async t => {
+  const leak = `${FAKE_KEY}${RUN_CAPABILITY}/Users/someone/.local/state/heimdall/coordinator.key`;
+  const request = hiddenTailRequest();
+  const bad = {
+    'a different request': coordinatorApproval(request, { requestId: 'apr_other' }),
+    'a different run': coordinatorApproval(request, { runId: 'run_other' }),
+    'text beyond the limit': coordinatorApproval({ ...request, scope: leak + 'x'.repeat(CANONICAL.text) }),
+    'an entry beyond the limit': coordinatorApproval({ ...request, verification: [leak + 'y'.repeat(CANONICAL.text)] }),
+    'too many entries': coordinatorApproval({ ...request, artifacts: Array.from({ length: CANONICAL.list + 1 }, (_, index) => `${leak}${index}`) }),
+    'a payload beyond the limit': coordinatorApproval({ ...request, verification: Array.from({ length: 20 }, () => 'z'.repeat(CANONICAL.text)) }),
+    'a non-text entry': coordinatorApproval({ ...request, onApprove: [leak, { nested: leak }] }),
+    'a missing field': coordinatorApproval({ ...request, completedWork: undefined }),
+    'an unknown state': coordinatorApproval(request, { state: leak }),
+    'an unknown continuation': coordinatorApproval(request, { continuation: leak }),
+    'an answered request without a decision': coordinatorApproval(request, { state: 'answered' }),
+    'a malformed revision': coordinatorApproval(request, { revision: { head: leak, digest: 'b'.repeat(64) } }),
+    'a string': leak,
+    'null': null,
+    'an array': [coordinatorApproval(request)],
+  };
+  for (const [name, answer] of Object.entries(bad)) {
+    const { adapter } = approvalAdapter(answer);
+    const result = await call(await listening(t, { token: SERVICE_TOKEN, adapter }), { path: APPROVAL_ROUTE });
+    assert.equal(result.status, 502, name);
+    assert.equal(result.json.error.kind, 'approval-unreadable', name);
+    assert.equal(result.json.error.message, 'The coordinator answered with an approval request that could not be read. Nothing is shown from it and nothing was changed.', name);
+    assert.deepEqual(Object.keys(result.json), ['error'], name);
+    for (const secret of [FAKE_KEY, RUN_CAPABILITY, 'RECEIPT-DIGEST-SECRET', 'coordinator.key', '/Users/', 'xxxxxxxx', 'zzzzzzzz', 'RAW-CHECKPOINT']) assert.equal(result.text.includes(secret), false, `${name}: ${secret}`);
+  }
+});
+
+test('coordinator failures on the approval read reach the panel as fixed text and an older coordinator is told apart', async t => {
+  const secretText = `boom ${FAKE_KEY} ${RUN_CAPABILITY} /Users/someone/.local/state/heimdall/coordinator.key`;
+  const cases = [
+    [{ statusCode: 404, code: 'approval-not-found', message: 'Approval request not found for this run' }, 404, 'not-found'],
+    [{ statusCode: 404, message: 'Run not found' }, 404, 'not-found'],
+    [{ statusCode: 404, message: 'Unknown coordinator route' }, 503, 'approval-unsupported'],
+    [{ statusCode: 401 }, 503, 'coordinator-unauthorized'],
+    [{ statusCode: 403, message: 'Administrator authorization required' }, 503, 'coordinator-unauthorized'],
+    [{ statusCode: 500 }, 503, 'coordinator-error'],
+    [{ code: 'ECONNREFUSED', message: 'Coordinator unavailable: connect ECONNREFUSED' }, 503, 'coordinator-offline'],
+    [{ message: 'Coordinator request timed out' }, 504, 'coordinator-timeout'],
+    [{ code: 'response-too-large', message: 'Coordinator response is too large' }, 503, 'coordinator-response-too-large'],
+  ];
+  for (const [failure, status, kind] of cases) {
+    const error = Object.assign(new Error(failure.message ?? secretText), failure);
+    const { adapter, requests } = approvalAdapter(() => { throw error; });
+    const answer = await call(await listening(t, { token: SERVICE_TOKEN, adapter }), { path: APPROVAL_ROUTE });
+    assert.equal(answer.status, status, JSON.stringify(failure));
+    assert.equal(answer.json.error.kind, kind, JSON.stringify(failure));
+    for (const secret of [FAKE_KEY, RUN_CAPABILITY, 'coordinator.key', '/Users/', 'boom', 'Administrator authorization', 'Unknown coordinator route', 'ECONN']) assert.equal(answer.text.includes(secret), false, `${secret} leaked for ${JSON.stringify(failure)}`);
+    assert.deepEqual(requests.map(entry => entry[0]), ['GET']);
+  }
+});
+
+test('the adapter reads one approval request with a GET on a route built from validated identifiers', async () => {
+  const { adapter, requests } = approvalAdapter({});
+  await adapter.approval('run_1', 'apr_1');
+  assert.deepEqual(requests, [['GET', APPROVAL_ROUTE, undefined]]);
+  for (const bad of ['../x', 'a/b', '', 'x'.repeat(129), '%2e%2e', 'a?b=1', undefined, 7]) {
+    await assert.rejects(adapter.approval(bad, 'apr_1'), error => error.kind === 'not-found');
+    await assert.rejects(adapter.approval('run_1', bad), error => error.kind === 'not-found');
+  }
+  assert.equal(requests.length, 1);
 });

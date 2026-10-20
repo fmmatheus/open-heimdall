@@ -29,6 +29,9 @@ const count = (value: unknown): number => {
 const CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f​-‏‪-‮⁦-⁩﻿]/g;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/** Control and bidirectional override characters become spaces, one for one: length and order are unchanged. */
+export const cleanText = (value: string): string => value.replace(CONTROL, ' ');
+
 interface Clipped { text: string; truncated: boolean }
 
 /** Shorten without splitting a surrogate pair; control and bidirectional override characters become spaces. */

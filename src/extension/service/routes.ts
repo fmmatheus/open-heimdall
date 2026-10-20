@@ -1,15 +1,16 @@
 import { loadCoordinatorConfiguration } from '../../coordinator/config.js';
 import type { CoordinatorConfiguration } from '../../coordinator/config.js';
 import type { ProjectRecord } from '../../coordinator/types.js';
+import { parseApprovalView } from '../../coordinator/approval-view.js';
 import { LIMITS, RUN_STATUSES } from '../shared/protocol.js';
 import type {
-  BlockerContentResponse, ChangeFeed, ProjectsResponse, ReviewFileResponse, ReviewResponse, RunResponse, RunsResponse, RunSummary,
+  ApprovalRequestResponse, BlockerContentResponse, ChangeFeed, ProjectsResponse, ReviewFileResponse, ReviewResponse, RunResponse, RunsResponse, RunSummary,
   TaskContentResponse, WireRunStatus,
 } from '../shared/protocol.js';
 import { CoordinatorAdapterError } from './coordinator.js';
 import type { CoordinatorAdapter } from './coordinator.js';
 import { createChangeTracker, InvalidCursorError } from './events.js';
-import { blockerContent, detailRun, summarizeProject, summarizeRun, taskContent } from './projection.js';
+import { blockerContent, cleanText, detailRun, summarizeProject, summarizeRun, taskContent } from './projection.js';
 import { reviewFile, reviewRun, ReviewGitError, ReviewRequestError, validReviewPath } from './review.js';
 import { HttpError } from './server.js';
 import type { Route } from './server.js';
@@ -101,6 +102,36 @@ export function projectionRoutes(options: { adapter: CoordinatorAdapter; now?: (
         const content = blockerContent(await adapter.run(id));
         if (content === null) throw new HttpError(404, 'not-found', 'This Heimdall run has no recorded blocker.');
         return { ...content, fetchedAt: now().toISOString() };
+      },
+    },
+    {
+      // Read-only: one approval request with all of its recorded content. Validated against the canonical request limits and
+      // projected to text and data fields only; an answer that does not validate is never shown, even in part.
+      method: 'GET', path: '/runs/:id/approvals/:requestId',
+      async handler({ params }): Promise<ApprovalRequestResponse> {
+        const runId = params.id!;
+        const requestId = params.requestId!;
+        // Rejected before the coordinator is consulted.
+        if (!IDENTIFIER.test(runId) || !IDENTIFIER.test(requestId)) throw new HttpError(404, 'not-found', 'No such Heimdall run or request.');
+        const answer = await adapter.approval(runId, requestId);
+        let view;
+        try { view = parseApprovalView(answer, { runId, requestId }); }
+        catch { throw new CoordinatorAdapterError('approval-unreadable'); }
+        const lines = (entries: string[]) => entries.map(cleanText);
+        const request = {
+          ...view,
+          taskId: cleanText(view.taskId),
+          attemptId: cleanText(view.attemptId),
+          question: cleanText(view.question),
+          scope: cleanText(view.scope),
+          completedWork: cleanText(view.completedWork),
+          verification: lines(view.verification),
+          artifacts: lines(view.artifacts),
+          onApprove: lines(view.onApprove),
+          onRequestChanges: lines(view.onRequestChanges),
+          response: view.response === null ? null : { ...view.response, feedback: view.response.feedback === null ? null : cleanText(view.response.feedback) },
+        };
+        return { request, fetchedAt: now().toISOString() };
       },
     },
     {

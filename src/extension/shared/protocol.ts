@@ -209,6 +209,21 @@ export const APPROVAL_LIMITS = {
   bodyBytes: 64 * 1024,
 } as const;
 
+/**
+ * Limits of a complete approval request (`GET /runs/:id/approvals/:requestId`). They equal the coordinator's canonical
+ * request limits, so a legal request is never shortened or refused; a test pins them to the contract.
+ */
+export const APPROVAL_FULL_LIMITS = {
+  /** Longest question, scope, completed work and list entry, in characters. */
+  text: 4000,
+  /** Most entries of a list. */
+  entries: 20,
+  /** Largest request content, in bytes of JSON. */
+  payloadBytes: 32 * 1024,
+  /** Longest recorded feedback, in characters. */
+  feedback: 8000,
+} as const;
+
 export type ApprovalState = 'pending' | 'answered' | 'superseded';
 export type ApprovalContinuation = 'none' | 'pending' | 'queued' | 'consumed' | 'superseded';
 export type ApprovalProgress = 'none' | 'recorded' | 'waiting-for-idle' | 'queued' | 'executing' | 'consumed' | 'superseded';
@@ -237,6 +252,38 @@ export interface ApprovalWaitView {
   createdAt: number;
   /** Any text or list of the request was shortened. */
   clipped: boolean;
+}
+
+/**
+ * One approval request with all of its recorded content, in order and within `APPROVAL_FULL_LIMITS`. Text and data only:
+ * no acknowledgement internals, keys, capabilities, checkpoints or raw error text.
+ */
+export interface ApprovalRequestView {
+  requestId: string;
+  runId: string;
+  state: ApprovalState;
+  continuation: ApprovalContinuation;
+  progress: ApprovalProgress;
+  taskId: string;
+  taskIndex: number;
+  attemptId: string;
+  /** The reviewed revision: full commit and content digest. */
+  revision: { head: string; digest: string };
+  question: string;
+  scope: string;
+  completedWork: string;
+  verification: string[];
+  artifacts: string[];
+  onApprove: string[];
+  onRequestChanges: string[];
+  response: { decision: ApprovalDecisionKind; feedback: string | null; answeredAt: number } | null;
+  createdAt: number;
+}
+
+/** Answer of `GET /runs/:id/approvals/:requestId`. */
+export interface ApprovalRequestResponse {
+  request: ApprovalRequestView;
+  fetchedAt: string;
 }
 
 /** A paused run that waits for owner guidance without a typed request. */

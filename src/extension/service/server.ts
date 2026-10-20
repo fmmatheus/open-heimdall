@@ -120,8 +120,8 @@ function statusFor(kind: ErrorKind): number {
     case 'coordinator-timeout': return 504;
     case 'stale-card': case 'approval-stale': case 'approval-conflict': case 'approval-pending': case 'pause-stale': case 'pause-not-ready':
     case 'response-conflict': case 'response-refused': return 409;
-    case 'delivery-uncertain': return 502;
-    case 'coordinator-unsupported': case 'coordinator-draining': return 503;
+    case 'delivery-uncertain': case 'approval-unreadable': return 502;
+    case 'coordinator-unsupported': case 'coordinator-draining': case 'approval-unsupported': return 503;
     case 'coordinator-offline': case 'coordinator-unauthorized': case 'configuration-invalid': case 'coordinator-error':
     case 'coordinator-response-too-large': case 'coordinator-incompatible': return 503;
     default: return 500;

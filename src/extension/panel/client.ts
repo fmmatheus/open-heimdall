@@ -1,6 +1,6 @@
-import { APPROVAL_LIMITS, CONTENT_LIMITS, MATCH_LIMITS, REVIEW_LIMITS, RUN_STATUSES } from '../shared/protocol.js';
+import { APPROVAL_FULL_LIMITS, APPROVAL_LIMITS, CONTENT_LIMITS, MATCH_LIMITS, REVIEW_LIMITS, RUN_STATUSES } from '../shared/protocol.js';
 import type {
-  ApprovalDecisionKind, ApprovalDecisionResponse, BlockerContentResponse, PauseResponseResponse, ChangeFeed, DirectoryMatch, ProjectsResponse, ReviewFileResponse, ReviewResponse, RunResponse, RunsResponse,
+  ApprovalDecisionKind, ApprovalDecisionResponse, ApprovalRequestResponse, BlockerContentResponse, PauseResponseResponse, ChangeFeed, DirectoryMatch, ProjectsResponse, ReviewFileResponse, ReviewResponse, RunResponse, RunsResponse,
   TaskContentResponse, WireRunStatus,
 } from '../shared/protocol.js';
 
@@ -14,7 +14,7 @@ export const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
 /** The only service routes the panel may request. All are GET. */
 const FIXED_PATHS = new Set(['/projects', '/runs', '/changes']);
-const RUN_PATH = /^\/runs\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}(?:\/(?:review(?:\/file)?|blocker|tasks\/(?:0|[1-9][0-9]{0,5})))?$/;
+const RUN_PATH = /^\/runs\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}(?:\/(?:review(?:\/file)?|blocker|tasks\/(?:0|[1-9][0-9]{0,5})|approvals\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}))?$/;
 
 export function isAllowedPath(path: string): boolean {
   return FIXED_PATHS.has(path) || RUN_PATH.test(path);
@@ -89,6 +89,8 @@ const SERVICE_ERRORS: Record<string, Mapped> = {
   'response-refused': { category: 'request', message: 'The coordinator refused the response. Nothing was recorded.', hint: null },
   'coordinator-unsupported': { category: 'request', message: 'The Heimdall coordinator does not support owner responses (likely an older version). Nothing was sent.', hint: 'Update Heimdall after active tasks finish, then retry.' },
   'coordinator-draining': { category: 'request', message: 'The Heimdall coordinator is draining and does not accept responses. Nothing was recorded.', hint: 'Retry once the coordinator has restarted.' },
+  'approval-unreadable': { category: 'request', message: 'Heimdall could not read the complete approval request. Nothing was changed.', hint: 'Check the request with: heimdall coordinator run approval RUN_ID --request REQUEST_ID' },
+  'approval-unsupported': { category: 'request', message: 'The Heimdall coordinator cannot return the complete approval request (likely an older version).', hint: 'Update Heimdall after active tasks finish, then retry.' },
 };
 
 const GENERIC_HOST: Mapped = { category: 'offline', message: 'The Heimdall service request failed.', hint: 'It will retry automatically.' };
@@ -143,6 +145,11 @@ export interface PanelClient {
   taskContent(id: string, index: number): Promise<TaskContentResponse>;
   /** More of the recorded blocker reason and resolution. */
   blockerContent(id: string): Promise<BlockerContentResponse>;
+  /**
+   * One approval request with all of its recorded content. Read-only; the answer is checked to belong to the requested run
+   * and request and to stay within the canonical request limits, and anything else fails as an invalid response.
+   */
+  approval(runId: string, requestId: string): Promise<ApprovalRequestResponse>;
   /**
    * Record the owner's decision on one approval request. `displayedVersion` is the run version of the card that was
    * clicked. Resolves with the coordinator's acknowledgement; a failure with `uncertain` set may have been recorded.
@@ -250,6 +257,41 @@ function isBlockerContent(body: Record<string, unknown>, id: string): boolean {
     && typeof body.complete === 'boolean';
 }
 
+const APPROVAL_STATES = ['pending', 'answered', 'superseded'];
+const APPROVAL_CONTINUATIONS = ['none', 'pending', 'queued', 'consumed', 'superseded'];
+const APPROVAL_PROGRESSES = ['none', 'recorded', 'waiting-for-idle', 'queued', 'executing', 'consumed', 'superseded'];
+const APPROVAL_TEXTS = ['question', 'scope', 'completedWork'] as const;
+const APPROVAL_LISTS = ['verification', 'artifacts', 'onApprove', 'onRequestChanges'] as const;
+const nonNegativeInteger = (value: unknown): boolean => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+const hexWithin = (value: unknown): boolean => typeof value === 'string' && /^[0-9a-f]{1,128}$/i.test(value);
+
+/** Exact shape and limit check of a complete approval request answer, bound to the run and request that were asked for. */
+function isApprovalRequest(body: Record<string, unknown>, runId: string, requestId: string): boolean {
+  const request = body.request;
+  if (!isRecord(request) || request.runId !== runId || request.requestId !== requestId) return false;
+  if (typeof request.state !== 'string' || !APPROVAL_STATES.includes(request.state) || typeof request.continuation !== 'string' || !APPROVAL_CONTINUATIONS.includes(request.continuation)
+    || typeof request.progress !== 'string' || !APPROVAL_PROGRESSES.includes(request.progress)) return false;
+  if (!textWithin(request.taskId, 128) || !textWithin(request.attemptId, 128) || !nonNegativeInteger(request.taskIndex) || !nonNegativeInteger(request.createdAt)) return false;
+  if (!isRecord(request.revision) || !hexWithin(request.revision.head) || !hexWithin(request.revision.digest)) return false;
+  const content: Record<string, unknown> = {};
+  for (const field of APPROVAL_TEXTS) {
+    if (!textWithin(request[field], APPROVAL_FULL_LIMITS.text)) return false;
+    content[field] = request[field];
+  }
+  for (const field of APPROVAL_LISTS) {
+    const entries = request[field];
+    if (!Array.isArray(entries) || entries.length > APPROVAL_FULL_LIMITS.entries || !entries.every(entry => textWithin(entry, APPROVAL_FULL_LIMITS.text))) return false;
+    content[field] = entries;
+  }
+  if (new TextEncoder().encode(JSON.stringify(content)).length > APPROVAL_FULL_LIMITS.payloadBytes) return false;
+  const response = request.response;
+  if (request.state === 'answered') {
+    return isRecord(response) && (response.decision === 'approve' || response.decision === 'request-changes')
+      && nullableTextWithin(response.feedback, APPROVAL_FULL_LIMITS.feedback) && nonNegativeInteger(response.answeredAt);
+  }
+  return response === null;
+}
+
 const CONTENT_FAILURE: Mapped = { category: 'request', message: 'Heimdall could not load the full text.', hint: null };
 
 /** A failure of one on-demand content request stays local to the text being expanded. */
@@ -351,6 +393,13 @@ export function createPanelClient(host: PanelHost): PanelClient {
       try { body = await get(`/runs/${id}/blocker`); } catch (error) { return contentFailure(error); }
       if (!isBlockerContent(body, id)) throw toError('invalid-response', BAD_RESPONSE);
       return body as unknown as BlockerContentResponse;
+    },
+    async approval(runId, requestId) {
+      if (!IDENTIFIER.test(runId) || !IDENTIFIER.test(requestId)) throw toError('not-found', SERVICE_ERRORS['not-found']!);
+      let body: Record<string, unknown>;
+      try { body = await get(`/runs/${runId}/approvals/${requestId}`); } catch (error) { return contentFailure(error); }
+      if (!isApprovalRequest(body, runId, requestId)) throw toError('invalid-response', BAD_RESPONSE);
+      return body as unknown as ApprovalRequestResponse;
     },
     async decideApproval(runId, requestId, input) {
       if (!IDENTIFIER.test(runId) || !IDENTIFIER.test(requestId)) throw toError('not-found', SERVICE_ERRORS['not-found']!);

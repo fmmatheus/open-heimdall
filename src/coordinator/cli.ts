@@ -12,6 +12,8 @@ import { loadCredentialFile } from './credentials.js';
 import { createOutputSanitizer, sanitizeProcessOutput } from './output.js';
 import { parseRespondArguments, sendResponse } from './respond.js';
 import type { RespondRequest } from './respond.js';
+import { parseApprovalReadArguments, readApproval } from './approval-read.js';
+import type { ApprovalReadRequest } from './approval-read.js';
 
 const STATUS_DEADLINE_MS = 10000;
 
@@ -27,6 +29,7 @@ Usage:
   heimdall coordinator run submit PROJECT_ID --feature FILE [--base REF]
   heimdall coordinator run list
   heimdall coordinator run show RUN_ID
+  heimdall coordinator run approval RUN_ID --request REQUEST_ID
   heimdall coordinator run resume RUN_ID --input RESOLUTION
   heimdall coordinator run respond RUN_ID --request REQUEST_ID --decision approve
   heimdall coordinator run respond RUN_ID --request REQUEST_ID --decision request-changes --input FEEDBACK
@@ -55,6 +58,13 @@ with an invalid response.
 
 run show and run list report what a paused run waits for in "wait": an approval request
 ({"kind":"approval","requestId":...}) or a generic pause ({"kind":"generic","pauseId":...,"reason":...}).
+
+run show and run list clip the text of an approval request ("clipped" says which fields). run approval prints one
+complete request as JSON on stdout: its question, scope, completed work and every list entry in order, the state, the
+reviewed revision and any recorded response, validated against the request limits. It is read-only and honors
+--coordinator-config. Exit status: 0 when a valid request was printed; 1 with a diagnostic on stderr and nothing on
+stdout when the arguments are incomplete (checked before any request), the request or run is unknown, the coordinator is
+an older version without the operation, refuses the key, is unavailable, or answers with an invalid request.
 
 run respond answers exactly one wait through a guarded coordinator operation and never prompts:
   --request REQUEST_ID --decision approve|request-changes   answer a typed approval request; request-changes
@@ -194,6 +204,13 @@ export async function coordinatorMain(args: string[], internals: CoordinatorMain
     check(positional.length, ['--request', '--decision', '--pause', '--input']);
     response = parseRespondArguments(identifier, options);
   }
+  // The same holds for the read of one complete approval request: nothing is sent unless both identifiers are valid.
+  let approvalRead: ApprovalReadRequest | undefined;
+  if (command === 'run' && action === 'approval') {
+    if (positional.length > 3) throw new Error('Invalid coordinator arguments; see --help');
+    check(positional.length, ['--request']);
+    approvalRead = parseApprovalReadArguments(identifier, options);
+  }
   const configurationFlag = options.get('--coordinator-config');
   // A native service definition passes the resolved default file and marks it as implicitly selected.
   const configuration = await loadCoordinatorConfiguration(configurationFlag, { implicitDefault: command === 'serve' && implicitDefaultMarkerApplies(configurationFlag) });
@@ -262,6 +279,8 @@ export async function coordinatorMain(args: string[], internals: CoordinatorMain
     result = await client.request('POST', `/runs/${encodeURIComponent(identifier)}/resume`, { input });
   } else if (response) {
     result = await sendResponse(client, configuration.endpoint, response);
+  } else if (approvalRead) {
+    result = await readApproval(client, configuration.endpoint, approvalRead);
   } else if (command === 'events') {
     check(1, ['--after']);
     const after = Number(options.get('--after') ?? 0);
