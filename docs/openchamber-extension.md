@@ -199,6 +199,9 @@ Uses a disposable run, never the live coordinator's real work. Automated tests
 cover behaviour with fakes and with an isolated coordinator; every live UI check
 below is **PENDING — not yet performed**. Record results in a new dated record
 under `docs/validation/` (earlier records are historical and are not edited).
+Items 8 to 14 are listed as unverified, with reproduction steps, in
+[validation/approval-workflow.md](validation/approval-workflow.md); the portable
+scenario to use for them is [`examples/approval-workflow/`](../examples/approval-workflow/README.md).
 
 Let `W` be a run's worktree and `B` its base commit (`run show RUN_ID`).
 
@@ -227,7 +230,8 @@ Let `W` be a run's worktree and `B` its base commit (`run show RUN_ID`).
    after viewing it, and no new OpenChamber sessions exist.
    **PENDING — not yet performed.**
 8. **Approval card.** With a disposable run that submitted an approval request
-   (an executor that returned an `approval-required` result), open it in the panel. The
+   (an executor that returned an `approval-required` result, for instance the
+   [approval workflow example](../examples/approval-workflow/README.md)), open it in the panel. The
    card shows the question, scope, completed work, verification, artifacts,
    revision and retained actions, as plain text, with the Pending state. Close
    and reopen the panel: nothing was decided and the card is unchanged. Compare

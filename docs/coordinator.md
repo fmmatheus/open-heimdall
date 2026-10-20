@@ -184,6 +184,12 @@ record the same two owner responses as `run respond` and nothing else; see the
 
 ## Approvals and owner responses
 
+A runnable, synthetic walk-through of the whole flow (owner decision, then the agent
+applying, migrating, verifying and completing the same run, plus the request-changes
+path) is in [`examples/approval-workflow/`](../examples/approval-workflow/README.md).
+What was and was not exercised is recorded in
+[validation/approval-workflow.md](validation/approval-workflow.md).
+
 A paused run reports what it waits for in `wait`, on `run show`, `run list` and the
 bounded `/run-list` page. There are two kinds, and a run never has both:
 

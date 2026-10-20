@@ -398,6 +398,14 @@ two-task spec, a guidance file and the steps to start a run, watch it pause,
 resume it and check that the first result was kept. It is operated by the owner
 and has not been run yet.
 
+[`examples/approval-workflow/`](../examples/approval-workflow/README.md) shows the
+typed approval flow instead: the run pauses on an approval request, the owner makes
+one decision (through these skills or `heimdall coordinator run respond`), and the
+agent does the remaining work in the same run. Its automated test uses a scripted
+stand-in model; the owner-operated steps with real skills, a real model and the
+panel are unverified, and are listed in the
+[approval workflow record](validation/approval-workflow.md).
+
 ## Verification status
 
 Statements about OpenCode and OpenChamber behavior in this guide come from these
