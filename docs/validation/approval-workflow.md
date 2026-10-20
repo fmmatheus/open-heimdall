@@ -7,17 +7,18 @@ Guides: [coordinator](../coordinator.md#approvals-and-owner-responses),
 [OpenChamber extension](../openchamber-extension.md), [skills](../skills.md). Example:
 [`examples/approval-workflow/`](../../examples/approval-workflow/README.md).
 
-**Status: DRAFT.** Automated and fake-model native checks pass. The real
-OpenChamber panel, real model behavior and the managed (coordinator-driven) path on
-a real OpenCode host are **not verified** (see [Unverified](#unverified-acceptance-items)).
-The independent review and correction sections are not written yet.
+**Status: final for the code listed below.** Automated and fake-model native checks
+pass, an independent review was performed and its material findings were corrected.
+The real OpenChamber panel, real model behavior and the managed
+(coordinator-driven) path on a real OpenCode host are **not verified** (see
+[Unverified](#unverified-acceptance-items)).
 
 ## Environment
 
 | Item | Value |
 | --- | --- |
 | Date | 2026-10-20 |
-| Code under test | `c6310d3` (`test(live): add an approval scenario to the native compatibility fixture`), on top of the feature commits `a7dfe6f`, `3486ede`, `eb78c61`, `e04d538`, `3060026`, `512e123` and the example commit `6641727`. Later commits in this series change documentation only. |
+| Code under test | `217e2d8` (`fix(coordinator): refuse a dropped approval written back into a checkpoint`). The feature commits are `a7dfe6f`, `3486ede`, `eb78c61`, `e04d538`, `3060026`, `512e123`, the example `6641727` and the native fixture scenario `c6310d3`; the review corrections are `eb3ffd9`, `5dd1f62`, `6d53c7e` and `217e2d8`. The commits that add or update this record change documentation only. |
 | Base | `87c691b` (`docs(skills): record OpenCode 2.0.32 integration checks`) |
 | OS / architecture | macOS 27.0.1 (Darwin 27.0.0), arm64 |
 | Node.js / npm | v22.22.3 / 10.9.8 (declared minimum: Node.js 22.19) |
@@ -52,42 +53,41 @@ These are kept apart on purpose.
 
 ## Commands and results
 
-Run in the foreground from the repository root on the code above, in this order.
+Run in the foreground from the repository root on commit `217e2d8`. The checks were
+first run on the code before the last review correction and rerun after it; only the
+runs on `217e2d8` are counted below.
 
 | Command | Result |
 | --- | --- |
 | `npm run check` | Exit 0. |
-| `npm test` (first run) | Exit 1: 1,742 tests, 1,741 passed, 1 failed (below). |
-| `npm test` (second run, no change in between) | Exit 0: 1,742 tests, 1,742 passed, 0 failed, 0 skipped. |
+| `npm test` | Exit 0: 1,750 tests, 1,750 passed, 0 failed, 0 skipped. |
 | `npm run build:extension` | Exit 0. |
 | `npm run test:package` | Exit 0: 87 tests, 87 passed, 0 failed, 0 skipped (consumer and temporary global installs outside the checkout). |
-| `node scripts/live/skills-eval/run-eval.mjs selftest` | Exit 0, "selftest passed" (13 checks, including the approval and guarded-pause scenarios). |
-| `node --test test/approval-workflow-example.test.mjs` | 3 tests, 3 passed in each of three runs alone and in both full `npm test` runs, without a failure. |
-| `node scripts/live/opencode-compatibility/run.mjs --opencode OPENCODE --out REPORT` | `passed: true` against `opencode v2.0.32`. |
-| `node scripts/live/opencode-compatibility/run.mjs --opencode OPENCODE --scenario approval --out REPORT` | `passed: true` against `opencode v2.0.32`, with `nativeApprovalPause` recorded. |
+| `node scripts/live/skills-eval/run-eval.mjs selftest` | Exit 0, `"selftest": "passed"` (13 checks, including the approval and guarded-pause scenarios). |
+| `node scripts/live/opencode-compatibility/run.mjs --opencode OPENCODE --scenario blocked --out REPORT` | `passed: true` against `opencode v2.0.32`, `fixtureRemoved: true`. |
+| `node scripts/live/opencode-compatibility/run.mjs --opencode OPENCODE --scenario approval --out REPORT` | `passed: true` against `opencode v2.0.32`, `nativeApprovalPause` recorded, `fixtureRemoved: true`. |
 
-### The failed full run
+`test/approval-workflow-example.test.mjs` (3 tests) is part of `npm test`.
 
-The first `npm test` failed one test in `test/coordinator-drain.test.mjs`:
-"a failed drain keeps admission off and persistence open, records drain-failed, and a
-later request retries the same operation". The assertion at the shutdown-record check
-read `'requested'` where it expected `'drain-failed'`. The test reads the shutdown
-record right after the lifecycle phase becomes visible, and the record is written
-slightly later; under the load of a parallel full run the read can come first.
+Earlier runs, kept for the record:
 
-Investigation, bounded to that file:
+- On the feature code (before the review), the first full `npm test` failed one test
+  in `test/coordinator-drain.test.mjs` ("a failed drain keeps admission off and
+  persistence open, ..."): the shutdown record was read as `'requested'` where
+  `'drain-failed'` was expected. The test reads the record right after the lifecycle
+  phase becomes visible and the record is written slightly later, so a loaded
+  parallel run can read first. No lifecycle code, drain test or fixture differs from
+  the base; the file passed alone five times (8 of 8 each time) and a second full run
+  passed. It is the already-benched lifecycle test-timing instability. It was not
+  fixed, no assertion was changed, and no reduced-concurrency run was needed.
+  The failure did not recur in the three later full runs (after the corrections and
+  after the last one).
+- After the three material corrections, `npm test` passed 1,749 of 1,749 and
+  `npm run test:package` 87 of 87. The last correction added one regression test
+  (1,750).
 
-- No file of the lifecycle code, the drain test or its fixtures differs from the base
-  (`git diff 87c691b HEAD` over `src/coordinator/lifecycle*.ts`,
-  `test/coordinator-drain.test.mjs` and `test/fixtures` is empty).
-- `node --test test/coordinator-drain.test.mjs` run alone five times: 8 of 8 passed
-  each time.
-- The second full `npm test` with default concurrency passed 1,742 of 1,742.
-
-The failure is classed as the already-benched lifecycle test-timing instability, not a
-defect of this feature. It was not fixed, and no assertion was changed. The failed
-output is kept with the run's scratch files and is not reproduced here. No
-reduced-concurrency run was needed.
+CI on macOS and Linux was **not executed locally**; the installed-package tests were
+run on macOS only.
 
 ## What the example test proves
 
@@ -117,7 +117,8 @@ changes and race conditions) and the live service lifecycle.
 ## Native host check
 
 OpenCode 2.0.32 was available locally and the existing compatibility fixture was run
-against it unchanged and with a new `--scenario approval` option. The fixture isolates
+against it unchanged and with a new `--scenario approval` option, on the feature code
+and again on `217e2d8` after the runner changed (both scenarios passed both times). The fixture isolates
 the server's configuration, database, home and data directories, uses a scripted local
 model and synthetic quota, listens on a random loopback port and removes its directory.
 It contacts no provider, no credential and no running service.
@@ -190,30 +191,93 @@ Use a disposable root, never your own profile, projects or coordinator.
 
 - The example test creates one temporary directory per test (project copy, coordinator
   state, configuration, isolated HOME and worktrees), shuts its own coordinator down and
-  removes the directory afterwards. After the runs no such directory remained.
+  removes the directory afterwards.
 - The compatibility fixture owns its host process, its temporary directory and its
-  random loopback port, stops the process and removes the directory itself. Both
-  reports state `fixtureRemoved: true`.
+  random loopback port, stops the process and removes the directory itself. Every
+  report states `fixtureRemoved: true`, and no fixture directory remained after the
+  final runs.
+- Leftovers from this work's own test runs were removed only after proving them
+  inactive: two empty `heimdall-structured-*`/`heimdall-repair-*` scratch directories
+  created by `test/structured-runner.test.mjs` and `test/submission-repair.test.mjs`
+  (empty, nothing holding them open) and one `heimdall-tarball-*` directory created by
+  the installed-package helper (no process or open file in it; it held only an npm
+  cache, empty npm configuration files and a packed tarball). Review probes and logs
+  lived in scratch directories under the system temporary directory and were removed.
 - No real project, run, pending approval, service, credential or provider was used or
-  changed. No dependency was installed. The user's OpenCode and OpenChamber processes
-  were not contacted.
+  changed. No dependency was installed. The user's OpenCode, OpenChamber and
+  coordinator processes were not contacted, stopped or modified; other temporary
+  directories on the machine were left alone.
 - The synthetic values are fake: the endpoint ends in `.invalid` and none of the
   values is a credential.
 
 ## Independent review
 
-Not yet performed. This section is completed when the independent review delivers its
-findings.
+A reviewer who had not written the code read the whole diff against the base and
+reported findings in five areas: owner authority, restart and concurrency, UI/CLI
+parity, old-client bypass and retained agent responsibility. Probes against the built
+code reproduced each material finding.
+
+| ID | Severity | Finding | Outcome |
+| --- | --- | --- | --- |
+| F1 | material | An agent-written checkpoint could carry a forged owner decision or approval wait that the runner later presented to the agent as the owner's. | Fixed. |
+| F2 | material | After a request was superseded, a bare free-text `approve` advanced the run through the unguarded resume, and the panel pointed the owner at it. | Fixed. |
+| F3 | material | A decision was marked delivered at the dispatch boundary before any attempt carried it; a crash or failed launch lost it and reported it as delivered. | Fixed. |
+| F4 | minor | A stale earlier approval stayed in the checkpoint across a fresh request. | Fixed. |
+| F5 | minor | The raw continuation envelope appeared as a later pause's "Resolution" in the panel. | Fixed. |
+| F6 | minor | The review revision's exclusions (ignored files, bookkeeping paths) were undocumented. | Documented. |
+| F7 | minor | A revision measurement failure (timeout, size limit) blocks publication or needs a manual reconcile at dispatch. | Benched: fails closed, liveness cost only. |
+| F8 | minor | The revision is measured when the request is submitted, while the session may still write. | Benched: fails closed. |
+| F9 | minor | A guarded legacy response has no inspection route by pause id. | Benched: an identical retry returns the stored acknowledgement and `run show` shows the labelled resolution. |
+| F10 | minor | The panel's stale-card check is stricter than the CLI's identity check. | Benched: fails safe. |
+| F11 | minor | One extra query per listed run; the runtime identity reads contract versions with a pattern. | Benched: bounded, fails closed. |
+
+Areas with no defect beyond the above: decision recording is administrator-only and
+atomic with the receipt; recording and queueing are one transaction; the review
+revision is rechecked at the dispatch boundary; drain refuses every write; the CLI,
+panel and skill helper use the same two operations and never fall back to `run resume`
+on an old coordinator; the executor and skill instructions keep implementation work
+with the agent.
 
 ## Corrections
 
-Not yet performed. This section lists the corrections made for material review
-findings and the review of their diff.
+Each correction has a regression test that failed on the code before it and passes
+after it (ten failing tests before the first three corrections; one before the last).
+
+| Commit | Fixes | Change |
+| --- | --- | --- |
+| `eb3ffd9` | F4 | A fresh approval request removes an earlier non-superseded `approve` from the checkpoint; contexts that only restrict stay. |
+| `5dd1f62` | F1, F2, F3, F6 | `saveCheckpoint` accepts `approval` only when unchanged, absent or exactly the context the coordinator delivered, and `wait` only for a request published for that attempt (a refused checkpoint is not stored, HTTP 400). A superseded request on a paused, released run is reported as a generic wait with a pause identity, so the guarded labelled response applies; an unguarded resume of a run that used typed approvals arrives labelled as guidance. A decision counts as delivered only once an attempt's checkpoint carries it; a dispatch lost at the boundary is queued once more when the run is back on the asking wait, and the generic resume is refused meanwhile. The revision scope is documented. No schema change. |
+| `6d53c7e` | F2 (panel), F5 | The superseded card no longer tells the owner to run `run resume`; the continuation envelope is not shown as a later pause's resolution. |
+
+### Review of the correction diff
+
+A second fresh review read the correction diff against each finding and the five
+areas. All three material corrections hold and no assertion was weakened (the
+fixture changes insert the request before the paused checkpoint, as the real flow
+does, set `consumed_attempt_id` where a fixture means "delivered", and make the
+resumed fake session active where a real launched session would be). It found one
+further material gap, corrected in `217e2d8`:
+
+| ID | Severity | Finding | Outcome |
+| --- | --- | --- | --- |
+| N1 | material | The delivered decision stays the run's stored resolution, so a checkpoint could write back an approval the runner had dropped for a fresh request, and a later plain resume would present it again. | Fixed in `217e2d8`: a new `approval` is accepted only while the stored checkpoint is still on the approval wait of the asking attempt. Regression test fails before and passes after. |
+| N2 | minor | An owed decision is queued again each time the run is proven idle, without a cap. | Benched, listed under remaining gaps. |
 
 ## Remaining gaps
 
-- The three unverified items above.
-- Local runs only: the installed-package tests were not run on Linux here, and CI was
-  not run.
-- A first full `npm test` hit one test-timing failure in unchanged lifecycle code; it
-  is recorded above and was not fixed.
+- The three unverified items above (managed path on a real OpenCode host,
+  OpenChamber 2.1.0 render/click/continuation, real model behavior).
+- CI on macOS and Linux for the installed package was not run; local runs are macOS
+  only.
+- An owed decision (dispatched but never carried by an attempt, which happens only
+  when the resumed session ends without the runner recording its resume) is queued
+  again each time the run is proven idle, without a retry limit. A probe whose
+  fake session always reported idle produced one admission per scheduler tick. It
+  affects cost and events only: no agent saw the decision, so no gated action ran.
+  A limit needs a policy for what the owner sees afterwards.
+- Benched review items F7 to F11 above.
+- The three packaged skill helpers keep a client-side pre-check that does not know a
+  decision is owed after a lost dispatch; the coordinator still refuses the generic
+  resume with `approval-pending`.
+- Revision measurement is at submission time and covers only git-visible content (see
+  [the coordinator guide](../coordinator.md#approvals-and-owner-responses)).
