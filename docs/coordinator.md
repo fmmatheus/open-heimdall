@@ -137,6 +137,39 @@ foreground coordinator, and both share one operation. Unresolved execution can
 keep draining open until reconciled. Abrupt process loss can interrupt checkpoint
 writes; reservations remain held for inspection after restart.
 
+### Continuing after an owner decision
+
+An accepted owner decision on an approval request continues the same unfinished
+task through the ordinary resume path, at most once per decision:
+
+- If the run is paused and its capacity is released, the coordinator proves it
+  idle again (managed worktree, runtime snapshot, native parent and children,
+  reviewed revision) and records the decision and queues the resume in one
+  transaction. Otherwise the decision is recorded and stays `pending`. Each
+  scheduler tick queues a pending decision once the same proof holds, before
+  admission. The coordinator never releases capacity, starts itself or answers
+  native forms and permissions to do this.
+- While admission is stopped or paused, and while draining, nothing is queued.
+  A draining coordinator also answers every non-GET request, including a
+  decision, with 503; retry after it restarts.
+- The queued resume carries a versioned JSON context (`approval-continuation`)
+  rendered by the coordinator as the run's resolution. A generic `resume` is
+  refused (`approval-pending`) while a request is pending or its decision is
+  queued but not yet delivered.
+- At the dispatch boundary the coordinator measures the reviewed worktree again.
+  An unchanged revision consumes the decision. A changed revision withdraws it:
+  the agent receives a superseded context, keeps its work, performs nothing
+  gated and must submit a fresh approval request.
+- A queued decision whose run returned to paused without dispatching (for
+  example after a restart and reconciliation) is queued again, once. A decision
+  already delivered is never queued again, even if the next attempt pauses.
+
+`GET /runs/RUN_ID/approvals/REQUEST_ID` reports `progress`: `recorded`
+(durable, awaiting the scheduler), `waiting-for-idle`, `queued` (waiting for
+capacity), `executing` (admitted), `consumed` or `superseded`. The decision
+acknowledgement reports `continuation`: `queued`, or `pending` while it waits
+for idle proof.
+
 Runs can also be watched and reviewed read-only from OpenChamber 2.1.0; see the
 [OpenChamber extension guide](openchamber-extension.md).
 

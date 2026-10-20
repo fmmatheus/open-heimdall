@@ -83,6 +83,13 @@ export type ApprovalDecision = 'approve' | 'request-changes';
  * reviewed material outgrew. `none` is a request that has no decision.
  */
 export type ApprovalContinuation = 'none' | 'pending' | 'queued' | 'consumed' | 'superseded';
+/**
+ * Where an owner decision stands, derived from the request and its run: `recorded` is durable and waiting for the scheduler's
+ * idle proof, `waiting-for-idle` has not yet been proven idle or has no released capacity, `queued` is a resume waiting for
+ * admission, `executing` is admitted and about to dispatch, `consumed` reached an attempt, `superseded` was withdrawn because
+ * the reviewed material changed. `none` is a request without a decision.
+ */
+export type ApprovalProgress = 'none' | 'recorded' | 'waiting-for-idle' | 'queued' | 'executing' | 'consumed' | 'superseded';
 /** The reviewed state, always computed by the coordinator and never supplied by an agent or client. */
 export interface ApprovalRevision { head: string; digest: string }
 /** Agent-authored request content, re-validated with the executor-result contract when it is stored. */
@@ -142,6 +149,7 @@ export interface ApprovalWait {
   requestId: string;
   state: ApprovalState;
   continuation: ApprovalContinuation;
+  progress: ApprovalProgress;
   phase: 'planner' | 'executor';
   taskIndex: number;
   taskId: string;

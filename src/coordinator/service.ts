@@ -6,9 +6,8 @@ import { CoordinatorStore } from './store.js';
 import { CoordinatorScheduler } from './scheduler.js';
 import { createManagedExecutor, credentialSourceFor } from './executor.js';
 import type { CredentialSource } from './executor.js';
-import { inspectProject, planManagedWorktree, resolveBaseCommit, verifyManagedWorktree } from './worktrees.js';
+import { inspectProject, planManagedWorktree, resolveBaseCommit } from './worktrees.js';
 import { CoordinatorError } from './errors.js';
-import { computeReviewRevision } from './review-revision.js';
 import { checkRuntimeConflicts, snapshotSpecification } from './runtime.js';
 import { canonicalPlannedDirectory, positiveInteger } from './config.js';
 import { COORDINATOR_SERVICE_ID, COORDINATOR_STATUS_SCHEMA_VERSION, parseCoordinatorStatus } from './status.js';
@@ -163,12 +162,7 @@ async function startOwnedService(options: ServiceOptions, root: string, ownershi
   const scheduler = new CoordinatorScheduler({ ...options.scheduler, store, executor, endpoint: configuration.endpoint });
   const visible = (run: RunRecord) => publicRun(run, store.approvalWait(run));
   /** Measures the run's managed worktree with read-only git; fails without a result when it is not the reserved checkout. */
-  const reviewRevision = async (current: RunRecord): Promise<ApprovalRevision> => {
-    const project = store.getProject(current.projectId);
-    if (!project) throw new Error('Registered project is missing');
-    await (options.scheduler?.verifyWorktree ?? verifyManagedWorktree)({ project, run: current });
-    return computeReviewRevision(current.worktreePath, { roles: Object.keys(current.specification.agents) });
-  };
+  const reviewRevision = (current: RunRecord): Promise<ApprovalRevision> => scheduler.reviewRevision(current);
   let ready = false;
   let draining = false;
   let state: ShutdownState = 'running';
@@ -310,7 +304,7 @@ async function startOwnedService(options: ServiceOptions, root: string, ownershi
         if (method === 'GET' && segments.length === 4) {
           const approval = store.getApproval(run.id, requestId);
           if (!approval) throw new CoordinatorError(404, 'approval-not-found', 'Approval request not found for this run');
-          send(200, publicApproval(approval)); return;
+          send(200, { ...publicApproval(approval), progress: store.approvalProgress(approval, run) }); return;
         }
         if (method === 'POST' && segments.length === 5 && segments[4] === 'decision') {
           const input = parseDecision(await body(request));
@@ -318,7 +312,10 @@ async function startOwnedService(options: ServiceOptions, root: string, ownershi
           if (!approval) throw new CoordinatorError(404, 'approval-not-found', 'Approval request not found for this run');
           // The reviewed material is measured here, outside the transaction; the store compares it to the request's own revision.
           const revision = approval.state === 'pending' ? await reviewRevision(store.getRun(run.id)!) : undefined;
-          send(200, store.decideApproval(run.id, requestId, input, revision)); return;
+          // A paused, released run proven idle right now is resumed by the same transaction that records the decision; any other
+          // run keeps the decision recorded and the scheduler queues it once the proof is complete. Nothing is released or started here.
+          const proven = approval.state === 'pending' ? await scheduler.proveContinuable(run.id) : undefined;
+          send(200, store.decideApproval(run.id, requestId, input, revision, proven?.version)); return;
         }
       }
       if (method === 'GET' && segments.length === 1 && segments[0] === 'events') {

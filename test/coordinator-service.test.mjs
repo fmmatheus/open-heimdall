@@ -343,13 +343,15 @@ async function published(t, { payload = approvalPayload(), prepare, project: con
     f, project, run, state, receipt, route, request, decide, store, caller,
     inspect: (requestId = request.requestId) => f.client.request('GET', `/runs/${run.id}/approvals/${requestId}`),
     /** The runner's pause on a valid approval request, then the scheduler's proof that the run is idle. */
-    async pause() {
+    async pause({ idle = false } = {}) {
       const paused = { ...state, status: 'paused', attempt: { ...state.attempt, status: 'rejected' }, wait: { kind: 'approval', attemptId: 'attempt_1', index: 0, taskId: 'T1' } };
       await f.client.request('PUT', `/runs/${run.id}/checkpoint`, paused, run.ownerToken);
       f.observation({ idle: true, status: 'paused', reason: 'Approval required' });
       await f.service().scheduler.tick();
       assert.equal(store.getRun(run.id).status, 'paused');
       assert.equal(store.getRun(run.id).capacityReserved, false);
+      // Without fresh idle proof at decision time a decision is only recorded; tests of the continuation ask for `idle`.
+      if (!idle) f.observation({ idle: false, status: 'unknown' });
       return paused;
     },
     sql(statement, ...values) {
@@ -404,6 +406,7 @@ test('the administrator records approve once; an identical retry returns the sto
   assert.equal(p.store.events().filter(event => event.type === 'approval.answered').length, 1);
   // Later advancement: the continuation is consumed, the run is resumed and admitted again.
   p.sql("UPDATE approval_requests SET continuation = 'consumed' WHERE request_id = ?", p.request.requestId);
+  p.f.observation({ idle: true, status: 'paused', reason: 'Approval required' });
   const resumed = await p.f.client.request('POST', `/runs/${p.run.id}/resume`, { input: 'Carry on' });
   assert.equal(resumed.status, 'queued');
   await p.f.service().scheduler.tick();
@@ -545,6 +548,7 @@ test('the generic resume is refused with approval-pending while a request is pen
   // Other failures keep their ordinary status.
   await assert.rejects(p.f.client.request('POST', `/runs/${p.run.id}/resume`, {}), status(400));
   p.sql("UPDATE approval_requests SET continuation = 'consumed' WHERE request_id = ?", p.request.requestId);
+  p.f.observation({ idle: true, status: 'paused', reason: 'Approval required' });
   assert.equal((await resume()).status, 'queued');
 });
 
@@ -553,6 +557,7 @@ test('a superseded request no longer blocks a guided generic resume', async t =>
   await p.pause();
   await fs.appendFile(path.join(p.run.worktreePath, 'README.md'), 'changed\n');
   await assert.rejects(p.decide({ decision: 'approve' }), status(409, 'approval-stale'));
+  p.f.observation({ idle: true, status: 'paused', reason: 'Approval required' });
   const resumed = await p.f.client.request('POST', `/runs/${p.run.id}/resume`, { input: 'The tree changed; ask again' });
   assert.equal(resumed.status, 'queued');
 });
@@ -653,4 +658,159 @@ test('the review revision is deterministic, content based, bounded and read only
   const plain = await fs.mkdtemp(path.join(os.tmpdir(), 'hd-rev-plain-'));
   t.after(() => fs.rm(plain, { recursive: true, force: true }));
   await assert.rejects(computeReviewRevision(plain), error => error instanceof ReviewRevisionError && error.code === 'revision-unavailable' && !error.message.includes(plain));
+});
+
+// --- Owner decisions: once-only continuation ------------------------------------------------------------------------------
+
+const IDLE = { idle: true, status: 'paused', reason: 'Approval required' };
+const ACTIVE = { idle: false, status: 'unknown' };
+const context = run => JSON.parse(run.resolution);
+
+test('approve on a paused, idle run queues exactly one resume and the dispatch delivers the decision context once', async t => {
+  const p = await published(t);
+  const before = p.store.getRun(p.run.id);
+  await p.pause({ idle: true });
+  const paused = p.store.getRun(p.run.id);
+  assert.equal(paused.status, 'paused');
+  // A double submission, concurrently: one recorded decision, one queue.
+  const acks = await Promise.all([p.decide({ decision: 'approve' }), p.decide({ decision: 'approve' })]);
+  assert.deepEqual(acks.map(ack => ack.retried).sort(), [false, true]);
+  assert.ok(acks.every(ack => ack.continuation === 'queued' && ack.run.status === 'queued'));
+  const queued = p.store.getRun(p.run.id);
+  assert.equal(queued.status, 'queued');
+  assert.equal(queued.launchAction, 'resume');
+  const view = await p.inspect();
+  assert.equal(view.progress, 'queued');
+  assert.equal(view.continuation, 'queued');
+  assert.deepEqual(context(queued), { heimdall: 'approval-continuation', version: 1, requestId: p.request.requestId, decision: 'approve', feedback: null, scope: 'Merge only the reviewed commit', revision: p.request.revision, onApprove: ['Merge the branch'], onRequestChanges: ['Correct and ask again'], taskId: 'T1', index: 0 });
+  assert.equal(p.store.events().filter(event => event.type === 'approval.continuation_queued').length, 1);
+  // The generic resume cannot replace or race the answered, unconsumed decision.
+  await assert.rejects(p.f.client.request('POST', `/runs/${p.run.id}/resume`, { input: 'approve' }), status(409, 'approval-pending'));
+  assert.equal(p.store.getRun(p.run.id).resolution, queued.resolution);
+  await p.f.service().scheduler.tick();
+  const admitted = await settled(p.store, p.run.id);
+  await p.f.waitForLaunch(2);
+  assert.equal(p.f.launches.length, 2, 'one admission');
+  assert.equal(p.f.launches[1].resolution, queued.resolution);
+  assert.deepEqual([admitted.id, admitted.parentSessionId, admitted.branch, admitted.worktreePath], [before.id, before.parentSessionId, before.branch, before.worktreePath]);
+  assert.notEqual(admitted.ownerToken, before.ownerToken);
+  const consumed = await p.inspect();
+  assert.equal(consumed.continuation, 'consumed');
+  assert.equal(consumed.progress, 'consumed');
+  assert.deepEqual(await p.decide({ decision: 'approve' }), { ...acks.find(ack => !ack.retried), retried: true });
+  assert.equal(p.store.events().filter(event => event.type === 'approval.consumed').length, 1);
+  const projected = await p.f.client.request('GET', `/runs/${p.run.id}`);
+  assert.equal(projected.wait, null, 'a consumed decision is history, not a wait');
+});
+
+test('a decision recorded while the run is still running stays pending; the scheduler queues it once after idle proof and open admission', async t => {
+  const p = await published(t);
+  const ack = await p.decide({ decision: 'request-changes', feedback: 'Use the shorter name' });
+  assert.deepEqual({ continuation: ack.continuation, status: ack.run.status }, { continuation: 'pending', status: 'running' });
+  assert.equal((await p.inspect()).progress, 'waiting-for-idle');
+  const paused = { ...p.state, status: 'paused', attempt: { ...p.state.attempt, status: 'rejected' }, wait: { kind: 'approval', attemptId: 'attempt_1', index: 0, taskId: 'T1' } };
+  await p.f.client.request('PUT', `/runs/${p.run.id}/checkpoint`, paused, p.run.ownerToken);
+  for (const value of [ACTIVE, { idle: false, status: 'paused' }, { idle: true, status: 'unknown' }]) {
+    p.f.observation(value);
+    await p.f.service().scheduler.tick();
+    const run = p.store.getRun(p.run.id);
+    assert.deepEqual({ status: run.status, reserved: run.capacityReserved }, { status: 'running', reserved: true }, 'capacity is not released before complete idle proof');
+  }
+  p.f.observation(IDLE);
+  p.f.service().scheduler.pauseAdmission(); // as while draining
+  await p.f.service().scheduler.tick();
+  assert.equal(p.store.getRun(p.run.id).status, 'paused');
+  assert.equal((await p.inspect()).continuation, 'pending');
+  assert.equal(p.f.launches.length, 1);
+  await p.f.restart();
+  await p.f.service().scheduler.tick();
+  await settled(p.f.service().store, p.run.id);
+  await p.f.waitForLaunch(2);
+  const delivered = context({ resolution: p.f.launches[1].resolution });
+  assert.deepEqual({ decision: delivered.decision, feedback: delivered.feedback }, { decision: 'request-changes', feedback: 'Use the shorter name' });
+  assert.equal(p.f.service().store.events().filter(event => event.type === 'approval.continuation_queued').length, 1);
+});
+
+test('reviewed content changed after acceptance supersedes the decision at dispatch, with or without a restart', async t => {
+  const mutations = {
+    committed: worktree => { gitIn(worktree, ['commit', '--allow-empty', '-m', 'move the reviewed head']); },
+    'uncommitted tracked': worktree => fs.appendFile(path.join(worktree, 'README.md'), 'late edit\n'),
+    untracked: worktree => fs.writeFile(path.join(worktree, 'late.txt'), 'late file\n'),
+  };
+  for (const [name, mutate] of Object.entries(mutations)) for (const restart of [false, true]) await t.test(`${name}${restart ? ' with a restart' : ''}`, async child => {
+    const p = await published(child);
+    await p.pause({ idle: true });
+    const ack = await p.decide({ decision: 'approve' });
+    assert.equal(ack.continuation, 'queued');
+    await mutate(p.run.worktreePath);
+    if (restart) await p.f.restart();
+    const store = p.f.service().store;
+    assert.equal(store.getRun(p.run.id).status, 'queued');
+    await p.f.service().scheduler.tick();
+    await settled(store, p.run.id);
+    await p.f.waitForLaunch(2);
+    const delivered = context({ resolution: p.f.launches[1].resolution });
+    assert.equal(delivered.superseded.reason, 'The reviewed worktree changed after the decision was recorded');
+    assert.equal(delivered.requestId, p.request.requestId);
+    const view = await p.f.client.request('GET', `/runs/${p.run.id}/approvals/${p.request.requestId}`);
+    assert.equal(view.continuation, 'superseded');
+    assert.equal(view.progress, 'superseded');
+    assert.equal(store.events().filter(event => event.type === 'approval.consumed').length, 0);
+    assert.deepEqual(await p.decide({ decision: 'approve' }), { ...ack, retried: true });
+  });
+  await t.test('unchanged content after a restart is consumed', async child => {
+    const p = await published(child);
+    await p.pause({ idle: true });
+    await p.decide({ decision: 'approve' });
+    await p.f.restart();
+    await p.f.service().scheduler.tick();
+    await settled(p.f.service().store, p.run.id);
+    await p.f.waitForLaunch(2);
+    assert.equal(context({ resolution: p.f.launches[1].resolution }).superseded, undefined);
+    assert.equal((await p.inspect()).continuation, 'consumed');
+  });
+});
+
+test('requested changes are delivered verbatim, the superseded request cannot be approved and a corrected proposal has its own request', async t => {
+  const feedback = '  Please:\n  - keep "quotes" and \'single quotes\'\n  - --decision approve --input=x\n\n\ttabbed and trailing space \n';
+  const p = await published(t);
+  await p.pause({ idle: true });
+  const ack = await p.decide({ decision: 'request-changes', feedback });
+  assert.equal(ack.continuation, 'queued');
+  await p.f.service().scheduler.tick();
+  const resumed = await settled(p.store, p.run.id);
+  await p.f.waitForLaunch(2);
+  const delivered = context({ resolution: p.f.launches[1].resolution });
+  assert.equal(delivered.feedback, feedback, 'verbatim, byte for byte');
+  assert.equal(delivered.decision, 'request-changes');
+  assert.equal(delivered.superseded, undefined);
+  p.f.observation(ACTIVE);
+  // The resumed runner corrects the work and submits a fresh request for its new attempt.
+  const caller = { sessionID: p.run.parentSessionId, id: 'native_call_2', messageID: 'assistant_message_2', agent: 'adr-orchestrator' };
+  await p.f.client.request('POST', `/runs/${p.run.id}/resume-binding`, caller, resumed.ownerToken);
+  const state2 = { ...p.state, caller, attempt: { id: 'attempt_2', phase: 'executor', index: 0, child: 'ses_child', status: 'admitted', startedAt: 2, model: 'anthropic/x' }, approval: delivered };
+  state2.submissionBinding = recordDispatchPrompt(openSubmissionBinding(state2, 2), 'prompt_2');
+  await p.f.client.request('PUT', `/runs/${p.run.id}/checkpoint`, state2, resumed.ownerToken);
+  const corrected = approvalReceipt(p.run, state2, approvalPayload({ question: 'Approve the corrected change?' }), {
+    attemptId: 'attempt_2', dispatch: 2, origin: 'prompt_2', caller: { sessionID: 'ses_child', agent: 'executor', messageID: 'msg_2', callId: 'call_2' },
+  });
+  await p.f.client.request('PUT', `/runs/${p.run.id}/submissions/attempt_2/executor-result`, corrected, resumed.ownerToken);
+  const second = p.store.latestApproval(p.run.id);
+  assert.notEqual(second.requestId, p.request.requestId);
+  assert.equal(second.request.question, 'Approve the corrected change?');
+  assert.equal(second.state, 'pending');
+  // The earlier request is closed by changes: it can never be approved, and its stored acknowledgement is unchanged.
+  await assert.rejects(p.decide({ decision: 'approve' }), status(409, 'approval-conflict'));
+  assert.deepEqual(await p.decide({ decision: 'request-changes', feedback }), { ...ack, retried: true });
+  assert.equal(p.store.getApproval(p.run.id, second.requestId).state, 'pending');
+  // The new request is answered by its own id and continues once more.
+  const paused2 = { ...state2, status: 'paused', attempt: { ...state2.attempt, status: 'rejected' }, wait: { kind: 'approval', attemptId: 'attempt_2', index: 0, taskId: 'T1' } };
+  await p.f.client.request('PUT', `/runs/${p.run.id}/checkpoint`, paused2, resumed.ownerToken);
+  p.f.observation(IDLE);
+  await p.f.service().scheduler.tick();
+  assert.equal(p.store.getRun(p.run.id).status, 'paused');
+  const approved = await p.decide({ decision: 'approve' }, second.requestId);
+  assert.equal(approved.continuation, 'queued');
+  assert.equal(context(p.store.getRun(p.run.id)).requestId, second.requestId);
+  assert.equal(p.store.events().filter(event => event.type === 'approval.continuation_queued').length, 2);
 });

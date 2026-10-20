@@ -7,6 +7,7 @@ import { createRunner } from '../dist/workflow/runner.js';
 import { createDurableSubmissionGate } from '../dist/workflow/durable-submission.js';
 import { createLocalSubmissionStore } from '../dist/workflow/submission-store.js';
 import { SUBMISSION_TOOL_IDS } from '../dist/workflow/contracts.js';
+import { renderApprovalContext, supersedeApprovalContext } from '../dist/workflow/approval-context.js';
 
 const RUN = 'run-structured';
 const settings = { plannerAgent: 'adr-planner', executorAgent: 'adr-executor', plannerModel: 'anthropic/planner', executorModel: 'anthropic/executor', executorFallbackModel: 'kimi/fallback', maxTasks: 10, minQuotaRemainingPercent: 10, tokenLimitsDisabled: true };
@@ -580,4 +581,135 @@ test('a stale wait is cleared when the next pause has another reason', async t =
   const state = await f.state();
   assert.equal(state.wait, undefined, 'a blocked pause never carries the earlier approval wait');
   assert.equal(state.reportRecovery.diagnostic.code, 'agent_blocked');
+});
+
+// --- Owner decisions delivered by the coordinator's resume ----------------------------------------------------------------
+
+const decisionEnvelope = (overrides = {}) => renderApprovalContext({
+  requestId: 'apr_synthetic_1', decision: 'approve', feedback: null, scope: 'Rename export only in src/index.ts and its tests',
+  revision: { head: 'a'.repeat(40), digest: 'b'.repeat(64) }, onApprove: ['Rename the export', 'Re-run the unit tests'],
+  onRequestChanges: ['Adjust the rename within the same scope and submit a fresh request'], taskId: 'T2', index: 1, ...overrides,
+});
+
+test('an approval decision continues the same task with a fresh attempt and binding, and completes only by an ordinary submission', async t => {
+  let during;
+  const f = await fixture(t, [
+    submits(plan('T1', 'T2')), submits(completed()), submits(approvalRequest()),
+    async ({ submit }) => {
+      during = await f.state(); // The decision has been delivered; nothing is complete yet.
+      const response = await submit(completed());
+      assert.equal(response.accepted, true, JSON.stringify(response));
+      return SPOKEN;
+    },
+  ]);
+  assert.equal((await f.start()).status, 'paused');
+  const waiting = await f.state();
+  assert.equal(waiting.index, 1);
+  assert.equal(waiting.wait.taskId, 'T2');
+  const earlier = { results: structuredClone(waiting.results), parent: waiting.parent, branch: waiting.branch, tasks: structuredClone(waiting.tasks), id: waiting.id };
+  const before = f.executorDispatches();
+  const asked = before.at(-1);
+  const resumed = await f.resume(decisionEnvelope());
+  assert.equal(resumed.status, 'completed');
+  const [, , , second] = f.dispatches;
+  assert.equal(second.child, asked.child, 'the same child continues the task');
+  assert.notEqual(second.attemptId, asked.attemptId, 'a fresh attempt');
+  assert.ok(second.n > asked.n, 'a fresh dispatch binding');
+  assert.equal(during.index, 1);
+  assert.equal(during.results.length, 1, 'the approval itself completed nothing');
+  assert.equal(during.wait, undefined);
+  assert.equal(during.resolution, undefined, 'a structured decision is not kept as free text');
+  assert.equal(during.approval.requestId, 'apr_synthetic_1');
+  assert.equal(during.approval.decision, 'approve');
+  assert.equal(during.attempt.id, second.attemptId);
+  assert.equal(during.submissionBinding.dispatch, second.n, 'the submission binding is reopened for the new dispatch');
+  assert.equal(second.prompt.includes('Owner decision on your approval request apr_synthetic_1 (task T2):'), true);
+  assert.match(second.prompt, /Decision: approve/);
+  assert.match(second.prompt, /Scope you asked approval for: Rename export only in src\/index\.ts and its tests/);
+  assert.match(second.prompt, /  - Rename the export\n  - Re-run the unit tests/);
+  assert.match(second.prompt, /An approval does not complete any gate/);
+  assert.equal(second.prompt.includes('Owner resolution:'), false);
+  const final = await f.state();
+  assert.equal(final.approval, undefined, 'the decision ends with the task');
+  assert.deepEqual({ results: final.results.slice(0, 1), parent: final.parent, branch: final.branch, tasks: final.tasks, id: final.id }, earlier);
+  assert.equal(final.results.length, 2);
+  assert.equal(final.index, 2);
+  assert.equal((await f.submission(second.attemptId, 'executor-result')).outcome, 'completed');
+  assert.equal((await f.submission(asked.attemptId, 'executor-result')).outcome, 'approval-required');
+});
+
+test('requested changes reach the child verbatim, forbid the gated action, and a corrected proposal asks again', async t => {
+  const feedback = '  Do not rename it yet.\n\n"Quote": keep `src/index.ts` as is\n--decision approve --input=x\n\ttabbed  \n';
+  let corrected;
+  const f = await fixture(t, [
+    submits(plan('T1')), submits(approvalRequest()),
+    async ({ submit }) => { corrected = await submit(approvalRequest({ question: 'Approve the corrected rename?' })); return SPOKEN; },
+    submits(completed()),
+  ]);
+  assert.equal((await f.start()).status, 'paused');
+  const changes = decisionEnvelope({ decision: 'request-changes', feedback, taskId: 'T1', index: 0 });
+  const second = await f.resume(changes);
+  assert.equal(second.status, 'paused');
+  assert.equal(corrected.accepted, true);
+  const [, , revised] = f.dispatches;
+  assert.equal(revised.prompt.includes('<<<OWNER FEEDBACK\n' + feedback + '\nOWNER FEEDBACK>>>'), true, 'verbatim, between fixed markers');
+  assert.match(revised.prompt, /Decision: request-changes/);
+  assert.match(revised.prompt, /Do NOT perform the gated action/);
+  assert.match(revised.prompt, /submit a fresh approval request; this request cannot be approved any more/);
+  assert.match(revised.prompt, /  - Adjust the rename within the same scope/);
+  const state = await f.state();
+  assert.equal(state.status, 'paused');
+  assert.equal(state.wait.taskId, 'T1');
+  assert.equal(state.wait.attemptId, revised.attemptId, 'the corrected proposal is a new attempt that is waiting for its own decision');
+  assert.notEqual(state.wait.attemptId, f.dispatches[1].attemptId);
+  assert.equal(state.approval.decision, 'request-changes', 'the context stays until the task really advances or a newer decision replaces it');
+  assert.equal(state.index, 0);
+  assert.deepEqual(state.results, []);
+  // The next decision replaces the context; a generic text resume keeps it.
+  const approved = await f.resume(decisionEnvelope({ requestId: 'apr_synthetic_2', taskId: 'T1', index: 0 }));
+  assert.equal(approved.status, 'completed');
+  const last = f.dispatches.at(-1);
+  assert.match(last.prompt, /apr_synthetic_2/);
+  assert.equal(last.prompt.includes('OWNER FEEDBACK'), false);
+});
+
+test('a superseded decision tells the child to keep its work and ask again, and a mismatched or damaged envelope is refused', async t => {
+  const f = await fixture(t, [submits(plan('T1')), submits(approvalRequest()), submits(completed())]);
+  assert.equal((await f.start()).status, 'paused');
+  const waiting = await f.state();
+  const saves = f.saves.length;
+  for (const bad of [
+    decisionEnvelope({ taskId: 'T9', index: 0 }), decisionEnvelope({ taskId: 'T1', index: 3 }), decisionEnvelope({ taskId: 'T2', index: 1 }),
+    JSON.stringify({ heimdall: 'approval-continuation', version: 1, requestId: 'apr_x', decision: 'approve' }),
+    JSON.stringify({ ...JSON.parse(decisionEnvelope({ taskId: 'T1', index: 0 })), extra: true }),
+    JSON.stringify({ ...JSON.parse(decisionEnvelope({ taskId: 'T1', index: 0 })), decision: 'request-changes', feedback: ' ' }),
+  ]) await assert.rejects(f.resume(bad), /approval continuation|Malformed|does not match/);
+  assert.equal(f.saves.length, saves, 'a refused decision changes nothing');
+  assert.deepEqual(await f.state(), waiting);
+  const resumed = await f.resume(supersedeApprovalContext(JSON.parse(decisionEnvelope({ taskId: 'T1', index: 0 })), 'The reviewed worktree changed after the decision was recorded'));
+  assert.equal(resumed.status, 'completed');
+  const prompt = f.dispatches.at(-1).prompt;
+  assert.match(prompt, /Decision: SUPERSEDED/);
+  assert.match(prompt, /Keep your work, do NOT perform the gated action, and submit a fresh approval request/);
+  assert.equal(prompt.includes('You keep every remaining action'), false, 'a withdrawn approval lists no authorized actions');
+});
+
+test('other resolutions keep the free-text behavior, with or without a prior decision, and an unmanaged runner never trusts an envelope', async t => {
+  const f = await fixture(t, [submits(plan('T1')), submits(approvalRequest()), submits({ status: 'blocked', reason: 'Need access' }), submits(completed())]);
+  await f.start();
+  assert.equal((await f.resume(decisionEnvelope({ taskId: 'T1', index: 0 }))).status, 'paused');
+  assert.equal((await f.state()).approval.decision, 'approve');
+  assert.equal((await f.resume('Access granted')).status, 'completed');
+  const prompt = f.dispatches.at(-1).prompt;
+  assert.match(prompt, /Owner resolution: Access granted/);
+  assert.match(prompt, /Owner decision on your approval request apr_synthetic_1/, 'the earlier decision is still in force until the task advances');
+  const plain = await fixture(t, [submits(plan('T1')), submits(approvalRequest()), submits(completed())]);
+  await plain.start();
+  const noPersistence = plain.build({ protocol: 'structured-v1', persistence: undefined });
+  const envelope = decisionEnvelope({ taskId: 'T1', index: 0 });
+  assert.equal((await plain.resume(envelope, noPersistence)).status, 'completed');
+  const unmanaged = plain.dispatches.at(-1).prompt;
+  assert.equal(unmanaged.includes('Owner resolution: ' + envelope), true, 'only a coordinator-managed run reads the envelope; here it is plain text');
+  assert.equal(unmanaged.includes('Owner decision on your approval request'), false);
+  assert.equal((await plain.state()).approval, undefined);
 });

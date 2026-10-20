@@ -1,8 +1,10 @@
 import { createManagedWorktree, verifyManagedWorktree } from './worktrees.js';
 import { prepareRuntime } from './runtime.js';
+import { computeReviewRevision } from './review-revision.js';
+import { parseApprovalContext } from '../workflow/approval-context.js';
 import { verifyRuntimeSnapshot } from './runtime-snapshot.js';
 import type { CoordinatorStore } from './store.js';
-import type { ManagedExecutor, ProjectRecord, RunRecord } from './types.js';
+import type { ApprovalRevision, ManagedExecutor, ProjectRecord, RunRecord } from './types.js';
 
 export interface SchedulerOptions {
   store: CoordinatorStore;
@@ -11,6 +13,8 @@ export interface SchedulerOptions {
   createWorktree?: (input: { project: ProjectRecord; run: RunRecord }) => Promise<void>;
   verifyWorktree?: (input: { project: ProjectRecord; run: RunRecord }) => Promise<void>;
   prepare?: (run: RunRecord, endpoint: string) => Promise<void>;
+  /** Measures the reviewed state of the run's worktree. Defaults to the verified managed worktree measured with read-only git. */
+  revision?: (run: RunRecord) => Promise<ApprovalRevision>;
 }
 
 /** Owns admission and observation. Child sequencing/model choice remain in the proven runner. */
@@ -44,6 +48,8 @@ export class CoordinatorScheduler {
     for (const run of store.listRuns()) {
       if (run.status === 'running' && run.capacityReserved && !this.launches.has(run.id)) await this.observe(run);
     }
+    // Owner decisions for paused, released runs are queued before admission so they compete in the ordinary queue order.
+    if (!this.stopped && !this.admissionStopped) await this.continueDecisions();
     while (!this.stopped && !this.admissionStopped) {
       const run = store.admitNext();
       if (!run) break;
@@ -62,8 +68,14 @@ export class CoordinatorScheduler {
       if (run.launchAction === 'start') await (this.options.createWorktree ?? createManagedWorktree)({ project, run });
       else await (this.options.verifyWorktree ?? verifyManagedWorktree)({ project, run });
       await (this.options.prepare ?? prepareRuntime)(run, endpoint);
-      store.markLaunchIntent(run.id, run.ownerToken!);
-      await executor.launch(run);
+      let launching = run;
+      if (run.launchAction === 'resume' && parseApprovalContext(run.resolution ?? undefined)) {
+        // The reviewed material is measured at the dispatch boundary: an unchanged revision consumes the decision, a changed one
+        // withdraws it. Both happen in the transaction that records launch intent, so a decision is neither lost nor delivered twice.
+        store.beginApprovalDispatch(run.id, run.ownerToken!, await this.reviewRevision(run));
+        launching = store.getRun(run.id)!;
+      } else store.markLaunchIntent(run.id, run.ownerToken!);
+      await executor.launch(launching);
       const current = store.getRun(run.id)!;
       if (current.status === 'preparing') store.transition(current.id, current.ownerToken!, current.version, 'running');
     } catch (error) {
@@ -106,12 +118,57 @@ export class CoordinatorScheduler {
     // Refused first and again inside queueResume's transaction: a pending approval or unconsumed decision is not resumable by free text.
     this.options.store.assertNoUnresolvedApproval(id);
     if (!run || run.status !== 'paused' || run.capacityReserved) throw new Error('Only a confirmed idle paused run may be resumed');
+    await this.proveIdle(run);
+    return this.options.store.queueResume(id, input);
+  }
+
+  /** Worktree, runtime and native idle proof for a paused, released run; throws unless every part holds. */
+  private async proveIdle(run: RunRecord): Promise<void> {
     const project = this.options.store.getProject(run.projectId)!;
     await (this.options.verifyWorktree ?? verifyManagedWorktree)({ project, run });
     await verifyRuntimeSnapshot(run); // Refuse an altered runtime at the request, not after the run is queued.
     const observation = await this.options.executor.inspect(run);
     if (!observation.idle || observation.status !== 'paused') throw new Error('Native parent and children must be confirmed idle before resume');
-    return this.options.store.queueResume(id, input);
+  }
+
+  /** The reviewed state of the run's managed worktree, from the same read-only measurement the approval request used. */
+  async reviewRevision(run: RunRecord): Promise<ApprovalRevision> {
+    if (this.options.revision) return this.options.revision(run);
+    const project = this.options.store.getProject(run.projectId);
+    if (!project) throw new Error('Registered project is missing');
+    await (this.options.verifyWorktree ?? verifyManagedWorktree)({ project, run });
+    return computeReviewRevision(run.worktreePath, { roles: Object.keys(run.specification.agents) });
+  }
+
+  /** Whether this process still accepts new work: false once admission is paused or the scheduler is stopped. */
+  get accepting(): boolean { return !this.stopped && !this.admissionStopped; }
+
+  /**
+   * The run as it was proven idle for continuing an owner decision, or undefined when any part of the proof is missing: the
+   * run must be paused and released, its worktree and runtime intact, and every native session confirmed idle on a paused
+   * checkpoint. Never starts, releases or reconciles anything.
+   */
+  async proveContinuable(id: string): Promise<RunRecord | undefined> {
+    const run = this.options.store.getRun(id);
+    if (!run || run.status !== 'paused' || run.capacityReserved || !this.accepting) return undefined;
+    try { await this.proveIdle(run); } catch { return undefined; }
+    const current = this.options.store.getRun(id);
+    return current && current.version === run.version && this.accepting ? current : undefined;
+  }
+
+  /** Queues each answered decision whose run is proven idle, once. A decision that cannot be proven yet stays recorded. */
+  private async continueDecisions(): Promise<void> {
+    const { store } = this.options;
+    for (const { run, approval } of store.pendingContinuations()) {
+      if (!this.accepting) return;
+      try {
+        const proven = await this.proveContinuable(run.id);
+        if (!proven) continue;
+        await this.reviewRevision(proven); // Unmeasurable work is not queued; a changed revision is decided at dispatch.
+        if (!this.accepting) return;
+        store.queueContinuation(run.id, approval.requestId, proven.version);
+      } catch { /* Left recorded; the next tick proves it again. */ }
+    }
   }
 
   /** Stop admission without cancelling native sessions or freeing their reservations. */

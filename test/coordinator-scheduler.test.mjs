@@ -5,13 +5,18 @@ import os from 'node:os';
 import path from 'node:path';
 import { CoordinatorStore } from '../dist/coordinator/store.js';
 import { CoordinatorScheduler } from '../dist/coordinator/scheduler.js';
+import { CoordinatorError } from '../dist/coordinator/errors.js';
+import { contractDigest, contractRef } from '../dist/workflow/contracts.js';
+import { openSubmissionBinding, recordDispatchPrompt } from '../dist/workflow/submission-store.js';
+import { parseApprovalContext } from '../dist/workflow/approval-context.js';
+import { DatabaseSync } from 'node:sqlite';
 
 const settings = { plannerAgent: 'planner', executorAgent: 'executor', plannerModel: 'anthropic/planner', executorModel: 'anthropic/executor', executorFallbackModel: 'kimi/fallback', maxTasks: 10, minQuotaRemainingPercent: 10, tokenLimitsDisabled: true };
 const specification = { settings, plannerPrompt: 'Synthetic planner', executorPrompt: 'Synthetic executor', agents: {}, opencode: { baseUrl: 'http://127.0.0.1:4321', passwordEnvironmentVariable: 'SYNTHETIC_PASSWORD' } };
 const turn = () => new Promise(resolve => setImmediate(resolve));
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
 
-async function fixture(t, { globalConcurrency = 1, executor = {}, createWorktree, verifyWorktree, prepare } = {}) {
+async function fixture(t, { globalConcurrency = 1, executor = {}, createWorktree, verifyWorktree, prepare, revision } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'heimdall scheduler fixture '));
   const store = new CoordinatorStore({ databasePath: path.join(directory, 'state.sqlite'), globalConcurrency });
   const calls = { launch: [], inspect: [], create: [], verify: [], prepare: [] };
@@ -20,13 +25,30 @@ async function fixture(t, { globalConcurrency = 1, executor = {}, createWorktree
     inspect: async run => { calls.inspect.push(run); return executor.inspect ? executor.inspect(run) : { idle: false, status: 'unknown' }; },
     interrupt: async run => executor.interrupt?.(run),
   };
-  const scheduler = new CoordinatorScheduler({
-    store, executor: native, endpoint: path.join(directory, 'synthetic-ipc'),
+  const schedulerFor = (owned) => new CoordinatorScheduler({
+    store: owned, executor: native, endpoint: path.join(directory, 'synthetic-ipc'),
     createWorktree: async input => { calls.create.push(input); await createWorktree?.(input); },
     verifyWorktree: async input => { calls.verify.push(input); await verifyWorktree?.(input); },
     prepare: async (run, endpoint) => { calls.prepare.push({ run, endpoint }); await prepare?.(run, endpoint); },
+    ...(revision ? { revision: async run => revision(run) } : {}),
   });
-  t.after(async () => { await scheduler.stop(); store.close(); await fs.rm(directory, { recursive: true, force: true }); });
+  const scheduler = schedulerFor(store);
+  const reopened = [];
+  /** A restarted coordinator: the same database, a new store and a new scheduler. The earlier ones are closed first. */
+  const reopen = async () => {
+    await scheduler.stop(); store.close();
+    for (const earlier of reopened) { await earlier.scheduler.stop(); earlier.store.close(); }
+    const next = new CoordinatorStore({ databasePath: path.join(directory, 'state.sqlite'), globalConcurrency });
+    const nextScheduler = schedulerFor(next);
+    reopened.length = 0; reopened.push({ store: next, scheduler: nextScheduler });
+    nextScheduler.markInterrupted();
+    return { store: next, scheduler: nextScheduler, tick: async () => { await nextScheduler.tick(); await turn(); } };
+  };
+  t.after(async () => {
+    await scheduler.stop(); store.close();
+    for (const later of reopened) { await later.scheduler.stop(); later.store.close(); }
+    await fs.rm(directory, { recursive: true, force: true });
+  });
   let projectNumber = 0;
   const project = async (concurrency = 1) => {
     const root = path.join(directory, 'project-' + ++projectNumber);
@@ -37,7 +59,7 @@ async function fixture(t, { globalConcurrency = 1, executor = {}, createWorktree
   };
   const enqueue = (registered, id) => store.enqueue({ id, projectId: registered.id, feature: 'feature.md', baseCommit: 'a'.repeat(40), worktreePath: path.join(directory, 'worktrees', registered.id, id, 'checkout'), branch: 'heimdall/run/' + id, specification });
   const tick = async () => { await scheduler.tick(); await turn(); };
-  return { directory, store, scheduler, calls, project, enqueue, tick };
+  return { directory, store, scheduler, calls, project, enqueue, tick, reopen, databasePath: path.join(directory, 'state.sqlite') };
 }
 
 function saveCheckpoint(store, id, status = 'paused') {
@@ -282,4 +304,422 @@ test('stop halts admission without cancelling native launch or releasing its res
     assert.equal(f.calls.launch.length, 1);
     assert.equal(f.calls.inspect.length, 0);
   } finally { acknowledgement.resolve(); }
+});
+
+// --- Owner decisions: idle-gated queueing, once-only continuation and dispatch revalidation ---------------------------------
+
+const R0 = { head: 'b'.repeat(40), digest: 'c'.repeat(64) };
+const R1 = { head: 'b'.repeat(40), digest: 'd'.repeat(64) };
+const approvalPayload = overrides => ({
+  status: 'approval-required', question: 'Ship the change?', scope: 'Merge only the reviewed commit', completedWork: 'Implemented and tested',
+  verification: ['npm test: 12 passed'], artifacts: ['src/a.ts'], onApprove: ['Merge the branch'], onRequestChanges: ['Correct and ask again'], ...overrides,
+});
+const taskT1 = { id: 'T1', title: 'Synthetic task', brief: 'Do it', dependsOn: [], dod: ['gate one'] };
+const requestFor = (store, id) => store.latestApproval(id);
+const progressOf = (store, id, requestId) => store.approvalProgress(store.getApproval(id, requestId), store.getRun(id));
+const eventCount = (store, type) => store.events().filter(event => event.type === type).length;
+const code = expected => error => error instanceof CoordinatorError && error.code === expected;
+
+/** A structured executor checkpoint on a running, reserved run: the steps a runner takes before and while it asks for approval. */
+function structured(store, id, attempt = 1, claimed) {
+  const run = store.getRun(id);
+  const caller = { sessionID: run.parentSessionId, id: 'call-' + id, messageID: 'msg-' + id, agent: 'adr-orchestrator' };
+  if (!run.binding) store.bindStart(id, run.ownerToken, caller);
+  const current = store.getRun(id);
+  const attemptId = 'attempt-' + attempt;
+  const state = {
+    id, status: 'running', adr: '.heimdall/feature.md', parent: run.parentSessionId, caller: claimed ?? current.checkpoint?.caller ?? caller, branch: run.branch, baseline: '',
+    index: 0, tasks: [taskT1], results: [], phase: 'executor', child: 'child-session', settings, protocol: 'structured-v1',
+    attempt: { id: attemptId, phase: 'executor', index: 0, child: 'child-session', status: 'admitted', startedAt: 1, model: 'anthropic/executor' },
+  };
+  state.submissionBinding = recordDispatchPrompt(openSubmissionBinding(state, attempt), 'prompt-' + attempt);
+  const canonical = payload => ({ ...payload, taskId: 'T1' });
+  const receipt = (payload = approvalPayload()) => {
+    const contract = contractRef('executor-result');
+    return {
+      receiptVersion: 1, protocol: 'structured-v1', contract, kind: 'executor-result', runId: id, phase: 'executor', index: 0, taskId: 'T1', attemptId, dispatch: attempt,
+      parent: state.parent, child: 'child-session', origin: 'prompt-' + attempt, caller: { sessionID: 'child-session', agent: 'executor', messageID: 'm' + attempt, callId: 'c' + attempt },
+      runtime: { packageVersion: '0.0.0', protocol: 'structured-v1' }, outcome: 'approval-required', rawPayload: payload, canonical: canonical(payload),
+      digest: contractDigest(contract, canonical(payload)), acceptedAt: 1,
+    };
+  };
+  const paused = { ...state, status: 'paused', attempt: { ...state.attempt, status: 'rejected' }, wait: { kind: 'approval', attemptId, index: 0, taskId: 'T1' } };
+  return {
+    state, paused, receipt,
+    save: value => store.saveCheckpoint(id, store.getRun(id).ownerToken, value),
+    publish: (payload, revision = R0) => store.writeSubmission(id, store.getRun(id).ownerToken, receipt(payload), revision),
+  };
+}
+/** Publishes a request and records the runner's pause on it. The run stays reserved until the scheduler observes it idle. */
+function ask(store, id, attempt = 1, payload, claimed) {
+  const step = structured(store, id, attempt, claimed);
+  step.save(step.state);
+  step.publish(payload);
+  step.save(step.paused);
+  return { ...step, request: requestFor(store, id) };
+}
+const idleOn = () => ({ idle: true, status: 'paused', reason: 'Approval required' });
+const activeOn = () => ({ idle: false, status: 'unknown' });
+
+test('approve on a paused, released, idle run queues exactly one resume that is consumed once at dispatch', async t => {
+  const f = await fixture(t, { executor: { inspect: async run => run.launchAction === 'resume' ? activeOn() : idleOn() }, revision: async () => R0 });
+  f.enqueue(await f.project(), 'run');
+  await f.tick();
+  const first = f.store.getRun('run');
+  const asked = ask(f.store, 'run');
+  await f.tick();
+  const paused = f.store.getRun('run');
+  assert.equal(paused.status, 'paused');
+  assert.equal(paused.capacityReserved, false);
+  assert.equal(f.calls.launch.length, 1, 'a request alone starts nothing');
+  const { requestId } = asked.request;
+  // Two submissions of the same decision race on the same proven version: one queue, one stored acknowledgement.
+  const acks = await Promise.all([1, 2].map(async () => {
+    const proven = await f.scheduler.proveContinuable('run');
+    assert.equal(proven.version, paused.version);
+    return f.store.decideApproval('run', requestId, { decision: 'approve' }, R0, proven.version);
+  }));
+  assert.deepEqual(acks.map(ack => ack.retried).sort(), [false, true]);
+  assert.ok(acks.every(ack => ack.continuation === 'queued'));
+  const queued = f.store.getRun('run');
+  assert.equal(queued.status, 'queued');
+  assert.equal(queued.launchAction, 'resume');
+  assert.notEqual(queued.promptMessageId, first.promptMessageId);
+  assert.equal(queued.version, paused.version + 1);
+  const context = parseApprovalContext(queued.resolution);
+  assert.deepEqual({ requestId: context.requestId, decision: context.decision, feedback: context.feedback, taskId: context.taskId, index: context.index, superseded: context.superseded },
+    { requestId, decision: 'approve', feedback: null, taskId: 'T1', index: 0, superseded: undefined });
+  assert.deepEqual(context.onApprove, ['Merge the branch']);
+  assert.equal(context.scope, 'Merge only the reviewed commit');
+  assert.deepEqual(context.revision, R0);
+  assert.equal(progressOf(f.store, 'run', requestId), 'queued');
+  assert.equal(f.store.getApproval('run', requestId).continuationMessageId, queued.promptMessageId);
+  assert.equal(f.store.queueContinuation('run', requestId, paused.version), null, 'a second queue of the same decision is refused');
+  assert.equal(f.store.queueContinuation('run', requestId, queued.version), null);
+  // A generic resume racing the answered, unconsumed decision is refused, by the scheduler and by the store.
+  await assert.rejects(f.scheduler.resume('run', 'approve'), code('approval-pending'));
+  assert.throws(() => f.store.queueResume('run', 'approve'), code('approval-pending'));
+  assert.throws(() => f.store.queueResume('run', queued.resolution), /cannot be an approval continuation/, 'free text cannot impersonate a decision');
+  assert.equal(f.store.getRun('run').version, queued.version);
+  await Promise.all([f.tick(), f.tick()]);
+  await f.tick();
+  assert.equal(f.calls.launch.length, 2, 'exactly one admission');
+  const resumed = f.store.getRun('run');
+  assert.equal(resumed.status, 'running');
+  assert.equal(resumed.capacityReserved, true);
+  assert.equal(resumed.launchIntent, true);
+  assert.notEqual(resumed.ownerToken, first.ownerToken, 'fresh authority');
+  assert.deepEqual([resumed.id, resumed.parentSessionId, resumed.branch, resumed.worktreePath], [first.id, first.parentSessionId, first.branch, first.worktreePath]);
+  assert.equal(f.calls.launch[1].resolution, queued.resolution);
+  assert.equal(f.store.getApproval('run', requestId).continuation, 'consumed');
+  assert.equal(progressOf(f.store, 'run', requestId), 'consumed');
+  assert.equal(eventCount(f.store, 'approval.answered'), 1);
+  assert.equal(eventCount(f.store, 'approval.continuation_queued'), 1);
+  assert.equal(eventCount(f.store, 'approval.consumed'), 1);
+  // The same decision never dispatches again, and an identical retry after advancement returns the stored acknowledgement.
+  assert.equal(f.store.beginApprovalDispatch('run', resumed.ownerToken, R1), 'authorized');
+  assert.equal(f.store.getApproval('run', requestId).continuation, 'consumed');
+  assert.deepEqual(f.store.decideApproval('run', requestId, { decision: 'approve' }), { ...acks.find(ack => !ack.retried), retried: true });
+  assert.throws(() => f.store.decideApproval('run', requestId, { decision: 'request-changes', feedback: 'late' }), code('approval-conflict'));
+  // The resumed attempt pauses again with its own request: the earlier request cannot answer it.
+  const claimed = { sessionID: resumed.parentSessionId, id: 'call-resume', messageID: 'msg-resume', agent: 'adr-orchestrator' };
+  f.store.bindResume('run', resumed.ownerToken, claimed);
+  const again = ask(f.store, 'run', 2, undefined, claimed);
+  assert.notEqual(again.request.requestId, requestId);
+  assert.deepEqual(f.store.decideApproval('run', requestId, { decision: 'approve' }), { ...acks.find(ack => !ack.retried), retried: true }, 'the stored acknowledgement, nothing more');
+  assert.throws(() => f.store.decideApproval('run', requestId, { decision: 'request-changes', feedback: 'no' }), code('approval-conflict'));
+  const second = f.store.getApproval('run', again.request.requestId);
+  assert.deepEqual({ state: second.state, continuation: second.continuation }, { state: 'pending', continuation: 'none' });
+  assert.equal(f.store.getRun('run').status, 'running');
+  assert.equal(eventCount(f.store, 'approval.continuation_queued'), 1);
+});
+
+test('a decision recorded while the run is active stays pending and is queued once, only after complete idle proof and open admission', async t => {
+  const script = [];
+  let observed = activeOn();
+  const f = await fixture(t, { executor: { inspect: async () => script.length ? script.shift() : observed }, revision: async () => R0 });
+  f.enqueue(await f.project(), 'run');
+  await f.tick();
+  const asked = ask(f.store, 'run');
+  const { requestId } = asked.request;
+  const ack = f.store.decideApproval('run', requestId, { decision: 'request-changes', feedback: 'Rename it' }, R0);
+  assert.deepEqual({ continuation: ack.continuation, status: ack.run.status }, { continuation: 'pending', status: 'running' });
+  assert.equal(progressOf(f.store, 'run', requestId), 'waiting-for-idle');
+  for (const value of [activeOn(), { idle: false, status: 'paused' }, { idle: true, status: 'unknown' }]) {
+    observed = value;
+    await f.tick();
+    const run = f.store.getRun('run');
+    assert.deepEqual({ status: run.status, reserved: run.capacityReserved }, { status: 'running', reserved: true }, 'capacity is not released early');
+    assert.equal(f.store.getApproval('run', requestId).continuation, 'pending');
+    assert.equal(f.calls.launch.length, 1);
+  }
+  // The observation proves idle, but the proof repeated for the continuation is incomplete: released, recorded, not queued.
+  script.push(idleOn(), activeOn());
+  await f.tick();
+  assert.deepEqual({ status: f.store.getRun('run').status, reserved: f.store.getRun('run').capacityReserved }, { status: 'paused', reserved: false });
+  assert.equal(f.store.getApproval('run', requestId).continuation, 'pending');
+  assert.equal(progressOf(f.store, 'run', requestId), 'recorded');
+  assert.equal(eventCount(f.store, 'approval.continuation_queued'), 0);
+  // Complete proof, but admission is paused (as while draining): the decision waits.
+  observed = idleOn();
+  f.scheduler.pauseAdmission();
+  await f.tick();
+  assert.equal(f.store.getRun('run').status, 'paused');
+  assert.equal(f.store.getApproval('run', requestId).continuation, 'pending');
+  assert.equal(await f.scheduler.proveContinuable('run'), undefined);
+  assert.equal(f.calls.launch.length, 1);
+  // A restarted coordinator with open admission queues it once and the ordinary admission launches it.
+  const restarted = await f.reopen();
+  await restarted.tick();
+  await restarted.tick();
+  assert.equal(f.calls.launch.length, 2);
+  assert.equal(restarted.store.getApproval('run', requestId).continuation, 'consumed');
+  assert.equal(eventCount(restarted.store, 'approval.continuation_queued'), 1);
+  const context = parseApprovalContext(f.calls.launch[1].resolution);
+  assert.equal(context.decision, 'request-changes');
+  assert.equal(context.feedback, 'Rename it');
+  assert.deepEqual(context.onRequestChanges, ['Correct and ask again']);
+});
+
+/** Run `a` waits for capacity behind run `b` after its decision was queued. */
+async function waitingForCapacity(t, extra = {}) {
+  const observed = { a: activeOn(), b: activeOn() };
+  const revision = { value: R0 };
+  const f = await fixture(t, { globalConcurrency: 1, executor: { inspect: async run => observed[run.id] }, revision: async () => revision.value, ...extra });
+  const project = await f.project(2);
+  f.enqueue(project, 'a');
+  f.enqueue(project, 'b');
+  await f.tick();
+  const asked = ask(f.store, 'a');
+  observed.a = idleOn();
+  await f.tick(); // a is observed idle and released; b takes the capacity.
+  assert.equal(f.store.getRun('b').capacityReserved, true);
+  const proven = await f.scheduler.proveContinuable('a');
+  const ack = f.store.decideApproval('a', asked.request.requestId, { decision: 'approve' }, R0, proven.version);
+  assert.equal(ack.continuation, 'queued');
+  assert.equal(f.store.getRun('a').status, 'queued');
+  assert.equal(progressOf(f.store, 'a', asked.request.requestId), 'queued');
+  await f.tick();
+  assert.equal(f.store.getRun('a').status, 'queued', 'waiting for capacity');
+  return { f, observed, revision, requestId: asked.request.requestId };
+}
+
+test('content changed after acceptance while waiting for capacity supersedes the decision at dispatch', async t => {
+  const { f, observed, revision, requestId } = await waitingForCapacity(t);
+  revision.value = R1; // committed and uncommitted reviewed content changed
+  observed.b = { idle: true, status: 'succeeded' };
+  await f.tick();
+  const run = f.store.getRun('a');
+  assert.equal(run.status, 'running');
+  assert.deepEqual(f.calls.launch.map(launched => launched.id), ['a', 'b', 'a']);
+  const delivered = parseApprovalContext(f.calls.launch[2].resolution);
+  assert.equal(delivered.superseded.reason, 'The reviewed worktree changed after the decision was recorded');
+  assert.equal(parseApprovalContext(run.resolution).superseded !== undefined, true, 'the stored resolution is the superseded one');
+  const stored = f.store.getApproval('a', requestId);
+  assert.equal(stored.continuation, 'superseded');
+  assert.equal(stored.state, 'answered');
+  assert.equal(progressOf(f.store, 'a', requestId), 'superseded');
+  assert.equal(eventCount(f.store, 'approval.consumed'), 0);
+  assert.equal(eventCount(f.store, 'approval.superseded'), 1);
+  assert.equal(run.launchIntent, true);
+  // Neither blocking a later generic resume nor requeueing the withdrawn decision.
+  assert.doesNotThrow(() => f.store.assertNoUnresolvedApproval('a'));
+  await f.tick();
+  assert.equal(f.calls.launch.length, 3);
+});
+
+test('a restart while the decision waits for capacity keeps it queued once; unchanged content is consumed, changed content is superseded', async t => {
+  for (const changed of [false, true]) await t.test(changed ? 'changed' : 'unchanged', async child => {
+    const { f, observed, revision, requestId } = await waitingForCapacity(child);
+    const restarted = await f.reopen();
+    assert.equal(restarted.store.getRun('a').status, 'queued');
+    assert.equal(restarted.store.getApproval('a', requestId).continuation, 'queued');
+    assert.equal(restarted.store.getRun('b').status, 'reconciliation-required');
+    assert.equal(restarted.store.getRun('b').capacityReserved, true, 'the retained run keeps its capacity');
+    await restarted.tick();
+    assert.equal(restarted.store.getRun('a').status, 'queued');
+    if (changed) revision.value = R1;
+    observed.b = { idle: true, status: 'succeeded' };
+    await restarted.scheduler.reconcile('b');
+    await restarted.tick();
+    assert.equal(restarted.store.getRun('a').status, 'running');
+    assert.deepEqual(f.calls.launch.map(launched => launched.id), ['a', 'b', 'a']);
+    assert.equal(restarted.store.getApproval('a', requestId).continuation, changed ? 'superseded' : 'consumed');
+    assert.equal(parseApprovalContext(f.calls.launch[2].resolution).superseded !== undefined, changed);
+    assert.equal(eventCount(restarted.store, 'approval.continuation_queued'), 1);
+    await restarted.tick();
+    assert.equal(f.calls.launch.length, 3);
+  });
+});
+
+function inject(f, statement) {
+  const database = new DatabaseSync(f.databasePath);
+  try { database.exec(statement); } finally { database.close(); }
+}
+
+test('a failure at request publication, response persistence, queueing or admission leaves no accepted response or exactly one continuation', async t => {
+  await t.test('request publication', async child => {
+    const f = await fixture(child, { executor: { inspect: async () => idleOn() }, revision: async () => R0 });
+    f.enqueue(await f.project(), 'run');
+    await f.tick();
+    const step = structured(f.store, 'run');
+    step.save(step.state);
+    inject(f, "CREATE TRIGGER fail_publication BEFORE INSERT ON approval_requests BEGIN SELECT RAISE(ABORT, 'injected publication failure'); END");
+    assert.throws(() => step.publish(), /injected publication failure/);
+    assert.equal(f.store.readSubmission('run', f.store.getRun('run').ownerToken, 'attempt-1', 'executor-result'), undefined, 'no receipt without its request');
+    assert.equal(f.store.latestApproval('run'), null);
+    assert.equal(eventCount(f.store, 'approval.requested'), 0);
+    inject(f, 'DROP TRIGGER fail_publication');
+    step.publish();
+    step.publish();
+    assert.equal(eventCount(f.store, 'approval.requested'), 1);
+    assert.equal(f.store.latestApproval('run').state, 'pending');
+  });
+
+  await t.test('response persistence', async child => {
+    const f = await fixture(child, { executor: { inspect: async () => idleOn() }, revision: async () => R0 });
+    f.enqueue(await f.project(), 'run');
+    await f.tick();
+    const { request } = ask(f.store, 'run');
+    await f.tick();
+    const before = f.store.getRun('run');
+    inject(f, "CREATE TRIGGER fail_response BEFORE UPDATE ON approval_requests WHEN NEW.state = 'answered' BEGIN SELECT RAISE(ABORT, 'injected response failure'); END");
+    assert.throws(() => f.store.decideApproval('run', request.requestId, { decision: 'approve' }, R0, before.version), /injected response failure/);
+    assert.equal(f.store.getApproval('run', request.requestId).state, 'pending', 'no accepted response');
+    assert.deepEqual(f.store.getRun('run'), before);
+    assert.equal(eventCount(f.store, 'approval.answered'), 0);
+    await f.tick();
+    assert.equal(f.calls.launch.length, 1);
+    inject(f, 'DROP TRIGGER fail_response');
+    f.store.decideApproval('run', request.requestId, { decision: 'approve' }, R0, before.version);
+    await f.tick();
+    assert.equal(f.calls.launch.length, 2);
+    assert.equal(eventCount(f.store, 'approval.answered'), 1);
+  });
+
+  await t.test('queueing', async child => {
+    const f = await fixture(child, { executor: { inspect: async () => idleOn() }, revision: async () => R0 });
+    f.enqueue(await f.project(), 'run');
+    await f.tick();
+    const { request } = ask(f.store, 'run');
+    await f.tick();
+    const before = f.store.getRun('run');
+    inject(f, "CREATE TRIGGER fail_queue BEFORE UPDATE ON runs WHEN NEW.status = 'queued' BEGIN SELECT RAISE(ABORT, 'injected queue failure'); END");
+    // Recording and queueing are one transaction: neither is kept.
+    assert.throws(() => f.store.decideApproval('run', request.requestId, { decision: 'approve' }, R0, before.version), /injected queue failure/);
+    assert.equal(f.store.getApproval('run', request.requestId).state, 'pending');
+    // A decision recorded without queueing stays pending while the queue operation fails, and nothing is lost or duplicated.
+    f.store.decideApproval('run', request.requestId, { decision: 'approve' }, R0);
+    assert.equal(f.store.getApproval('run', request.requestId).continuation, 'pending');
+    await f.tick();
+    await f.tick();
+    assert.deepEqual({ status: f.store.getRun('run').status, continuation: f.store.getApproval('run', request.requestId).continuation, launches: f.calls.launch.length }, { status: 'paused', continuation: 'pending', launches: 1 });
+    inject(f, 'DROP TRIGGER fail_queue');
+    await f.tick();
+    await f.tick();
+    assert.equal(f.calls.launch.length, 2);
+    assert.equal(eventCount(f.store, 'approval.continuation_queued'), 1);
+    assert.equal(f.store.getApproval('run', request.requestId).continuation, 'consumed');
+  });
+
+  await t.test('admission before dispatch, then reconciliation', async child => {
+    let failPrepare = true;
+    let observed = activeOn();
+    const f = await fixture(child, { executor: { inspect: async () => observed }, revision: async () => R0, prepare: async run => { if (failPrepare && run.launchAction === 'resume') throw new Error('Preparation could not be confirmed'); } });
+    f.enqueue(await f.project(), 'run');
+    await f.tick();
+    const { request } = ask(f.store, 'run');
+    observed = idleOn();
+    await f.tick();
+    f.store.decideApproval('run', request.requestId, { decision: 'approve' }, R0);
+    await f.tick();
+    await f.tick();
+    const retained = f.store.getRun('run');
+    assert.deepEqual({ status: retained.status, reserved: retained.capacityReserved, intent: retained.launchIntent }, { status: 'reconciliation-required', reserved: true, intent: false });
+    assert.equal(f.store.getApproval('run', request.requestId).continuation, 'queued', 'not consumed before the dispatch boundary');
+    assert.equal(f.calls.launch.length, 1);
+    observed = activeOn();
+    assert.equal((await f.scheduler.reconcile('run')).capacityReserved, true, 'native-uncertain keeps its capacity');
+    failPrepare = false;
+    observed = idleOn();
+    const released = await f.scheduler.reconcile('run');
+    assert.deepEqual({ status: released.status, reserved: released.capacityReserved }, { status: 'paused', reserved: false });
+    await f.tick();
+    await f.tick();
+    assert.equal(f.calls.launch.length, 2, 'one later continuation');
+    assert.equal(f.store.getApproval('run', request.requestId).continuation, 'consumed');
+    assert.equal(eventCount(f.store, 'approval.continuation_queued'), 2, 'the unconsumed queue was refreshed, never doubled');
+    assert.equal(eventCount(f.store, 'approval.consumed'), 1);
+  });
+
+  await t.test('launch failure after the dispatch boundary keeps capacity and does not requeue a consumed decision', async child => {
+    let observed = activeOn();
+    let failLaunch = false;
+    const f = await fixture(child, { executor: { inspect: async () => observed, launch: async () => { if (failLaunch) throw new Error('Native launch outcome unknown'); } }, revision: async () => R0 });
+    f.enqueue(await f.project(), 'run');
+    await f.tick();
+    const { request } = ask(f.store, 'run');
+    observed = idleOn();
+    await f.tick();
+    failLaunch = true;
+    f.store.decideApproval('run', request.requestId, { decision: 'approve' }, R0);
+    await f.tick();
+    await f.tick();
+    const uncertain = f.store.getRun('run');
+    assert.deepEqual({ status: uncertain.status, reserved: uncertain.capacityReserved, intent: uncertain.launchIntent }, { status: 'reconciliation-required', reserved: true, intent: true });
+    assert.equal(f.store.getApproval('run', request.requestId).continuation, 'consumed');
+    observed = activeOn();
+    assert.equal((await f.scheduler.reconcile('run')).capacityReserved, true);
+    failLaunch = false;
+    observed = idleOn();
+    assert.equal((await f.scheduler.reconcile('run')).status, 'paused');
+    await f.tick();
+    await f.tick();
+    assert.equal(f.calls.launch.length, 2, 'the consumed decision is never delivered a second time');
+    assert.equal(eventCount(f.store, 'approval.continuation_queued'), 1);
+  });
+
+  await t.test('restart between queueing and dispatch', async child => {
+    let observed = activeOn();
+    const f = await fixture(child, { executor: { inspect: async () => observed }, revision: async () => R0 });
+    f.enqueue(await f.project(), 'run');
+    await f.tick();
+    const { request } = ask(f.store, 'run');
+    observed = idleOn();
+    await f.tick();
+    f.store.decideApproval('run', request.requestId, { decision: 'approve' }, R0, f.store.getRun('run').version);
+    assert.ok(f.store.admitNext(), 'admitted, but the process ends before it dispatches');
+    const restarted = await f.reopen();
+    const interrupted = restarted.store.getRun('run');
+    assert.deepEqual({ status: interrupted.status, reserved: interrupted.capacityReserved, intent: interrupted.launchIntent }, { status: 'reconciliation-required', reserved: true, intent: false });
+    assert.equal(restarted.store.getApproval('run', request.requestId).continuation, 'queued');
+    observed = activeOn();
+    await assert.rejects(restarted.scheduler.reconcile('run').then(run => { assert.equal(run.capacityReserved, true); throw new Error('retained'); }), /retained/);
+    observed = idleOn();
+    assert.equal((await restarted.scheduler.reconcile('run')).status, 'paused');
+    await restarted.tick();
+    await restarted.tick();
+    assert.equal(f.calls.launch.length, 2);
+    assert.equal(restarted.store.getApproval('run', request.requestId).continuation, 'consumed');
+    assert.equal(eventCount(restarted.store, 'approval.consumed'), 1);
+  });
+});
+
+test('a request cannot be approved after the run paused again for another attempt, and a corrected proposal is a new request', async t => {
+  let observed = activeOn();
+  const f = await fixture(t, { executor: { inspect: async () => observed }, revision: async () => R0 });
+  f.enqueue(await f.project(), 'run');
+  await f.tick();
+  const first = ask(f.store, 'run');
+  // The task was dispatched again before the owner answered (a later pause with a different attempt).
+  const later = structured(f.store, 'run', 2);
+  later.save({ ...later.state, status: 'paused', attempt: { ...later.state.attempt, status: 'rejected' }, reason: 'Blocked for another reason' });
+  observed = idleOn();
+  await f.tick();
+  assert.equal(f.store.getRun('run').status, 'paused');
+  assert.throws(() => f.store.decideApproval('run', first.request.requestId, { decision: 'approve' }, R0, f.store.getRun('run').version), code('approval-stale'));
+  assert.equal(f.store.getApproval('run', first.request.requestId).state, 'superseded');
+  assert.equal(await f.scheduler.proveContinuable('run') !== undefined, true);
+  assert.equal(f.store.pendingContinuations().length, 0);
+  assert.throws(() => f.store.decideApproval('run', first.request.requestId, { decision: 'approve' }), code('approval-stale'));
 });

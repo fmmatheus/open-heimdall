@@ -1,3 +1,4 @@
+import type { ApprovalContext } from './approval-context.js';
 import type { ExecutorSelection, QuotaSettings, QuotaSnapshot } from '../policy/types.js';
 import type { ContractRef, SubmissionKind, SUBMISSION_PROTOCOL } from './contracts.js';
 import type { DispatchPromptSync } from './prompt-sync.js';
@@ -428,6 +429,8 @@ export interface RunState {
   reason?: string;
   /** The typed semantic wait of a paused run, when it is waiting for an owner decision. See `RunWait`. */
   wait?: RunWait;
+  /** The owner decision a resumed task received from the coordinator. Kept until the task really advances; see `ApprovalContext`. */
+  approval?: ApprovalContext;
   reportRecovery?: ReportRecovery;
   /** Structured runs only: the durable format-repair bound of the current planner phase or executor task. */
   submissionRepair?: SubmissionRepairRecord;

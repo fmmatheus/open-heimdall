@@ -12,9 +12,10 @@ import {
   assertOutcomeMatchesCheckpoint, assertSubmissionMatchesCheckpoint, isNativeOutcome, isSubmissionKind, isSubmissionReceipt, sameOutcome, sameSubmission,
 } from '../workflow/submission-store.js';
 import type { NativeOutcome, RunState, SubmissionReceipt } from '../workflow/types.js';
+import { parseApprovalContext, renderApprovalContext, supersedeApprovalContext } from '../workflow/approval-context.js';
 import { CoordinatorError } from './errors.js';
 import type {
-  ApprovalAck, ApprovalContinuation, ApprovalDecision, ApprovalRecord, ApprovalRequestContent, ApprovalRevision, ApprovalState, ApprovalWait,
+  ApprovalAck, ApprovalContinuation, ApprovalDecision, ApprovalProgress, ApprovalRecord, ApprovalRequestContent, ApprovalRevision, ApprovalState, ApprovalWait,
   CoordinatorEvent, ProjectRecord, Receipt, RunRecord, RunStatus, StartBinding,
 } from './types.js';
 import { RUN_LIST_FEATURE_HEAD, RUN_LIST_MAX_BYTES, RUN_LIST_PAGE_SIZE } from './run-list.js';
@@ -554,6 +555,12 @@ export class CoordinatorStore {
       // A late writer holding an older view can never erase a seal, conflict, outcome or refusal, nor lower the repair counter.
       assertRepairMonotonic(run.checkpoint, state);
       this.db.prepare('UPDATE runs SET checkpoint_json = ?, updated_at = ? WHERE id = ?').run(encoded, Date.now(), id);
+      // The first fresh attempt that carries a delivered decision is recorded as the attempt that consumed it.
+      if (state.approval && state.attempt && state.status === 'running') {
+        this.db.prepare(`UPDATE approval_requests SET consumed_attempt_id = ?
+          WHERE run_id = ? AND request_id = ? AND consumed_attempt_id IS NULL AND continuation IN ('consumed','superseded') AND attempt_id != ?`)
+          .run(state.attempt.id, id, state.approval.requestId, state.attempt.id);
+      }
       this.event('checkpoint.saved', run, null, {
         status: state.status, phase: state.phase, index: state.index, child: state.child,
         usage: {
@@ -675,6 +682,8 @@ export class CoordinatorStore {
 
   queueResume(id: string, input: string): RunRecord {
     nonempty(input, 'Resume resolution');
+    // Only an answered approval request produces an approval continuation; free text cannot impersonate one.
+    if (parseApprovalContext(input)) throw new Error('A resume resolution cannot be an approval continuation');
     return this.transaction(() => {
       this.assertNoUnresolvedApproval(id);
       const run = this.requireRun(id);
@@ -780,7 +789,7 @@ export class CoordinatorStore {
    * - Any other decision for an answered, superseded or foreign request fails; no stored value changes.
    * - Recording stores the decision and the `pending` continuation together with the event in one transaction.
    */
-  decideApproval(runId: string, requestId: string, input: { decision: ApprovalDecision; feedback?: string }, revision?: ApprovalRevision): ApprovalAck {
+  decideApproval(runId: string, requestId: string, input: { decision: ApprovalDecision; feedback?: string }, revision?: ApprovalRevision, queueAtVersion?: number): ApprovalAck {
     if (input.decision !== 'approve' && input.decision !== 'request-changes') throw new Error('Decision must be approve or request-changes');
     const feedback = input.feedback ?? null;
     const outcome = this.transaction((): { ack: ApprovalAck } | { stale: string } => {
@@ -801,20 +810,128 @@ export class CoordinatorStore {
         return { stale: reason };
       }
       const now = Date.now();
+      // Recording and queueing are one transaction only when the caller proved the run idle at exactly this version.
+      const queue = queueAtVersion === run.version && this.continuable(run, request);
       const ack: ApprovalAck = {
-        runId, requestId, decision: input.decision, recordedAt: now, retried: false, continuation: 'pending',
-        run: { status: run.status, version: run.version },
+        runId, requestId, decision: input.decision, recordedAt: now, retried: false, continuation: queue ? 'queued' : 'pending',
+        run: queue ? { status: 'queued', version: run.version + 1 } : { status: run.status, version: run.version },
       };
       this.db.prepare(`UPDATE approval_requests SET state = 'answered', decision = ?, feedback = ?, response_json = ?, answered_at = ?,
         continuation = 'pending', continuation_at = ? WHERE run_id = ? AND request_id = ? AND state = 'pending'`)
         .run(input.decision, feedback, serialize(ack), now, now, runId, requestId);
       this.event('approval.answered', run, null, {
-        requestId, attemptId: request.attemptId, decision: input.decision, feedbackLength: feedback === null ? 0 : feedback.length, continuation: 'pending',
+        requestId, attemptId: request.attemptId, decision: input.decision, feedbackLength: feedback === null ? 0 : feedback.length, continuation: ack.continuation,
       });
+      if (queue) this.enqueueContinuation(run, this.getApproval(runId, requestId)!);
       return { ack };
     });
     if ('stale' in outcome) throw new CoordinatorError(409, 'approval-stale', outcome.stale);
     return outcome.ack;
+  }
+
+  /** True when the run is released, paused on exactly the task and attempt that asked, and may be resumed by the decision. */
+  private continuable(run: RunRecord, request: ApprovalRecord): boolean {
+    const state = run.checkpoint;
+    return run.status === 'paused' && !run.capacityReserved && !!run.binding && !!state && state.status === 'paused'
+      && state.phase === request.phase && state.index === request.taskIndex && state.tasks[request.taskIndex]?.id === request.taskId
+      && state.wait?.kind === 'approval' && state.wait.attemptId === request.attemptId && state.attempt?.id === request.attemptId;
+  }
+
+  /** Queues the one resume that carries an answered request's decision. The caller holds the transaction and has checked `continuable`. */
+  private enqueueContinuation(run: RunRecord, request: ApprovalRecord): void {
+    const messageId = 'msg_' + randomUUID();
+    const resolution = renderApprovalContext({
+      requestId: request.requestId, decision: request.decision!, feedback: request.feedback, scope: request.request.scope, revision: request.revision,
+      onApprove: request.request.onApprove, onRequestChanges: request.request.onRequestChanges, taskId: request.taskId, index: request.taskIndex,
+    });
+    this.db.prepare("UPDATE runs SET status = 'queued', owner_token = NULL, prompt_message_id = ?, launch_action = 'resume', resolution = ?, resume_binding_json = NULL, launch_intent = 0, reason = NULL, queue_sequence = ?, version = version + 1, updated_at = ? WHERE id = ?")
+      .run(messageId, resolution, this.nextQueueSequence(), Date.now(), run.id);
+    this.db.prepare("UPDATE approval_requests SET continuation = 'queued', continuation_at = ?, continuation_message_id = ? WHERE run_id = ? AND request_id = ?")
+      .run(Date.now(), messageId, run.id, request.requestId);
+    const queued = this.requireRun(run.id);
+    this.event('run.resume_queued', queued, null, { version: queued.version, messageID: queued.promptMessageId, requestId: request.requestId });
+    this.event('approval.continuation_queued', queued, null, { requestId: request.requestId, messageID: messageId, version: queued.version });
+  }
+
+  /** Answered requests whose decision still has to reach a resumed attempt, for runs that are paused and released right now. */
+  pendingContinuations(): Array<{ run: RunRecord; approval: ApprovalRecord }> {
+    const found: Array<{ run: RunRecord; approval: ApprovalRecord }> = [];
+    for (const row of this.db.prepare("SELECT * FROM approval_requests WHERE state = 'answered' AND continuation IN ('pending','queued') ORDER BY answered_at, rowid").all()) {
+      const approval = this.approvalFromRow(row);
+      const run = this.getRun(approval.runId);
+      if (run && this.continuable(run, approval)) found.push({ run, approval });
+    }
+    return found;
+  }
+
+  /**
+   * Queues the resume that carries an answered decision, at most once per decision. `expectedVersion` is the run version at
+   * which the caller proved the run idle; any other version, a run that is not paused and released on the asking task, or a
+   * continuation that is no longer waiting returns null and changes nothing. A continuation left `queued` by a run that
+   * returned to paused without dispatching is waiting again and is queued once more.
+   */
+  queueContinuation(runId: string, requestId: string, expectedVersion: number): RunRecord | null {
+    if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 0) throw new Error('Expected version must be a nonnegative safe integer');
+    return this.transaction(() => {
+      const request = this.getApproval(runId, requestId);
+      const run = this.getRun(runId);
+      if (!request || !run || request.state !== 'answered' || !['pending', 'queued'].includes(request.continuation)) return null;
+      if (run.version !== expectedVersion || !this.continuable(run, request)) return null;
+      this.enqueueContinuation(run, request);
+      return this.requireRun(runId);
+    });
+  }
+
+  /**
+   * The dispatch boundary of an admitted resume that carries an approval decision: records native launch intent and, in the
+   * same transaction, consumes the decision. `revision` is the worktree measured just before. An unchanged revision consumes
+   * the continuation; a changed one withdraws the authorization and replaces the delivered context with a superseded one, so
+   * the agent keeps its work, performs nothing gated and asks again. Replaying after the boundary reports the stored outcome.
+   * A resolution that is not an approval decision only marks launch intent.
+   */
+  beginApprovalDispatch(id: string, ownerToken: string, revision?: ApprovalRevision): 'plain' | 'authorized' | 'superseded' {
+    return this.transaction(() => {
+      const run = this.requireOwner(id, ownerToken);
+      const context = run.launchAction === 'resume' ? parseApprovalContext(run.resolution ?? undefined) : undefined;
+      const mark = () => {
+        this.db.prepare('UPDATE runs SET launch_intent = 1, updated_at = ? WHERE id = ?').run(Date.now(), id);
+        this.event('run.launch_intent', run, null, { launchAction: run.launchAction });
+      };
+      if (!context) { if (!run.launchIntent) mark(); return 'plain'; }
+      const request = this.getApproval(id, context.requestId);
+      if (!request || request.state !== 'answered' || request.decision !== context.decision || request.continuationMessageId !== run.promptMessageId) throw new Error('The approval continuation is not the one queued for this admission');
+      if (run.launchIntent) return request.continuation === 'superseded' ? 'superseded' : 'authorized';
+      if (request.continuation !== 'queued') throw new Error('The approval continuation was already delivered');
+      if (!revision) throw new Error('Dispatching an approval continuation requires the current review revision');
+      const now = Date.now();
+      if (revision.head === request.revision.head && revision.digest === request.revision.digest) {
+        this.db.prepare("UPDATE approval_requests SET continuation = 'consumed', continuation_at = ? WHERE run_id = ? AND request_id = ?").run(now, id, request.requestId);
+        this.event('approval.consumed', run, null, { requestId: request.requestId, messageID: run.promptMessageId });
+        mark();
+        return 'authorized';
+      }
+      const reason = 'The reviewed worktree changed after the decision was recorded';
+      this.db.prepare("UPDATE approval_requests SET continuation = 'superseded', continuation_at = ?, superseded_at = ?, superseded_reason = ? WHERE run_id = ? AND request_id = ?")
+        .run(now, now, reason, id, request.requestId);
+      this.db.prepare('UPDATE runs SET resolution = ? WHERE id = ?').run(supersedeApprovalContext(context, reason), id);
+      this.event('approval.superseded', run, null, { requestId: request.requestId, attemptId: request.attemptId, reason, continuation: 'superseded' });
+      mark();
+      return 'superseded';
+    });
+  }
+
+  /** Where an answered request's decision stands, from the request and the run together. */
+  approvalProgress(request: ApprovalRecord, run: RunRecord): ApprovalProgress {
+    if (request.state !== 'answered') return 'none';
+    switch (request.continuation) {
+      case 'consumed': return 'consumed';
+      case 'superseded': return 'superseded';
+      case 'queued':
+        if (run.status === 'queued') return 'queued';
+        return run.capacityReserved ? 'executing' : 'waiting-for-idle';
+      case 'pending': return this.continuable(run, request) ? 'recorded' : 'waiting-for-idle';
+      default: return 'none';
+    }
   }
 
   /**
@@ -826,6 +943,7 @@ export class CoordinatorStore {
     if (!request) return null;
     if (request.state === 'answered' && request.continuation === 'consumed') return null;
     if (request.state === 'superseded' && run.status !== 'paused') return null;
+    if (request.continuation === 'superseded' && (run.status === 'succeeded' || run.status === 'failed')) return null;
     const task = run.checkpoint?.tasks[request.taskIndex];
     const clipped = { question: false, scope: false, completedWork: false, verification: false, artifacts: false, onApprove: false, onRequestChanges: false, taskTitle: false, feedback: false };
     const text = (name: keyof typeof clipped, value: string, limit: number): string => {
@@ -842,7 +960,7 @@ export class CoordinatorStore {
       });
     };
     return {
-      kind: 'approval', requestId: request.requestId, state: request.state, continuation: request.continuation, phase: request.phase,
+      kind: 'approval', requestId: request.requestId, state: request.state, continuation: request.continuation, progress: this.approvalProgress(request, run), phase: request.phase,
       taskIndex: request.taskIndex, taskId: request.taskId, taskTitle: task && task.id === request.taskId ? text('taskTitle', task.title, WAIT_TITLE_LIMIT) : null,
       attemptId: request.attemptId, question: text('question', request.request.question, WAIT_TEXT_LIMIT), scope: text('scope', request.request.scope, WAIT_TEXT_LIMIT),
       completedWork: text('completedWork', request.request.completedWork, WAIT_TEXT_LIMIT), verification: list('verification', request.request.verification),

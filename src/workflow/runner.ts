@@ -7,6 +7,7 @@ import { chooseExecutor, authExpired, executorCandidates } from '../policy/quota
 import { bounded, classifyError, classifyResult, pauseReportRecovery, REPORT_FIELDS, reportPauseReason, submissionPauseReason, submissionRepairPauseReason } from './report.js';
 import { MAX_SUBMISSION_REPAIRS } from './submission-repair.js';
 import { writeCheckpointFile } from './repair-state.js';
+import { approvalPromptBlock, parseApprovalContext } from './approval-context.js';
 import { runtimeIdentity } from './runtime-identity.js';
 import type { ConflictInfo, RepairDecision, RepairHandler, RepairRequest } from './submission-repair.js';
 import type { OriginReason } from './submission.js';
@@ -340,8 +341,16 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
         }
         state.settings = settings;
         state.caller = callerIdentity(context);
+        // A coordinator-rendered approval decision for exactly the task that asked is kept as structured context; other text stays a free-text resolution.
+        const decision = persistence ? parseApprovalContext(args.input) : undefined;
+        if (decision) {
+          const waiting = state.wait;
+          if (state.phase !== 'executor' || state.status !== 'paused' || !waiting || waiting.kind !== 'approval' || waiting.index !== decision.index || waiting.taskId !== decision.taskId
+            || state.index !== decision.index || state.tasks[state.index]?.id !== decision.taskId) throw new Error('The approval continuation does not match the task that asked for approval');
+          state.approval = decision;
+          delete state.resolution;
+        } else state.resolution = args.input;
         state.status = 'running';
-        state.resolution = args.input;
         delete state.reason;
         delete state.wait; // A resumed run is running again; any later pause records its own wait.
         await save(state);
@@ -435,6 +444,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
         const next = { ...state, child: null };
         delete next.attempt;
         delete next.resolution;
+        delete next.approval; // The decision belongs to the task it was about.
         delete next.wait; // The semantic wait ends with the task it was about.
         delete next.taskStartedAt;
         delete next.taskElapsedMs;
@@ -624,7 +634,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
           const variant = correcting ? correcting.variant : planning ? cfg.plannerVariant : state.selection!.variant;
           const attemptID = correcting ? correcting.id : randomUUID();
           const instructions = correcting ? '' : await fs.readFile(promptPaths[planning ? 'planner' : 'executor'], 'utf8');
-          const prompt = correcting ? correctionInstruction(task, state.reportRecovery!.corrections, state.reportRecovery!.diagnostic ?? { code: 'report_format' }) : (tokenLimitsDisabled ? 'Token limits disabled by owner; usage tracking remains enabled.' : 'Budget: ' + (planning ? cfg.maxPlannerTokens : cfg.maxSessionTokens) + ' reported tokens for this session, ' + cfg.maxRunTokens + ' for the ADR;') + ' ' + (timeoutMinutes > 0 ? 'Time warning after ' + cfg.timeoutMinutes + ' active minutes: continue working toward the DoD; elapsed time alone is not a blocker.' : 'No elapsed-time warning or task deadline is configured.') + ' Keep context narrow. Token limits, when enabled, still apply.\n' + instructions + '\n\nADR: ' + state.adr + '\nProject: ' + directory + '\nBranch: ' + state.branch + ' (stay on this branch; return blocked if another branch is required)\nPre-existing changes, do not overwrite or commit:\n' + state.baseline + '\nRun directory: ' + runDir + '\nPlanning artifact directory: ' + path.join(planRoot, 'adr-' + state.id) + '\n' + (planning ? '' : 'Task: ' + JSON.stringify(task) + '\nRead facts.md and ledger.md in the run directory. Do not read prior session transcripts.') + '\n' + (state.resolution ? 'Owner resolution: ' + state.resolution : '') + '\nDo not invoke other agents, background jobs, or Session Goals. ' + (structured ? 'Report only through the submission tool named in the contract below; your final chat text is human-readable and is never parsed.' : 'Return the specified JSON as your final answer.') + ' If interrupted, reconcile files and existing completed work before continuing. Do not repeat passed checks unless affected by new changes.';
+          const prompt = correcting ? correctionInstruction(task, state.reportRecovery!.corrections, state.reportRecovery!.diagnostic ?? { code: 'report_format' }) : (tokenLimitsDisabled ? 'Token limits disabled by owner; usage tracking remains enabled.' : 'Budget: ' + (planning ? cfg.maxPlannerTokens : cfg.maxSessionTokens) + ' reported tokens for this session, ' + cfg.maxRunTokens + ' for the ADR;') + ' ' + (timeoutMinutes > 0 ? 'Time warning after ' + cfg.timeoutMinutes + ' active minutes: continue working toward the DoD; elapsed time alone is not a blocker.' : 'No elapsed-time warning or task deadline is configured.') + ' Keep context narrow. Token limits, when enabled, still apply.\n' + instructions + '\n\nADR: ' + state.adr + '\nProject: ' + directory + '\nBranch: ' + state.branch + ' (stay on this branch; return blocked if another branch is required)\nPre-existing changes, do not overwrite or commit:\n' + state.baseline + '\nRun directory: ' + runDir + '\nPlanning artifact directory: ' + path.join(planRoot, 'adr-' + state.id) + '\n' + (planning ? '' : 'Task: ' + JSON.stringify(task) + '\nRead facts.md and ledger.md in the run directory. Do not read prior session transcripts.') + '\n' + (state.resolution ? 'Owner resolution: ' + state.resolution : '') + (state.approval && !planning ? '\n' + approvalPromptBlock(state.approval) : '') + '\nDo not invoke other agents, background jobs, or Session Goals. ' + (structured ? 'Report only through the submission tool named in the contract below; your final chat text is human-readable and is never parsed.' : 'Return the specified JSON as your final answer.') + ' If interrupted, reconcile files and existing completed work before continuing. Do not repeat passed checks unless affected by new changes.';
           if (!correcting) {
             state.attempt = { id: attemptID, phase: state.phase, index: state.index, child: state.child, status: 'launching', startedAt: Date.now(), model: chosen, ...(variant ? { variant } : {}) };
             // Structured runs persist the submission authority with the attempt, in the same save, before any prompt is sent.
