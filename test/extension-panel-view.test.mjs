@@ -1178,7 +1178,9 @@ test('the card shows the answered, superseded and withdrawn states from the coor
   assert.equal(superseded.title, 'Approval request superseded');
   assert.deepEqual(superseded.badge, { label: 'Superseded', tone: 'neutral' });
   assert.equal(superseded.controls, null, 'a superseded request cannot be answered');
-  assert.match(superseded.status, /heimdall coordinator run resume run_1 --input/);
+  assert.doesNotMatch(superseded.status, /run resume/, 'the unguarded resume is no longer the instruction');
+  assert.match(superseded.status, /response card appears here/);
+  assert.match(superseded.status, /Guidance is not an approval/);
 
   const withdrawn = cardOf(approval({ state: 'answered', continuation: 'superseded', progress: 'superseded', response: { decision: 'approve', feedback: null, answeredAt: 1 } }));
   assert.match(withdrawn.status, /authorizes nothing/);

@@ -852,7 +852,7 @@ const DECISION_LABEL = { approve: 'Approved', 'request-changes': 'Changes reques
 export const canRequestChanges = (feedback: string): boolean => feedback.trim() !== '' && feedback.length <= APPROVAL_LIMITS.input;
 export const canRespond = canRequestChanges;
 
-function approvalStatus(wait: ApprovalWaitView, runId: string, ackRetried: boolean | null): { badge: Badge; title: string; status: string; fields: Array<{ label: string; text: string }> } {
+function approvalStatus(wait: ApprovalWaitView, ackRetried: boolean | null): { badge: Badge; title: string; status: string; fields: Array<{ label: string; text: string }> } {
   if (wait.state === 'pending') {
     return { badge: { label: 'Pending', tone: 'warning' }, title: 'Approval requested', status: 'Waiting for your decision. Leaving this panel decides nothing.', fields: [] };
   }
@@ -860,7 +860,7 @@ function approvalStatus(wait: ApprovalWaitView, runId: string, ackRetried: boole
     return {
       badge: { label: 'Superseded', tone: 'neutral' },
       title: 'Approval request superseded',
-      status: `This request can no longer be answered: a newer request replaced it, or the reviewed material changed. The run stays paused. To continue it, resume it from the CLI so the agent can ask again: heimdall coordinator run resume ${runId} --input "guidance".`,
+      status: 'This request can no longer be answered: a newer request replaced it, or the reviewed material changed. The run stays paused. Once the run is idle, a response card appears here so you can give the agent guidance; it then keeps its work and asks again. Guidance is not an approval.',
       fields: [],
     };
   }
@@ -911,7 +911,7 @@ export function waitCard(
     };
   }
 
-  const state = approvalStatus(wait, detail.id, ack?.retried ?? null);
+  const state = approvalStatus(wait, ack?.retried ?? null);
   // Between the acknowledgement and the next read the card may still show the request as pending.
   const acknowledged = wait.state === 'pending' && ack !== null;
   const task = wait.taskTitle ? `${wait.taskId}: ${wait.taskTitle}` : wait.taskId;

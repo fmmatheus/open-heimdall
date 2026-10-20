@@ -149,12 +149,17 @@ export function summarizeRun(run: PublicRun | RunListEntry, project: { directory
 
 const NO_REASON = 'The coordinator did not record a reason for this status.';
 
+/** How the coordinator renders an approval decision context (see `renderApprovalContext`). */
+const APPROVAL_CONTINUATION_PREFIX = /^\{"heimdall":"approval-continuation"/;
+
 function blockerOf(run: PublicRun, budget: Budget, limit: number = LIMITS.reason): Blocker | null {
   const status = statusOf(run);
   if (status !== 'paused' && status !== 'failed' && status !== 'reconciliation-required') return null;
   const checkpoint = record(run.checkpoint);
   const recorded = [run.reason, checkpoint?.reason].map(value => text(value)).find(value => value !== undefined && value.trim() !== '');
-  const resolution = [run.resolution, checkpoint?.resolution].map(value => text(value)).find(value => value !== undefined && value.trim() !== '');
+  // The coordinator keeps the last decision context it delivered as the run's resolution. It is not an owner resolution to show
+  // for a later, unrelated pause (and carries the owner's feedback), so only free-text resolutions are projected.
+  const resolution = [run.resolution, checkpoint?.resolution].map(value => text(value)).find(value => value !== undefined && value.trim() !== '' && !APPROVAL_CONTINUATION_PREFIX.test(value));
   const reason = budget.info(recorded, limit);
   const shortResolution = budget.info(resolution, limit);
   return {

@@ -233,6 +233,16 @@ test('blockers use only recorded reasons and say so when none was recorded', () 
   assert.equal(detailRun(makeRun({ status: 'running', reason: 'stale' }), project).blocker, null);
 });
 
+test('a delivered approval continuation is never shown as the blocker resolution of a later pause', () => {
+  const envelope = JSON.stringify({ heimdall: 'approval-continuation', version: 1, requestId: 'apr_1', decision: 'request-changes', feedback: 'Private feedback', scope: 'Scope', revision: { head: 'a'.repeat(40), digest: 'b'.repeat(64) }, onApprove: [], onRequestChanges: [], taskId: 'T2', index: 1 });
+  const later = detailRun({ ...fixtures.paused(), resolution: envelope }, project);
+  assert.equal(later.blocker.resolution, null, 'the coordinator-rendered envelope is not an owner resolution to display');
+  assert.equal(later.blocker.reason, 'Executor quota is below the minimum');
+  assert.equal(JSON.stringify(later).includes('Private feedback'), false);
+  const ordinary = detailRun({ ...fixtures.paused(), resolution: '{"note":"plain owner text that merely looks like JSON"}' }, project);
+  assert.equal(ordinary.blocker.resolution, '{"note":"plain owner text that merely looks like JSON"}');
+});
+
 test('succeeded detail lists every result with its evidence', () => {
   const detail = detailRun(fixtures.succeeded(), project);
   assert.equal(detail.phase, 'succeeded');

@@ -185,7 +185,8 @@ configuration location. The extension manifest also declares the default socket
 ## Limitations
 
 - Besides the two owner responses above, no resume, reconcile, cancel or
-  submission; use the CLI. A superseded request is continued from the CLI.
+  submission; use the CLI. A superseded request leaves a paused run that is
+  answered with the same guarded Respond and continue control as any pause.
 - Usage is what the coordinator has recorded, not a live meter. Timeout is a
   warning only.
 - Review is shown in the panel: OpenChamber's commit view (`openCommit`) cannot
