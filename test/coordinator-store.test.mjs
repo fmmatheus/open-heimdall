@@ -744,9 +744,12 @@ test('a newer request supersedes an older pending one and the generic resume gua
   assert.equal(f.store.getRun(f.run.id).status, 'paused', 'a refused resume changes nothing');
   f.store.decideApproval(f.run.id, f.request.requestId, { decision: 'request-changes', feedback: 'Please revise' }, revision);
   guard(() => f.store.queueResume(f.run.id, 'approve'));
-  // Once the continuation is consumed (a later task), the run may be resumed by guidance again.
+  // Dispatched but carried by no attempt, the decision is still owed to the agent: the run is not resumable by free text.
   const db = new DatabaseSync(f.databasePath);
   db.prepare("UPDATE approval_requests SET continuation = 'consumed' WHERE request_id = ?").run(f.request.requestId);
+  guard(() => f.store.queueResume(f.run.id, 'approve'));
+  // Once an attempt carried it (a later task), the run may be resumed by guidance again.
+  db.prepare("UPDATE approval_requests SET consumed_attempt_id = 'attempt-2' WHERE request_id = ?").run(f.request.requestId);
   db.close();
   f.store.assertNoUnresolvedApproval(f.run.id);
   assert.equal(f.store.queueResume(f.run.id, 'Use guidance').status, 'queued');

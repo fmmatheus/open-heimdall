@@ -134,6 +134,8 @@ node dist/cli.js coordinator run resume RUN_ID --input "Owner's resolution"
 Reconciliation observes existing execution and never resubmits a prompt. Resume
 requires an idle paused checkpoint and an explicit resolution. It is the
 unguarded operation: it is refused while an approval request is unresolved, and
+for a run that has used typed approvals its text reaches the agent labelled as
+owner guidance (never as a bare string that could pass for an approval).
 `run respond` is the guarded way to answer a pause the owner has seen. Ambiguous child
 creation, unfinished checkpoints or stale local locks still need manual
 inspection; this version does not guess or repair them. Existing IPC endpoints
@@ -170,7 +172,27 @@ task through the ordinary resume path, at most once per decision:
   gated and must submit a fresh approval request.
 - A queued decision whose run returned to paused without dispatching (for
   example after a restart and reconciliation) is queued again, once. A decision
-  already delivered is never queued again, even if the next attempt pauses.
+  counts as delivered only when the resumed attempt's checkpoint carries it. If
+  the dispatch was lost after the boundary (a crash or a failed native launch),
+  the decision is `consumed` but not delivered; once the run is back on the
+  paused wait that asked, it is owed again and queued once more, and `progress`
+  never says `consumed` for it meanwhile. A generic `resume` is refused for the
+  same time. A decision whose attempt carried it is never queued again, even if
+  the next attempt pauses.
+- A checkpoint written by the run's process cannot create, alter or erase an
+  owner decision. The coordinator accepts a checkpoint's `approval` only when it
+  is unchanged or exactly the context it delivered for that admission, and its
+  `wait` only when it is unchanged or names a request published for that attempt;
+  anything else is refused (400) and nothing is stored. A newer approval request
+  from the agent removes an earlier approval from the checkpoint, so a later
+  plain resume is never presented to the agent as that approval.
+- The reviewed revision is the commit plus the content of every tracked change
+  and every untracked file that git does not ignore. It deliberately excludes
+  anything git ignores (for example a local environment file), `.heimdall`,
+  `.omc`, `.opencode/plugins/heimdall.ts` and the run's `.opencode/agents/ROLE.md`
+  files. A change confined to those paths does not supersede a request, so an
+  agent that wants the owner to review such content must make it visible to git
+  or describe it in the request.
 
 `GET /runs/RUN_ID/approvals/REQUEST_ID` reports `progress`: `recorded`
 (durable, awaiting the scheduler), `waiting-for-idle`, `queued` (waiting for
@@ -208,9 +230,10 @@ bounded `/run-list` page. There are two kinds, and a run never has both:
   started by an older runtime. It carries `pauseId`, the recorded blocker as
   `reason` (at most 1500 characters, with `reasonClipped`). The `pauseId` is a
   digest of the run, its version, the parent session, phase, task index, attempt
-  and blocker, so a later pause of the same run has a different one. A superseded
-  request that left the run paused is still reported as an approval wait; use
-  `run resume` for that run.
+  and blocker, so a later pause of the same run has a different one. A request
+  that was superseded (a newer request, or changed reviewed material) and left
+  the run paused and released is reported as this generic wait, so the guarded
+  response below applies and the guidance reaches the agent labelled as such.
 
 A generic `wait` exists only while the run is paused with its capacity released.
 An approval `wait` lasts while its request or decision is unresolved (including

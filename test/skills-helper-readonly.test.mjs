@@ -934,13 +934,14 @@ async function coordinatorFixture(t) {
       wait: { kind: 'approval', attemptId: attempt.id, index: 1, taskId: 'T2' }, protocol: 'structured-v1',
     };
     service.store.bindStart(id, run.ownerToken, caller);
-    service.store.saveCheckpoint(id, run.ownerToken, saved);
-    run = service.store.transition(id, run.ownerToken, run.version, 'running');
-    service.store.transition(id, run.ownerToken, run.version, 'paused', saved.reason, true);
+    // The request is published before the runner records its pause on it.
     const request = { question: 'Ship the migration?', scope: 'Only the reviewed commit', completedWork: 'Migration written', verification: ['unit tests pass'], artifacts: ['src/migrate.ts'], onApprove: ['merge the migration'], onRequestChanges: ['fix and ask again'], ...content };
     const requestId = `apr_${id}_1`;
     sql(`INSERT INTO approval_requests(run_id, request_id, phase, task_index, task_id, attempt_id, receipt_digest, request_json, revision_json, state, continuation, created_at)
       VALUES (?, ?, 'executor', 1, 'T2', ?, 'digest', ?, ?, 'pending', 'none', 1000)`, id, requestId, attempt.id, JSON.stringify(request), JSON.stringify({ head: 'a'.repeat(40), digest: 'b'.repeat(64) }));
+    service.store.saveCheckpoint(id, run.ownerToken, saved);
+    run = service.store.transition(id, run.ownerToken, run.version, 'running');
+    service.store.transition(id, run.ownerToken, run.version, 'paused', saved.reason, true);
     return { requestId };
   };
   const state = () => ({ runs: service.store.listRuns(), events: service.store.events(), counts: service.store.statusCounts(), approvals: sql('SELECT * FROM approval_requests ORDER BY rowid'), responses: sql('SELECT * FROM run_responses ORDER BY rowid') });

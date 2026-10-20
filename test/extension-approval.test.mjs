@@ -75,11 +75,12 @@ async function fixture(t) {
       ...(approval ? { wait: { kind: 'approval', attemptId: attempt.id, index: 0, taskId: 'T1' }, protocol: 'structured-v1' } : {}),
     };
     coordinator.store.bindStart(id, run.ownerToken, caller);
+    // The request is published before the runner records its pause on it.
+    const requestId = approval ? `apr_${id}_1` : undefined;
+    if (approval) insertRequest(id, requestId, attempt.id, 1000);
     coordinator.store.saveCheckpoint(id, run.ownerToken, state);
     const running = coordinator.store.transition(id, run.ownerToken, run.version, 'running');
     coordinator.store.transition(id, running.ownerToken, running.version, 'paused', reason, true);
-    const requestId = approval ? `apr_${id}_1` : undefined;
-    if (approval) insertRequest(id, requestId, attempt.id, 1000);
     return { id, requestId };
   };
   /** What the agent does after the owner's answer: it resumes, corrects and pauses again with a new request. */
@@ -93,7 +94,7 @@ async function fixture(t) {
     checkpoint.status = 'paused';
     sql("UPDATE runs SET status = 'paused', capacity_reserved = 0, checkpoint_json = ?, version = version + 1 WHERE id = ?", JSON.stringify(checkpoint), runId);
     if (supersede) sql("UPDATE approval_requests SET state = 'superseded', superseded_at = 2, superseded_reason = 'replaced' WHERE run_id = ? AND request_id = ?", runId, previousRequestId);
-    else sql("UPDATE approval_requests SET continuation = 'consumed' WHERE run_id = ? AND request_id = ?", runId, previousRequestId);
+    else sql("UPDATE approval_requests SET continuation = 'consumed', consumed_attempt_id = ? WHERE run_id = ? AND request_id = ?", attemptId, runId, previousRequestId);
     insertRequest(runId, requestId, attemptId, 1000 + number);
     return requestId;
   };

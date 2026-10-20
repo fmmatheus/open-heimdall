@@ -97,6 +97,7 @@ async function coordinatorFor(t, name) {
     service.store.enqueue({ id, projectId: project.id, feature: '# Feature', baseCommit: 'c'.repeat(40), worktreePath: path.join(root, 'worktrees', id), branch: `heimdall/${id}`, specification: runSpecification });
     const run = service.store.admitNext();
     assert.equal(run.id, id);
+    let requestId;
     const caller = { sessionID: run.parentSessionId, id: `call-${id}`, messageID: `message-${id}`, agent: 'adr-orchestrator' };
     const attempt = { id: `attempt_${id}`, phase: 'executor', index: 0, child: 'ses_child', status: 'rejected', startedAt: 1, model: 'anthropic/x' };
     const state = {
@@ -105,10 +106,7 @@ async function coordinatorFor(t, name) {
       ...(approval ? { wait: { kind: 'approval', attemptId: attempt.id, index: 0, taskId: 'T1' }, protocol: 'structured-v1' } : {}),
     };
     service.store.bindStart(id, run.ownerToken, caller);
-    service.store.saveCheckpoint(id, run.ownerToken, state);
-    const running = service.store.transition(id, run.ownerToken, run.version, 'running');
-    service.store.transition(id, running.ownerToken, running.version, 'paused', reason, true);
-    let requestId;
+    // The request is published before the runner records its pause on it.
     if (approval) {
       requestId = `apr_${id}`;
       const database = new DatabaseSync(path.join(configuration.stateDirectory, 'coordinator.sqlite'));
@@ -118,6 +116,9 @@ async function coordinatorFor(t, name) {
           .run(id, requestId, attempt.id, JSON.stringify({ question: 'Ship it?', scope: 'The reviewed commit', completedWork: 'Done', verification: ['tests pass'], artifacts: ['README.md'], onApprove: ['merge'], onRequestChanges: ['fix'] }), JSON.stringify(REVISION));
       } finally { database.close(); }
     }
+    service.store.saveCheckpoint(id, run.ownerToken, state);
+    const running = service.store.transition(id, run.ownerToken, run.version, 'running');
+    service.store.transition(id, running.ownerToken, running.version, 'paused', reason, true);
     return { id, requestId };
   };
   const rows = (statement, ...values) => {

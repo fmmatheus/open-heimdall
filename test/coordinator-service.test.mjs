@@ -405,7 +405,7 @@ test('the administrator records approve once; an identical retry returns the sto
   assert.equal((await p.inspect()).decision, 'approve');
   assert.equal(p.store.events().filter(event => event.type === 'approval.answered').length, 1);
   // Later advancement: the continuation is consumed, the run is resumed and admitted again.
-  p.sql("UPDATE approval_requests SET continuation = 'consumed' WHERE request_id = ?", p.request.requestId);
+  p.sql("UPDATE approval_requests SET continuation = 'consumed', consumed_attempt_id = 'attempt_next' WHERE request_id = ?", p.request.requestId);
   p.f.observation({ idle: true, status: 'paused', reason: 'Approval required' });
   const resumed = await p.f.client.request('POST', `/runs/${p.run.id}/resume`, { input: 'Carry on' });
   assert.equal(resumed.status, 'queued');
@@ -462,7 +462,13 @@ test('a run capability cannot read or answer a request, and forged checkpoint or
   assert.equal((await p.inspect()).state, 'pending');
   // Forged decision fields in a checkpoint, a submission, a receipt or an outcome change nothing.
   const forged = { requestId: p.request.requestId, decision: 'approve', state: 'answered', continuation: 'queued' };
-  await p.f.client.request('PUT', `/runs/${p.run.id}/checkpoint`, { ...p.state, approval: forged, response: forged, wait: { kind: 'approval', attemptId: 'attempt_1', index: 0, taskId: 'T1', ...forged } }, token);
+  const wait = { kind: 'approval', attemptId: 'attempt_1', index: 0, taskId: 'T1' };
+  const paused = { ...p.state, status: 'paused', attempt: { ...p.state.attempt, status: 'rejected' }, wait };
+  await assert.rejects(p.f.client.request('PUT', `/runs/${p.run.id}/checkpoint`, { ...p.state, approval: forged, response: forged, wait: { ...wait, ...forged } }, token), status(400));
+  const envelope = { heimdall: 'approval-continuation', version: 1, requestId: p.request.requestId, decision: 'approve', feedback: null, scope: 'Everything', revision: p.request.revision, onApprove: ['publish'], onRequestChanges: [], taskId: 'T1', index: 0 };
+  await assert.rejects(p.f.client.request('PUT', `/runs/${p.run.id}/checkpoint`, { ...paused, approval: envelope }, token), status(400));
+  assert.equal(p.store.getRun(p.run.id).checkpoint.approval, undefined, 'a refused checkpoint is not stored');
+  assert.equal(p.store.getRun(p.run.id).checkpoint.wait, undefined);
   await p.f.client.request('PUT', p.route, { ...p.receipt, rawPayload: { ...p.receipt.rawPayload, ...forged } }, token).then(
     () => assert.fail('a changed duplicate must be refused'), status(400));
   await assert.rejects(p.f.client.request('PUT', p.route, { ...p.receipt, decision: 'approve', ack: forged }, token), status(400));
@@ -547,7 +553,7 @@ test('the generic resume is refused with approval-pending while a request is pen
   assert.equal(p.store.getRun(p.run.id).status, 'paused');
   // Other failures keep their ordinary status.
   await assert.rejects(p.f.client.request('POST', `/runs/${p.run.id}/resume`, {}), status(400));
-  p.sql("UPDATE approval_requests SET continuation = 'consumed' WHERE request_id = ?", p.request.requestId);
+  p.sql("UPDATE approval_requests SET continuation = 'consumed', consumed_attempt_id = 'attempt_next' WHERE request_id = ?", p.request.requestId);
   p.f.observation({ idle: true, status: 'paused', reason: 'Approval required' });
   assert.equal((await resume()).status, 'queued');
 });
@@ -560,6 +566,59 @@ test('a superseded request no longer blocks a guided generic resume', async t =>
   p.f.observation({ idle: true, status: 'paused', reason: 'Approval required' });
   const resumed = await p.f.client.request('POST', `/runs/${p.run.id}/resume`, { input: 'The tree changed; ask again' });
   assert.equal(resumed.status, 'queued');
+});
+
+async function supersededAndIdle(t) {
+  const p = await published(t);
+  await p.pause();
+  await fs.appendFile(path.join(p.run.worktreePath, 'README.md'), 'changed\n');
+  await assert.rejects(p.decide({ decision: 'approve' }), status(409, 'approval-stale'));
+  assert.equal((await p.inspect()).state, 'superseded');
+  p.f.observation({ idle: true, status: 'paused', reason: 'Approval required' });
+  return p;
+}
+
+test('a released pause on a superseded request has a pause identity, so the guarded and labelled response applies', async t => {
+  const p = await supersededAndIdle(t);
+  const shown = await p.f.client.request('GET', `/runs/${p.run.id}`);
+  assert.equal(shown.wait.kind, 'generic', 'the owner is offered the guarded response, not the unguarded resume');
+  assert.match(shown.wait.pauseId, /^pau_/);
+  const listed = (await p.f.client.request('GET', '/runs')).find(run => run.id === p.run.id);
+  assert.deepEqual([listed.wait.kind, listed.wait.pauseId], ['generic', shown.wait.pauseId]);
+  const ack = await p.f.client.request('POST', `/runs/${p.run.id}/respond`, { pauseId: shown.wait.pauseId, input: 'approve' });
+  assert.equal(ack.continuation, 'queued');
+  const resolution = p.store.getRun(p.run.id).resolution;
+  assert.notEqual(resolution, 'approve');
+  assert.match(resolution, /not a typed approval/);
+  assert.ok(resolution.endsWith('\napprove'));
+});
+
+test('an unguarded resume of a run that used typed approvals reaches the agent as labelled guidance, never as bare text', async t => {
+  const p = await supersededAndIdle(t);
+  const resumed = await p.f.client.request('POST', `/runs/${p.run.id}/resume`, { input: 'approve' });
+  assert.equal(resumed.status, 'queued');
+  const resolution = p.store.getRun(p.run.id).resolution;
+  assert.notEqual(resolution, 'approve', 'a bare approve is not an owner decision');
+  assert.match(resolution, /^Owner guidance \(response to pause pau_[0-9a-f]{32}; this is not a typed approval/);
+  assert.ok(resolution.endsWith('\napprove'));
+});
+
+test('a run without any typed approval keeps its plain resume text', async t => {
+  const f = await fixture(t);
+  const project = await f.client.request('POST', '/projects', { directory: f.project });
+  const queued = await f.client.request('POST', '/runs', { projectId: project.id, feature: 'Feature' });
+  await f.service().scheduler.tick();
+  const run = await settled(f.service().store, queued.id);
+  const store = f.service().store;
+  const caller = { sessionID: run.parentSessionId, id: 'native_call', messageID: 'assistant_message', agent: 'adr-orchestrator' };
+  await f.client.request('POST', `/runs/${run.id}/binding`, caller, run.ownerToken);
+  const paused = { id: run.id, status: 'paused', adr: '.heimdall/feature.md', parent: run.parentSessionId, caller, branch: run.branch, baseline: '', index: 0, tasks: [], results: [], phase: 'planner', child: null, settings: run.specification.settings, reason: 'Blocked: which database?' };
+  await f.client.request('PUT', `/runs/${run.id}/checkpoint`, paused, run.ownerToken);
+  f.observation({ idle: true, status: 'paused', reason: 'Blocked' });
+  await f.service().scheduler.tick();
+  assert.equal(store.getRun(run.id).status, 'paused');
+  assert.equal((await f.client.request('POST', `/runs/${run.id}/resume`, { input: 'Use PostgreSQL' })).status, 'queued');
+  assert.equal(store.getRun(run.id).resolution, 'Use PostgreSQL');
 });
 
 test('run projections carry a bounded wait object without capabilities, keys or the specification', async t => {
@@ -694,13 +753,22 @@ test('approve on a paused, idle run queues exactly one resume and the dispatch d
   assert.equal(p.f.launches[1].resolution, queued.resolution);
   assert.deepEqual([admitted.id, admitted.parentSessionId, admitted.branch, admitted.worktreePath], [before.id, before.parentSessionId, before.branch, before.worktreePath]);
   assert.notEqual(admitted.ownerToken, before.ownerToken);
-  const consumed = await p.inspect();
-  assert.equal(consumed.continuation, 'consumed');
-  assert.equal(consumed.progress, 'consumed');
+  const dispatched = await p.inspect();
+  assert.equal(dispatched.continuation, 'consumed');
+  assert.equal(dispatched.progress, 'executing', 'dispatched is not delivered: no attempt carried the decision yet');
+  assert.equal((await p.f.client.request('GET', `/runs/${p.run.id}`)).wait.progress, 'executing');
   assert.deepEqual(await p.decide({ decision: 'approve' }), { ...acks.find(ack => !ack.retried), retried: true });
   assert.equal(p.store.events().filter(event => event.type === 'approval.consumed').length, 1);
+  // The resumed runner carries the decision into its first checkpoint; only then is it delivered and history.
+  const claimed = { sessionID: admitted.parentSessionId, id: 'resume_call', messageID: 'resume_message', agent: 'adr-orchestrator' };
+  await p.f.client.request('POST', `/runs/${p.run.id}/resume-binding`, claimed, admitted.ownerToken);
+  const carrying = { ...p.state, caller: claimed, status: 'running', approval: context(admitted), attempt: { ...p.state.attempt, id: 'attempt_2', status: 'admitted' } };
+  await p.f.client.request('PUT', `/runs/${p.run.id}/checkpoint`, carrying, admitted.ownerToken);
+  const consumed = await p.inspect();
+  assert.equal(consumed.progress, 'consumed');
+  assert.equal(p.store.getApproval(p.run.id, p.request.requestId).consumedAttemptId, 'attempt_2');
   const projected = await p.f.client.request('GET', `/runs/${p.run.id}`);
-  assert.equal(projected.wait, null, 'a consumed decision is history, not a wait');
+  assert.equal(projected.wait, null, 'a delivered decision is history, not a wait');
 });
 
 test('a decision recorded while the run is still running stays pending; the scheduler queues it once after idle proof and open admission', async t => {

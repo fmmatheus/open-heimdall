@@ -18,7 +18,7 @@ import type {
   ApprovalAck, ApprovalContinuation, ApprovalDecision, ApprovalProgress, ApprovalRecord, ApprovalRequestContent, ApprovalRevision, ApprovalState, ApprovalWait,
   CoordinatorEvent, PauseResponseAck, ProjectRecord, Receipt, RunRecord, RunStatus, RunWaitSummary, StartBinding,
 } from './types.js';
-import { clipText, currentPauseId, genericWaitOf, labelledGuidance, pauseIdFor, PAUSE_REASON_IDENTITY_BYTES, PAUSE_REASON_LIMIT } from './pause.js';
+import { clipText, currentPauseId, genericWaitOf, isPausedCheckpoint, labelledGuidance, pauseIdFor, PAUSE_REASON_IDENTITY_BYTES, PAUSE_REASON_LIMIT } from './pause.js';
 import type { GenericWait } from './pause.js';
 import { RUN_LIST_FEATURE_HEAD, RUN_LIST_MAX_BYTES, RUN_LIST_PAGE_SIZE } from './run-list.js';
 import type { RunListEntry, RunListPage } from './run-list.js';
@@ -118,11 +118,30 @@ function clip(value: string, limit: number): { text: string; clipped: boolean } 
   if (last >= 0xd800 && last <= 0xdbff) end -= 1;
   return { text: value.slice(0, end), clipped: true };
 }
-/** Whether a run's latest request is still part of what it is waiting for, or only history. */
-function approvalShown(request: Pick<ApprovalRecord, 'state' | 'continuation'>, status: RunStatus): boolean {
-  if (request.state === 'answered' && request.continuation === 'consumed') return false;
-  if (request.state === 'superseded' && status !== 'paused') return false;
-  if (request.continuation === 'superseded' && (status === 'succeeded' || status === 'failed')) return false;
+/** Where a run stands, as far as deciding whether its latest request is still what it waits for. */
+interface WaitPlace {
+  status: RunStatus;
+  /** Paused with released capacity on a paused checkpoint: the run has a pause identity and accepts a guarded response. */
+  released: boolean;
+  /** The attempt of the checkpoint's approval wait, or null. */
+  waitAttempt: string | null;
+}
+/**
+ * Whether a run's latest request is still part of what it is waiting for, or only history.
+ *
+ * - A decision is history only once an attempt carried it (`consumedAttemptId`). Dispatched but not yet carried, it is still
+ *   shown while the run executes, and again when the run came back to its paused wait without having received it.
+ * - A superseded request or withdrawn decision that left the run paused and released is not shown as an approval: the run has
+ *   a pause identity then, and the owner answers it with the guarded, labelled response like any other pause.
+ */
+function approvalShown(request: Pick<ApprovalRecord, 'state' | 'continuation' | 'attemptId' | 'consumedAttemptId'>, place: WaitPlace): boolean {
+  const finished = place.status === 'succeeded' || place.status === 'failed';
+  if (request.state === 'superseded') return place.status === 'paused' && !place.released;
+  if (request.state === 'answered' && request.continuation === 'consumed') {
+    if (request.consumedAttemptId !== null || finished) return false;
+    return place.status !== 'paused' || (place.released && place.waitAttempt === request.attemptId);
+  }
+  if (request.continuation === 'superseded') return !finished && request.consumedAttemptId === null && !(place.status === 'paused' && place.released);
   return true;
 }
 function sameBinding(left: StartBinding, right: StartBinding): boolean {
@@ -391,6 +410,7 @@ export class CoordinatorStore {
       CASE WHEN ${paused} THEN substr(CAST(json_extract(checkpoint_json, '$.attempt.id') AS BLOB), 1, 512) END AS pause_attempt,
       CASE WHEN ${paused} THEN substr(CAST(json_extract(checkpoint_json, '$.reason') AS BLOB), 1, ${PAUSE_REASON_IDENTITY_BYTES}) END AS pause_reason,
       CASE WHEN ${paused} THEN length(CAST(json_extract(checkpoint_json, '$.reason') AS BLOB)) END AS pause_reason_bytes,
+      CASE WHEN ${paused} AND json_extract(checkpoint_json, '$.wait.kind') = 'approval' THEN substr(CAST(json_extract(checkpoint_json, '$.wait.attemptId') AS BLOB), 1, 512) END AS pause_wait_attempt,
       substr(CAST(feature AS BLOB), 1, ? * 4) AS feature_head,
       CASE json_extract(checkpoint_json, '$.phase') WHEN 'planner' THEN 'planner' WHEN 'executor' THEN 'executor' END AS phase,
       coalesce(json_array_length(checkpoint_json, '$.tasks'), 0) AS task_count,
@@ -444,8 +464,15 @@ export class CoordinatorStore {
   /** The bounded wait summary of one list row: the current typed request, else a generic pause, else null. */
   private listWait(row: Row, head: (value: SQLOutputValue, length: number) => string): RunWaitSummary | null {
     const status = row.status as RunStatus;
-    const request = this.db.prepare('SELECT request_id, state, continuation, task_id FROM approval_requests WHERE run_id = ? ORDER BY rowid DESC LIMIT 1').get(row.id!);
-    if (request && approvalShown({ state: request.state as ApprovalState, continuation: request.continuation as ApprovalContinuation }, status)) {
+    const request = this.db.prepare('SELECT request_id, state, continuation, task_id, attempt_id, consumed_attempt_id FROM approval_requests WHERE run_id = ? ORDER BY rowid DESC LIMIT 1').get(row.id!);
+    const place: WaitPlace = {
+      status, released: row.generic_candidate === 1,
+      waitAttempt: row.pause_wait_attempt === null || row.pause_wait_attempt === undefined ? null : Buffer.from(row.pause_wait_attempt as Uint8Array).toString('utf8'),
+    };
+    if (request && approvalShown({
+      state: request.state as ApprovalState, continuation: request.continuation as ApprovalContinuation, attemptId: String(request.attempt_id),
+      consumedAttemptId: request.consumed_attempt_id === null ? null : String(request.consumed_attempt_id),
+    }, place)) {
       return { kind: 'approval', requestId: String(request.request_id), state: request.state as ApprovalState, continuation: request.continuation as ApprovalContinuation, taskId: head(request.task_id!, 121) };
     }
     if (row.generic_candidate !== 1) return null;
@@ -590,8 +617,10 @@ export class CoordinatorStore {
       if (run.checkpoint && !isDeepStrictEqual(run.checkpoint.runtime, state.runtime)) throw new Error('Run runtime identity is immutable once recorded');
       // A late writer holding an older view can never erase a seal, conflict, outcome or refusal, nor lower the repair counter.
       assertRepairMonotonic(run.checkpoint, state);
+      this.assertOwnerFieldsUnforged(run, state);
       this.db.prepare('UPDATE runs SET checkpoint_json = ?, updated_at = ? WHERE id = ?').run(encoded, Date.now(), id);
-      // The first fresh attempt that carries a delivered decision is recorded as the attempt that consumed it.
+      // The first fresh attempt that carries a delivered decision is recorded as the attempt that consumed it. The decision was
+      // validated above against the coordinator's own records, so the request named here is never one the checkpoint made up.
       if (state.approval && state.attempt && state.status === 'running') {
         this.db.prepare(`UPDATE approval_requests SET consumed_attempt_id = ?
           WHERE run_id = ? AND request_id = ? AND consumed_attempt_id IS NULL AND continuation IN ('consumed','superseded') AND attempt_id != ?`)
@@ -606,6 +635,31 @@ export class CoordinatorStore {
         ...(report ? { report } : {}),
       });
     });
+  }
+
+  /**
+   * A checkpoint is written by the run's own process, which an agent can influence, so the two fields that stand for the owner
+   * are never taken from it on trust. `approval` may only be unchanged, absent, or exactly the decision context the coordinator
+   * delivered for this admission (its stored resolution, backed by an answered request whose continuation passed the dispatch
+   * boundary). `wait` may only be unchanged, absent, or the pause on a request this coordinator published for that very attempt.
+   */
+  private assertOwnerFieldsUnforged(run: RunRecord, state: RunState): void {
+    const previous = run.checkpoint;
+    if (state.approval !== undefined && !isDeepStrictEqual(state.approval, previous?.approval)) {
+      const delivered = run.launchAction === 'resume' ? parseApprovalContext(run.resolution ?? undefined) : undefined;
+      const stored = delivered ? this.getApproval(run.id, delivered.requestId) : null;
+      const genuine = !!delivered && !!stored && isDeepStrictEqual(state.approval, delivered)
+        && stored.state === 'answered' && stored.decision === delivered.decision && ['consumed', 'superseded'].includes(stored.continuation)
+        && stored.continuationMessageId === run.promptMessageId && delivered.index === state.index && state.tasks[state.index]?.id === delivered.taskId;
+      if (!genuine) throw new Error('Checkpoint carries an approval decision that the coordinator did not deliver for this admission');
+    }
+    if (state.wait !== undefined && !isDeepStrictEqual(state.wait, previous?.wait)) {
+      const wait = state.wait;
+      const published = wait.kind === 'approval' && state.status === 'paused' && state.phase === 'executor' && state.attempt?.id === wait.attemptId
+        && state.index === wait.index && state.tasks[wait.index]?.id === wait.taskId
+        && !!this.db.prepare('SELECT 1 FROM approval_requests WHERE run_id = ? AND attempt_id = ? AND task_index = ? AND task_id = ?').get(run.id, wait.attemptId, wait.index, wait.taskId);
+      if (!published) throw new Error('Checkpoint approval wait does not match an approval request published for this attempt');
+    }
   }
 
   readReceipt(id: string, ownerToken: string, attemptId: string): Receipt | undefined {
@@ -710,10 +764,22 @@ export class CoordinatorStore {
   assertNoUnresolvedApproval(id: string): void {
     const open = this.db.prepare(`SELECT request_id, state FROM approval_requests
       WHERE run_id = ? AND (state = 'pending' OR (state = 'answered' AND continuation IN ('pending','queued'))) ORDER BY rowid LIMIT 1`).get(id);
-    if (!open) return;
-    throw new CoordinatorError(409, 'approval-pending', open.state === 'pending'
+    const owed = open ? undefined : this.undeliveredDecision(id);
+    if (!open && !owed) return;
+    throw new CoordinatorError(409, 'approval-pending', open?.state === 'pending'
       ? 'An approval request is waiting for an owner decision; answer it with the approval decision operation instead of resuming'
       : 'An owner decision is recorded and its continuation has not been consumed; it continues automatically and cannot be replaced by a generic resume');
+  }
+
+  /**
+   * An answered request that passed the dispatch boundary but whose decision no attempt carried, while the run sits again on the
+   * paused wait that asked: the dispatch was lost (a crash or failed launch), so the decision is still owed to the agent.
+   */
+  private undeliveredDecision(runId: string): ApprovalRecord | undefined {
+    const run = this.getRun(runId);
+    if (!run) return undefined;
+    return this.db.prepare("SELECT * FROM approval_requests WHERE run_id = ? AND state = 'answered' AND continuation = 'consumed' AND consumed_attempt_id IS NULL ORDER BY rowid")
+      .all(runId).map(row => this.approvalFromRow(row)).find(request => this.continuable(run, request));
   }
 
   queueResume(id: string, input: string): RunRecord {
@@ -724,7 +790,9 @@ export class CoordinatorStore {
       this.assertNoUnresolvedApproval(id);
       const run = this.requireRun(id);
       if (run.status !== 'paused' || run.capacityReserved || !run.checkpoint || !run.binding) throw new Error('Resume requires a released paused run with a bound checkpoint');
-      return this.queueResolution(id, input);
+      // A run that used typed approvals never receives unscoped text that could be read as one: it arrives labelled as guidance.
+      const typed = !!this.db.prepare('SELECT 1 FROM approval_requests WHERE run_id = ? LIMIT 1').get(id);
+      return this.queueResolution(id, typed ? labelledGuidance(currentPauseId(run) ?? 'unidentified', input) : input);
     });
   }
 
@@ -934,7 +1002,8 @@ export class CoordinatorStore {
   /** Answered requests whose decision still has to reach a resumed attempt, for runs that are paused and released right now. */
   pendingContinuations(): Array<{ run: RunRecord; approval: ApprovalRecord }> {
     const found: Array<{ run: RunRecord; approval: ApprovalRecord }> = [];
-    for (const row of this.db.prepare("SELECT * FROM approval_requests WHERE state = 'answered' AND continuation IN ('pending','queued') ORDER BY answered_at, rowid").all()) {
+    for (const row of this.db.prepare(`SELECT * FROM approval_requests WHERE state = 'answered'
+      AND (continuation IN ('pending','queued') OR (continuation = 'consumed' AND consumed_attempt_id IS NULL)) ORDER BY answered_at, rowid`).all()) {
       const approval = this.approvalFromRow(row);
       const run = this.getRun(approval.runId);
       if (run && this.continuable(run, approval)) found.push({ run, approval });
@@ -946,14 +1015,17 @@ export class CoordinatorStore {
    * Queues the resume that carries an answered decision, at most once per decision. `expectedVersion` is the run version at
    * which the caller proved the run idle; any other version, a run that is not paused and released on the asking task, or a
    * continuation that is no longer waiting returns null and changes nothing. A continuation left `queued` by a run that
-   * returned to paused without dispatching is waiting again and is queued once more.
+   * returned to paused without dispatching is waiting again and is queued once more. So is a decision that passed the dispatch
+   * boundary but was never carried by an attempt: when the run is back on the paused wait that asked, it is still owed.
    */
   queueContinuation(runId: string, requestId: string, expectedVersion: number): RunRecord | null {
     if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 0) throw new Error('Expected version must be a nonnegative safe integer');
     return this.transaction(() => {
       const request = this.getApproval(runId, requestId);
       const run = this.getRun(runId);
-      if (!request || !run || request.state !== 'answered' || !['pending', 'queued'].includes(request.continuation)) return null;
+      if (!request || !run || request.state !== 'answered') return null;
+      const owed = request.continuation === 'consumed' && request.consumedAttemptId === null;
+      if (!owed && !['pending', 'queued'].includes(request.continuation)) return null;
       if (run.version !== expectedVersion || !this.continuable(run, request)) return null;
       this.enqueueContinuation(run, request);
       return this.requireRun(runId);
@@ -1002,7 +1074,11 @@ export class CoordinatorStore {
   approvalProgress(request: ApprovalRecord, run: RunRecord): ApprovalProgress {
     if (request.state !== 'answered') return 'none';
     switch (request.continuation) {
-      case 'consumed': return 'consumed';
+      case 'consumed':
+        // Delivered means an attempt carried it. Dispatched but not carried, it is executing, or owed again once the run is idle.
+        if (request.consumedAttemptId !== null) return 'consumed';
+        if (run.capacityReserved) return 'executing';
+        return this.continuable(run, request) ? 'waiting-for-idle' : 'consumed';
       case 'superseded': return 'superseded';
       case 'queued':
         if (run.status === 'queued') return 'queued';
@@ -1023,7 +1099,11 @@ export class CoordinatorStore {
    */
   approvalWait(run: RunRecord): ApprovalWait | null {
     const request = this.latestApproval(run.id);
-    if (!request || !approvalShown(request, run.status)) return null;
+    const place: WaitPlace = {
+      status: run.status, released: !!run.checkpoint && isPausedCheckpoint(run, run.checkpoint.status),
+      waitAttempt: run.checkpoint?.wait?.kind === 'approval' ? run.checkpoint.wait.attemptId : null,
+    };
+    if (!request || !approvalShown(request, place)) return null;
     const task = run.checkpoint?.tasks[request.taskIndex];
     const clipped = { question: false, scope: false, completedWork: false, verification: false, artifacts: false, onApprove: false, onRequestChanges: false, taskTitle: false, feedback: false };
     const text = (name: keyof typeof clipped, value: string, limit: number): string => {

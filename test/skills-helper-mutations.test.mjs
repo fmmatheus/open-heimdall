@@ -849,14 +849,15 @@ async function coordinatorFixture(t, { admission = false } = {}) {
       ...(approval ? { wait: { kind: 'approval', attemptId: attempt.id, index: 1, taskId: 'T2' }, protocol: 'structured-v1' } : {}),
     };
     service.store.bindStart(id, run.ownerToken, caller);
-    service.store.saveCheckpoint(id, run.ownerToken, saved);
-    run = service.store.transition(id, run.ownerToken, run.version, 'running');
-    const paused = service.store.transition(id, run.ownerToken, run.version, 'paused', saved.reason, true);
+    // The request is published before the runner records its pause on it.
     const requestId = approval ? `apr_${id}_1` : undefined;
     if (approval) {
       sql(`INSERT INTO approval_requests(run_id, request_id, phase, task_index, task_id, attempt_id, receipt_digest, request_json, revision_json, state, continuation, created_at)
         VALUES (?, ?, 'executor', 1, 'T2', ?, 'digest', ?, ?, 'pending', 'none', 1000)`, id, requestId, attempt.id, JSON.stringify(APPROVAL_CONTENT), JSON.stringify(REVISION));
     }
+    service.store.saveCheckpoint(id, run.ownerToken, saved);
+    run = service.store.transition(id, run.ownerToken, run.version, 'running');
+    const paused = service.store.transition(id, run.ownerToken, run.version, 'paused', saved.reason, true);
     return { run: paused, requestId };
   };
   const approvalRow = requestId => sql('SELECT request_id, state, decision, feedback, continuation FROM approval_requests WHERE request_id = ?', requestId)[0];
