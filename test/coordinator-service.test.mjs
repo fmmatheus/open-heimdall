@@ -844,7 +844,7 @@ test('reviewed content changed after acceptance supersedes the decision at dispa
     assert.equal(delivered.requestId, p.request.requestId);
     const view = await p.f.client.request('GET', `/runs/${p.run.id}/approvals/${p.request.requestId}`);
     assert.equal(view.continuation, 'superseded');
-    assert.equal(view.progress, 'superseded');
+    assert.equal(view.progress, 'executing', 'withdrawn but not yet carried by an attempt: still being delivered');
     assert.equal(store.events().filter(event => event.type === 'approval.consumed').length, 0);
     assert.deepEqual(await p.decide({ decision: 'approve' }), { ...ack, retried: true });
   });

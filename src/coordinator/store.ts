@@ -131,8 +131,11 @@ interface WaitPlace {
  *
  * - A decision is history only once an attempt carried it (`consumedAttemptId`). Dispatched but not yet carried, it is still
  *   shown while the run executes, and again when the run came back to its paused wait without having received it.
- * - A superseded request or withdrawn decision that left the run paused and released is not shown as an approval: the run has
- *   a pause identity then, and the owner answers it with the guarded, labelled response like any other pause.
+ * - A superseded request that left the run paused and released is not shown as an approval: the run has a pause identity
+ *   then, and the owner answers it with the guarded, labelled response like any other pause.
+ * - A withdrawn decision (its answer is kept, its authorization is not) is delivered like any other: until an attempt carried
+ *   its superseded context it stays shown, also when the run is back on the paused wait that asked, because the delivery is
+ *   still owed and the run does not take guidance in the meantime.
  */
 function approvalShown(request: Pick<ApprovalRecord, 'state' | 'continuation' | 'attemptId' | 'consumedAttemptId'>, place: WaitPlace): boolean {
   const finished = place.status === 'succeeded' || place.status === 'failed';
@@ -141,7 +144,10 @@ function approvalShown(request: Pick<ApprovalRecord, 'state' | 'continuation' | 
     if (request.consumedAttemptId !== null || finished) return false;
     return place.status !== 'paused' || (place.released && place.waitAttempt === request.attemptId);
   }
-  if (request.continuation === 'superseded') return !finished && request.consumedAttemptId === null && !(place.status === 'paused' && place.released);
+  if (request.continuation === 'superseded') {
+    if (request.consumedAttemptId !== null || finished) return false;
+    return place.status !== 'paused' || !place.released || place.waitAttempt === request.attemptId;
+  }
   return true;
 }
 function sameBinding(left: StartBinding, right: StartBinding): boolean {
@@ -771,17 +777,20 @@ export class CoordinatorStore {
     if (!open && !owed) return;
     throw new CoordinatorError(409, 'approval-pending', open?.state === 'pending'
       ? 'An approval request is waiting for an owner decision; answer it with the approval decision operation instead of resuming'
-      : 'An owner decision is recorded and its continuation has not been consumed; it continues automatically and cannot be replaced by a generic resume');
+      : owed?.continuation === 'superseded'
+        ? 'An owner decision was withdrawn and its superseded context has not reached the agent; it is delivered automatically and cannot be replaced by a generic resume or response'
+        : 'An owner decision is recorded and its continuation has not been consumed; it continues automatically and cannot be replaced by a generic resume');
   }
 
   /**
    * An answered request that passed the dispatch boundary but whose decision no attempt carried, while the run sits again on the
-   * paused wait that asked: the dispatch was lost (a crash or failed launch), so the decision is still owed to the agent.
+   * paused wait that asked: the dispatch was lost (a crash or failed launch), so the decision is still owed to the agent. A
+   * decision withdrawn at the boundary is owed the same way, as superseded context that authorizes nothing.
    */
   private undeliveredDecision(runId: string): ApprovalRecord | undefined {
     const run = this.getRun(runId);
     if (!run) return undefined;
-    return this.db.prepare("SELECT * FROM approval_requests WHERE run_id = ? AND state = 'answered' AND continuation = 'consumed' AND consumed_attempt_id IS NULL ORDER BY rowid")
+    return this.db.prepare("SELECT * FROM approval_requests WHERE run_id = ? AND state = 'answered' AND continuation IN ('consumed','superseded') AND consumed_attempt_id IS NULL ORDER BY rowid")
       .all(runId).map(row => this.approvalFromRow(row)).find(request => this.continuable(run, request));
   }
 
@@ -986,27 +995,34 @@ export class CoordinatorStore {
       && state.wait?.kind === 'approval' && state.wait.attemptId === request.attemptId && state.attempt?.id === request.attemptId;
   }
 
-  /** Queues the one resume that carries an answered request's decision. The caller holds the transaction and has checked `continuable`. */
+  /**
+   * Queues the one resume that carries an answered request's decision. The caller holds the transaction and has checked
+   * `continuable`. A withdrawn decision is rendered with its superseded marker, whatever the worktree measures now: its
+   * withdrawal is permanent, so it can only ever tell the agent what the owner said and that nothing is authorized.
+   */
   private enqueueContinuation(run: RunRecord, request: ApprovalRecord): void {
     const messageId = 'msg_' + randomUUID();
+    const withdrawn = request.continuation === 'superseded';
     const resolution = renderApprovalContext({
       requestId: request.requestId, decision: request.decision!, feedback: request.feedback, scope: request.request.scope, revision: request.revision,
       onApprove: request.request.onApprove, onRequestChanges: request.request.onRequestChanges, taskId: request.taskId, index: request.taskIndex,
+      ...(withdrawn ? { superseded: { reason: request.supersededReason ?? 'The reviewed worktree changed after the decision was recorded' } } : {}),
     });
     this.db.prepare("UPDATE runs SET status = 'queued', owner_token = NULL, prompt_message_id = ?, launch_action = 'resume', resolution = ?, resume_binding_json = NULL, launch_intent = 0, reason = NULL, queue_sequence = ?, version = version + 1, updated_at = ? WHERE id = ?")
       .run(messageId, resolution, this.nextQueueSequence(), Date.now(), run.id);
-    this.db.prepare("UPDATE approval_requests SET continuation = 'queued', continuation_at = ?, continuation_message_id = ? WHERE run_id = ? AND request_id = ?")
-      .run(Date.now(), messageId, run.id, request.requestId);
+    // A withdrawn decision keeps its continuation: the new message id is what a later dispatch recognizes as its queued delivery.
+    this.db.prepare('UPDATE approval_requests SET continuation = ?, continuation_at = ?, continuation_message_id = ? WHERE run_id = ? AND request_id = ?')
+      .run(withdrawn ? 'superseded' : 'queued', Date.now(), messageId, run.id, request.requestId);
     const queued = this.requireRun(run.id);
     this.event('run.resume_queued', queued, null, { version: queued.version, messageID: queued.promptMessageId, requestId: request.requestId });
-    this.event('approval.continuation_queued', queued, null, { requestId: request.requestId, messageID: messageId, version: queued.version });
+    this.event('approval.continuation_queued', queued, null, { requestId: request.requestId, messageID: messageId, version: queued.version, ...(withdrawn ? { superseded: true } : {}) });
   }
 
   /** Answered requests whose decision still has to reach a resumed attempt, for runs that are paused and released right now. */
   pendingContinuations(): Array<{ run: RunRecord; approval: ApprovalRecord }> {
     const found: Array<{ run: RunRecord; approval: ApprovalRecord }> = [];
     for (const row of this.db.prepare(`SELECT * FROM approval_requests WHERE state = 'answered'
-      AND (continuation IN ('pending','queued') OR (continuation = 'consumed' AND consumed_attempt_id IS NULL)) ORDER BY answered_at, rowid`).all()) {
+      AND (continuation IN ('pending','queued') OR (continuation IN ('consumed','superseded') AND consumed_attempt_id IS NULL)) ORDER BY answered_at, rowid`).all()) {
       const approval = this.approvalFromRow(row);
       const run = this.getRun(approval.runId);
       if (run && this.continuable(run, approval)) found.push({ run, approval });
@@ -1019,7 +1035,8 @@ export class CoordinatorStore {
    * which the caller proved the run idle; any other version, a run that is not paused and released on the asking task, or a
    * continuation that is no longer waiting returns null and changes nothing. A continuation left `queued` by a run that
    * returned to paused without dispatching is waiting again and is queued once more. So is a decision that passed the dispatch
-   * boundary but was never carried by an attempt: when the run is back on the paused wait that asked, it is still owed.
+   * boundary but was never carried by an attempt: when the run is back on the paused wait that asked, it is still owed. A
+   * decision withdrawn at the boundary and never carried is owed the same way, as superseded context without authorization.
    */
   queueContinuation(runId: string, requestId: string, expectedVersion: number): RunRecord | null {
     if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 0) throw new Error('Expected version must be a nonnegative safe integer');
@@ -1027,7 +1044,7 @@ export class CoordinatorStore {
       const request = this.getApproval(runId, requestId);
       const run = this.getRun(runId);
       if (!request || !run || request.state !== 'answered') return null;
-      const owed = request.continuation === 'consumed' && request.consumedAttemptId === null;
+      const owed = ['consumed', 'superseded'].includes(request.continuation) && request.consumedAttemptId === null;
       if (!owed && !['pending', 'queued'].includes(request.continuation)) return null;
       if (run.version !== expectedVersion || !this.continuable(run, request)) return null;
       this.enqueueContinuation(run, request);
@@ -1054,6 +1071,13 @@ export class CoordinatorStore {
       const request = this.getApproval(id, context.requestId);
       if (!request || request.state !== 'answered' || request.decision !== context.decision || request.continuationMessageId !== run.promptMessageId) throw new Error('The approval continuation is not the one queued for this admission');
       if (run.launchIntent) return request.continuation === 'superseded' ? 'superseded' : 'authorized';
+      if (request.continuation === 'superseded') {
+        // A withdrawn decision requeued because no attempt carried its context: the delivery admitted here only informs the agent.
+        // The revision is not measured again, since withdrawal is permanent and nothing can make this decision authorize again.
+        if (!context.superseded) throw new Error('A withdrawn approval decision cannot be delivered as an authorization');
+        mark();
+        return 'superseded';
+      }
       if (request.continuation !== 'queued') throw new Error('The approval continuation was already delivered');
       if (!revision) throw new Error('Dispatching an approval continuation requires the current review revision');
       const now = Date.now();
@@ -1082,7 +1106,12 @@ export class CoordinatorStore {
         if (request.consumedAttemptId !== null) return 'consumed';
         if (run.capacityReserved) return 'executing';
         return this.continuable(run, request) ? 'waiting-for-idle' : 'consumed';
-      case 'superseded': return 'superseded';
+      case 'superseded':
+        // Withdrawn: it authorizes nothing, but its context is owed to the agent until an attempt carries it.
+        if (request.consumedAttemptId !== null) return 'superseded';
+        if (run.status === 'queued') return 'queued';
+        if (run.capacityReserved) return 'executing';
+        return this.continuable(run, request) ? 'waiting-for-idle' : 'superseded';
       case 'queued':
         if (run.status === 'queued') return 'queued';
         return run.capacityReserved ? 'executing' : 'waiting-for-idle';

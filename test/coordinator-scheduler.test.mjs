@@ -526,12 +526,13 @@ test('content changed after acceptance while waiting for capacity supersedes the
   const stored = f.store.getApproval('a', requestId);
   assert.equal(stored.continuation, 'superseded');
   assert.equal(stored.state, 'answered');
-  assert.equal(progressOf(f.store, 'a', requestId), 'superseded');
+  assert.equal(progressOf(f.store, 'a', requestId), 'executing', 'withdrawn but not yet carried by an attempt: still being delivered');
   assert.equal(eventCount(f.store, 'approval.consumed'), 0);
   assert.equal(eventCount(f.store, 'approval.superseded'), 1);
   assert.equal(run.launchIntent, true);
-  // Neither blocking a later generic resume nor requeueing the withdrawn decision.
+  // While the run executes, the withdrawn decision blocks nothing and is not queued again.
   assert.doesNotThrow(() => f.store.assertNoUnresolvedApproval('a'));
+  observed.a = activeOn(); // The resumed session is working.
   await f.tick();
   assert.equal(f.calls.launch.length, 3);
 });
@@ -843,4 +844,245 @@ test('a decision the runner dropped for a fresh request cannot be written back i
   assert.equal(f.store.getRun('run').checkpoint.approval, undefined);
   assert.throws(() => carrier.save({ ...carrier.state, approval: delivered }), /approval/i);
   assert.equal(f.store.getRun('run').checkpoint.approval, undefined);
+});
+
+// --- A withdrawn decision whose context no attempt carried is still owed to the agent ----------------------------------------
+
+const MULTILINE = '  Rename `load()` to `read()`:\n\n\t- keep the "quotes" and \'single quotes\'\n  - --decision approve --input=x\r\nlast line with trailing spaces   \n';
+
+/**
+ * The decision was answered at R0 and queued; the reviewed content is R1 at the dispatch boundary, which withdraws it, and the
+ * native launch then fails before any attempt can carry the superseded context. The existing explicit reconciliation proves the
+ * run idle. Returns with the run paused and released on the asking task, its delivery owed.
+ */
+async function withdrawnAtDispatch(t, decision, { atDispatch = R1 } = {}) {
+  const state = { observed: activeOn(), failLaunch: false, revision: R0 };
+  const f = await fixture(t, {
+    executor: { inspect: async () => state.observed, launch: async () => { if (state.failLaunch) throw new Error('Native launch outcome unknown'); } },
+    revision: async () => { if (state.revision === undefined) throw new Error('The worktree cannot be measured'); return state.revision; },
+  });
+  f.enqueue(await f.project(), 'run');
+  await f.tick();
+  const first = f.store.getRun('run');
+  const asked = ask(f.store, 'run');
+  state.observed = idleOn();
+  await f.tick();
+  const { requestId } = asked.request;
+  const input = decision === 'approve' ? { decision } : { decision, feedback: MULTILINE };
+  const ack = f.store.decideApproval('run', requestId, input, R0);
+  assert.equal(ack.continuation, 'pending');
+  state.failLaunch = true;
+  state.revision = atDispatch;
+  await f.tick();
+  await f.tick();
+  const uncertain = f.store.getRun('run');
+  assert.deepEqual({ status: uncertain.status, reserved: uncertain.capacityReserved, intent: uncertain.launchIntent }, { status: 'reconciliation-required', reserved: true, intent: true });
+  const withdrawn = f.store.getApproval('run', requestId);
+  assert.deepEqual({ state: withdrawn.state, continuation: withdrawn.continuation, carried: withdrawn.consumedAttemptId }, { state: 'answered', continuation: 'superseded', carried: null });
+  state.observed = activeOn();
+  assert.equal((await f.scheduler.reconcile('run')).capacityReserved, true, 'native-uncertain keeps its capacity');
+  state.failLaunch = false;
+  state.observed = idleOn();
+  const released = await f.scheduler.reconcile('run');
+  assert.deepEqual({ status: released.status, reserved: released.capacityReserved }, { status: 'paused', reserved: false });
+  return { f, state, first, requestId, ack, input };
+}
+
+/** What a runner does with the delivered context: it starts a fresh attempt that carries it in its checkpoint. */
+function carry(f, attempt = 2) {
+  const resumed = f.store.getRun('run');
+  const claimed = { sessionID: resumed.parentSessionId, id: 'call-resume-' + attempt, messageID: 'msg-resume-' + attempt, agent: 'adr-orchestrator' };
+  f.store.bindResume('run', resumed.ownerToken, claimed);
+  const carrier = structured(f.store, 'run', attempt, claimed);
+  const delivered = parseApprovalContext(resumed.resolution);
+  carrier.save({ ...carrier.state, approval: delivered });
+  return { resumed, claimed, carrier, delivered };
+}
+
+const waitOf = (store, id) => store.runWait(store.getRun(id));
+
+for (const decision of ['request-changes', 'approve']) {
+  test(`a ${decision} decision withdrawn at dispatch whose launch failed is delivered once as superseded context, with no owner response or resume`, async t => {
+    const { f, state, first, requestId, input } = await withdrawnAtDispatch(t, decision);
+    const before = f.store.getRun('run');
+    const answered = eventCount(f.store, 'approval.answered');
+    // Owed, not history: the public run still presents the approval with an existing progress value, not a generic pause.
+    assert.equal(progressOf(f.store, 'run', requestId), 'waiting-for-idle');
+    assert.deepEqual({ kind: waitOf(f.store, 'run').kind, continuation: waitOf(f.store, 'run').continuation, progress: waitOf(f.store, 'run').progress, requestId: waitOf(f.store, 'run').requestId },
+      { kind: 'approval', continuation: 'superseded', progress: 'waiting-for-idle', requestId });
+    const listed = f.store.listRunPage().runs.find(entry => entry.id === 'run');
+    assert.deepEqual({ kind: listed.wait.kind, continuation: listed.wait.continuation, requestId: listed.wait.requestId }, { kind: 'approval', continuation: 'superseded', requestId });
+    assert.equal(f.store.pendingContinuations().length, 1);
+    // Generic resume and the guarded pause response cannot replace or bypass the owed context.
+    await assert.rejects(f.scheduler.resume('run', 'carry on'), code('approval-pending'));
+    await assert.rejects(f.scheduler.respond('run', 'pause-1', 'carry on'), code('approval-pending'));
+    assert.throws(() => f.store.queueResume('run', 'carry on'), code('approval-pending'));
+    assert.throws(() => f.store.recordPauseResponse('run', 'pause-1', 'carry on', before.version), code('approval-pending'));
+    assert.deepEqual(f.store.getRun('run'), before, 'a refused bypass changes nothing');
+    assert.equal(f.store.getPauseResponse('run', 'pause-1'), null);
+    assert.equal(f.calls.launch.length, 2);
+    // One tick queues and admits exactly one fresh continuation; repeated ticks and an identical owner retry add nothing.
+    if (decision === 'approve') state.revision = R0; // The worktree is back at the reviewed content, which changes nothing.
+    await Promise.all([f.tick(), f.tick()]);
+    state.observed = activeOn(); // The resumed session is working.
+    await f.tick();
+    await f.tick();
+    assert.equal(f.calls.launch.length, 3, 'exactly one further admission');
+    const launched = f.calls.launch[2];
+    const context = parseApprovalContext(launched.resolution);
+    assert.equal(context.superseded.reason, 'The reviewed worktree changed after the decision was recorded');
+    assert.deepEqual({ requestId: context.requestId, decision: context.decision, taskId: context.taskId, index: context.index, scope: context.scope }, { requestId, decision, taskId: 'T1', index: 0, scope: 'Merge only the reviewed commit' });
+    assert.equal(context.feedback, decision === 'approve' ? null : MULTILINE, 'byte-exact feedback');
+    assert.deepEqual(context.revision, R0, 'the reviewed revision stays as history');
+    assert.deepEqual([context.onApprove, context.onRequestChanges], [['Merge the branch'], ['Correct and ask again']]);
+    const resumed = f.store.getRun('run');
+    assert.deepEqual([resumed.status, resumed.capacityReserved, resumed.launchIntent, resumed.launchAction], ['running', true, true, 'resume']);
+    assert.notEqual(resumed.ownerToken, first.ownerToken, 'fresh authority');
+    assert.deepEqual([resumed.id, resumed.parentSessionId, resumed.branch, resumed.worktreePath, resumed.checkpoint], [first.id, first.parentSessionId, first.branch, first.worktreePath, before.checkpoint]);
+    assert.deepEqual(resumed.checkpoint.results, before.checkpoint.results);
+    assert.equal(resumed.checkpoint.index, 0);
+    const stored = f.store.getApproval('run', requestId);
+    assert.deepEqual([stored.state, stored.continuation, stored.consumedAttemptId, stored.decision, stored.feedback], ['answered', 'superseded', null, decision, input.feedback ?? null]);
+    assert.equal(progressOf(f.store, 'run', requestId), 'executing');
+    assert.equal(eventCount(f.store, 'approval.answered'), answered);
+    assert.equal(eventCount(f.store, 'approval.consumed'), 0, 'never reported as consumed');
+    assert.equal(eventCount(f.store, 'approval.continuation_queued'), 2, 'the earlier queue and one recovery queue');
+    assert.equal(eventCount(f.store, 'run.response_recorded'), 0, 'no owner response');
+    assert.deepEqual(await f.store.decideApproval('run', requestId, input, undefined, resumed.version), { ...f.store.getApproval('run', requestId).ack, retried: true });
+    assert.equal(f.calls.launch.length, 3);
+    // Carried by a fresh attempt checkpoint: history from then on, never delivered again.
+    const { carrier } = carry(f);
+    assert.equal(f.store.getApproval('run', requestId).consumedAttemptId, 'attempt-2');
+    assert.equal(progressOf(f.store, 'run', requestId), 'superseded');
+    assert.equal(f.store.approvalWait(f.store.getRun('run')), null, 'a delivered context is history');
+    assert.equal(f.store.pendingContinuations().length, 0);
+    // The withdrawal is permanent: the agent needs a fresh request, and only that request authorizes its own scope.
+    const fresh = ask(f.store, 'run', 2, approvalPayload({ scope: 'Publish nothing but the fresh scope' }), carrier.state.caller);
+    assert.notEqual(fresh.request.requestId, requestId);
+    assert.deepEqual(f.store.decideApproval('run', requestId, input), { ...stored.ack, retried: true }, 'the old request cannot be answered again');
+    assert.throws(() => f.store.decideApproval('run', requestId, decision === 'approve' ? { decision: 'request-changes', feedback: 'x' } : { decision: 'approve' }), code('approval-conflict'));
+    assert.equal(f.store.getApproval('run', requestId).continuation, 'superseded');
+    state.observed = idleOn();
+    await f.tick();
+    assert.equal(f.store.getRun('run').status, 'paused');
+    await f.tick();
+    assert.equal(f.calls.launch.length, 3, 'nothing is redelivered after a carrying checkpoint');
+    state.revision = R0;
+    f.store.decideApproval('run', fresh.request.requestId, { decision: 'approve' }, R0);
+    await f.tick();
+    state.observed = activeOn();
+    await f.tick();
+    assert.equal(f.calls.launch.length, 4);
+    const authorized = parseApprovalContext(f.calls.launch[3].resolution);
+    assert.deepEqual({ requestId: authorized.requestId, scope: authorized.scope, superseded: authorized.superseded }, { requestId: fresh.request.requestId, scope: 'Publish nothing but the fresh scope', superseded: undefined });
+    assert.equal(f.store.getApproval('run', requestId).continuation, 'superseded');
+    assert.equal(f.store.getApproval('run', fresh.request.requestId).continuation, 'consumed');
+  });
+}
+
+test('a withdrawn decision stays superseded when the reviewed content returns to what was approved; the stored request never authorizes again', async t => {
+  const { f, state, requestId } = await withdrawnAtDispatch(t, 'approve');
+  state.revision = R0;
+  assert.deepEqual(f.store.getApproval('run', requestId).revision, R0);
+  await f.tick();
+  state.observed = activeOn();
+  await f.tick();
+  const resumed = f.store.getRun('run');
+  const context = parseApprovalContext(resumed.resolution);
+  assert.deepEqual([context.superseded !== undefined, f.calls.launch.length], [true, 3]);
+  assert.deepEqual(parseApprovalContext(f.calls.launch[2].resolution), context);
+  assert.equal(f.store.getApproval('run', requestId).continuation, 'superseded');
+  assert.equal(eventCount(f.store, 'approval.consumed'), 0);
+  // A checkpoint cannot present the withdrawn decision as an authorization, whatever the worktree measures.
+  const claimed = { sessionID: resumed.parentSessionId, id: 'call-resume', messageID: 'msg-resume', agent: 'adr-orchestrator' };
+  f.store.bindResume('run', resumed.ownerToken, claimed);
+  const carrier = structured(f.store, 'run', 2, claimed);
+  const { superseded: _withdrawn, ...ordinary } = context;
+  assert.throws(() => carrier.save({ ...carrier.state, approval: ordinary }), /approval/i);
+  assert.equal(f.store.getApproval('run', requestId).consumedAttemptId, null);
+  carrier.save({ ...carrier.state, approval: context });
+  assert.equal(f.store.getApproval('run', requestId).consumedAttemptId, 'attempt-2');
+});
+
+test('the withdrawal and a failed dispatch survive restarts: one queue and one admission, and nothing after a carrying checkpoint', async t => {
+  const { f, state, requestId, input } = await withdrawnAtDispatch(t, 'request-changes');
+  // A restart while delivery is owed keeps it owed and neither authorizes nor loses it.
+  let current = await f.reopen();
+  assert.equal(current.store.getRun('run').status, 'paused');
+  let stored = current.store.getApproval('run', requestId);
+  assert.deepEqual([stored.state, stored.continuation, stored.consumedAttemptId, stored.feedback], ['answered', 'superseded', null, MULTILINE]);
+  assert.equal(current.store.pendingContinuations().length, 1);
+  assert.throws(() => current.store.queueResume('run', 'carry on'), code('approval-pending'));
+  // The coordinator queues it, then ends before dispatching: the queue is not doubled and recovery goes through reconciliation.
+  const proven = await current.scheduler.proveContinuable('run');
+  const queued = current.store.queueContinuation('run', requestId, proven.version);
+  assert.equal(queued.status, 'queued');
+  assert.equal(current.store.queueContinuation('run', requestId, proven.version), null);
+  assert.equal(current.store.queueContinuation('run', requestId, queued.version), null);
+  assert.ok(current.store.admitNext(), 'admitted, but the process ends before it dispatches');
+  current = await f.reopen();
+  const interrupted = current.store.getRun('run');
+  assert.deepEqual({ status: interrupted.status, reserved: interrupted.capacityReserved, intent: interrupted.launchIntent }, { status: 'reconciliation-required', reserved: true, intent: false });
+  assert.equal(parseApprovalContext(interrupted.resolution).superseded !== undefined, true, 'still the superseded context');
+  await current.tick();
+  assert.equal(current.store.getRun('run').status, 'reconciliation-required', 'nothing is delivered until the existing reconciliation proves idle');
+  assert.equal(f.calls.launch.length, 2);
+  assert.equal((await current.scheduler.reconcile('run')).status, 'paused');
+  // Repeated ticks and identical owner retries after the restart: one queue, one admission.
+  assert.deepEqual(current.store.decideApproval('run', requestId, input), { ...current.store.getApproval('run', requestId).ack, retried: true });
+  await Promise.all([current.tick(), current.tick()]);
+  state.observed = activeOn();
+  await current.tick();
+  await current.tick();
+  assert.equal(f.calls.launch.length, 3, 'exactly one admission after the failed dispatch');
+  assert.equal(eventCount(current.store, 'approval.continuation_queued'), 3);
+  assert.equal(parseApprovalContext(f.calls.launch[2].resolution).feedback, MULTILINE);
+  assert.deepEqual(current.store.decideApproval('run', requestId, input), { ...current.store.getApproval('run', requestId).ack, retried: true });
+  assert.equal(f.calls.launch.length, 3);
+  // Carried by the fresh attempt: later ticks and restarts deliver nothing.
+  const resumed = current.store.getRun('run');
+  const claimed = { sessionID: resumed.parentSessionId, id: 'call-resume', messageID: 'msg-resume', agent: 'adr-orchestrator' };
+  current.store.bindResume('run', resumed.ownerToken, claimed);
+  const carrier = structured(current.store, 'run', 2, claimed);
+  carrier.save({ ...carrier.state, approval: parseApprovalContext(resumed.resolution) });
+  assert.equal(current.store.getApproval('run', requestId).consumedAttemptId, 'attempt-2');
+  await current.tick();
+  assert.equal(current.store.pendingContinuations().length, 0);
+  for (let restart = 0; restart < 2; restart++) {
+    current = await f.reopen();
+    state.observed = idleOn();
+    if (current.store.getRun('run').capacityReserved) assert.equal((await current.scheduler.reconcile('run')).status, 'paused');
+    assert.equal(current.store.getRun('run').status, 'paused');
+    await current.tick();
+    await current.tick();
+    assert.equal(current.store.pendingContinuations().length, 0);
+    assert.equal(current.store.approvalWait(current.store.getRun('run')), null);
+    assert.equal(f.calls.launch.length, 3, 'no redelivery of a carried context');
+  }
+  assert.equal(eventCount(current.store, 'approval.continuation_queued'), 3);
+  assert.equal(eventCount(current.store, 'approval.answered'), 1);
+  assert.equal(eventCount(current.store, 'run.response_recorded'), 0);
+});
+
+test('a withdrawn delivery waits for complete idle proof and open admission, and its dispatch never needs a measurement', async t => {
+  const { f, state, requestId } = await withdrawnAtDispatch(t, 'request-changes');
+  state.revision = undefined; // The worktree can no longer be measured; the withdrawn context authorizes nothing, so that does not matter.
+  state.observed = idleOn();
+  const inspect = f.calls.inspect.length;
+  f.scheduler.pauseAdmission();
+  await f.tick();
+  assert.equal(f.store.getRun('run').status, 'paused');
+  assert.equal(f.calls.launch.length, 2);
+  assert.equal(f.calls.inspect.length, inspect, 'a stopped scheduler proves nothing');
+  const restarted = await f.reopen();
+  state.observed = activeOn();
+  await restarted.tick();
+  assert.equal(restarted.store.getRun('run').status, 'paused', 'an active native session is not delivered to');
+  assert.equal(f.calls.launch.length, 2);
+  state.observed = idleOn();
+  await restarted.tick();
+  state.observed = activeOn();
+  await restarted.tick();
+  assert.equal(f.calls.launch.length, 3);
+  assert.equal(parseApprovalContext(f.calls.launch[2].resolution).requestId, requestId);
 });

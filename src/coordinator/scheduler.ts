@@ -71,10 +71,12 @@ export class CoordinatorScheduler {
       else await (this.options.verifyWorktree ?? verifyManagedWorktree)({ project, run });
       await (this.options.prepare ?? prepareRuntime)(run, endpoint);
       let launching = run;
-      if (run.launchAction === 'resume' && parseApprovalContext(run.resolution ?? undefined)) {
+      const context = run.launchAction === 'resume' ? parseApprovalContext(run.resolution ?? undefined) : undefined;
+      if (context) {
         // The reviewed material is measured at the dispatch boundary: an unchanged revision consumes the decision, a changed one
         // withdraws it. Both happen in the transaction that records launch intent, so a decision is neither lost nor delivered twice.
-        store.beginApprovalDispatch(run.id, run.ownerToken!, await this.reviewRevision(run));
+        // A decision already withdrawn is delivered as it is: nothing can make it authorize again, so nothing is measured.
+        store.beginApprovalDispatch(run.id, run.ownerToken!, context.superseded ? undefined : await this.reviewRevision(run));
         launching = store.getRun(run.id)!;
       } else store.markLaunchIntent(run.id, run.ownerToken!);
       await executor.launch(launching);
@@ -185,7 +187,9 @@ export class CoordinatorScheduler {
       try {
         const proven = await this.proveContinuable(run.id);
         if (!proven) continue;
-        await this.reviewRevision(proven); // Unmeasurable work is not queued; a changed revision is decided at dispatch.
+        // Unmeasurable work is not queued for a decision that may authorize; a changed revision is decided at dispatch. A withdrawn
+        // decision authorizes nothing, so its delivery does not depend on a measurement.
+        if (approval.continuation !== 'superseded') await this.reviewRevision(proven);
         if (!this.accepting) return;
         store.queueContinuation(run.id, approval.requestId, proven.version);
       } catch { /* Left recorded; the next tick proves it again. */ }
