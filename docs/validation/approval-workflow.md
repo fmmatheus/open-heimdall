@@ -281,3 +281,230 @@ further material gap, corrected in `217e2d8`:
   resume with `approval-pending`.
 - Revision measurement is at submission time and covers only git-visible content (see
   [the coordinator guide](../coordinator.md#approvals-and-owner-responses)).
+
+## Follow-up (2026-10-20): guarded continuation, request inspection and withdrawn feedback
+
+This section is appended to the record above; the earlier sections are unchanged and
+remain the evidence for the code they name. A later review of the delivered workflow
+found three further defects. Each was reproduced against the exact base, fixed with a
+regression test that fails on the base and passes after, reviewed by a reader who had
+not written the fix, and then the complete checks were run on the settled code.
+
+### Environment
+
+| Item | Value |
+| --- | --- |
+| Base | `f18ce4f` (`docs(validation): finalize approval workflow record`) |
+| Code under test | `9933656` (`test(workflow): prove withdrawn feedback reaches a fresh attempt without authorization`). The commits that add this section and the guide updates change documentation and skill instruction text only. |
+| Fix commits | `62fcbc4` (defect 1), `173565d`, `75cae28`, `0d13944` (defect 2), `bdbf842`, `f0d51f9`, `9933656` (defect 3) |
+| OS / architecture | macOS 27.0.1 (Darwin 27.0.0), arm64 |
+| Node.js / npm | v22.22.3 / 10.9.8 (declared minimum: Node.js 22.19) |
+| Evidence level | Automated, in process, with real coordinator, scheduler, CLI child processes, extension service, panel store and a scripted stand-in for the native session. Same levels as above; no real model, host or OpenChamber. |
+
+### Defect 1: the resume skill fell back to an unguarded resume
+
+Before: the helper's `resume` sent the guidance with `run resume RUN_ID --input ...`
+whenever `run show` gave no usable `wait` (a missing or null wait, or an older
+coordinator). With a recording stand-in for the command line, a run was read at pause A
+(version 1, no wait). Before the helper sent anything, the stand-in advanced the run
+to pause B (version 3). The base helper then sent pause A's guidance through
+`run resume`, which applied it to pause B, and reported `resumed`, exit 0.
+
+After (`62fcbc4`): the helper sends guidance only as the guarded
+`run respond RUN_ID --pause PAUSE_ID --input=GUIDANCE`, and only for a generic wait
+with a valid pause identity. In the same scenario it reports `refused`
+(`pause-identity-unavailable`), exit 1, `mutationsAttempted: []`, and the only recorded
+command is `run show`. A guarded response that is unsupported, stale or rejected gets
+exactly one attempt and never a fallback. `heimdall coordinator run resume RUN_ID
+--input ...` is unchanged as the owner's explicit command.
+
+Regressions (`test/skills-helper-mutations.test.mjs`, argv-recorded): missing, null,
+superseded, unknown and malformed identities refuse with no mutation; the A/B race
+refuses with both `run resume` and `run respond` scripted to succeed; stale and
+unsupported guarded routes get exactly one `run respond` for the displayed pause. On
+the base, two of the three selected new tests fail. The evaluator's `resume-with-guidance`
+scenario now allows one `run respond` and `boundary-guidance-as-spec` allows none.
+
+### Defect 2: hidden request content could be approved
+
+Before: the coordinator accepts up to 4000 characters per text, 20 entries per list and
+32 KiB per request, while run projections clip text at 1500 characters and lists at 10
+entries, and the extension clips again. A synthetic request had a 1,900-character scope
+whose authorizing action started at character 1,510. At the base the complete stored
+request contained that action; `run show`, `run list`, the extension projection and the
+card did not. No command read the complete request, the card said it was available
+"through the CLI", and **Approve and continue** stayed enabled: the card's handler
+recorded an approval of the full stored scope.
+
+After (`173565d`, `75cae28`, `0d13944`):
+
+- `heimdall coordinator run approval RUN_ID --request REQUEST_ID` prints the complete
+  validated request (read-only; exit 1 with a diagnostic and no stdout on any refusal,
+  including an older coordinator). The extension service has the matching read-only
+  `GET /runs/:id/approvals/:requestId`.
+- On a shortened card **Approve and continue** stays off until **Load full request**
+  has loaded and validated the complete request for exactly this run, request,
+  revision and displayed version. A failed, invalid, mismatched or late answer leaves
+  Approve off. **Request changes** is always available. The approval then carries a
+  reviewed binding (request id, revision, content digest) that the service re-checks
+  against a fresh full read (409 `review-required` / `review-mismatch`).
+- The skill helper has a read-only `request RUN_ID --request ID` command, and the
+  monitor and resume instructions require it before presenting a shortened request.
+
+In the same scenario the base fails with `Unknown coordinator command`, `client.approval is
+not a function`, and an enabled Approve whose click posted one decision and stored the
+approval including the hidden action. After the change Approve is disabled and a
+click sends no decision and no read; after loading, the card shows the action and one
+click records exactly one decision.
+
+Regressions: `test/cli.test.mjs` (real CLI processes against a real coordinator: hidden
+tail, entries beyond the compact limits, a request exactly at 32 KiB, argument and
+refusal paths, no state change), `test/extension-service.test.mjs`,
+`test/extension-approval.test.mjs` (the real card controls on a fake DOM wired to the
+real panel store, client, extension service and coordinator), `test/extension-panel-*.test.mjs`,
+`test/skills-helper-readonly.test.mjs` and the installed-package tests.
+
+### Defect 3: withdrawn feedback could be stranded
+
+Before: an owner decision was recorded for revision R0, the reviewed worktree changed
+to R1 before dispatch (so the decision was correctly withdrawn and the superseded
+context stored), and the executor launch failed before a fresh attempt carried it.
+After the existing explicit idle reconciliation the base run stayed paused with capacity
+released, `continuation: superseded` and no carrying attempt. Scheduler ticks queued
+nothing (2 launches before and after), the public run showed a generic wait, and the
+exact feedback was stored but never reached the agent.
+
+After (`bdbf842`, `f0d51f9`, `9933656`): the coordinator queues the superseded context
+again, once, when the run is proven idle, with no owner response or resume (3
+launches). The context repeats the decision and feedback unchanged and authorizes
+nothing, the revision is not measured again, and the stored request stays withdrawn.
+While the delivery is owed the run keeps an approval wait (`continuation: superseded`,
+progress `waiting-for-idle`, `queued` or `executing`); `run resume` and
+`run respond --pause` are refused with `approval-pending`; the panel shows "Decision
+withdrawn" with no controls; the helper reports `wait`. No schema change was needed.
+
+End to end (`test/approval-workflow-example.test.mjs`, real coordinator, runner and
+durable gate, scripted stand-in for the native session), for a request-changes decision
+with committed drift and for an approve with an uncommitted edit: after the injected
+launch failure and the existing reconciliation, ticks alone produce exactly one fresh
+executor dispatch whose prompt carries the superseded block and the exact feedback and
+none of the request's actions. The saved checkpoint carries the context and records the
+fresh attempt as the carrier. The scripted agent performs nothing gated and files a
+fresh request; the old request stays withdrawn (an opposite decision is refused, an
+identical retry is acknowledged without new events); the run id, branch, parent
+session, worktree, task index, earlier results and commits are the same, and approving
+only the fresh request finishes the same run. The two tests fail on the code before
+`bdbf842`.
+
+Two existing assertions changed because they encoded the defect: a dispatched but not
+yet carried withdrawn decision now reports progress `executing` instead of
+`superseded`, and a capacity-wait test sets the resumed session active (an idle report
+without a carrying checkpoint redelivers). The commit message of `bdbf842` says so.
+
+### Commands for the owner
+
+```sh
+heimdall coordinator run approval RUN_ID --request REQUEST_ID
+heimdall coordinator run respond RUN_ID --request REQUEST_ID --decision approve
+heimdall coordinator run respond RUN_ID --request REQUEST_ID --decision request-changes --input FEEDBACK
+heimdall coordinator run respond RUN_ID --pause PAUSE_ID --input GUIDANCE
+node skills/openheimdall-monitor/scripts/openheimdall.mjs request RUN_ID --request REQUEST_ID
+```
+
+The helper's `resume` and `respond --pause` refuse, and send nothing, when the run does
+not show a valid generic pause identity or while an approval or a withdrawn delivery
+is unresolved.
+
+### Review and corrections
+
+| Review | Reader | Scope | Result |
+| --- | --- | --- | --- |
+| 1 | fresh session | the whole diff `f18ce4f..9933656`, tests, authority boundaries and the interaction of the three fixes | 0 material, 4 minor, 4 benched |
+| 2 | fresh session | the correction diff | empty diff (the correction stage changed nothing); review 1 confirmed |
+
+Review 1 also ran twelve mutation probes on a disposable extraction of the code: eleven
+were caught by the new tests and one survivor was an equivalent mutant. It confirmed
+the absence of bypasses around the unsupported-client refusal, the complete reads,
+late detail responses, the owed-delivery guards, restart persistence and permanent
+withdrawal. The minor findings:
+
+| Finding | Status |
+| --- | --- |
+| The panel computes the content digest with Web Crypto, which exists only in secure contexts. Without it the load fails closed (Approve stays off) and may be presented as an offline state. Whether OpenChamber's guest page is a secure context is unverified. | Open, owner follow-up (below). |
+| Coordinator, extension and skills documentation | Closed by this section and the guide updates. |
+| Any run-version change discards a loaded complete request | Deliberate and fail-closed; unchanged. |
+| Final verification on settled code | Closed by the results below. |
+
+No material finding existed in review 1 or review 2, so no correction code was written
+and none of it is unreviewed. Final-stage edits are documentation and two skill
+instruction sentences (the withdrawn-delivery state in the monitor and resume
+`SKILL.md`), which the full checks below ran after.
+
+### Check results
+
+All run in the foreground from the repository root, on the code of `9933656` plus the
+documentation and instruction edits of this section. Logs are kept by the run.
+
+| Command | Result |
+| --- | --- |
+| `npm run check` | pass |
+| `npm test` | 1793 tests, 1793 pass. A second full run on the same tree had one failure (below); a rerun of the whole suite passed 1793/1793. |
+| `npm run build:extension` | pass |
+| `npm run test:package` | 89 tests, 89 pass (consumer and global install; the installed help lists `run approval`; the installed helpers' `request` reads a complete request outside the checkout) |
+| `node scripts/live/skills-eval/run-eval.mjs selftest` | `passed`, 16 checks |
+
+The one failure was `the review revision is deterministic, content based, bounded and
+read only` (`test/coordinator-service.test.mjs`), at its `binary edit` step: an edit
+to a 4-byte file that kept the same size and landed in the same timestamp tick left
+the revision digest unchanged. It passed in the first full run, in eight consecutive
+isolated reruns, and in the third full run. The revision code and this test are
+unchanged since the base, so it is a pre-existing timing sensitivity, most likely git's
+stat-based change detection for a same-size edit made within one timestamp tick (the
+cause was not confirmed). It was not changed, and the failed run is not counted as a
+pass.
+
+Existing assertions that stayed intact in the same runs: the installed SDK and its
+Effect dependency load and execute the normal API; exports and the quota helper modules
+load; the installed pinned quota package resolves; the runtime snapshot refusals
+(`launch and resume refuse a tampered snapshot: ...`); and the ownership guard
+(`global ownership guard is inert outside managed worktrees and disposes all hooks`,
+`ownership tampering and project identity changes fail without cleanup or replacement`).
+The three helper copies are byte-identical (`cmp`, and the artifact test).
+
+### Cleanup
+
+Base comparisons used disposable `git archive` extractions of the base and of
+intermediate commits inside the OpenCode temporary directory, with the repository's
+`node_modules` linked; they, their path files, mutation scratch copies, edit scripts and
+logs created by the run were removed. Test fixtures remove their own directories; none
+remained after the final runs. Nothing in a real profile, project, coordinator or
+OpenChamber installation was read or changed. The synthetic fixtures contain no
+credentials.
+
+### Unverified
+
+- The managed (coordinator-driven) path on a real OpenCode host, as before.
+- The real OpenChamber 2.1.0 render and click, including the **Load full request**
+  flow, and whether its guest page provides Web Crypto (see the first minor finding).
+  The card is exercised by its real handlers on a deterministic stand-in for the SDK
+  components.
+- Real model behavior, including how a real agent reacts to the superseded context.
+  The agent in the tests is scripted.
+- Hosted CI on macOS and Linux for the installed package; only the local macOS run
+  above was executed.
+
+### Follow-up and benched items
+
+Owner follow-up (not done here): remove the panel's dependency on Web Crypto, either
+by returning the digest from the service read or with a shared pure-JavaScript
+SHA-256, mapping any failure to a fixed `request`-category error and testing it with
+`crypto` absent.
+
+Kept benched and not changed here: revision-measurement failures and active-worktree
+behavior, legacy response inspection, the stricter panel staleness check, list-query
+and contract-test polish, the redelivery retry cap (a failure before capacity is
+reserved re-queues on each tick, the same mechanism as the earlier lost-dispatch
+redelivery), the unproven structural pause-identity observation, lifecycle and test
+timing nits, spec heuristics, bounded-watch timing and evaluator naming polish. The
+CLI and helper do not require a read receipt before approving. Integration follows a
+separate owner review.

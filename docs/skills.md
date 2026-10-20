@@ -332,6 +332,13 @@ What the skills never do:
   request is pending or its decision has not been consumed, and it never sends a
   decision.
 - They never choose a decision for you and never retry a refused one with another.
+- A decision withdrawn because the reviewed work changed after it was recorded stays
+  owed to the agent until a fresh attempt has received the feedback (the wait is still
+  an approval with `continuation` `superseded` and a `progress` other than
+  `superseded`). The coordinator delivers it on its own once the run is idle. The
+  skills treat it as unresolved: they report that delivery is under way, offer
+  monitoring, and `resume` and `respond --pause` refuse with `approval-pending` and
+  send nothing. Nothing is authorized by it; the agent files a fresh request.
 - For a generic pause, `resume` sends the guidance as the guarded response for
   exactly the pause the run showed, with one `run respond RUN_ID --pause ID`. It is
   labelled as owner guidance, not as an approval. When the run does not show a valid

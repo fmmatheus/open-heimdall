@@ -50,6 +50,7 @@ if you approve and what it will do if you request changes, and its state:
 | --- | --- |
 | Pending | Waiting for your decision. **Approve and continue** and **Request changes** are available. Leaving the panel decides nothing. |
 | Approved / Changes requested | Your decision is recorded. The card shows how far it got: recorded, waiting for the run to be idle, queued (not started), the agent resumed with it, or delivered. "Queued" is never shown as running or finished. |
+| Decision withdrawn | The reviewed material changed after your decision was recorded, and the agent has not yet received your feedback. The card has no controls and says nothing is authorized; the coordinator delivers the feedback on its own. |
 | Superseded | A newer request replaced it, or the reviewed material changed. It can no longer be answered; the card says how to continue from the CLI. |
 
 - The first click on a button is the decision. There is no confirmation step.
@@ -59,6 +60,14 @@ if you approve and what it will do if you request changes, and its state:
   agent receives it unchanged, does not perform the gated action, corrects within
   the task scope and submits a fresh request, which appears as a new card.
 - Artifact references that are files offer **Show in Review**.
+- **Shortened requests.** The card shows a bounded copy of the request. When the
+  card says text was shortened, **Approve and continue** stays off and **Load full
+  request** appears. It reads the complete request once, shows every text and list
+  entry, and enables **Approve** only for exactly that run, request, revision and
+  displayed version; if the load fails, is invalid, or no longer matches the card,
+  Approve stays off and nothing is sent. **Request changes** needs no load. The
+  same request can be read with `heimdall coordinator run approval RUN_ID
+  --request REQUEST_ID`.
 
 **Generic pause.** A paused run with no approval request shows the recorded
 reason and **Respond and continue** with a text field (at most 8000 characters).
@@ -133,12 +142,19 @@ configuration location. The extension manifest also declares the default socket
 ## Read-only guarantees and data handling
 
 - The service reads from the coordinator with `GET` requests (projects, runs,
-  events) plus a local directory-matching route. It has exactly two write
+  events, and `GET /runs/RUN_ID/approvals/REQUEST_ID`, which returns one complete
+  validated approval request as text; an answer that fails validation yields the
+  fixed error `approval-unreadable`, and an older coordinator `approval-unsupported`)
+  plus a local directory-matching route. It has exactly two write
   operations, each forwarding one owner response to the same coordinator
   operation that the CLI's `run respond` uses:
   - `POST /runs/RUN_ID/approvals/REQUEST_ID/decision` with
-    `{decision, feedback?, displayedVersion}`, forwarded to the coordinator's
-    approval decision operation.
+    `{decision, feedback?, displayedVersion, reviewed?}`, forwarded to the
+    coordinator's approval decision operation. For an approval of a shortened card,
+    `reviewed` (`{requestId, revision, contentDigest}`) is required: the service
+    reads the complete request again and refuses a missing binding (409
+    `review-required`) or one that no longer matches (409 `review-mismatch`)
+    before the coordinator is contacted. `reviewed` is refused on request changes.
   - `POST /runs/RUN_ID/pause-response` with `{pauseId, input, displayedVersion}`,
     forwarded to the coordinator's guarded pause response.
 
@@ -238,6 +254,12 @@ Let `W` be a run's worktree and `B` its base commit (`run show RUN_ID`).
    and reopen the panel: nothing was decided and the card is unchanged. Compare
    the text with `heimdall coordinator run show RUN_ID`.
    **PENDING — not yet performed.**
+    **Shortened request (new).** With a disposable request whose scope is longer
+    than 1500 characters, with an action only after that point, the card shows
+    **Load full request** and Approve is off; after loading, the whole scope is
+    visible and Approve works once. **PENDING — not yet performed in a real
+    OpenChamber.** Covered only by the fake-DOM tests described in
+    [validation/approval-workflow.md](validation/approval-workflow.md).
 9. **Approve.** Click **Approve and continue** once. The card shows the decision
    and its progress (queued or waiting for idle, never running before the agent
    resumed). `heimdall coordinator run show RUN_ID` agrees, and exactly one

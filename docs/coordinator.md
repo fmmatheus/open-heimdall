@@ -179,6 +179,21 @@ task through the ordinary resume path, at most once per decision:
   never says `consumed` for it meanwhile. A generic `resume` is refused for the
   same time. A decision whose attempt carried it is never queued again, even if
   the next attempt pauses.
+- A withdrawn decision is owed the same way. When the reviewed worktree changed
+  after the decision was recorded, the stored decision is withdrawn
+  (`continuation` `superseded`) and the agent is owed the owner's feedback as a
+  superseded context. If no attempt has carried that context (the launch failed
+  after the dispatch boundary, or the run was reconciled), the coordinator queues
+  it again on its own once the run is proven idle, with no owner response or
+  resume. The context states the original decision, repeats the feedback
+  unchanged and authorizes nothing; the revision is not measured again and the
+  stored request stays withdrawn, so gated work needs a fresh request. While the
+  delivery is owed the run keeps an approval `wait` (`continuation` `superseded`,
+  `progress` `waiting-for-idle`, `queued` or `executing`) instead of a generic
+  pause, and `run resume` and `run respond --pause` are refused with
+  `approval-pending`. When a fresh attempt's checkpoint carries the context,
+  `progress` becomes `superseded`, the `wait` is cleared and nothing is queued
+  again.
 - A checkpoint written by the run's process cannot create, alter or erase an
   owner decision. The coordinator accepts a checkpoint's `approval` only when it
   is unchanged or exactly the context it delivered for that admission (and then
@@ -236,11 +251,15 @@ bounded `/run-list` page. There are two kinds, and a run never has both:
   that was superseded (a newer request, or changed reviewed material) and left
   the run paused and released is reported as this generic wait, so the guarded
   response below applies and the guidance reaches the agent labelled as such.
+  The exception is a decision withdrawn after it was recorded whose superseded
+  context no attempt has carried yet: it stays an approval `wait` (see
+  [Continuing after an owner decision](#continuing-after-an-owner-decision)).
 
 A generic `wait` exists only while the run is paused with its capacity released.
 An approval `wait` lasts while its request or decision is unresolved (including
-while the resume is queued or executing) and is `null` once the decision was
-consumed. A run with neither has `wait: null`. The run `status` values are unchanged: no public status
+while the resume is queued or executing, and while a withdrawn decision's
+feedback is still owed to the agent) and is `null` once the decision was
+consumed or its withdrawal was carried by an attempt. A run with neither has `wait: null`. The run `status` values are unchanged: no public status
 was added. `coordinator status` is unchanged too, because its schema-1 document is
 validated strictly (an unknown field is rejected as an invalid response), so adding
 a field would make newer coordinators unreadable by the current CLI.
@@ -346,6 +365,33 @@ guidance is delivered to the resumed task labelled as owner guidance
 is not an approval and grants nothing beyond the original task scope. A different
 input for the same pause conflicts, and a response meant for an earlier pause can
 only return its own stored acknowledgement, never act on a later pause.
+
+### Reading the complete request
+
+`run show` and `run list` carry a compact copy of an approval request: each text is
+cut at 1500 characters and each list at 10 entries of 400 characters, and `clipped`
+names the fields that were cut. A request may be longer (4000 characters per text,
+20 entries per list, 32 KiB in all), so the owner must read it in full before
+approving it:
+
+```sh
+heimdall coordinator run approval RUN_ID --request REQUEST_ID
+```
+
+The command is read-only, honors `--coordinator-config FILE` and calls
+`GET /runs/RUN_ID/approvals/REQUEST_ID` (administrator key only). It prints the
+request as JSON on stdout: `requestId`, `runId`, `state`, `continuation`, `progress`,
+`taskId`, `taskIndex`, `attemptId`, the reviewed `revision`, the `question`, `scope`
+and `completedWork`, the `verification`, `artifacts`, `onApprove` and
+`onRequestChanges` lists, every entry in order, the recorded `response` (decision,
+feedback, time) and `createdAt`. The answer is validated against the run, the
+request and the limits above; receipt digests, acknowledgement internals,
+checkpoints, keys and capabilities are never printed. Exit status 0 means a valid
+request was printed. Exit status 1 means the arguments were incomplete (checked
+before any request), the request or run is unknown, the coordinator is an older
+version without the operation, the key was refused, the coordinator is unavailable
+or the answer was invalid; the diagnostic goes to stderr and nothing to stdout.
+The OpenChamber panel and the skill helper's `request` command use the same read.
 
 ### Draining and older runs
 
