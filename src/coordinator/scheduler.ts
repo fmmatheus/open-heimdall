@@ -103,6 +103,8 @@ export class CoordinatorScheduler {
 
   async resume(id: string, input: string): Promise<RunRecord> {
     const run = this.options.store.getRun(id);
+    // Refused first and again inside queueResume's transaction: a pending approval or unconsumed decision is not resumable by free text.
+    this.options.store.assertNoUnresolvedApproval(id);
     if (!run || run.status !== 'paused' || run.capacityReserved) throw new Error('Only a confirmed idle paused run may be resumed');
     const project = this.options.store.getProject(run.projectId)!;
     await (this.options.verifyWorktree ?? verifyManagedWorktree)({ project, run });

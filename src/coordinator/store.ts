@@ -6,19 +6,24 @@ import type { SQLOutputValue } from 'node:sqlite';
 import { isDeepStrictEqual } from 'node:util';
 import { checkpointReportInfo } from '../workflow/report-info.js';
 import { assertRepairMonotonic } from '../workflow/repair-state.js';
+import { contractDigest, validateSubmission } from '../workflow/contracts.js';
 import type { SubmissionKind } from '../workflow/contracts.js';
 import {
   assertOutcomeMatchesCheckpoint, assertSubmissionMatchesCheckpoint, isNativeOutcome, isSubmissionKind, isSubmissionReceipt, sameOutcome, sameSubmission,
 } from '../workflow/submission-store.js';
 import type { NativeOutcome, RunState, SubmissionReceipt } from '../workflow/types.js';
-import type { CoordinatorEvent, ProjectRecord, Receipt, RunRecord, RunStatus, StartBinding } from './types.js';
+import { CoordinatorError } from './errors.js';
+import type {
+  ApprovalAck, ApprovalContinuation, ApprovalDecision, ApprovalRecord, ApprovalRequestContent, ApprovalRevision, ApprovalState, ApprovalWait,
+  CoordinatorEvent, ProjectRecord, Receipt, RunRecord, RunStatus, StartBinding,
+} from './types.js';
 import { RUN_LIST_FEATURE_HEAD, RUN_LIST_MAX_BYTES, RUN_LIST_PAGE_SIZE } from './run-list.js';
 import type { RunListEntry, RunListPage } from './run-list.js';
 
 type Row = Record<string, SQLOutputValue>;
 type ProjectInput = Omit<ProjectRecord, 'id' | 'createdAt'>;
 type EnqueueInput = Pick<RunRecord, 'id' | 'projectId' | 'feature' | 'baseCommit' | 'worktreePath' | 'branch' | 'specification'>;
-const schemaVersion = 3;
+const schemaVersion = 4;
 const NATIVE_OUTCOME = 'native-outcome';
 const submissionsTable = (ifNotExists: string) => `
   CREATE TABLE ${ifNotExists}submissions (
@@ -28,6 +33,51 @@ const submissionsTable = (ifNotExists: string) => `
     submission_json TEXT NOT NULL CHECK (json_valid(submission_json)),
     created_at INTEGER NOT NULL,
     PRIMARY KEY (run_id, attempt_id, kind)
+  ) STRICT;`;
+/**
+ * Version 4 (additive, one migration): durable approval requests with the owner's response, and recorded responses to
+ * generic pauses. Both tables are created together so a later feature needs no further schema change. Existing rows are
+ * never read or rewritten.
+ */
+const approvalTables = (ifNotExists: string) => `
+  CREATE TABLE ${ifNotExists}approval_requests (
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    request_id TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK (phase IN ('planner','executor')),
+    task_index INTEGER NOT NULL CHECK (task_index >= 0),
+    task_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL,
+    receipt_digest TEXT NOT NULL,
+    request_json TEXT NOT NULL CHECK (json_valid(request_json)),
+    revision_json TEXT NOT NULL CHECK (json_valid(revision_json)),
+    state TEXT NOT NULL CHECK (state IN ('pending','answered','superseded')),
+    decision TEXT CHECK (decision IS NULL OR decision IN ('approve','request-changes')),
+    feedback TEXT,
+    response_json TEXT CHECK (response_json IS NULL OR json_valid(response_json)),
+    answered_at INTEGER,
+    continuation TEXT NOT NULL CHECK (continuation IN ('none','pending','queued','consumed','superseded')),
+    continuation_at INTEGER,
+    continuation_message_id TEXT,
+    consumed_attempt_id TEXT,
+    superseded_at INTEGER,
+    superseded_reason TEXT,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (run_id, request_id),
+    UNIQUE (request_id),
+    UNIQUE (run_id, attempt_id),
+    CHECK ((state = 'answered') = (decision IS NOT NULL)),
+    CHECK ((state = 'answered') = (response_json IS NOT NULL)),
+    CHECK (decision IS NULL OR decision != 'request-changes' OR (feedback IS NOT NULL AND length(trim(feedback)) > 0)),
+    CHECK (decision IS NULL OR decision != 'approve' OR feedback IS NULL)
+  ) STRICT;
+  CREATE INDEX ${ifNotExists}approval_requests_open ON approval_requests(run_id, state, continuation);
+  CREATE TABLE ${ifNotExists}run_responses (
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    pause_id TEXT NOT NULL,
+    input TEXT NOT NULL,
+    ack_json TEXT NOT NULL CHECK (json_valid(ack_json)),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (run_id, pause_id)
   ) STRICT;`;
 const transitions: Record<RunStatus, readonly RunStatus[]> = {
   queued: [],
@@ -52,6 +102,18 @@ function serialize(value: unknown): string {
 }
 function nullableJSON<T>(value: SQLOutputValue): T | null {
   return value === null ? null : JSON.parse(String(value)) as T;
+}
+const WAIT_TEXT_LIMIT = 1500;
+const WAIT_ENTRY_LIMIT = 400;
+const WAIT_LIST_LIMIT = 10;
+const WAIT_TITLE_LIMIT = 200;
+/** Clips to at most `limit` UTF-16 units without splitting a surrogate pair. */
+function clip(value: string, limit: number): { text: string; clipped: boolean } {
+  if (value.length <= limit) return { text: value, clipped: false };
+  let end = limit;
+  const last = value.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return { text: value.slice(0, end), clipped: true };
 }
 function sameBinding(left: StartBinding, right: StartBinding): boolean {
   return left.sessionID === right.sessionID && left.id === right.id && left.messageID === right.messageID && left.agent === right.agent;
@@ -219,6 +281,10 @@ export class CoordinatorStore {
         // Additive: the new table never touches existing receipts, checkpoints or run rows.
         this.db.exec(submissionsTable('IF NOT EXISTS ') + ' PRAGMA user_version = 3;');
         version = 3;
+      }
+      if (version === 3) {
+        this.db.exec(approvalTables('IF NOT EXISTS ') + ' PRAGMA user_version = 4;');
+        version = 4;
       }
       const configured = Number(this.db.prepare('SELECT global_concurrency FROM coordinator_settings WHERE singleton = 1').get()!.global_concurrency);
       if (configured !== globalConcurrency) throw new Error('Global concurrency differs from the persisted coordinator setting');
@@ -538,8 +604,12 @@ export class CoordinatorStore {
    * Immutable and idempotent. The owner must hold the capacity fence, the native start must be bound, and the receipt
    * must describe the checkpoint's current open binding exactly. An identical duplicate returns the stored receipt;
    * anything else for the same (run, attempt, kind) is rejected and the stored row is never touched.
+   *
+   * An `approval-required` executor result also publishes its approval request in the same transaction, bound to the
+   * identity the checkpoint matched and to `revision`, which the caller computed from the managed worktree. A duplicate
+   * returns the stored receipt and never publishes a second request.
    */
-  writeSubmission(id: string, ownerToken: string, receipt: SubmissionReceipt): SubmissionReceipt {
+  writeSubmission(id: string, ownerToken: string, receipt: SubmissionReceipt, revision?: ApprovalRevision): SubmissionReceipt {
     if (!isSubmissionReceipt(receipt) || receipt.runId !== id) throw new Error('Submission identity mismatch');
     const encoded = serialize(receipt);
     return this.transaction(() => {
@@ -554,6 +624,7 @@ export class CoordinatorStore {
       this.db.prepare('INSERT INTO submissions(run_id, attempt_id, kind, submission_json, created_at) VALUES (?, ?, ?, ?, ?)')
         .run(id, receipt.attemptId, receipt.kind, encoded, Date.now());
       this.event('submission.saved', run, null, { attemptId: receipt.attemptId, kind: receipt.kind, phase: receipt.phase, index: receipt.index, dispatch: receipt.dispatch, digest: receipt.digest });
+      if (receipt.kind === 'executor-result') this.publishApproval(run, receipt, revision);
       return JSON.parse(encoded) as SubmissionReceipt;
     });
   }
@@ -589,9 +660,23 @@ export class CoordinatorStore {
     return row ? JSON.parse(String(row.submission_json)) as T : undefined;
   }
 
+  /**
+   * Refuses when the run has an unresolved approval request, or an owner decision whose continuation has not been consumed.
+   * The generic resume operation is not a way to answer such a request or to replace its scoped decision context.
+   */
+  assertNoUnresolvedApproval(id: string): void {
+    const open = this.db.prepare(`SELECT request_id, state FROM approval_requests
+      WHERE run_id = ? AND (state = 'pending' OR (state = 'answered' AND continuation IN ('pending','queued'))) ORDER BY rowid LIMIT 1`).get(id);
+    if (!open) return;
+    throw new CoordinatorError(409, 'approval-pending', open.state === 'pending'
+      ? 'An approval request is waiting for an owner decision; answer it with the approval decision operation instead of resuming'
+      : 'An owner decision is recorded and its continuation has not been consumed; it continues automatically and cannot be replaced by a generic resume');
+  }
+
   queueResume(id: string, input: string): RunRecord {
     nonempty(input, 'Resume resolution');
     return this.transaction(() => {
+      this.assertNoUnresolvedApproval(id);
       const run = this.requireRun(id);
       if (run.status !== 'paused' || run.capacityReserved || !run.checkpoint || !run.binding) throw new Error('Resume requires a released paused run with a bound checkpoint');
       this.db.prepare("UPDATE runs SET status = 'queued', owner_token = NULL, prompt_message_id = ?, launch_action = 'resume', resolution = ?, resume_binding_json = NULL, launch_intent = 0, reason = NULL, queue_sequence = ?, version = version + 1, updated_at = ? WHERE id = ?")
@@ -600,5 +685,171 @@ export class CoordinatorStore {
       this.event('run.resume_queued', queued, null, { version: queued.version, messageID: queued.promptMessageId });
       return queued;
     });
+  }
+
+  // --- Approval requests and owner decisions ----------------------------------------------------------------------------
+
+  private approvalFromRow(row: Row): ApprovalRecord {
+    return {
+      runId: String(row.run_id), requestId: String(row.request_id), phase: row.phase as 'planner' | 'executor', taskIndex: Number(row.task_index),
+      taskId: String(row.task_id), attemptId: String(row.attempt_id), receiptDigest: String(row.receipt_digest),
+      request: JSON.parse(String(row.request_json)) as ApprovalRequestContent, revision: JSON.parse(String(row.revision_json)) as ApprovalRevision,
+      state: row.state as ApprovalState, decision: row.decision === null ? null : row.decision as ApprovalDecision,
+      feedback: row.feedback === null ? null : String(row.feedback), ack: nullableJSON<ApprovalAck>(row.response_json),
+      answeredAt: row.answered_at === null ? null : Number(row.answered_at), continuation: row.continuation as ApprovalContinuation,
+      continuationAt: row.continuation_at === null ? null : Number(row.continuation_at),
+      continuationMessageId: row.continuation_message_id === null ? null : String(row.continuation_message_id),
+      consumedAttemptId: row.consumed_attempt_id === null ? null : String(row.consumed_attempt_id),
+      supersededAt: row.superseded_at === null ? null : Number(row.superseded_at),
+      supersededReason: row.superseded_reason === null ? null : String(row.superseded_reason), createdAt: Number(row.created_at),
+    };
+  }
+
+  getApproval(runId: string, requestId: string): ApprovalRecord | null {
+    const row = this.db.prepare('SELECT * FROM approval_requests WHERE run_id = ? AND request_id = ?').get(runId, requestId);
+    return row ? this.approvalFromRow(row) : null;
+  }
+
+  /** The newest request of a run, whatever its state. */
+  latestApproval(runId: string): ApprovalRecord | null {
+    const row = this.db.prepare('SELECT * FROM approval_requests WHERE run_id = ? ORDER BY rowid DESC LIMIT 1').get(runId);
+    return row ? this.approvalFromRow(row) : null;
+  }
+
+  /**
+   * Publishes the approval request carried by an accepted executor submission. Called inside the submission transaction, so
+   * a request exists if and only if its receipt does. Identity comes from the receipt the checkpoint just matched; the
+   * content is re-validated with the executor-result contract, never taken from the receipt on trust.
+   */
+  private publishApproval(run: RunRecord, receipt: SubmissionReceipt, revision: ApprovalRevision | undefined): void {
+    const canonical = receipt.canonical;
+    const isApproval = typeof canonical === 'object' && canonical !== null && !Array.isArray(canonical) && (canonical as Record<string, unknown>).status === 'approval-required';
+    if (isApproval !== (receipt.outcome === 'approval-required')) throw new Error('Submission outcome does not match its approval payload');
+    if (!isApproval) return;
+    if (receipt.phase !== 'executor' || receipt.taskId === undefined) throw new Error('An approval request belongs to an executor task');
+    if (!revision || !/^[a-f0-9]{40,64}$/.test(revision.head) || !/^[a-f0-9]{64}$/.test(revision.digest)) throw new Error('An approval request requires a review revision computed by the coordinator');
+    const { taskId, ...payload } = canonical as Record<string, unknown>;
+    if (taskId !== receipt.taskId || receipt.digest !== contractDigest(receipt.contract, canonical)) throw new Error('Approval request does not match its submission');
+    const result = validateSubmission({ kind: 'executor-result', dodCount: run.checkpoint?.tasks[receipt.index]?.dod.length ?? 0 }, payload);
+    if (!result.ok || result.outcome !== 'approval-required') throw new Error('Approval request does not satisfy the executor-result contract');
+    const value = result.value as unknown as ApprovalRequestContent;
+    const content: ApprovalRequestContent = {
+      question: value.question, scope: value.scope, completedWork: value.completedWork, verification: [...value.verification],
+      artifacts: [...value.artifacts], onApprove: [...value.onApprove], onRequestChanges: [...value.onRequestChanges],
+    };
+    const now = Date.now();
+    const requestId = 'apr_' + randomUUID();
+    const replaced = this.db.prepare("UPDATE approval_requests SET state = 'superseded', superseded_at = ?, superseded_reason = ? WHERE run_id = ? AND state = 'pending'")
+      .run(now, 'A newer approval request was published', run.id);
+    this.db.prepare(`INSERT INTO approval_requests(
+      run_id, request_id, phase, task_index, task_id, attempt_id, receipt_digest, request_json, revision_json, state, continuation, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'none', ?)`).run(
+      run.id, requestId, receipt.phase, receipt.index, receipt.taskId, receipt.attemptId, receipt.digest, serialize(content),
+      serialize({ head: revision.head, digest: revision.digest }), now,
+    );
+    this.event('approval.requested', run, null, {
+      requestId, attemptId: receipt.attemptId, phase: receipt.phase, index: receipt.index, taskId: receipt.taskId,
+      revision: { head: revision.head, digest: revision.digest }, supersededRequests: Number(replaced.changes),
+    });
+  }
+
+  /** Why a pending request can no longer be answered, or undefined while it is the run's current paused-or-pending request. */
+  private staleApproval(run: RunRecord, request: ApprovalRecord): string | undefined {
+    if (run.status === 'succeeded' || run.status === 'failed') return 'The run has finished';
+    const state = run.checkpoint;
+    if (!state || state.phase !== request.phase || state.index !== request.taskIndex || state.tasks[request.taskIndex]?.id !== request.taskId) return 'The run is no longer on the task that asked for approval';
+    if (state.attempt?.id !== request.attemptId) return 'The task was dispatched again after this request';
+    if (state.status === 'paused' && (state.wait?.kind !== 'approval' || state.wait.attemptId !== request.attemptId)) return 'The run is not waiting for this approval request';
+    return undefined;
+  }
+
+  private supersedeApproval(run: RunRecord, request: ApprovalRecord, reason: string): void {
+    this.db.prepare("UPDATE approval_requests SET state = 'superseded', superseded_at = ?, superseded_reason = ? WHERE run_id = ? AND request_id = ? AND state = 'pending'")
+      .run(Date.now(), reason, run.id, request.requestId);
+    this.event('approval.superseded', run, null, { requestId: request.requestId, attemptId: request.attemptId, reason });
+  }
+
+  /**
+   * Records the owner's decision on one request, once. `revision` is the worktree's current review revision, computed by the
+   * caller before this transaction; it is required only while the request is pending.
+   *
+   * - A pending request whose checkpoint or reviewed material moved on is marked superseded and the call fails with
+   *   `approval-stale`; nothing is recorded.
+   * - An identical decision (and verbatim feedback) for an answered request returns the stored acknowledgement with
+   *   `retried: true`, whatever the run has done since.
+   * - Any other decision for an answered, superseded or foreign request fails; no stored value changes.
+   * - Recording stores the decision and the `pending` continuation together with the event in one transaction.
+   */
+  decideApproval(runId: string, requestId: string, input: { decision: ApprovalDecision; feedback?: string }, revision?: ApprovalRevision): ApprovalAck {
+    if (input.decision !== 'approve' && input.decision !== 'request-changes') throw new Error('Decision must be approve or request-changes');
+    const feedback = input.feedback ?? null;
+    const outcome = this.transaction((): { ack: ApprovalAck } | { stale: string } => {
+      const request = this.getApproval(runId, requestId);
+      if (!request) throw new CoordinatorError(404, 'approval-not-found', 'Approval request not found for this run');
+      if (request.state === 'answered') {
+        if (request.decision === input.decision && request.feedback === feedback) return { ack: { ...request.ack!, retried: true } };
+        throw new CoordinatorError(409, 'approval-conflict', 'This approval request was already answered with a different decision');
+      }
+      if (request.state === 'superseded') return { stale: request.supersededReason ?? 'The approval request was superseded' };
+      const run = this.requireRun(runId);
+      const moved = this.staleApproval(run, request);
+      if (moved) { this.supersedeApproval(run, request, moved); return { stale: moved }; }
+      if (!revision) throw new Error('A review revision is required to answer a pending approval request');
+      if (revision.head !== request.revision.head || revision.digest !== request.revision.digest) {
+        const reason = 'The reviewed worktree changed after the request was published';
+        this.supersedeApproval(run, request, reason);
+        return { stale: reason };
+      }
+      const now = Date.now();
+      const ack: ApprovalAck = {
+        runId, requestId, decision: input.decision, recordedAt: now, retried: false, continuation: 'pending',
+        run: { status: run.status, version: run.version },
+      };
+      this.db.prepare(`UPDATE approval_requests SET state = 'answered', decision = ?, feedback = ?, response_json = ?, answered_at = ?,
+        continuation = 'pending', continuation_at = ? WHERE run_id = ? AND request_id = ? AND state = 'pending'`)
+        .run(input.decision, feedback, serialize(ack), now, now, runId, requestId);
+      this.event('approval.answered', run, null, {
+        requestId, attemptId: request.attemptId, decision: input.decision, feedbackLength: feedback === null ? 0 : feedback.length, continuation: 'pending',
+      });
+      return { ack };
+    });
+    if ('stale' in outcome) throw new CoordinatorError(409, 'approval-stale', outcome.stale);
+    return outcome.ack;
+  }
+
+  /**
+   * The bounded projection of a run's current request, or null. An answered request whose continuation was consumed is
+   * history, and a superseded one is shown only while the run is still paused on it.
+   */
+  approvalWait(run: RunRecord): ApprovalWait | null {
+    const request = this.latestApproval(run.id);
+    if (!request) return null;
+    if (request.state === 'answered' && request.continuation === 'consumed') return null;
+    if (request.state === 'superseded' && run.status !== 'paused') return null;
+    const task = run.checkpoint?.tasks[request.taskIndex];
+    const clipped = { question: false, scope: false, completedWork: false, verification: false, artifacts: false, onApprove: false, onRequestChanges: false, taskTitle: false, feedback: false };
+    const text = (name: keyof typeof clipped, value: string, limit: number): string => {
+      const result = clip(value, limit);
+      if (result.clipped) clipped[name] = true;
+      return result.text;
+    };
+    const list = (name: keyof typeof clipped, values: string[]): string[] => {
+      if (values.length > WAIT_LIST_LIMIT) clipped[name] = true;
+      return values.slice(0, WAIT_LIST_LIMIT).map(value => {
+        const result = clip(value, WAIT_ENTRY_LIMIT);
+        if (result.clipped) clipped[name] = true;
+        return result.text;
+      });
+    };
+    return {
+      kind: 'approval', requestId: request.requestId, state: request.state, continuation: request.continuation, phase: request.phase,
+      taskIndex: request.taskIndex, taskId: request.taskId, taskTitle: task && task.id === request.taskId ? text('taskTitle', task.title, WAIT_TITLE_LIMIT) : null,
+      attemptId: request.attemptId, question: text('question', request.request.question, WAIT_TEXT_LIMIT), scope: text('scope', request.request.scope, WAIT_TEXT_LIMIT),
+      completedWork: text('completedWork', request.request.completedWork, WAIT_TEXT_LIMIT), verification: list('verification', request.request.verification),
+      artifacts: list('artifacts', request.request.artifacts), onApprove: list('onApprove', request.request.onApprove),
+      onRequestChanges: list('onRequestChanges', request.request.onRequestChanges), revision: request.revision,
+      response: request.state === 'answered' ? { decision: request.decision!, feedback: request.feedback === null ? null : text('feedback', request.feedback, WAIT_TEXT_LIMIT), answeredAt: request.answeredAt! } : null,
+      createdAt: request.createdAt, clipped,
+    };
   }
 }

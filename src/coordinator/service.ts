@@ -6,7 +6,9 @@ import { CoordinatorStore } from './store.js';
 import { CoordinatorScheduler } from './scheduler.js';
 import { createManagedExecutor, credentialSourceFor } from './executor.js';
 import type { CredentialSource } from './executor.js';
-import { inspectProject, planManagedWorktree, resolveBaseCommit } from './worktrees.js';
+import { inspectProject, planManagedWorktree, resolveBaseCommit, verifyManagedWorktree } from './worktrees.js';
+import { CoordinatorError } from './errors.js';
+import { computeReviewRevision } from './review-revision.js';
 import { checkRuntimeConflicts, snapshotSpecification } from './runtime.js';
 import { canonicalPlannedDirectory, positiveInteger } from './config.js';
 import { COORDINATOR_SERVICE_ID, COORDINATOR_STATUS_SCHEMA_VERSION, parseCoordinatorStatus } from './status.js';
@@ -20,7 +22,7 @@ import {
 } from './lifecycle.js';
 import type { CoordinatorInstance, CoordinatorPhase, CoordinatorShutdownSummary, LifecycleOptions, ShutdownAcknowledgement, ShutdownRecord, ShutdownStage, ShutdownStatus } from './lifecycle.js';
 import type { CoordinatorConfiguration } from './config.js';
-import type { ManagedExecutor, Receipt, RunRecord, StartBinding } from './types.js';
+import type { ApprovalDecision, ApprovalRecord, ApprovalRevision, ApprovalWait, ManagedExecutor, Receipt, RunRecord, StartBinding } from './types.js';
 import { isSubmissionKind } from '../workflow/submission-store.js';
 import type { NativeOutcome, RunState, SubmissionReceipt } from '../workflow/types.js';
 
@@ -34,9 +36,31 @@ const id = (value: string) => {
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value)) throw new Error('Invalid coordinator record ID');
   return value;
 };
-function publicRun(run: RunRecord) {
+/** `wait` is the bounded approval projection; the owner token, binding and specification never leave the coordinator. */
+function publicRun(run: RunRecord, wait: ApprovalWait | null) {
   const { ownerToken: _ownerToken, specification, binding: _binding, ...visible } = run;
-  return { ...visible, settings: specification.settings };
+  return { ...visible, settings: specification.settings, wait };
+}
+
+const FEEDBACK_LIMIT = 8000;
+/** The owner's answer to an approval request: a closed set of fields, with feedback required to request changes and refused to approve. */
+function parseDecision(input: Record<string, unknown>): { decision: ApprovalDecision; feedback?: string } {
+  for (const key of Object.keys(input)) if (key !== 'decision' && key !== 'feedback') throw new Error(`Unknown decision field: ${key}`);
+  const { decision, feedback } = input;
+  if (decision !== 'approve' && decision !== 'request-changes') throw new Error('decision must be "approve" or "request-changes"');
+  if (decision === 'approve') {
+    if (feedback !== undefined) throw new Error('Approving takes no feedback; request changes to send feedback');
+    return { decision };
+  }
+  if (typeof feedback !== 'string' || !feedback.trim()) throw new Error('Requesting changes requires nonempty feedback');
+  if (feedback.length > FEEDBACK_LIMIT || Buffer.byteLength(feedback) > 4 * FEEDBACK_LIMIT) throw new Error(`Feedback exceeds ${FEEDBACK_LIMIT} characters`);
+  return { decision, feedback };
+}
+
+/** Full inspection of one approval request for resolving a lost response; the request text is bounded by its contract. */
+function publicApproval(approval: ApprovalRecord) {
+  const { receiptDigest: _receiptDigest, ...visible } = approval;
+  return visible;
 }
 
 async function privateDirectory(directory: string): Promise<string> {
@@ -137,6 +161,14 @@ async function startOwnedService(options: ServiceOptions, root: string, ownershi
   const store = new CoordinatorStore({ databasePath, globalConcurrency: configuration.globalConcurrency });
   const executor = options.executor ?? createManagedExecutor({ getRun: runId => store.getRun(runId)!, credentialSource: options.credentialSource ?? credentialSourceFor({ credentials: options.credentials, managed: options.lifecycle?.mode === 'managed' }) });
   const scheduler = new CoordinatorScheduler({ ...options.scheduler, store, executor, endpoint: configuration.endpoint });
+  const visible = (run: RunRecord) => publicRun(run, store.approvalWait(run));
+  /** Measures the run's managed worktree with read-only git; fails without a result when it is not the reserved checkout. */
+  const reviewRevision = async (current: RunRecord): Promise<ApprovalRevision> => {
+    const project = store.getProject(current.projectId);
+    if (!project) throw new Error('Registered project is missing');
+    await (options.scheduler?.verifyWorktree ?? verifyManagedWorktree)({ project, run: current });
+    return computeReviewRevision(current.worktreePath, { roles: Object.keys(current.specification.agents) });
+  };
   let ready = false;
   let draining = false;
   let state: ShutdownState = 'running';
@@ -198,7 +230,10 @@ async function startOwnedService(options: ServiceOptions, root: string, ownershi
           if (method === 'PUT') {
             const receipt = await body(request) as unknown as SubmissionReceipt;
             if (receipt.attemptId !== attemptId || receipt.kind !== kind) throw new Error('Submission identity does not match its route');
-            send(200, store.writeSubmission(run.id, token, receipt)); return;
+            // Only a new approval request needs the worktree measured; a duplicate returns the stored receipt untouched.
+            const revision = kind === 'executor-result' && receipt.outcome === 'approval-required' && !store.readSubmission(run.id, token, attemptId, kind)
+              ? await reviewRevision(store.getRun(run.id)!) : undefined;
+            send(200, store.writeSubmission(run.id, token, receipt, revision)); return;
           }
         }
         if (segments[2] === 'outcomes' && segments.length === 4) {
@@ -249,7 +284,7 @@ async function startOwnedService(options: ServiceOptions, root: string, ownershi
         }
       }
       if (segments.length === 1 && segments[0] === 'runs') {
-        if (method === 'GET') { send(200, store.listRuns().map(publicRun)); return; }
+        if (method === 'GET') { send(200, store.listRuns().map(visible)); return; }
         if (method === 'POST') {
           const input = await body(request);
           const project = store.getProject(id(text(input.projectId, 'projectId')));
@@ -261,13 +296,30 @@ async function startOwnedService(options: ServiceOptions, root: string, ownershi
           await checkRuntimeConflicts(project, baseCommit, specification);
           const newId = randomUUID();
           const worktree = planManagedWorktree({ root, projectId: project.id, runId: newId });
-          send(201, publicRun(store.enqueue({ id: newId, projectId: project.id, feature, baseCommit, worktreePath: worktree.worktreePath, branch: worktree.branch, specification }))); return;
+          send(201, visible(store.enqueue({ id: newId, projectId: project.id, feature, baseCommit, worktreePath: worktree.worktreePath, branch: worktree.branch, specification }))); return;
         }
       }
-      if (method === 'GET' && segments.length === 2 && run) { send(200, publicRun(run)); return; }
+      if (method === 'GET' && segments.length === 2 && run) { send(200, visible(run)); return; }
       if (method === 'POST' && segments.length === 3 && run) {
-        if (segments[2] === 'reconcile') { send(200, publicRun(await scheduler.reconcile(run.id))); return; }
-        if (segments[2] === 'resume') { send(200, publicRun(await scheduler.resume(run.id, text((await body(request)).input, 'input')))); return; }
+        if (segments[2] === 'reconcile') { send(200, visible(await scheduler.reconcile(run.id))); return; }
+        if (segments[2] === 'resume') { send(200, visible(await scheduler.resume(run.id, text((await body(request)).input, 'input')))); return; }
+      }
+      if (segments.length >= 4 && segments[2] === 'approvals' && run) {
+        // Administrator only: a run capability is answered 403 above and can neither read nor change an approval row.
+        const requestId = id(segments[3]!);
+        if (method === 'GET' && segments.length === 4) {
+          const approval = store.getApproval(run.id, requestId);
+          if (!approval) throw new CoordinatorError(404, 'approval-not-found', 'Approval request not found for this run');
+          send(200, publicApproval(approval)); return;
+        }
+        if (method === 'POST' && segments.length === 5 && segments[4] === 'decision') {
+          const input = parseDecision(await body(request));
+          const approval = store.getApproval(run.id, requestId);
+          if (!approval) throw new CoordinatorError(404, 'approval-not-found', 'Approval request not found for this run');
+          // The reviewed material is measured here, outside the transaction; the store compares it to the request's own revision.
+          const revision = approval.state === 'pending' ? await reviewRevision(store.getRun(run.id)!) : undefined;
+          send(200, store.decideApproval(run.id, requestId, input, revision)); return;
+        }
       }
       if (method === 'GET' && segments.length === 1 && segments[0] === 'events') {
         const after = Number(url.searchParams.get('after') ?? 0);
@@ -282,7 +334,11 @@ async function startOwnedService(options: ServiceOptions, root: string, ownershi
         })); return;
       }
       send(404, { error: 'Unknown coordinator route' });
-    })().catch((error: unknown) => { if (!response.headersSent) send(400, { error: error instanceof Error ? error.message : 'Coordinator request failed' }); else response.destroy(); });
+    })().catch((error: unknown) => {
+      if (response.headersSent) { response.destroy(); return; }
+      if (error instanceof CoordinatorError) send(error.status, { error: error.message, code: error.code });
+      else send(400, { error: error instanceof Error ? error.message : 'Coordinator request failed' });
+    });
   });
   server.requestTimeout = 30000;
   try {
