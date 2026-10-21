@@ -133,6 +133,7 @@ function hostFor(f, behavior = {}) {
       const completeRead = request.method === 'GET' && /\/approvals\/[^/]+$/.test(request.path);
       // A read of a complete request that waits for the test to release it (read at that moment) or is rewritten on the way back.
       if (completeRead && behavior.gateRead) await behavior.gateRead;
+      if (request.method === 'GET' && request.path === behavior.gatedRunDetailPath && behavior.gateRunDetail) await behavior.gateRunDetail;
       const write = request.method === 'POST' && request.path !== '/directories/match';
       if (write && behavior.dropBefore) throw Object.assign(new Error('lost'), { code: 'HOST_TIMEOUT' });
       if (write && behavior.gate) await behavior.gate;
@@ -539,15 +540,30 @@ test('a shortened card: Approve stays off and sends nothing until the complete r
   assert.equal(approve.clickable, true);
 
   const version = store.getState().detail.version;
-  assert.equal(approve.click(), true);
-  await until(() => store.getState().action.ack !== null || store.getState().detail.wait.state === 'answered', 'the decision');
   const expected = await approvalContentDigest(request);
-  assert.deepEqual(posts(host), [{
-    method: 'POST', path: `/runs/${target.id}/approvals/${target.requestId}/decision`,
-    body: { decision: 'approve', displayedVersion: version, reviewed: { requestId: target.requestId, revision: REVISION, contentDigest: expected } },
-  }]);
-  assert.equal(f.approvalRow(target.requestId).decision, 'approve');
-  assert.equal(f.approvalRow(other.requestId).state, 'pending', 'no other run or request was touched');
+  const detailPath = `/runs/${target.id}`;
+  const detailReads = () => host.requests.filter(read => read.method === 'GET' && read.path === detailPath).length;
+  const readsBeforeDecision = detailReads();
+  let releaseDetail;
+  host.behavior.gatedRunDetailPath = detailPath;
+  host.behavior.gateRunDetail = new Promise(resolve => { releaseDetail = resolve; });
+  try {
+    assert.equal(approve.click(), true);
+    await until(() => store.getState().action.ack !== null && detailReads() === readsBeforeDecision + 1, 'the acknowledged decision with its detail refresh held');
+    assert.deepEqual({ runId: store.getState().action.ack.runId, requestId: store.getState().action.ack.requestId, decision: store.getState().action.ack.decision }, { runId: target.id, requestId: target.requestId, decision: 'approve' });
+    assert.equal(f.approvalRow(target.requestId).state, 'answered', 'the coordinator durably recorded the decision before the detail refresh');
+    assert.equal(store.getState().detail.wait.state, 'pending', 'an acknowledgement does not mean the card detail has refreshed');
+    assert.deepEqual(posts(host), [{
+      method: 'POST', path: `/runs/${target.id}/approvals/${target.requestId}/decision`,
+      body: { decision: 'approve', displayedVersion: version, reviewed: { requestId: target.requestId, revision: REVISION, contentDigest: expected } },
+    }]);
+    assert.equal(f.approvalRow(target.requestId).decision, 'approve');
+    assert.equal(f.approvalRow(other.requestId).state, 'pending', 'no other run or request was touched');
+  } finally {
+    host.behavior.gateRunDetail = null;
+    releaseDetail();
+  }
+  await until(() => store.getState().action.ack !== null && store.getState().detail.wait.requestId === target.requestId && store.getState().detail.wait.state === 'answered' && store.getState().detail.wait.progress === 'queued', 'the acknowledged decision and refreshed card detail');
   assert.equal(store.getState().detail.wait.state, 'answered');
   assert.equal(store.getState().detail.wait.progress, 'queued');
   assert.equal(JSON.stringify(host.requests).includes(SERVICE_TOKEN), false);
