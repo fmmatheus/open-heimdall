@@ -157,6 +157,32 @@ async function fingerprint(checkout: string, relative: string, budget: Budget): 
 }
 
 /**
+ * Copies the index for a private, read-only measurement and gives the copy a timestamp that is never newer than the source.
+ *
+ * Git trusts an entry's cached stat data only while the entry is older than the index file ("racy git"): when the entry's
+ * mtime is not older than the index file's mtime, a same-size edit made within the same timestamp could have escaped the
+ * stat comparison, so Git compares content instead. A plain copy is dated now, which would make every entry look safely
+ * older than the index and let a same-size edit with a restored mtime pass as unchanged. The copy therefore carries the
+ * source's mtime floored to whole seconds; an older timestamp can only cause extra content comparisons, never hide a change.
+ * The bytes and the timestamp are taken from one file version (one open handle, and the copy fails closed if that file
+ * changed while it was read), so the timestamp always describes the bytes it accompanies.
+ */
+async function copyIndex(source: string, target: string): Promise<void> {
+  try {
+    const handle = await fs.open(source, constants.O_RDONLY);
+    try {
+      const before = await handle.stat({ bigint: true });
+      const bytes = await handle.readFile();
+      const after = await handle.stat({ bigint: true });
+      if (!before.isFile() || before.ino !== after.ino || before.size !== after.size || before.mtimeNs !== after.mtimeNs || BigInt(bytes.length) !== after.size) throw unavailable();
+      await fs.writeFile(target, bytes);
+      const seconds = Number(before.mtimeNs / 1_000_000_000n);
+      await fs.utimes(target, seconds, seconds);
+    } finally { await handle.close(); }
+  } catch { throw unavailable(); }
+}
+
+/**
  * Computes the review revision of a managed worktree.
  *
  * The digest covers, in order: the HEAD commit; `git status --porcelain=v2` of every non-ignored path (staged, unstaged
@@ -192,8 +218,7 @@ export async function computeReviewRevision(directory: string, options: ReviewRe
   let status: Buffer;
   try {
     const source = (await collect(checkout, ['rev-parse', '--path-format=absolute', '--git-path', 'index'], budget, undefined, 4096)).toString('utf8').replace(/\r?\n$/, '');
-    try { await fs.copyFile(source, path.join(scratch, 'index')); }
-    catch { throw unavailable(); }
+    await copyIndex(source, path.join(scratch, 'index'));
     const environment = { GIT_INDEX_FILE: path.join(scratch, 'index') };
 
     status = await collect(checkout, ['status', '--porcelain=v2', '-z', '--untracked-files=all', '--no-renames', ...pathspec], budget, undefined, STATUS_LIMIT, environment);
