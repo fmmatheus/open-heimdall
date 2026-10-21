@@ -19,6 +19,7 @@ import { assertRacyEntry, createRacyRepository, indexSnapshot } from './fixtures
 import { openSubmissionBinding, recordDispatchPrompt } from '../dist/workflow/submission-store.js';
 import { computeRuntimeIdentity, runtimeIdentity } from '../dist/workflow/runtime-identity.js';
 import { sourcePackageRoot } from '../dist/coordinator/runtime-snapshot.js';
+import { approvalPromptBlock } from '../dist/workflow/approval-context.js';
 
 const git = (directory, args) => execFileSync('git', args, { cwd: directory, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 async function fixture(t) {
@@ -1038,6 +1039,96 @@ test('reviewed content changed after acceptance supersedes the decision at dispa
     assert.equal((await p.inspect()).continuation, 'consumed');
   });
 });
+
+// The decision is accepted from unchanged material and held from dispatch. The scheduler then measures the managed linked worktree
+// itself (the service passes no revision override) while a same-size tracked edit hides behind a racily clean index.
+for (const drift of [true, false]) {
+  test(drift
+    ? 'a same-size tracked edit hidden by a racily clean worktree index withdraws an accepted decision at dispatch for good'
+    : 'an unchanged worktree behind a racily clean worktree index consumes an accepted decision at dispatch', async t => {
+    const { p, dir, earlier, readme, restoreTimes } = await racyApproval(t);
+    const original = await fs.readFile(readme);
+    await p.pause({ idle: true });
+    const ack = await p.decide({ decision: 'approve' });
+    assert.deepEqual({ continuation: ack.continuation, retried: ack.retried, status: ack.run.status }, { continuation: 'queued', retried: false, status: 'queued' });
+    // Held from dispatch: pollIntervalMs is 60000 and no tick has run since the decision.
+    const queued = p.store.getRun(p.run.id);
+    assert.equal(queued.status, 'queued');
+    assert.equal(queued.launchAction, 'resume');
+    assert.equal(p.f.launches.length, 1);
+    assert.equal(context(queued).superseded, undefined);
+    const before = { checkpoint: queued.checkpoint, run: runIdentity(queued) };
+    assert.ok(before.checkpoint, 'the paused checkpoint is carried');
+    if (drift) {
+      await fs.writeFile(readme, 'agent edi!\n'); // same size, different bytes
+      await restoreTimes(readme);
+    }
+    // Immediately before the dispatch tick: only a content comparison can see the edit.
+    await assertRacyEntry(dir, 'README.md', earlier.indexPath, { drifted: drift });
+    assert.equal(git(dir, ['rev-parse', 'HEAD']), earlier.head);
+    assert.equal(p.store.getRun(p.run.id).status, 'queued');
+    await p.f.service().scheduler.tick();
+    await settled(p.store, p.run.id);
+    await p.f.waitForLaunch(2);
+    p.f.observation(ACTIVE);
+    const admitted = p.store.getRun(p.run.id);
+    assert.equal(p.f.launches.length, 2, 'one admission');
+    const delivered = context({ resolution: p.f.launches[1].resolution });
+    assert.equal(p.f.launches[1].resolution, admitted.resolution);
+    assert.equal(delivered.requestId, p.request.requestId);
+    assert.deepEqual(runIdentity(admitted), before.run);
+    assert.equal(git(dir, ['rev-parse', 'HEAD']), earlier.head);
+    git(dir, ['merge-base', '--is-ancestor', earlier.head, 'HEAD']);
+    assert.deepEqual({ tasks: admitted.checkpoint.tasks, results: admitted.checkpoint.results }, { tasks: before.checkpoint.tasks, results: before.checkpoint.results });
+    const consumed = () => p.store.events().filter(event => event.type === 'approval.consumed').length;
+    if (!drift) {
+      assert.equal(delivered.superseded, undefined);
+      assert.equal(delivered.decision, 'approve');
+      assert.match(approvalPromptBlock(delivered), /The owner approved exactly that scope/);
+      assert.equal((await p.inspect()).continuation, 'consumed');
+      assert.equal(consumed(), 1);
+      assert.deepEqual(await p.decide({ decision: 'approve' }), { ...ack, retried: true });
+      return;
+    }
+    // Withdrawn by the real measurement: the stored scope is context only and authorizes nothing.
+    assert.deepEqual(delivered.superseded, { reason: 'The reviewed worktree changed after the decision was recorded' });
+    assert.deepEqual(delivered.revision, p.request.revision);
+    const block = approvalPromptBlock(delivered);
+    assert.match(block, /SUPERSEDED/);
+    assert.match(block, /nothing is authorized/);
+    assert.match(block, /do NOT perform the gated action/);
+    assert.doesNotMatch(block, /The owner approved exactly that scope/);
+    const view = await p.inspect();
+    assert.equal(view.state, 'answered');
+    assert.equal(view.continuation, 'superseded');
+    assert.equal(view.progress, 'executing', 'withdrawn but not yet carried by an attempt: still being delivered');
+    assert.equal(consumed(), 0);
+    assert.equal(p.store.events().filter(event => event.type === 'approval.superseded').length, 1);
+    assert.equal(p.store.getApproval(p.run.id, p.request.requestId).consumedAttemptId, null);
+
+    // Returning to the reviewed bytes and mtime restores the reviewed revision, which must not revive the authorization.
+    await fs.writeFile(readme, original);
+    await restoreTimes(readme);
+    const returned = await computeReviewRevision(dir, { roles: Object.keys(p.run.specification.agents) });
+    assert.deepEqual(returned, p.request.revision, 'the worktree measures exactly what was reviewed again');
+    const launches = p.f.launches.length;
+    await p.f.service().scheduler.tick();
+    await p.f.service().scheduler.tick();
+    const after = p.store.getRun(p.run.id);
+    assert.equal(p.f.launches.length, launches, 'no new launch');
+    assert.equal(after.status, 'running');
+    assert.equal(after.resolution, admitted.resolution, 'the delivered context is unchanged');
+    assert.equal((await p.inspect()).continuation, 'superseded');
+    assert.deepEqual(await p.decide({ decision: 'approve' }), { ...ack, retried: true });
+    assert.equal(p.store.getRun(p.run.id).status, 'running');
+    assert.equal(p.store.getRun(p.run.id).resolution, admitted.resolution);
+    assert.equal(p.store.events().filter(event => event.type === 'approval.continuation_queued').length, 1);
+    assert.equal(p.store.events().filter(event => event.type === 'approval.answered').length, 1);
+    assert.equal(p.f.launches.length, launches);
+    assert.equal((await p.inspect()).continuation, 'superseded');
+    assert.equal(consumed(), 0);
+  });
+}
 
 test('requested changes are delivered verbatim, the superseded request cannot be approved and a corrected proposal has its own request', async t => {
   const feedback = '  Please:\n  - keep "quotes" and \'single quotes\'\n  - --decision approve --input=x\n\n\ttabbed and trailing space \n';
