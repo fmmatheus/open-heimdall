@@ -463,6 +463,12 @@ stat-based change detection for a same-size edit made within one timestamp tick 
 cause was not confirmed). It was not changed, and the failed run is not counted as a
 pass.
 
+> Correction (2026-10-21): the interpretation above ("a pre-existing timing
+> sensitivity ... the cause was not confirmed") was incomplete. The cause was a
+> defect in the review revision measurement, not test timing; see
+> [Follow-up (2026-10-21)](#follow-up-2026-10-21-review-revision-missed-same-size-edits-behind-a-racily-clean-index).
+> The original text is kept as the record of what was known at the time.
+
 Existing assertions that stayed intact in the same runs: the installed SDK and its
 Effect dependency load and execute the normal API; exports and the quota helper modules
 load; the installed pinned quota package resolves; the runtime snapshot refusals
@@ -508,3 +514,218 @@ redelivery), the unproven structural pause-identity observation, lifecycle and t
 timing nits, spec heuristics, bounded-watch timing and evaluator naming polish. The
 CLI and helper do not require a read receipt before approving. Integration follows a
 separate owner review.
+
+## Follow-up (2026-10-21): review revision missed same-size edits behind a racily clean index
+
+This section is appended to the record above; earlier sections are unchanged apart from
+a pointer to this one beside the earlier interpretation of the `binary edit` failure.
+It records a defect in the review revision measurement, its deterministic reproduction,
+the fix, the regression evidence at the three authority boundaries, an independent
+review, and the complete checks on the settled code.
+
+### Root cause
+
+The coordinator measures the reviewed worktree with a private copy of the worktree's
+index (`GIT_INDEX_FILE`), so measuring never writes the real index. `git` caches each
+tracked file's size and timestamp in the index and normally trusts them. Because a
+same-size edit made within the same timestamp tick would escape that comparison, `git`
+treats an entry as "racily clean" when the entry's timestamp is not older than the index
+file's own timestamp, and then compares content instead.
+
+The copy was made with `fs.copyFile`, so it was dated at the time of measurement. Every
+entry then looked safely older than the index, the content comparison was skipped, and a
+same-size edit whose file timestamp equalled the cached one was reported as unchanged.
+The revision digest therefore did not change, and the admission and dispatch checks
+that rely on it could accept or consume a decision for content that had changed.
+
+Correction of the earlier interpretation: the `binary edit` failure recorded in
+"Check results" above (a 4-byte same-size edit leaving the digest unchanged in one full
+run) was described there as a pre-existing timing sensitivity of unconfirmed cause. It
+is explained by this defect: when the edit, the cached entry and the real index fall in
+the same timestamp tick, the real index falls back to content while the freshly dated
+copy does not. The intermittent failure itself was not reproduced on demand at the time;
+the deterministic fixture below reproduces the same condition and fails on the base
+every time. The failure was therefore not a flaw of the test, and it was intermittent
+because it depended on the tick. The earlier text is kept unchanged.
+
+### Fix
+
+`copyIndex()` in `src/coordinator/review-revision.ts` replaces the plain copy. It opens
+the source index once, reads its status, its bytes and its status again through that
+handle, and fails closed (`revision-unavailable`) if the file changed while it was read
+or the byte count does not match. It writes the copy and dates it with the source's
+modification time floored to whole seconds, so the copy is never newer than the source
+and the racy content comparison happens exactly where it would for the real index. An
+older timestamp can only add content comparisons, never hide a change. The revision
+format, the `{ head, digest }` result, error codes, the sanitized Git environment, the
+budgets and the removal of the private scratch directory are unchanged.
+
+### Environment
+
+| Item | Value |
+| --- | --- |
+| Base | `3cf7d75` (`docs(validation): record approval follow-up fixes and verification`) |
+| Code under test | `d0e6d7c` |
+| Commits | `c90df85` (regression test and fixture), `84fb8f4` (fix), `d166f76` (owner decision admission tests), `d0e6d7c` (dispatch tests) |
+| Changed files | `src/coordinator/review-revision.ts`, `test/coordinator-service.test.mjs`, `test/fixtures/racy-index.mjs` |
+| OS / architecture | macOS (Darwin 27.0.0), arm64 |
+| Node.js / npm / Git | v22.22.3 / 10.9.8 / 2.54.0 (Apple Git-157) |
+| Evidence level | Automated, in process, with real Git, the real measurement code, and for admission and dispatch the real coordinator service, scheduler and authenticated owner decision route on a managed linked worktree. No real model, host or OpenChamber. |
+
+### Fixture design and preconditions
+
+`test/fixtures/racy-index.mjs` builds a disposable repository and reproduces the racy
+condition without sleeps, retries or skips:
+
+- `core.checkStat=minimal` and `core.trustctime=false` are set in the fixture
+  repository, so only whole-second modification time, size and mode are compared and a
+  rewrite cannot reveal itself through change time, nanoseconds or inode on any platform.
+- The tracked file and the source index are dated to the same integer second, an hour in
+  the past. The drift is a write of different bytes with the same size, followed by
+  restoring the file's timestamp to that second.
+- The test asserts the preconditions before the digest assertion: the worktree content
+  differs from the indexed blob; the cached size and second equal the file's; the index
+  second is not newer than the cached second; the original index reports the file as
+  modified; a freshly dated copy of the index reports it clean (the defect condition);
+  and the source index bytes and timestamp are unchanged by these controls.
+- The admission and dispatch tests use a managed linked worktree (its index is not at
+  `<worktree>/.git/index`) and assert the preconditions again immediately before the
+  owner decision and immediately before the dispatch tick.
+
+### Before and after
+
+| Measurement | Base `3cf7d75` | Fixed `d0e6d7c` |
+| --- | --- | --- |
+| `node --test --test-name-pattern='review revision' test/coordinator-service.test.mjs` | 4 tests, 3 pass, 1 fail: `review revision detects same-size unstaged edits that a racily clean index would hide`, at `binary edit: a same-size unstaged edit changes the digest` | 4 tests, 4 pass, 0 fail, 0 skipped |
+| The racy measurement test repeated 5 times | 5 of 5 fail | 5 of 5 pass |
+| `... --test-name-pattern='racily clean'` (measurement, admission, dispatch; drift tests and unchanged controls) | 6 tests, 3 pass, 3 fail: the three drift tests fail, the three controls pass | all pass |
+
+Preconditions pass on both the base and the fixed code, and the base fails only at the
+digest or decision assertion, so the tests detect the defect rather than a broken
+fixture. Digests of unchanged content were identical between base and fixed code in 10
+of 10 combinations (five repository states, each in the main checkout and a linked
+worktree; text, binary, executable, symlink, ignored and generated files), so existing
+requests and decisions keep matching.
+
+The real measurement also detects a same-size text edit, is stable when nothing
+changes, and returns exactly the original revision after the bytes and timestamp are
+restored. A staged-only entry plus a later racy edit and a revert to the staged bytes
+behave as before. That staged test also passes on the base; it is a check that staged
+semantics are preserved, not a reproduction of the defect (for an entry that differs
+from HEAD in the index, `git diff HEAD` reads the worktree file either way). The defect
+reproduces for entries equal to HEAD, that is, unstaged edits.
+
+After every measurement, including a deliberate failure (a change larger than the byte
+budget, which rejects with `revision-too-large`), the tests assert that the source index
+bytes and timestamp are unchanged, that `index.lock` does not exist, and that the private
+`heimdall-revision-*` scratch directory (observed by pointing the temporary directory
+at a fixture directory) is gone.
+
+### Admission and dispatch evidence
+
+Admission (`d166f76`), through the real owner decision route:
+
+- With same-size drift hidden by the racy index, the decision is refused with 409
+  `approval-stale`, the request becomes superseded, nothing is recorded or queued, no
+  launch occurs, and run identity, branch, earlier commit, checkpoint and the worktree
+  index (bytes and timestamp) are unchanged. On the base the test fails with
+  `Missing expected rejection.`.
+- The unchanged control in the same racy setup is accepted and queued (one answered
+  and one continuation event, no launch). It passes on the base as well.
+
+Dispatch (`d0e6d7c`), through `scheduler.tick()` and the scheduler's own measurement
+(no injected revision):
+
+- An accepted decision held from dispatch, followed by the same-size racy drift, is
+  superseded at dispatch. The delivered context says the decision is superseded and
+  authorizes nothing; there is no `approval.consumed` event; run id, session, branch,
+  worktree, earlier commit and checkpoint are retained. On the base the delivered
+  context is not superseded.
+- Restoring the original bytes and timestamp does not revive the authorization: the
+  continuation stays superseded, no new launch occurs, the delivered context is
+  unchanged and an identical retry is only acknowledged.
+- The unchanged control dispatches normally and the decision is consumed once.
+
+Existing tests that inject a fake revision (`test/coordinator-scheduler.test.mjs`) were
+not used as evidence for the real measurement. The existing withdrawn-feedback
+delivery, carrying-checkpoint and retained-work tests (`test/approval-workflow-example.test.mjs`)
+pass unchanged.
+
+### Review and corrections
+
+| Review | Reader | Scope | Result |
+| --- | --- | --- | --- |
+| 1 | fresh session | `3cf7d75..d0e6d7c`: mechanism, one-version copy, fixture preconditions, read-only guarantees, digest compatibility, error messages, authority boundaries, scope of the diff | 0 material, 9 minor |
+| 2 | fresh session | the correction diff | empty: no correction was required, and there were no commits after `d0e6d7c` |
+
+The reviewer reproduced the base failure and the fixed pass in a fresh context
+(extraction of the base commit outside the repository), and ran hostile-index and
+digest-compatibility probes. No material finding existed, so no correction code was
+written and none of the settled code is unreviewed. Minor items, kept benched and not
+changed:
+
+| Item | Note |
+| --- | --- |
+| The inode comparison in `copyIndex` | Vacuous because it compares two reads of one handle; size and modification time still detect a change. |
+| The fail-closed path for an index changing during the copy | Not covered by a test; it cannot be triggered deterministically. |
+| Index copy memory and budget | The copy is read into memory and not charged to the measurement budget; the previous plain copy was not budgeted either. |
+| Flooring | Can add content comparisons for entries touched in the same second as the index; verdicts do not change. |
+| Timestamps before 1970 | Would truncate toward zero; theoretical. |
+| Environment mutation in tests | The tests change `TMPDIR`; this is safe only while the tests of that file run sequentially, as they do by default. |
+| Staged-plus-racy test | Also passes on the base (see above). |
+| Golden digest | No committed golden-digest test for unchanged content; the compatibility measurement above was ad hoc and is not committed. |
+| Platforms | Linux and a Git build with nanosecond timestamps were not run. The floored copy has zero nanoseconds, so the set of entries it treats as racy is a superset of the real index's, and the fixture's integer-second precondition holds there too; this is reasoning, not execution. |
+
+### Check results
+
+All run in the foreground from the repository root on `d0e6d7c` with a clean tree and
+locked dependencies installed with `npm ci --ignore-scripts`. Logs were kept outside the
+repository.
+
+| Command | Result |
+| --- | --- |
+| `npm run check` | pass |
+| `npm test` | 1800 tests, 1800 pass, 0 fail, 0 cancelled, 0 skipped, 0 todo (1793 before this change plus 7 new tests) |
+| `npm run build:extension` | pass |
+| `npm run test:package` | 89 tests, 89 pass, 0 fail, 0 cancelled, 0 skipped |
+| `node scripts/live/skills-eval/run-eval.mjs selftest` | `passed`, 16 checks |
+
+Each full command ran once, with no failure, so no rerun was needed. Within the full
+run, the SDK and Effect execution test, the export tests, the runtime snapshot
+tamper refusals (`launch and resume refuse a tampered snapshot: edited dist file`) and
+the ownership guard tests (`global ownership guard is inert outside managed worktrees and
+disposes all hooks`, `ownership tampering and project identity changes fail without
+cleanup or replacement`) passed. The seven new tests are: `review revision detects
+same-size unstaged edits that a racily clean index would hide`, `review revision keeps
+staged semantics when a later same-size edit is racily clean`, `review revision leaves
+no index lock or private scratch after a measurement error`, `a same-size tracked edit
+hidden by a racily clean worktree index refuses the owner decision as stale`, `an
+unchanged worktree behind a racily clean worktree index still accepts and queues the
+owner decision`, `a same-size tracked edit hidden by a racily clean worktree index
+withdraws an accepted decision at dispatch for good` and `an unchanged worktree behind
+a racily clean worktree index consumes an accepted decision at dispatch`. The existing
+`the review revision is deterministic, content based, bounded and read only` test is
+unchanged and passed.
+
+### Cleanup
+
+Base comparisons used disposable `git archive` extractions of the base outside the
+repository, with the repository's `node_modules` linked; these, their scripts and logs
+were removed after the results above were summarized. Fixtures remove their own
+directories and the final full run left no `heimdall-revision-*` directory behind. Nothing
+in a real profile, project, coordinator or OpenChamber installation was read or
+changed. The fixtures are synthetic and contain no credentials.
+
+### Unverified
+
+- Linux, a Git build with nanosecond timestamps, and hosted CI; only the local macOS
+  run above was executed.
+- The managed path on a real OpenCode host, the real OpenChamber render and click, and
+  whether OpenChamber's guest page provides Web Crypto (unchanged from the earlier
+  follow-up).
+- Real model behavior; the agent in the tests is scripted.
+- Behavior of the real racy-git window on a real long-lived worktree beyond the
+  deterministic fixture (the fixture reproduces the condition; frequency in the field
+  is unknown).
+
+Integration follows a separate owner review; nothing was pushed or merged.
