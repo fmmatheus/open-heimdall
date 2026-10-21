@@ -15,6 +15,7 @@ import { contractDigest, contractRef } from '../dist/workflow/contracts.js';
 import { computeReviewRevision, ReviewRevisionError } from '../dist/coordinator/review-revision.js';
 import { DatabaseSync } from 'node:sqlite';
 import { hiddenTailRequest, nearLimitRequest } from './fixtures/approval-requests.mjs';
+import { createRacyRepository, indexSnapshot } from './fixtures/racy-index.mjs';
 import { openSubmissionBinding, recordDispatchPrompt } from '../dist/workflow/submission-store.js';
 import { computeRuntimeIdentity, runtimeIdentity } from '../dist/workflow/runtime-identity.js';
 import { sourcePackageRoot } from '../dist/coordinator/runtime-snapshot.js';
@@ -739,6 +740,89 @@ test('the review revision is deterministic, content based, bounded and read only
   const plain = await fs.mkdtemp(path.join(os.tmpdir(), 'hd-rev-plain-'));
   t.after(() => fs.rm(plain, { recursive: true, force: true }));
   await assert.rejects(computeReviewRevision(plain), error => error instanceof ReviewRevisionError && error.code === 'revision-unavailable' && !error.message.includes(plain));
+});
+
+// A racily clean index (see test/fixtures/racy-index.mjs): the private index copy must not make Git trust stale stat data.
+// `scratchRoot` is also TMPDIR for the test, so leftover private scratch directories are observable.
+async function racyWorkspace(t) {
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'hd-racy-')));
+  const scratchRoot = path.join(root, 'tmp');
+  await fs.mkdir(scratchRoot);
+  const previous = process.env.TMPDIR;
+  process.env.TMPDIR = scratchRoot;
+  t.after(async () => {
+    if (previous === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = previous;
+    await fs.rm(root, { recursive: true, force: true });
+  });
+  const leftovers = async () => (await fs.readdir(scratchRoot)).filter(name => name.startsWith('heimdall-revision-'));
+  return { root, scratchRoot, leftovers };
+}
+
+/** Measures and proves the measurement was read only: source index bytes and mtime unchanged, no lock, no scratch left. */
+async function measureReadOnly(repository, workspace, options) {
+  const before = await indexSnapshot(repository.directory);
+  const revision = await computeReviewRevision(repository.directory, options);
+  assert.deepEqual(await indexSnapshot(repository.directory), before, 'the source index bytes and mtime are unchanged');
+  await assert.rejects(fs.stat(path.join(repository.directory, '.git', 'index.lock')), { code: 'ENOENT' });
+  assert.deepEqual(await workspace.leftovers(), [], 'no private scratch directory is left behind');
+  return revision;
+}
+
+test('review revision detects same-size unstaged edits that a racily clean index would hide', async t => {
+  const workspace = await racyWorkspace(t);
+  const repository = await createRacyRepository(workspace.root, { 'notes.txt': 'one\n', 'blob.bin': Buffer.from([0, 1, 2, 3]) });
+  const base = await measureReadOnly(repository, workspace);
+  assert.equal(base.head, repository.git('rev-parse', 'HEAD'));
+  assert.deepEqual(await measureReadOnly(repository, workspace), base, 'an unchanged worktree measures the same twice');
+
+  const edits = [
+    ['binary', 'blob.bin', Buffer.from([0, 1, 2, 3]), Buffer.from([0, 1, 2, 4])],
+    ['text', 'notes.txt', 'one\n', 'two\n'],
+  ];
+  for (const [label, relative, original, edited] of edits) {
+    await repository.write(relative, edited);
+    await repository.assertRacy(relative);
+    const changed = await measureReadOnly(repository, workspace);
+    assert.equal(changed.head, base.head, `${label} edit: HEAD is unchanged`);
+    assert.notEqual(changed.digest, base.digest, `${label} edit: a same-size unstaged edit changes the digest`);
+    assert.deepEqual(await measureReadOnly(repository, workspace), changed, `${label} edit: the changed state measures the same twice`);
+    await repository.write(relative, original);
+    assert.deepEqual(await measureReadOnly(repository, workspace), base, `${label} edit: reverting bytes and mtime restores the revision`);
+  }
+});
+
+test('review revision keeps staged semantics when a later same-size edit is racily clean', async t => {
+  const workspace = await racyWorkspace(t);
+  const repository = await createRacyRepository(workspace.root, { 'notes.txt': 'one\n' });
+  const base = await measureReadOnly(repository, workspace);
+
+  await repository.stage('notes.txt', 'two\n');
+  const stagedBlob = repository.git('rev-parse', ':notes.txt');
+  const staged = await measureReadOnly(repository, workspace);
+  assert.notEqual(staged.digest, base.digest, 'staged content is part of the revision');
+  assert.deepEqual(await measureReadOnly(repository, workspace), staged, 'the staged-only control is stable');
+
+  await repository.write('notes.txt', 'tre\n');
+  await repository.assertRacy('notes.txt', { expectedBlob: stagedBlob });
+  const racy = await measureReadOnly(repository, workspace);
+  assert.notEqual(racy.digest, staged.digest, 'a racily clean edit on top of staged content changes the digest');
+  assert.notEqual(racy.digest, base.digest);
+  assert.equal(repository.git('rev-parse', ':notes.txt'), stagedBlob, 'the real index still holds the staged blob');
+
+  await repository.write('notes.txt', 'two\n');
+  assert.deepEqual(await measureReadOnly(repository, workspace), staged, 'restoring the staged bytes restores the staged revision');
+});
+
+test('review revision leaves no index lock or private scratch after a measurement error', async t => {
+  const workspace = await racyWorkspace(t);
+  const repository = await createRacyRepository(workspace.root, { 'big.bin': Buffer.alloc(64 * 1024, 7) });
+  await repository.write('big.bin', Buffer.alloc(64 * 1024 + 1, 8));
+  const before = await indexSnapshot(repository.directory);
+  // The tracked diff is far larger than the budget, so the error is raised while the private index copy exists.
+  await assert.rejects(computeReviewRevision(repository.directory, { maxBytes: 16 * 1024 }), error => error instanceof ReviewRevisionError && error.code === 'revision-too-large');
+  assert.deepEqual(await indexSnapshot(repository.directory), before, 'the source index bytes and mtime are unchanged after an error');
+  await assert.rejects(fs.stat(path.join(repository.directory, '.git', 'index.lock')), { code: 'ENOENT' });
+  assert.deepEqual(await workspace.leftovers(), [], 'no private scratch directory is left behind after an error');
 });
 
 // --- Owner decisions: once-only continuation ------------------------------------------------------------------------------
