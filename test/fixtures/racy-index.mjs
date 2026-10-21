@@ -38,8 +38,8 @@ export function diffFilesStatus(cwd, relative, extra = {}) {
 export const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 
 /** Bytes and nanosecond mtime of the index file, to prove that a measurement never touched it. */
-export async function indexSnapshot(directory) {
-  const file = path.join(directory, '.git', 'index');
+export async function indexSnapshot(directory, indexPath = path.join(directory, '.git', 'index')) {
+  const file = indexPath;
   const [bytes, stat] = await Promise.all([fs.readFile(file), fs.stat(file, { bigint: true })]);
   return { bytes: sha256(bytes), mtimeNs: stat.mtimeNs };
 }
@@ -51,6 +51,39 @@ export function cachedStat(directory, relative, extra = {}) {
   const size = /^\s+size: (\d+)/m.exec(output);
   assert.ok(mtime && size, 'git ls-files --debug output is parseable');
   return { mtimeSeconds: Number(mtime[1]), size: Number(size[1]) };
+}
+
+/**
+ * Asserts the racy preconditions of one tracked entry in the worktree at `directory`, whose index file is `indexPath`
+ * (a linked worktree keeps its index outside the worktree). Each check is an assertion, never a retry.
+ *
+ * With `drifted` (the default) the file holds same-size bytes that differ from the indexed blob: the original index must
+ * report it modified while a freshly dated copy of the index reports it clean. Without `drifted` the file still equals the
+ * indexed blob, but the index timestamp is racy all the same. The index bytes and mtime are never changed by the checks.
+ */
+export async function assertRacyEntry(directory, relative, indexPath, { expectedBlob, drifted = true } = {}) {
+  const stat = await fs.stat(path.join(directory, ...relative.split('/')));
+  const worktree = gitOutput(directory, ['hash-object', '--', relative]);
+  const indexed = gitOutput(directory, ['ls-files', '-s', '--', relative]).split(/\s+/)[1];
+  if (drifted) assert.notEqual(worktree, indexed, `${relative}: worktree bytes differ from the indexed blob`);
+  else assert.equal(worktree, indexed, `${relative}: worktree bytes equal the indexed blob`);
+  if (expectedBlob) assert.equal(indexed, expectedBlob, `${relative}: the index still holds the staged blob`);
+  const cached = cachedStat(directory, relative);
+  assert.equal(cached.size, stat.size, `${relative}: cached size equals the file size`);
+  assert.equal(cached.mtimeSeconds, Math.floor(stat.mtimeMs / 1000), `${relative}: cached mtime second equals the file mtime second`);
+  const indexStat = await fs.stat(indexPath);
+  assert.ok(Math.floor(indexStat.mtimeMs / 1000) <= cached.mtimeSeconds, 'the index is not newer than the cached mtime second, so Git must compare content');
+
+  const before = await indexSnapshot(directory, indexPath);
+  assert.equal(diffFilesStatus(directory, relative), drifted ? 1 : 0, `${relative}: the original index reports the file ${drifted ? 'modified' : 'clean'}`);
+  const scratch = await fs.mkdtemp(path.join(os.tmpdir(), 'racy-copy-'));
+  try {
+    const copy = path.join(scratch, 'index');
+    await fs.copyFile(indexPath, copy);
+    assert.ok(Math.floor((await fs.stat(copy)).mtimeMs / 1000) > cached.mtimeSeconds, 'a plain copy of the index is newer than the cached mtime second');
+    assert.equal(diffFilesStatus(directory, relative, { GIT_INDEX_FILE: copy }), 0, `${relative}: a freshly dated copy of the index reports the file clean`);
+  } finally { await fs.rm(scratch, { recursive: true, force: true }); }
+  assert.deepEqual(await indexSnapshot(directory, indexPath), before, 'the controls leave the source index bytes and mtime untouched');
 }
 
 /**
@@ -93,29 +126,7 @@ export async function createRacyRepository(parent, files) {
       await api.ageIndex();
     },
     /** Preconditions that make the defect reproducible; each is an assertion, never a retry. */
-    async assertRacy(relative, { expectedBlob } = {}) {
-      const stat = await fs.stat(file(relative));
-      const worktree = gitOutput(directory, ['hash-object', '--', relative]);
-      const indexed = gitOutput(directory, ['ls-files', '-s', '--', relative]).split(/\s+/)[1];
-      assert.notEqual(worktree, indexed, `${relative}: worktree bytes differ from the indexed blob`);
-      if (expectedBlob) assert.equal(indexed, expectedBlob, `${relative}: the index still holds the staged blob`);
-      const cached = cachedStat(directory, relative);
-      assert.equal(cached.size, stat.size, `${relative}: cached size equals the file size`);
-      assert.equal(cached.mtimeSeconds, Math.floor(stat.mtimeMs / 1000), `${relative}: cached mtime second equals the file mtime second`);
-      const indexStat = await fs.stat(api.indexPath);
-      assert.ok(Math.floor(indexStat.mtimeMs / 1000) <= cached.mtimeSeconds, 'the index is not newer than the cached mtime second, so Git must compare content');
-
-      const before = await indexSnapshot(directory);
-      assert.equal(diffFilesStatus(directory, relative), 1, `${relative}: the original index reports the file modified`);
-      const scratch = await fs.mkdtemp(path.join(os.tmpdir(), 'racy-copy-'));
-      try {
-        const copy = path.join(scratch, 'index');
-        await fs.copyFile(api.indexPath, copy);
-        assert.ok(Math.floor((await fs.stat(copy)).mtimeMs / 1000) > cached.mtimeSeconds, 'a plain copy of the index is newer than the cached mtime second');
-        assert.equal(diffFilesStatus(directory, relative, { GIT_INDEX_FILE: copy }), 0, `${relative}: a freshly dated copy of the index reports the file clean`);
-      } finally { await fs.rm(scratch, { recursive: true, force: true }); }
-      assert.deepEqual(await indexSnapshot(directory), before, 'the controls leave the source index bytes and mtime untouched');
-    },
+    assertRacy: (relative, options) => assertRacyEntry(directory, relative, api.indexPath, options),
   };
 
   for (const [relative, bytes] of Object.entries(files)) {

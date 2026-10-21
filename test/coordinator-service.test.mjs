@@ -15,7 +15,7 @@ import { contractDigest, contractRef } from '../dist/workflow/contracts.js';
 import { computeReviewRevision, ReviewRevisionError } from '../dist/coordinator/review-revision.js';
 import { DatabaseSync } from 'node:sqlite';
 import { hiddenTailRequest, nearLimitRequest } from './fixtures/approval-requests.mjs';
-import { createRacyRepository, indexSnapshot } from './fixtures/racy-index.mjs';
+import { assertRacyEntry, createRacyRepository, indexSnapshot } from './fixtures/racy-index.mjs';
 import { openSubmissionBinding, recordDispatchPrompt } from '../dist/workflow/submission-store.js';
 import { computeRuntimeIdentity, runtimeIdentity } from '../dist/workflow/runtime-identity.js';
 import { sourcePackageRoot } from '../dist/coordinator/runtime-snapshot.js';
@@ -560,6 +560,100 @@ test('changes confined to ignored or generated runtime paths do not change the r
   assert.equal(ack.retried, false);
   assert.equal((await p.inspect()).state, 'answered');
 });
+
+// A same-size edit hidden by a racily clean index of the managed linked worktree. The service measures the worktree itself,
+// through its real computeReviewRevision; nothing here injects or precomputes a revision.
+async function racyApproval(t) {
+  const seconds = Math.floor(Date.now() / 1000) - 3600;
+  const earlier = { head: '', indexPath: '' };
+  const age = target => fs.utimes(target, seconds, seconds);
+  const p = await published(t, {
+    // Fixture-local stat configuration of the disposable project: only mtime seconds, size and mode are compared.
+    project: async f => { git(f.project, ['config', 'core.checkStat', 'minimal']); git(f.project, ['config', 'core.trustctime', 'false']); },
+    prepare: async dir => {
+      // Agent work committed before the request is published, so the measured HEAD is not the pinned base.
+      const readme = path.join(dir, 'README.md');
+      await fs.writeFile(readme, 'agent edit\n');
+      await age(readme);
+      gitIn(dir, ['add', 'README.md']);
+      gitIn(dir, ['commit', '-m', 'agent work']);
+      earlier.head = git(dir, ['rev-parse', 'HEAD']);
+      earlier.indexPath = git(dir, ['rev-parse', '--path-format=absolute', '--git-path', 'index']);
+      await age(earlier.indexPath);
+    },
+  });
+  const dir = p.run.worktreePath;
+  assert.equal(git(dir, ['config', 'core.checkStat']), 'minimal', 'the managed linked worktree uses the fixture stat configuration');
+  assert.notEqual(earlier.indexPath, path.join(dir, '.git', 'index'), 'the managed worktree is a linked worktree with its own index');
+  assert.equal(p.request.revision.head, earlier.head, 'the published revision covers the earlier commit');
+  return { p, dir, earlier, readme: path.join(dir, 'README.md'), restoreTimes: age };
+}
+
+const runIdentity = run => ({ id: run.id, parentSessionId: run.parentSessionId, branch: run.branch, worktreePath: run.worktreePath });
+
+for (const drift of [true, false]) {
+  test(drift
+    ? 'a same-size tracked edit hidden by a racily clean worktree index refuses the owner decision as stale'
+    : 'an unchanged worktree behind a racily clean worktree index still accepts and queues the owner decision', async t => {
+    const { p, dir, earlier, readme, restoreTimes } = await racyApproval(t);
+    if (drift) {
+      await fs.writeFile(readme, 'agent edi!\n'); // same size, different bytes
+      await restoreTimes(readme);
+    }
+    await p.pause({ idle: true });
+    // Immediately before the decision: the racy preconditions hold, so only a content comparison can see the edit.
+    await assertRacyEntry(dir, 'README.md', earlier.indexPath, { drifted: drift });
+    const indexBefore = await indexSnapshot(dir, earlier.indexPath);
+    const runBefore = p.store.getRun(p.run.id);
+    const launchesBefore = p.f.launches.length;
+    const headBefore = git(dir, ['rev-parse', 'HEAD']);
+    assert.equal(headBefore, earlier.head);
+    assert.equal(runBefore.status, 'paused');
+
+    const decision = p.decide({ decision: 'approve' });
+    if (!drift) {
+      const ack = await decision;
+      assert.deepEqual({ decision: ack.decision, retried: ack.retried, continuation: ack.continuation, status: ack.run.status }, { decision: 'approve', retried: false, continuation: 'queued', status: 'queued' });
+      const view = await p.inspect();
+      assert.equal(view.state, 'answered');
+      assert.equal(view.continuation, 'queued');
+      assert.equal(p.store.getRun(p.run.id).status, 'queued');
+      assert.equal(p.store.getRun(p.run.id).launchAction, 'resume');
+      assert.equal(p.store.events().filter(event => event.type === 'approval.answered').length, 1);
+      assert.equal(p.store.events().filter(event => event.type === 'approval.continuation_queued').length, 1);
+      assert.equal(p.f.launches.length, launchesBefore, 'queueing alone starts nothing');
+    } else {
+      await assert.rejects(decision, status(409, 'approval-stale'));
+      const stored = await p.inspect();
+      assert.equal(stored.state, 'superseded');
+      assert.equal(stored.decision, null);
+      assert.equal(stored.ack, null);
+      assert.equal(stored.continuation, 'none');
+      assert.match(stored.supersededReason, /worktree changed/);
+      assert.equal(p.sql("SELECT count(*) AS count FROM approval_requests WHERE state != 'superseded' OR decision IS NOT NULL")[0].count, 0);
+      const events = p.store.events();
+      assert.equal(events.filter(event => event.type === 'approval.answered').length, 0);
+      assert.equal(events.filter(event => event.type === 'approval.continuation_queued').length, 0);
+      assert.equal(events.filter(event => event.type === 'approval.superseded').length, 1);
+      const after = p.store.getRun(p.run.id);
+      assert.equal(after.status, 'paused', 'the run is not queued');
+      assert.equal(after.launchAction, runBefore.launchAction);
+      assert.equal(after.resolution, runBefore.resolution);
+      assert.equal(after.capacityReserved, false);
+      assert.deepEqual(after.checkpoint, runBefore.checkpoint, 'the paused checkpoint is unchanged');
+      // A scheduler pass has nothing to dispatch either.
+      await p.f.service().scheduler.tick();
+      assert.equal(p.store.getRun(p.run.id).status, 'paused');
+      assert.equal(p.f.launches.length, launchesBefore, 'no additional launch');
+    }
+    const after = p.store.getRun(p.run.id);
+    assert.deepEqual(runIdentity(after), runIdentity(runBefore));
+    assert.equal(git(dir, ['rev-parse', 'HEAD']), headBefore);
+    git(dir, ['merge-base', '--is-ancestor', earlier.head, 'HEAD']);
+    assert.deepEqual(await indexSnapshot(dir, earlier.indexPath), indexBefore, 'the decision leaves the worktree index bytes and mtime unchanged');
+    await assert.rejects(fs.stat(`${earlier.indexPath}.lock`), { code: 'ENOENT' });
+  });
+}
 
 test('the generic resume is refused with approval-pending while a request is pending or its decision is unconsumed', async t => {
   const p = await published(t);
