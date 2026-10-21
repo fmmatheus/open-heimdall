@@ -7,6 +7,9 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { DatabaseSync } from 'node:sqlite';
 import { CoordinatorStore } from '../dist/coordinator/store.js';
+import { CoordinatorError } from '../dist/coordinator/errors.js';
+import { contractDigest, contractRef } from '../dist/workflow/contracts.js';
+import { openSubmissionBinding, recordDispatchPrompt } from '../dist/workflow/submission-store.js';
 
 const execute = promisify(execFile);
 const moduleUrl = new URL('../dist/coordinator/store.js', import.meta.url).href;
@@ -91,9 +94,9 @@ test('SQLite schema is strict and versioned; authoritative global limits cannot 
   const store = f.open();
   const db = new DatabaseSync(f.databasePath);
   try {
-    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 3);
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 4);
     const tables = db.prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all();
-    assert.equal(tables.length, 7);
+    assert.equal(tables.length, 9);
     assert.ok(tables.every(row => /STRICT\s*$/i.test(row.sql)));
   } finally { db.close(); }
   assert.throws(() => new CoordinatorStore({ databasePath: f.databasePath, globalConcurrency: 3 }), /persisted/);
@@ -543,4 +546,251 @@ test('a checkpoint from a stale view can never erase a seal, conflict, outcome o
   store.saveCheckpoint(run.id, run.ownerToken, { ...base, submissionRepair: record({ sealed: markers.sealed }) });
   store.saveCheckpoint(run.id, run.ownerToken, { ...base, phase: 'executor', attempt: undefined });
   assert.equal(store.getRun(run.id).checkpoint.submissionRepair, undefined);
+});
+
+// --- Schema v4: durable approval requests and owner decisions -------------------------------------------------------------
+
+const revision = { head: 'b'.repeat(40), digest: 'c'.repeat(64) };
+const approvalPayload = overrides => ({
+  status: 'approval-required', question: 'Ship the change?', scope: 'Merge only the reviewed commit', completedWork: 'Implemented and tested',
+  verification: ['npm test: 12 passed'], artifacts: ['src/a.ts'], onApprove: ['Merge the branch'], onRequestChanges: ['Correct and ask again'], ...overrides,
+});
+/** A structured executor checkpoint with an open submission binding for task T1, attempt `attempt-1`. */
+function structuredCheckpoint(run, overrides = {}) {
+  const state = {
+    ...checkpoint(run), protocol: 'structured-v1', phase: 'executor', child: 'child-session',
+    tasks: [{ id: 'T1', title: 'Synthetic task', brief: 'Do it', dependsOn: [], dod: ['gate one'] }],
+    attempt: { id: 'attempt-1', phase: 'executor', index: 0, child: 'child-session', status: 'admitted', startedAt: 1000, model: 'anthropic/executor' },
+    ...overrides,
+  };
+  state.submissionBinding = recordDispatchPrompt(openSubmissionBinding(state, 1), 'prompt-1');
+  return state;
+}
+function approvalReceipt(run, state, payload = approvalPayload(), overrides = {}) {
+  const canonical = { ...payload, taskId: 'T1' };
+  const contract = contractRef('executor-result');
+  return {
+    receiptVersion: 1, protocol: 'structured-v1', contract, kind: 'executor-result', runId: run.id, phase: 'executor', index: 0, taskId: 'T1',
+    attemptId: 'attempt-1', dispatch: 1, parent: state.parent, child: 'child-session', origin: 'prompt-1',
+    caller: { sessionID: 'child-session', agent: 'executor', messageID: 'm1', callId: 'c1' }, runtime: { packageVersion: '0.0.0', protocol: 'structured-v1' },
+    outcome: 'approval-required', rawPayload: payload, canonical, digest: contractDigest(contract, canonical), acceptedAt: 1, ...overrides,
+  };
+}
+async function approvalFixture(t, payload) {
+  const f = await admitFixture(t);
+  f.store.bindStart(f.run.id, f.run.ownerToken, binding(f.run));
+  const state = structuredCheckpoint(f.run);
+  f.store.saveCheckpoint(f.run.id, f.run.ownerToken, state);
+  f.run = f.store.transition(f.run.id, f.run.ownerToken, f.run.version, 'running');
+  const receipt = approvalReceipt(f.run, state, payload);
+  f.store.writeSubmission(f.run.id, f.run.ownerToken, receipt, revision);
+  const request = f.store.latestApproval(f.run.id);
+  return { ...f, state, receipt, request };
+}
+/** Mirrors the runner's pause on a valid approval request. */
+function pauseOnApproval(f) {
+  const paused = { ...f.state, status: 'paused', attempt: { ...f.state.attempt, status: 'rejected' }, wait: { kind: 'approval', attemptId: 'attempt-1', index: 0, taskId: 'T1' } };
+  f.store.saveCheckpoint(f.run.id, f.run.ownerToken, paused);
+  const current = f.store.getRun(f.run.id);
+  f.store.transition(f.run.id, f.run.ownerToken, current.version, 'paused', undefined, true);
+  return paused;
+}
+const rows = (db, table) => db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all().map(row => ({ ...row }));
+
+test('a v3 database migrates to v4 additively, keeping runs, receipts and submissions byte for byte', async t => {
+  const f = await approvalFixture(t);
+  f.store.writeReceipt(f.run.id, f.run.ownerToken, { ...f.state.attempt, response: 'synthetic-response' });
+  f.store.close();
+  const downgrade = new DatabaseSync(f.databasePath);
+  downgrade.exec('DROP TABLE approval_requests; DROP TABLE run_responses; PRAGMA user_version = 3');
+  const before = Object.fromEntries(['runs', 'receipts', 'submissions', 'events', 'projects', 'worktrees'].map(table => [table, rows(downgrade, table)]));
+  downgrade.close();
+  assert.ok(before.submissions.length === 1 && before.receipts.length === 1 && before.runs.length === 1);
+
+  const upgraded = f.open();
+  assert.equal(upgraded.latestApproval(f.run.id), null, 'no request is invented for old rows');
+  upgraded.close();
+  const inspect = new DatabaseSync(f.databasePath);
+  try {
+    assert.equal(inspect.prepare('PRAGMA user_version').get().user_version, 4);
+    const names = inspect.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(row => row.name);
+    assert.ok(names.includes('approval_requests') && names.includes('run_responses'));
+    for (const [table, expected] of Object.entries(before)) assert.deepEqual(rows(inspect, table), expected, table + ' is untouched by the migration');
+    assert.equal(inspect.prepare('SELECT count(*) AS count FROM approval_requests').get().count, 0);
+  } finally { inspect.close(); }
+  const again = f.open();
+  assert.equal(again.getRun(f.run.id).checkpoint.protocol, 'structured-v1');
+  assert.deepEqual(again.readSubmission(f.run.id, f.run.ownerToken, 'attempt-1', 'executor-result'), f.receipt);
+});
+
+test('a pending request and an answered response survive closing and reopening the database', async t => {
+  const f = await approvalFixture(t);
+  pauseOnApproval(f);
+  const pending = f.store.getApproval(f.run.id, f.request.requestId);
+  assert.equal(pending.state, 'pending');
+  f.store.close();
+  const reopened = f.open();
+  assert.deepEqual(reopened.getApproval(f.run.id, f.request.requestId), pending);
+  assert.equal(reopened.approvalWait(reopened.getRun(f.run.id)).state, 'pending');
+  const feedback = 'First line\n\n  second line with trailing space \n';
+  const ack = reopened.decideApproval(f.run.id, f.request.requestId, { decision: 'request-changes', feedback }, revision);
+  assert.equal(ack.retried, false);
+  reopened.close();
+  const final = f.open();
+  const answered = final.getApproval(f.run.id, f.request.requestId);
+  assert.equal(answered.state, 'answered');
+  assert.equal(answered.decision, 'request-changes');
+  assert.equal(answered.feedback, feedback, 'feedback is stored verbatim');
+  assert.equal(answered.continuation, 'pending');
+  assert.deepEqual(answered.ack, ack);
+  assert.deepEqual(final.decideApproval(f.run.id, f.request.requestId, { decision: 'request-changes', feedback }), { ...ack, retried: true });
+});
+
+test('an approval-required submission publishes one request bound to the checkpoint identity and the computed revision', async t => {
+  const f = await approvalFixture(t);
+  assert.match(f.request.requestId, /^apr_[0-9a-f-]{36}$/);
+  assert.deepEqual({ runId: f.request.runId, phase: f.request.phase, taskIndex: f.request.taskIndex, taskId: f.request.taskId, attemptId: f.request.attemptId },
+    { runId: f.run.id, phase: 'executor', taskIndex: 0, taskId: 'T1', attemptId: 'attempt-1' });
+  assert.deepEqual(f.request.revision, revision);
+  const { status: _status, ...content } = approvalPayload();
+  assert.deepEqual(f.request.request, content, 'the stored content is the validated request without identity or status');
+  assert.equal(f.request.state, 'pending');
+  assert.equal(f.request.continuation, 'none');
+  assert.equal(f.request.decision, null);
+  const events = f.store.events().filter(event => event.type === 'approval.requested');
+  assert.equal(events.length, 1);
+  assert.equal(events[0].payload.requestId, f.request.requestId);
+  assert.ok(!JSON.stringify(events).includes('Ship the change?'), 'events carry no request text');
+  // An identical duplicate (new call identity and time) returns the stored receipt and publishes nothing.
+  const duplicate = approvalReceipt(f.run, f.state, approvalPayload(), { acceptedAt: 99, caller: { ...f.receipt.caller, callId: 'c2', messageID: 'm2' } });
+  assert.deepEqual(f.store.writeSubmission(f.run.id, f.run.ownerToken, duplicate, { head: 'd'.repeat(40), digest: 'e'.repeat(64) }), f.receipt);
+  assert.equal(f.store.events().filter(event => event.type === 'approval.requested').length, 1);
+  assert.deepEqual(f.store.latestApproval(f.run.id), f.request);
+  assert.throws(() => f.store.writeSubmission(f.run.id, f.run.ownerToken, approvalReceipt(f.run, f.state, approvalPayload({ question: 'Other?' })), revision), /immutable/);
+});
+
+test('an approval request is rejected whole, with its receipt, when it is not valid, matched and measured', async t => {
+  const f = await admitFixture(t);
+  f.store.bindStart(f.run.id, f.run.ownerToken, binding(f.run));
+  const state = structuredCheckpoint(f.run);
+  f.store.saveCheckpoint(f.run.id, f.run.ownerToken, state);
+  const write = (receipt, measured = revision) => f.store.writeSubmission(f.run.id, f.run.ownerToken, receipt, measured);
+  const forged = payload => {
+    const canonical = { ...payload, taskId: 'T1' };
+    return approvalReceipt(f.run, state, payload, { canonical, digest: contractDigest(contractRef('executor-result'), canonical) });
+  };
+  assert.throws(() => f.store.writeSubmission(f.run.id, f.run.ownerToken, approvalReceipt(f.run, state)), /review revision/);
+  assert.throws(() => write(approvalReceipt(f.run, state), { head: 'zz', digest: 'c'.repeat(64) }), /review revision/);
+  assert.throws(() => write(forged(approvalPayload({ question: 'x'.repeat(4001) }))), /contract/);
+  assert.throws(() => write(forged(approvalPayload({ artifacts: [] }))), /contract/);
+  assert.throws(() => write(forged({ ...approvalPayload(), decision: 'approve' })), /contract/);
+  assert.throws(() => write(approvalReceipt(f.run, state, approvalPayload(), { digest: 'f'.repeat(64) })), /submission/);
+  assert.throws(() => write(approvalReceipt(f.run, state, approvalPayload(), { outcome: 'completed' })), /does not match/);
+  assert.throws(() => write(approvalReceipt(f.run, state, approvalPayload(), { index: 1 })), /checkpoint attempt/);
+  assert.throws(() => write(approvalReceipt(f.run, state, approvalPayload(), { attemptId: 'other-attempt' })), /checkpoint attempt/);
+  assert.equal(f.store.readSubmission(f.run.id, f.run.ownerToken, 'attempt-1', 'executor-result'), undefined, 'a refused request leaves no receipt');
+  assert.equal(f.store.latestApproval(f.run.id), null);
+});
+
+test('only the administrator operation answers a request, once, and only for the current checkpoint attempt', async t => {
+  const f = await approvalFixture(t);
+  const id = f.request.requestId;
+  const decide = (input, measured = revision, run = f.run.id, request = id) => f.store.decideApproval(run, request, input, measured);
+  const code = (action, expected) => assert.throws(action, error => error instanceof CoordinatorError && error.code === expected && error.status === (expected === 'approval-not-found' ? 404 : 409));
+  code(() => decide({ decision: 'approve' }, revision, 'another-run'), 'approval-not-found');
+  code(() => decide({ decision: 'approve' }, revision, f.run.id, 'apr_missing'), 'approval-not-found');
+  assert.throws(() => decide({ decision: 'maybe' }), /approve or request-changes/);
+  assert.throws(() => f.store.decideApproval(f.run.id, id, { decision: 'approve' }), /review revision/);
+  const events = f.store.events().length;
+  const ack = decide({ decision: 'approve' });
+  assert.deepEqual(ack, { runId: f.run.id, requestId: id, decision: 'approve', recordedAt: ack.recordedAt, retried: false, continuation: 'pending', run: { status: 'running', version: f.run.version } });
+  assert.equal(f.store.events().filter(event => event.type === 'approval.answered').length, 1);
+  assert.equal(f.store.events().length, events + 1, 'one event is committed with the response');
+  assert.deepEqual(decide({ decision: 'approve' }, undefined), { ...ack, retried: true });
+  code(() => decide({ decision: 'request-changes', feedback: 'no' }), 'approval-conflict');
+  assert.equal(f.store.getApproval(f.run.id, id).decision, 'approve', 'a refused response changes nothing');
+  assert.equal(f.store.getApproval(f.run.id, id).feedback, null);
+  assert.equal(f.store.events().filter(event => event.type === 'approval.answered').length, 1);
+});
+
+test('a moved checkpoint or a changed revision supersedes the request and records nothing', async t => {
+  for (const [name, change] of [
+    ['revision head', (f) => ({ revision: { ...revision, head: 'd'.repeat(40) } })],
+    ['revision digest', (f) => ({ revision: { ...revision, digest: 'd'.repeat(64) } })],
+    ['task index', (f) => { f.store.saveCheckpoint(f.run.id, f.run.ownerToken, { ...f.state, index: 1, tasks: [...f.state.tasks, { ...f.state.tasks[0], id: 'T2' }] }); return {}; }],
+    ['paused without the wait', (f) => { f.store.saveCheckpoint(f.run.id, f.run.ownerToken, { ...f.state, status: 'paused' }); return {}; }],
+  ]) {
+    const f = await approvalFixture(t);
+    const measured = { revision, ...change(f) }.revision;
+    assert.throws(() => f.store.decideApproval(f.run.id, f.request.requestId, { decision: 'approve' }, measured), error => error instanceof CoordinatorError && error.code === 'approval-stale', name);
+    const stored = f.store.getApproval(f.run.id, f.request.requestId);
+    assert.equal(stored.state, 'superseded', name);
+    assert.equal(stored.decision, null, name);
+    assert.equal(stored.ack, null, name);
+    assert.ok(stored.supersededReason, name);
+    assert.ok(f.store.events().some(event => event.type === 'approval.superseded'), name);
+    // A superseded request can never be answered later, even with the original revision.
+    assert.throws(() => f.store.decideApproval(f.run.id, f.request.requestId, { decision: 'approve' }, revision), error => error.code === 'approval-stale', name);
+    f.store.close();
+  }
+});
+
+test('a newer request supersedes an older pending one and the generic resume guard follows the unresolved request', async t => {
+  const f = await approvalFixture(t);
+  const paused = pauseOnApproval(f);
+  const guard = action => assert.throws(action, error => error instanceof CoordinatorError && error.code === 'approval-pending' && error.status === 409);
+  guard(() => f.store.queueResume(f.run.id, 'approve'));
+  guard(() => f.store.assertNoUnresolvedApproval(f.run.id));
+  assert.equal(f.store.getRun(f.run.id).status, 'paused', 'a refused resume changes nothing');
+  f.store.decideApproval(f.run.id, f.request.requestId, { decision: 'request-changes', feedback: 'Please revise' }, revision);
+  guard(() => f.store.queueResume(f.run.id, 'approve'));
+  // Dispatched but carried by no attempt, the decision is still owed to the agent: the run is not resumable by free text.
+  const db = new DatabaseSync(f.databasePath);
+  db.prepare("UPDATE approval_requests SET continuation = 'consumed' WHERE request_id = ?").run(f.request.requestId);
+  guard(() => f.store.queueResume(f.run.id, 'approve'));
+  // Once an attempt carried it (a later task), the run may be resumed by guidance again.
+  db.prepare("UPDATE approval_requests SET consumed_attempt_id = 'attempt-2' WHERE request_id = ?").run(f.request.requestId);
+  db.close();
+  f.store.assertNoUnresolvedApproval(f.run.id);
+  assert.equal(f.store.queueResume(f.run.id, 'Use guidance').status, 'queued');
+  assert.equal(paused.status, 'paused');
+});
+
+test('the wait projection is bounded and clipped, and carries no capability, key or specification', async t => {
+  const long = 'é'.repeat(2000);
+  const f = await approvalFixture(t, approvalPayload({
+    question: long, scope: long, completedWork: 'short', verification: Array.from({ length: 20 }, (_, index) => `check ${index} ` + 'é'.repeat(450)),
+    artifacts: ['a.txt'], onApprove: ['😀'.repeat(300)], onRequestChanges: ['fix'],
+  }));
+  pauseOnApproval(f);
+  const wait = f.store.approvalWait(f.store.getRun(f.run.id));
+  assert.equal(wait.kind, 'approval');
+  assert.equal(wait.requestId, f.request.requestId);
+  assert.equal(wait.state, 'pending');
+  assert.equal(wait.taskTitle, 'Synthetic task');
+  assert.equal(wait.taskIndex, 0);
+  assert.equal(wait.question.length, 1500);
+  assert.equal(wait.clipped.question, true);
+  assert.equal(wait.clipped.scope, true);
+  assert.equal(wait.clipped.completedWork, false);
+  assert.equal(wait.completedWork, 'short');
+  assert.equal(wait.verification.length, 10);
+  assert.ok(wait.verification.every(entry => entry.length <= 400));
+  assert.equal(wait.clipped.verification, true);
+  assert.equal(wait.clipped.artifacts, false);
+  assert.equal(wait.clipped.onApprove, true);
+  assert.ok(!wait.onApprove[0].endsWith('\ud83d'), 'a clip never splits a surrogate pair');
+  assert.equal(wait.response, null);
+  assert.deepEqual(wait.revision, revision);
+  const feedback = 'f'.repeat(4000);
+  f.store.decideApproval(f.run.id, f.request.requestId, { decision: 'request-changes', feedback }, revision);
+  const answered = f.store.approvalWait(f.store.getRun(f.run.id));
+  assert.equal(answered.state, 'answered');
+  assert.equal(answered.continuation, 'pending');
+  assert.equal(answered.response.decision, 'request-changes');
+  assert.equal(answered.response.feedback.length, 1500);
+  assert.equal(answered.clipped.feedback, true);
+  assert.ok(Buffer.byteLength(JSON.stringify(answered)) < 24 * 1024, 'the projection stays far below the 32 KiB request and the stored full text');
+  const text = JSON.stringify(answered);
+  for (const secret of [f.run.ownerToken, 'synthetic-private-prompt', 'synthetic-executor-prompt', 'specification', 'ownerToken']) assert.ok(!text.includes(secret), secret);
 });

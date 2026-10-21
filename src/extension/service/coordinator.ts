@@ -3,9 +3,15 @@ import { loadCoordinatorConfiguration } from '../../coordinator/config.js';
 import type { CoordinatorConfiguration } from '../../coordinator/config.js';
 import { readCoordinatorToken } from '../../coordinator/token.js';
 import type { CoordinatorEvent, ProjectRecord, RunRecord } from '../../coordinator/types.js';
+import type { ApprovalWait } from '../../coordinator/types.js';
+import type { GenericWait } from '../../coordinator/pause.js';
 import type { RunListEntry, RunListPage } from '../../coordinator/run-list.js';
 
-export type PublicRun = Omit<RunRecord, 'ownerToken' | 'specification' | 'binding'> & { settings: unknown };
+export type PublicRun = Omit<RunRecord, 'ownerToken' | 'specification' | 'binding'> & { settings: unknown; wait?: ApprovalWait | GenericWait | null };
+
+/** The two owner responses the panel may send. Bodies are validated by the routes before they reach the adapter. */
+export interface ApprovalDecisionBody { decision: 'approve' | 'request-changes'; feedback?: string }
+export interface PauseResponseBody { pauseId: string; input: string }
 
 export type AdapterErrorKind =
   | 'coordinator-offline'
@@ -15,7 +21,27 @@ export type AdapterErrorKind =
   | 'coordinator-incompatible'
   | 'configuration-invalid'
   | 'not-found'
-  | 'coordinator-error';
+  | 'coordinator-error'
+  /** A response was sent and no answer arrived: it may or may not have been recorded. */
+  | 'delivery-uncertain'
+  | 'stale-card'
+  | 'approval-stale'
+  | 'approval-conflict'
+  | 'approval-pending'
+  | 'pause-stale'
+  | 'pause-not-ready'
+  | 'response-conflict'
+  | 'response-refused'
+  | 'coordinator-unsupported'
+  | 'coordinator-draining'
+  /** An approval read the coordinator answered with something that is not a valid complete request. */
+  | 'approval-unreadable'
+  /** The coordinator has no operation to read one approval request (an older version). */
+  | 'approval-unsupported'
+  /** An approval of a shortened card that names no reviewed complete request. */
+  | 'review-required'
+  /** An approval whose reviewed complete request differs from the one the coordinator holds now. */
+  | 'review-mismatch';
 
 /** Fixed texts: nothing from the underlying failure (paths, keys, headers, stacks) reaches the panel. */
 const MESSAGES: Record<AdapterErrorKind, string> = {
@@ -27,6 +53,21 @@ const MESSAGES: Record<AdapterErrorKind, string> = {
   'configuration-invalid': 'The Heimdall coordinator configuration or access key is invalid.',
   'not-found': 'The requested Heimdall record was not found.',
   'coordinator-error': 'The Heimdall coordinator could not complete the request.',
+  'delivery-uncertain': 'The coordinator did not confirm the response. It may or may not have been recorded; check the run before sending it again.',
+  'stale-card': 'The run changed since this card was shown. Nothing was sent; refresh to see the current request.',
+  'approval-stale': 'This request is no longer current: the run or the reviewed material changed. Nothing was recorded.',
+  'approval-conflict': 'A different decision was already recorded for this request.',
+  'approval-pending': 'This run waits on an approval request; answer that request instead. Nothing was recorded.',
+  'pause-stale': 'The run has paused again since this card was shown. Nothing was recorded.',
+  'pause-not-ready': 'The run is not ready to continue yet (it must be paused, released and idle). Nothing was recorded.',
+  'response-conflict': 'Different guidance was already recorded for this pause.',
+  'response-refused': 'The coordinator refused the response. Nothing was recorded.',
+  'coordinator-unsupported': 'The Heimdall coordinator does not support owner responses (likely an older version). Nothing was sent.',
+  'coordinator-draining': 'The Heimdall coordinator is draining and does not accept responses. Nothing was recorded.',
+  'approval-unreadable': 'The coordinator answered with an approval request that could not be read. Nothing is shown from it and nothing was changed.',
+  'approval-unsupported': 'The Heimdall coordinator cannot return the complete approval request (likely an older version). Nothing was changed.',
+  'review-required': 'This card shows a shortened request. Load the full request before approving. Nothing was recorded.',
+  'review-mismatch': 'The full request you reviewed is not the request the coordinator holds now. Nothing was recorded.',
 };
 
 export class CoordinatorAdapterError extends Error {
@@ -40,9 +81,9 @@ export class CoordinatorAdapterError extends Error {
 
 export const adapterErrorMessage = (kind: AdapterErrorKind): string => MESSAGES[kind];
 
-/** Only the read half of the coordinator client is ever needed here. */
+/** The coordinator client as used here: GET for everything, and POST only for the two response routes built below. */
 export interface ReadClient {
-  request(method: string, route: string): Promise<unknown>;
+  request(method: string, route: string, body?: unknown): Promise<unknown>;
 }
 
 export interface CoordinatorAdapterOptions {
@@ -54,6 +95,15 @@ export interface CoordinatorAdapterOptions {
 }
 
 export interface CoordinatorAdapter {
+  /** The one approval write: the coordinator's decision operation for exactly this run and request. */
+  decideApproval(runId: string, requestId: string, body: ApprovalDecisionBody): Promise<unknown>;
+  /** The other write: the coordinator's guarded response to exactly this pause. */
+  respondToPause(runId: string, body: PauseResponseBody): Promise<unknown>;
+  /**
+   * The coordinator's complete record of one approval request, exactly as it answered (unvalidated); a read, never a write.
+   * The route validates it before anything is shown.
+   */
+  approval(runId: string, requestId: string): Promise<unknown>;
   projects(): Promise<ProjectRecord[]>;
   runs(): Promise<Array<PublicRun | RunListEntry>>;
   run(id: string): Promise<PublicRun>;
@@ -61,6 +111,43 @@ export interface CoordinatorAdapter {
 }
 
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+
+/** Connection failures that happen before anything was written to the coordinator. */
+const NOT_SENT = new Set(['ENOENT', 'ECONNREFUSED', 'EACCES', 'EPERM', 'ENOTSOCK']);
+
+/**
+ * Maps the failure of a response request to a fixed kind. The coordinator's own text is never relayed. A refusal that
+ * carries a status means nothing was recorded; a failure with no answer after the request was written is uncertain.
+ */
+function classifyWrite(error: unknown): AdapterErrorKind {
+  if (error instanceof CoordinatorAdapterError) return error.kind;
+  const status = (error as { statusCode?: unknown } | null)?.statusCode;
+  const code = (error as { code?: unknown } | null)?.code;
+  const message = error instanceof Error ? error.message : '';
+  if (typeof status === 'number') {
+    if (status === 401 || status === 403) return 'coordinator-unauthorized';
+    if (status === 404) return /^Unknown coordinator route$/.test(message) ? 'coordinator-unsupported' : 'not-found';
+    if (status === 503) return /draining/i.test(message) ? 'coordinator-draining' : 'coordinator-offline';
+    if (status === 409 && typeof code === 'string') {
+      if (code === 'approval-stale' || code === 'approval-conflict' || code === 'approval-pending' || code === 'pause-stale' || code === 'pause-not-ready' || code === 'response-conflict') return code;
+    }
+    if (status === 400 || status === 409) return 'response-refused';
+    return 'coordinator-error';
+  }
+  if (typeof code === 'string' && NOT_SENT.has(code)) return 'coordinator-offline';
+  // Written (or possibly written) with no answer: timeouts, resets and unreadable answers.
+  return 'delivery-uncertain';
+}
+
+/** Maps the failure of the approval read: an older coordinator and an unknown request are told apart from other failures. */
+function classifyApprovalRead(error: unknown): AdapterErrorKind {
+  if (error instanceof CoordinatorAdapterError) return error.kind;
+  const status = (error as { statusCode?: unknown } | null)?.statusCode;
+  const message = error instanceof Error ? error.message : '';
+  if (status === 404 && message === 'Unknown coordinator route') return 'approval-unsupported';
+  if (status === 401 || status === 403) return 'coordinator-unauthorized';
+  return classify(error);
+}
 
 function classify(error: unknown): AdapterErrorKind {
   if (error instanceof CoordinatorAdapterError) return error.kind;
@@ -109,7 +196,41 @@ export function createCoordinatorAdapter(options: CoordinatorAdapterOptions = {}
     }
   }
 
+  async function readApproval(route: string): Promise<unknown> {
+    try {
+      return await (await connect()).request('GET', route);
+    } catch (error) {
+      const kind = classifyApprovalRead(error);
+      if (kind !== 'not-found' && kind !== 'approval-unsupported') client = undefined;
+      throw new CoordinatorAdapterError(kind);
+    }
+  }
+
+  /** The only POST: callers pass a route built from validated identifiers and a body already validated by the route. */
+  async function post(route: string, body: unknown): Promise<unknown> {
+    try {
+      return await (await connect()).request('POST', route, body);
+    } catch (error) {
+      const kind = classifyWrite(error);
+      // A refusal means the connection is fine; anything else may mean a restarted coordinator.
+      if (!['stale-card', 'approval-stale', 'approval-conflict', 'approval-pending', 'pause-stale', 'pause-not-ready', 'response-conflict', 'response-refused', 'not-found', 'coordinator-unsupported', 'coordinator-draining'].includes(kind)) client = undefined;
+      throw new CoordinatorAdapterError(kind);
+    }
+  }
+
   return {
+    decideApproval(runId, requestId, body) {
+      if (!IDENTIFIER.test(runId) || !IDENTIFIER.test(requestId)) return Promise.reject(new CoordinatorAdapterError('not-found'));
+      return post(`/runs/${runId}/approvals/${requestId}/decision`, body.decision === 'approve' ? { decision: 'approve' } : { decision: 'request-changes', feedback: body.feedback });
+    },
+    respondToPause(runId, body) {
+      if (!IDENTIFIER.test(runId) || !IDENTIFIER.test(body.pauseId)) return Promise.reject(new CoordinatorAdapterError('not-found'));
+      return post(`/runs/${runId}/respond`, { pauseId: body.pauseId, input: body.input });
+    },
+    approval(runId, requestId) {
+      if (typeof runId !== 'string' || typeof requestId !== 'string' || !IDENTIFIER.test(runId) || !IDENTIFIER.test(requestId)) return Promise.reject(new CoordinatorAdapterError('not-found'));
+      return readApproval(`/runs/${runId}/approvals/${requestId}`);
+    },
     projects: () => get<ProjectRecord[]>('/projects'),
     async runs() {
       const runs: RunListEntry[] = [];

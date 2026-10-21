@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { SUBMISSION_KINDS, SUBMISSION_PROTOCOL, contractRef } from './contracts.js';
+import { SUBMISSION_KINDS, SUBMISSION_PROTOCOL } from './contracts.js';
 import type { RuntimeBuildIdentity, RuntimeIdentity } from './types.js';
 
 /** File written at the root of an immutable runtime snapshot. It is outside every hashed tree. */
@@ -190,6 +190,25 @@ function dependencyIdentity(root: string, manifest: Record<string, unknown>, for
   return { lockfile, direct, resolved: sha256(entries.sort().join('\n')) };
 }
 
+/** Contract versions published before the contracts module of a package was inspected. A root that carries no contracts module reports these. */
+const LEGACY_CONTRACT_VERSION = 1;
+
+/**
+ * The submission contract versions of the package at `root`, read from the root's own built contracts module rather than from
+ * the code now executing. A runtime snapshot of an earlier release therefore keeps the contract map it was admitted with, and
+ * a root whose executing code declares a newer version reports it. A root without a contracts module reports the legacy versions.
+ */
+function contractVersions(root: string): Record<string, number> {
+  const file = path.join(root, 'dist', 'workflow', 'contracts.js');
+  if (!existsSync(file)) return Object.fromEntries(SUBMISSION_KINDS.map(kind => [kind, LEGACY_CONTRACT_VERSION]));
+  const source = readFileSync(file, 'utf8');
+  return Object.fromEntries(SUBMISSION_KINDS.map(kind => {
+    const declared = new RegExp(`kind:\\s*['"]${kind}['"],\\s*version:\\s*(\\d+)`).exec(source);
+    if (!declared) throw new Error('Runtime contracts module declares no version for ' + kind);
+    return [kind, Number(declared[1])];
+  }));
+}
+
 /**
  * Identity of the package rooted at `root`: what is actually executing, computed from file content and never from Git.
  * `snapshot` records whether the root is an immutable run-owned copy; it is not part of `digest`. `dependencyFormat` is chosen
@@ -200,7 +219,7 @@ export function computeRuntimeIdentity(root: string, dependencyFormat: Dependenc
   if (!record(manifest) || typeof manifest.name !== 'string' || typeof manifest.version !== 'string') throw new Error('Runtime package manifest has no name and version');
   if (!existsSync(path.join(root, 'dist'))) throw new Error('Runtime package has no built dist');
   const hashes = Object.fromEntries(RUNTIME_ASSETS.map(asset => [asset.name, treeHash(root, asset)])) as Record<RuntimeAssetName, string>;
-  const contracts = Object.fromEntries(SUBMISSION_KINDS.map(kind => [kind, contractRef(kind).version]));
+  const contracts = contractVersions(root);
   const dependencies = dependencyIdentity(root, manifest, dependencyFormat);
   const basis = { packageName: manifest.name, packageVersion: manifest.version, protocol: SUBMISSION_PROTOCOL, contracts, ...hashes, dependencies };
   let snapshot = false;

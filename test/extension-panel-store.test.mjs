@@ -781,3 +781,231 @@ test('the client allows only the exact content paths and checks the shape of the
   await assert.rejects(createPanelClient(answer(blockerContentOf('run_2'))).blockerContent('run_1'), error => error.code === 'invalid-response');
   await assert.rejects(createPanelClient(answer({ ...blockerContentOf('run_1'), clipped: {} })).blockerContent('run_1'), error => error.code === 'invalid-response');
 });
+
+test('the client reads one complete approval request only from the exact path and checks the answer against the request asked for', async () => {
+  for (const path of ['/runs/run_1/approvals/apr_1', '/runs/A-b_9/approvals/x']) assert.equal(isAllowedPath(path), true, path);
+  for (const path of ['/runs/run_1/approvals', '/runs/run_1/approvals/', '/runs/run_1/approvals/apr_1/', '/runs/run_1/approvals/apr_1/decision', '/runs/run_1/approvals/apr_1/x', '/runs/run_1/approvals/-x', '/runs/run_1/approvals/%2e%2e',
+    '/runs/run_1/approvals/..', '/runs/run_1/approvals/apr_1?x=1', '/runs/../approvals/apr_1', '/runs//approvals/apr_1', `/runs/run_1/approvals/${'a'.repeat(129)}`]) {
+    assert.equal(isAllowedPath(path), false, path);
+  }
+  const content = { question: 'Q', scope: 'S', completedWork: 'C', verification: ['v'], artifacts: ['a'], onApprove: ['o'], onRequestChanges: ['r'] };
+  const view = (overrides = {}) => ({
+    request: { requestId: 'apr_1', runId: 'run_1', state: 'pending', continuation: 'none', progress: 'none', taskId: 'T1', taskIndex: 0, attemptId: 'attempt_1', revision: { head: 'a'.repeat(40), digest: 'b'.repeat(64) }, ...content, response: null, createdAt: 1, ...overrides },
+    fetchedAt: 'x',
+  });
+  const seen = [];
+  const answer = body => ({ async serviceRequest(request) { seen.push(request); return { status: 200, body: JSON.stringify(body) }; } });
+  const read = body => createPanelClient(answer(body)).approval('run_1', 'apr_1');
+
+  assert.equal((await read(view())).request.scope, 'S');
+  assert.deepEqual(seen, [{ method: 'GET', path: '/runs/run_1/approvals/apr_1' }]);
+  const long = 'x'.repeat(4000);
+  assert.equal((await read(view({ scope: long, verification: Array.from({ length: 20 }, () => long.slice(0, 1000)) }))).request.scope.length, 4000, 'canonical maxima are accepted');
+  const answered = { state: 'answered', response: { decision: 'request-changes', feedback: 'f', answeredAt: 5 } };
+  assert.equal((await read(view(answered))).request.response.decision, 'request-changes');
+  for (const [name, body] of Object.entries({
+    'another request': view({ requestId: 'apr_2' }),
+    'another run': view({ runId: 'run_2' }),
+    'text beyond the limit': view({ scope: 'x'.repeat(4001) }),
+    'too many entries': view({ artifacts: Array.from({ length: 21 }, () => 'a') }),
+    'an entry beyond the limit': view({ onApprove: ['x'.repeat(4001)] }),
+    'a payload beyond the limit': view({ verification: Array.from({ length: 20 }, () => 'z'.repeat(2000)), artifacts: Array.from({ length: 20 }, () => 'z'.repeat(2000)) }),
+    'an unknown state': view({ state: 'maybe' }),
+    'an answered request without a response': view({ state: 'answered' }),
+    'a pending request with a response': view({ response: { decision: 'approve', feedback: null, answeredAt: 1 } }),
+    'a malformed revision': view({ revision: { head: 'zz', digest: 'b' } }),
+    'no request': { fetchedAt: 'x' },
+    'an array': [],
+  })) await assert.rejects(read(body), error => error.code === 'invalid-response', name);
+  const before = seen.length;
+  for (const bad of ['../x', 'a/b', '', 'x'.repeat(129)]) {
+    await assert.rejects(createPanelClient(answer(view())).approval(bad, 'apr_1'), error => error.code === 'not-found');
+    await assert.rejects(createPanelClient(answer(view())).approval('run_1', bad), error => error.code === 'not-found');
+  }
+  assert.equal(seen.length, before, 'invalid identifiers never reach the host');
+  // Fixed service errors keep their fixed texts and stay local to the request.
+  const failing = kind => createPanelClient({ async serviceRequest() { return { status: 502, body: JSON.stringify({ error: { kind, message: SECRET } }) }; } }).approval('run_1', 'apr_1');
+  for (const kind of ['approval-unreadable', 'approval-unsupported']) {
+    await assert.rejects(failing(kind), error => error.code === kind && error.category === 'request' && !error.message.includes('RAW-SECRET') && !(error.hint ?? '').includes('RAW-SECRET'), kind);
+  }
+});
+
+// ----- approval and response controls -----
+
+const approvalWait = (overrides = {}) => ({
+  kind: 'approval', requestId: 'apr_1', state: 'pending', continuation: 'none', progress: 'none', taskId: 'T2', taskTitle: 'Second',
+  question: 'Ship it?', scope: 'The reviewed commit', completedWork: 'Done', verification: ['tests pass'], artifacts: ['src/a.ts'], onApprove: ['merge'], onRequestChanges: ['fix'],
+  revision: { head: 'a'.repeat(40), digest: 'b'.repeat(12) }, response: null, createdAt: 1, clipped: false, ...overrides,
+});
+const waiting = (wait, version = 5, id = 'run_1') => ({ ...detailOf(id), status: 'paused', phase: 'paused', version, wait });
+const ackReply = (body, status = 200) => ({ status, body: JSON.stringify(body) });
+const decisionAck = (overrides = {}) => ({ ack: { runId: 'run_1', requestId: 'apr_1', decision: 'approve', recordedAt: 9, retried: false, continuation: 'queued', run: { status: 'queued', version: 6 }, ...overrides }, fetchedAt: 'x' });
+const writes = service => service.requests.filter(request => request.method === 'POST');
+
+async function waitingFixture(wait = approvalWait()) {
+  const f = fixture();
+  f.service.details.run_1 = waiting(wait);
+  f.store.start();
+  await f.clock.advance(0);
+  f.store.select('run_1');
+  await f.clock.advance(0);
+  return f;
+}
+
+test('the panel client sends only the two response routes as POST, with validated bodies', async () => {
+  const requests = [];
+  const host = { async serviceRequest(request) { requests.push(request); return ackReply(request.path.endsWith('pause-response') ? { ack: { runId: 'run_1', pauseId: 'pau_a' } } : decisionAck()); }, async serviceStatus() { return { status: 'ready' }; } };
+  const client = createPanelClient(host);
+  await client.decideApproval('run_1', 'apr_1', { decision: 'approve', displayedVersion: 5 });
+  await client.decideApproval('run_1', 'apr_1', { decision: 'request-changes', feedback: 'fix', displayedVersion: 5 }).catch(() => undefined);
+  await client.respondToPause('run_1', { pauseId: 'pau_a', input: 'go', displayedVersion: 5 });
+  assert.deepEqual(requests.map(request => [request.method, request.path]), [
+    ['POST', '/runs/run_1/approvals/apr_1/decision'], ['POST', '/runs/run_1/approvals/apr_1/decision'], ['POST', '/runs/run_1/pause-response'],
+  ]);
+  assert.deepEqual(JSON.parse(requests[0].body), { decision: 'approve', displayedVersion: 5 });
+  assert.deepEqual(JSON.parse(requests[2].body), { pauseId: 'pau_a', input: 'go', displayedVersion: 5 });
+
+  const before = requests.length;
+  const refuse = (promise, code) => assert.rejects(promise, error => error.code === code);
+  await refuse(client.decideApproval('../x', 'apr_1', { decision: 'approve', displayedVersion: 1 }), 'not-found');
+  await refuse(client.decideApproval('run_1', 'a/b', { decision: 'approve', displayedVersion: 1 }), 'not-found');
+  await refuse(client.decideApproval('run_1', 'apr_1', { decision: 'approve', feedback: 'no', displayedVersion: 1 }), 'invalid-request');
+  await refuse(client.decideApproval('run_1', 'apr_1', { decision: 'request-changes', displayedVersion: 1 }), 'invalid-request');
+  await refuse(client.decideApproval('run_1', 'apr_1', { decision: 'request-changes', feedback: ' ', displayedVersion: 1 }), 'invalid-request');
+  await refuse(client.decideApproval('run_1', 'apr_1', { decision: 'request-changes', feedback: 'x'.repeat(8001), displayedVersion: 1 }), 'invalid-request');
+  await refuse(client.decideApproval('run_1', 'apr_1', { decision: 'approve', displayedVersion: 1.5 }), 'invalid-request');
+  await refuse(client.decideApproval('run_1', 'apr_1', { decision: 'delete', displayedVersion: 1 }), 'invalid-request');
+  await refuse(client.respondToPause('run_1', { pauseId: '../p', input: 'go', displayedVersion: 1 }), 'not-found');
+  await refuse(client.respondToPause('run_1', { pauseId: 'pau_a', input: '', displayedVersion: 1 }), 'invalid-request');
+  assert.equal(requests.length, before, 'nothing invalid was sent');
+
+  const { isAllowedPostPath } = await import('../dist/extension/panel/client.js');
+  for (const path of ['/directories/match', '/runs/run_1/pause-response', '/runs/run_1/approvals/apr_1/decision']) assert.equal(isAllowedPostPath(path), true, path);
+  for (const path of ['/runs/run_1/resume', '/runs/run_1/respond', '/runs/run_1/reconcile', '/runs/run_1', '/runs/run_1/approvals/apr_1', '/runs/run_1/approvals/apr_1/decision/x', '/runs/../pause-response', '/runs/run_1/pause-response/', '/projects']) {
+    assert.equal(isAllowedPostPath(path), false, path);
+  }
+});
+
+test('loading, polling and leaving a run never decide anything; the first click on a button is the only write', async () => {
+  const { store, service, clock } = await waitingFixture();
+  assert.equal(store.getState().detail.wait.requestId, 'apr_1');
+  await clock.advance(POLL * 3);
+  store.select(null);
+  store.select('run_1');
+  await clock.advance(0);
+  assert.deepEqual(writes(service), []);
+
+  service.respond = request => request.method === 'POST' ? ackReply(decisionAck()) : null;
+  const outcome = await store.decideApproval('run_1', 'apr_1', 'approve');
+  assert.equal(outcome, 'recorded');
+  // No confirmation step: one click, one request.
+  assert.equal(writes(service).length, 1);
+  assert.deepEqual(JSON.parse(writes(service)[0].body), { decision: 'approve', displayedVersion: 5 });
+  assert.equal(store.getState().action.ack.decision, 'approve');
+  assert.equal(store.getState().action.inFlight, false);
+  store.dispose();
+});
+
+test('a card that is not the pending request on screen sends nothing and refreshes', async () => {
+  const { store, service, clock } = await waitingFixture();
+  const mark = service.requests.length;
+  assert.equal(await store.decideApproval('run_1', 'apr_other', 'approve'), 'refreshed');
+  assert.equal(await store.decideApproval('run_2', 'apr_1', 'approve'), 'ignored');
+  assert.equal(await store.respondToPause('run_1', 'pau_x', 'go'), 'refreshed');
+  assert.deepEqual(writes(service), []);
+  assert.equal(service.requests.slice(mark).some(request => request.path === '/runs/run_1'), true, 'the run is read again');
+  assert.match(store.getState().action.notice, /no longer matches the run/);
+
+  service.details.run_1 = waiting(approvalWait({ state: 'answered', continuation: 'queued', progress: 'queued', response: { decision: 'approve', feedback: null, answeredAt: 8 } }));
+  store.refreshDetail();
+  await clock.advance(0);
+  assert.equal(await store.decideApproval('run_1', 'apr_1', 'approve'), 'refreshed', 'an answered request is never answered again');
+  assert.deepEqual(writes(service), []);
+  store.dispose();
+});
+
+test('refusals map to fixed sentences and refresh; the text of the response is never echoed', async () => {
+  const { store, service, clock } = await waitingFixture();
+  const refusal = (status, kind) => ({ status, body: JSON.stringify({ error: { kind, message: SECRET } }) });
+  for (const [status, kind, expectedRefresh] of [[409, 'approval-stale', true], [409, 'stale-card', true], [409, 'approval-conflict', true], [409, 'response-refused', false], [503, 'coordinator-draining', false], [503, 'coordinator-unsupported', false]]) {
+    service.respond = request => request.method === 'POST' ? refusal(status, kind) : null;
+    const mark = service.requests.length;
+    assert.equal(await store.decideApproval('run_1', 'apr_1', 'approve'), 'refused', kind);
+    const state = store.getState();
+    assert.equal(state.action.inFlight, false, kind);
+    assert.equal(state.action.verifying, false, kind);
+    assert.equal(JSON.stringify(state.action).includes('RAW-SECRET'), false, kind);
+    assert.equal(state.action.notice.includes('Bearer'), false, kind);
+    assert.equal(service.requests.slice(mark).some(request => request.method === 'GET' && request.path === '/runs/run_1'), expectedRefresh, kind);
+    assert.equal(state.connection, 'online', `${kind} does not look like a connection problem`);
+  }
+  store.dispose();
+});
+
+test('an unanswered response is unconfirmed: the run is read again, nothing is resent, and the buttons stay off until it has been', async () => {
+  const { store, service, clock } = await waitingFixture();
+  service.respond = request => request.method === 'POST' ? { status: 502, body: JSON.stringify({ error: { kind: 'delivery-uncertain', message: SECRET } }) } : null;
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const getHost = service.intercept;
+  service.intercept = async request => { if (request.method === 'GET' && request.path === '/runs/run_1' && service.hold) await gate; };
+  service.hold = true;
+  const pending = store.decideApproval('run_1', 'apr_1', 'approve');
+  await clock.advance(0);
+  assert.equal(store.getState().action.verifying, true, 'verifying while the coordinator is being read');
+  const { waitCard } = await import('../dist/extension/panel/view-model.js');
+  const card = waitCard(store.getState().detail, store.getState());
+  assert.equal(card.controls.approve.disabled, true);
+  assert.equal(card.controls.requestChanges.disabled, true);
+  service.hold = false;
+  release();
+  assert.equal(await pending, 'uncertain');
+  service.intercept = getHost;
+  assert.equal(writes(service).length, 1, 'never sent a second time');
+  assert.equal(store.getState().action.verifying, false);
+  assert.match(store.getState().action.notice, /could not confirm whether your response was recorded/);
+  assert.equal(JSON.stringify(store.getState().action).includes('RAW-SECRET'), false);
+
+  // A host failure after the request was handed over is just as unconfirmed.
+  service.respond = null;
+  service.fail = request => request.method === 'POST' ? new HostRequestError('HOST_TIMEOUT', 'timed out') : null;
+  assert.equal(await store.decideApproval('run_1', 'apr_1', 'approve'), 'uncertain');
+  service.fail = null;
+  assert.equal(writes(service).length, 2, 'two deliberate clicks, two writes; none repeated by the panel');
+  store.dispose();
+});
+
+test('a host that never started the request is not reported as unconfirmed', async () => {
+  const { store, service } = await waitingFixture();
+  service.fail = request => request.method === 'POST' ? new HostRequestError('NOT_GRANTED', 'denied') : null;
+  assert.equal(await store.decideApproval('run_1', 'apr_1', 'approve'), 'refused');
+  assert.equal(store.getState().action.verifying, false);
+  assert.match(store.getState().action.notice, /^Nothing was sent\./);
+  store.dispose();
+});
+
+test('selecting another run drops the action state, and a late answer for the first run is not shown on the second', async () => {
+  const { store, service, clock } = await waitingFixture();
+  service.details.run_2 = waiting(approvalWait({ requestId: 'apr_2' }), 3, 'run_2');
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  service.intercept = async request => { if (request.method === 'POST') await gate; };
+  service.respond = request => request.method === 'POST' ? ackReply(decisionAck()) : null;
+  const first = store.decideApproval('run_1', 'apr_1', 'approve');
+  await clock.advance(0);
+  assert.equal(store.getState().action.inFlight, true);
+  store.select('run_2');
+  await clock.advance(0);
+  assert.equal(store.getState().action.inFlight, false);
+  assert.equal(store.getState().action.runId, null);
+  release();
+  await first;
+  await clock.advance(0);
+  assert.equal(store.getState().action.runId, null, 'the answer of the earlier run is not shown on this one');
+  assert.equal(store.getState().detail.id, 'run_2');
+  // The second run can be answered at once; the earlier request does not block it.
+  service.intercept = null;
+  service.respond = request => request.method === 'POST' ? ackReply(decisionAck({ runId: 'run_2', requestId: 'apr_2' })) : null;
+  assert.equal(await store.decideApproval('run_2', 'apr_2', 'approve'), 'recorded');
+  store.dispose();
+});

@@ -2,10 +2,13 @@
 // OpenHeimdall skill helper.
 //
 // A dependency-free wrapper around the installed `heimdall coordinator` command line. It gathers repository
-// and coordinator context, selects a run and reports compact state. `context`, `snapshot`, `watch` and
-// `inspect-spec` only read. `start` and `resume` are the only commands that mutate, each at most once per
+// and coordinator context, selects a run and reports compact state. `context`, `snapshot`, `watch`, `request` and
+// `inspect-spec` only read. `start`, `resume` and `respond` are the only commands that mutate, each at most once per
 // invocation: they never retry, reconcile, stop or restart anything, and an unconfirmed outcome is reported as
-// uncertain instead of being repeated.
+// uncertain instead of being repeated. Reports of a run include its bounded wait: the typed approval request the
+// agent is waiting on, or the identity of a generic pause. A compact wait is shortened when a text or list is cut, and
+// says so; `request` then reads the complete request through `run approval`. Guidance reaches a run only through the guarded response for
+// the identity of that pause; without it the helper refuses and sends nothing.
 //
 // The command line is invoked without a shell: `execFile` with an argument array, using the binary named by
 // HEIMDALL_BIN or `heimdall` on PATH. Every option value is data, so paths may contain spaces, quotes or a
@@ -14,13 +17,17 @@
 //   openheimdall.mjs context  [--base REF]
 //   openheimdall.mjs snapshot [RUN_ID]
 //   openheimdall.mjs watch    [RUN_ID] [--budget-seconds N] [--interval-seconds N]
+//   openheimdall.mjs request  RUN_ID --request ID
 //   openheimdall.mjs inspect-spec FILE
 //   openheimdall.mjs start    --spec FILE [--base REF] [--register] [--start-coordinator]
 //   openheimdall.mjs resume   RUN_ID (--guidance-file FILE | --guidance-stdin)
+//   openheimdall.mjs respond  RUN_ID --request ID --decision approve
+//   openheimdall.mjs respond  RUN_ID --request ID --decision request-changes (--feedback-file FILE | --feedback-stdin)
+//   openheimdall.mjs respond  RUN_ID --pause ID (--guidance-file FILE | --guidance-stdin)
 //
 // Common options: --cwd DIR (default: the current directory), --coordinator-config FILE (resolved against --cwd
 // and forwarded to every coordinator call). Reports are JSON on stdout. `watch` prints one JSON line per change.
-// Exit status: 0 for a report (for `start` and `resume`: the coordinator accepted the request), 1 when the
+// Exit status: 0 for a report (for `start`, `resume` and `respond`: the coordinator accepted the request), 1 when the
 // coordinator or transport failed or the request was not accepted, 2 for a usage error.
 
 import { execFile } from 'node:child_process';
@@ -48,7 +55,18 @@ const COMMIT = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/;
 export const MAX_SPEC_BYTES = 128 * 1024;
 // Guidance travels as one command-line argument; stay well below the per-argument limits of common systems.
 export const MAX_GUIDANCE_BYTES = 64 * 1024;
-export const GUIDANCE_HEADER = 'Owner guidance for resuming this run, delivered verbatim by the OpenHeimdall resume skill. Everything after this line is the guidance:';
+// The longest feedback or guidance the coordinator accepts for a response, in characters.
+export const RESPONSE_INPUT_LIMIT = 8000;
+// Bounds for the wait a report shows. The coordinator bounds its own projection; these hold whatever it sends.
+export const WAIT_QUESTION_LIMIT = 1500;
+export const WAIT_TEXT_LIMIT = 1000;
+export const WAIT_LIST_LIMIT = 10;
+export const WAIT_ENTRY_LIMIT = 300;
+// The limits of a complete approval request, as the coordinator accepts it: characters per text and per list entry,
+// entries per list, and bytes of the whole request as JSON.
+export const REQUEST_TEXT_LIMIT = 4000;
+export const REQUEST_LIST_LIMIT = 20;
+export const REQUEST_PAYLOAD_LIMIT = 32 * 1024;
 const MUTATION_TIMEOUT_MS = 60000;
 const COORDINATOR_START_TIMEOUT_MS = 150000;
 const START_SUCCESS_OUTCOMES = Object.freeze(['ready', 'already-running', 'already-running-foreground']);
@@ -58,9 +76,11 @@ const COMMANDS = {
   context: { options: ['--base'], positional: 0 },
   snapshot: { options: [], positional: 1 },
   watch: { options: ['--budget-seconds', '--interval-seconds'], positional: 1 },
+  request: { options: ['--request'], positional: 1 },
   'inspect-spec': { options: [], positional: 1 },
   start: { options: ['--spec', '--base'], flags: ['--register', '--start-coordinator'], positional: 0 },
   resume: { options: ['--guidance-file'], flags: ['--guidance-stdin'], positional: 1 },
+  respond: { options: ['--request', '--decision', '--pause', '--feedback-file', '--guidance-file'], flags: ['--feedback-stdin', '--guidance-stdin'], positional: 1 },
 };
 const COMMON_OPTIONS = ['--cwd', '--coordinator-config'];
 
@@ -70,12 +90,18 @@ Usage:
   openheimdall.mjs context  [--base REF]
   openheimdall.mjs snapshot [RUN_ID]
   openheimdall.mjs watch    [RUN_ID] [--budget-seconds N] [--interval-seconds N]
+  openheimdall.mjs request  RUN_ID --request ID
   openheimdall.mjs inspect-spec FILE
   openheimdall.mjs start    --spec FILE [--base REF] [--register] [--start-coordinator]
   openheimdall.mjs resume   RUN_ID (--guidance-file FILE | --guidance-stdin)
+  openheimdall.mjs respond  RUN_ID --request ID --decision approve
+  openheimdall.mjs respond  RUN_ID --request ID --decision request-changes (--feedback-file FILE | --feedback-stdin)
+  openheimdall.mjs respond  RUN_ID --pause ID (--guidance-file FILE | --guidance-stdin)
 
 Common options: --cwd DIR, --coordinator-config FILE
-context, snapshot, watch and inspect-spec only read. start and resume change coordinator state, at most once each.
+context, snapshot, watch, request and inspect-spec only read. request prints the complete approval request that a shortened
+wait cannot show. start, resume and respond change coordinator state, at most once each.
+respond carries only an explicit owner decision for the displayed request, or explicit guidance for the displayed pause.
 `;
 
 export class UsageError extends Error {}
@@ -152,7 +178,7 @@ function run(file, args, { env, signal, timeoutMs = COMMAND_TIMEOUT_MS } = {}) {
       else if (error.name === 'AbortError' || error.code === 'ABORT_ERR') kind = 'aborted';
       else if (error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') kind = 'response-too-large';
       else if (error.killed) kind = 'timeout';
-      resolve({ ok: false, kind, stdout: stdout ?? '', stderr: stderr ?? '', message: String(error.message) });
+      resolve({ ok: false, kind, exitCode: typeof error.code === 'number' ? error.code : null, stdout: stdout ?? '', stderr: stderr ?? '', message: String(error.message) });
     });
   });
 }
@@ -368,6 +394,94 @@ export const EVIDENCE_LIMITS = Object.freeze([
 
 const timestamp = value => (typeof value === 'number' && Number.isFinite(value) ? new Date(value).toISOString() : null);
 
+const WAIT_STATES = Object.freeze(['pending', 'answered', 'superseded']);
+const WAIT_CONTINUATIONS = Object.freeze(['none', 'pending', 'queued', 'consumed', 'superseded']);
+const WAIT_PROGRESS = Object.freeze(['none', 'recorded', 'waiting-for-idle', 'queued', 'executing', 'consumed', 'superseded']);
+const WAIT_DECISIONS = Object.freeze(['approve', 'request-changes']);
+const waitText = (value, limit) => (typeof value === 'string' ? limitText(value, limit) : null);
+const waitList = value => (Array.isArray(value) ? value.filter(entry => typeof entry === 'string').slice(0, WAIT_LIST_LIMIT).map(entry => limitText(entry, WAIT_ENTRY_LIMIT)) : []);
+// Whether the helper shortens a text or a list when it builds a compact wait. Whitespace collapsing alone is not shortening.
+const textCut = (value, limit) => typeof value === 'string' && limitText(value, Number.MAX_SAFE_INTEGER).length > limit;
+const listCut = value => Array.isArray(value) && (value.length > WAIT_LIST_LIMIT || value.some(entry => typeof entry !== 'string' || textCut(entry, WAIT_ENTRY_LIMIT)));
+const oneOf = (value, allowed) => (typeof value === 'string' && allowed.includes(value) ? value : null);
+
+/**
+ * The bounded wait of a run record: the typed approval request it is waiting on, or the identity of a generic pause,
+ * else null. Text is shortened and lists are capped, however much the coordinator sent. Feedback the owner gave is not
+ * copied: only the decision is. A shape this helper does not know is reported as unrecognized, never guessed at.
+ */
+export function projectWait(value) {
+  if (value === undefined || value === null) return null;
+  if (!isObject(value)) return { kind: 'unrecognized' };
+  if (value.kind === 'generic') {
+    if (typeof value.pauseId !== 'string' || !RUN_ID.test(value.pauseId)) return { kind: 'unrecognized' };
+    return { kind: 'generic', pauseId: value.pauseId, reasonClipped: value.reasonClipped === true };
+  }
+  if (value.kind !== 'approval') return { kind: 'unrecognized' };
+  const state = oneOf(value.state, WAIT_STATES);
+  if (typeof value.requestId !== 'string' || !RUN_ID.test(value.requestId) || state === null) return { kind: 'unrecognized' };
+  const response = isObject(value.response) && oneOf(value.response.decision, WAIT_DECISIONS)
+    ? { decision: value.response.decision, answeredAt: timestamp(value.response.answeredAt), feedbackRecorded: typeof value.response.feedback === 'string' && value.response.feedback.length > 0 }
+    : null;
+  const revision = isObject(value.revision) && typeof value.revision.head === 'string' && typeof value.revision.digest === 'string'
+    ? { head: value.revision.head.replace(/[^0-9a-f]/gi, '').slice(0, 12), digest: value.revision.digest.replace(/[^0-9a-f]/gi, '').slice(0, 12) } : null;
+  const clippedFields = isObject(value.clipped) ? Object.keys(value.clipped).filter(name => value.clipped[name] === true).slice(0, 9).map(name => limitText(name, 30)) : [];
+  const shortened = clippedFields.length > 0 || textCut(value.question, WAIT_QUESTION_LIMIT) || textCut(value.scope, WAIT_TEXT_LIMIT) || textCut(value.completedWork, WAIT_TEXT_LIMIT)
+    || [value.verification, value.artifacts, value.onApprove, value.onRequestChanges].some(listCut);
+  return {
+    kind: 'approval',
+    requestId: value.requestId,
+    state,
+    continuation: oneOf(value.continuation, WAIT_CONTINUATIONS),
+    progress: oneOf(value.progress, WAIT_PROGRESS),
+    taskId: waitText(value.taskId, 120),
+    taskTitle: waitText(value.taskTitle, 200),
+    question: waitText(value.question, WAIT_QUESTION_LIMIT),
+    scope: waitText(value.scope, WAIT_TEXT_LIMIT),
+    completedWork: waitText(value.completedWork, WAIT_TEXT_LIMIT),
+    verification: waitList(value.verification),
+    artifacts: waitList(value.artifacts),
+    onApprove: waitList(value.onApprove),
+    onRequestChanges: waitList(value.onRequestChanges),
+    revision,
+    response,
+    clippedFields,
+    shortened,
+  };
+}
+
+/**
+ * Whether an answered decision was withdrawn (the reviewed material changed) and its feedback has not been carried by a fresh
+ * attempt yet. The coordinator delivers it by itself; until then it is neither history nor an ordinary pause.
+ */
+export const withdrawnDeliveryOwed = wait => wait?.kind === 'approval' && wait.state === 'answered' && wait.continuation === 'superseded' && wait.progress !== 'superseded';
+
+/**
+ * Whether a projected wait is a typed request that still has to be answered, an answer whose continuation is not consumed, or a
+ * withdrawn decision whose feedback is still owed to the agent.
+ */
+export function approvalUnresolved(wait) {
+  if (!wait) return false;
+  if (wait.kind === 'unrecognized') return true;
+  if (wait.kind !== 'approval') return false;
+  return wait.state === 'pending' || (wait.state === 'answered' && (wait.continuation === 'pending' || wait.continuation === 'queued')) || withdrawnDeliveryOwed(wait);
+}
+
+/**
+ * A shortened approval wait names the command that reads the whole request, so a report never passes a summary off as the
+ * request. The note is part of the wait and therefore shows in every report that carries it.
+ */
+function withCompleteRequestHint(runId, wait) {
+  if (!wait || wait.kind !== 'approval' || wait.shortened !== true) return wait;
+  return {
+    ...wait,
+    completeRequest: {
+      command: `request ${runId} --request ${wait.requestId}`,
+      note: 'This request is shortened: some text or list entries are cut. Read the complete request with the request command before presenting it, and do not treat this summary as the full scope.',
+    },
+  };
+}
+
 /** Project a coordinator run record to the compact fields a report may show. The feature, checkpoint bodies, resolution and settings are never copied. */
 export function projectRun(record) {
   if (!isObject(record) || typeof record.id !== 'string' || typeof record.status !== 'string') throw new Error('Run record has an unexpected shape');
@@ -399,6 +513,8 @@ export function projectRun(record) {
     currentTask,
     blocker: blocker.text,
     blockerTruncated: blocker.truncated,
+    waitReported: Object.hasOwn(record, 'wait'),
+    wait: withCompleteRequestHint(record.id, projectWait(record.wait)),
     worktreePath: typeof record.worktreePath === 'string' ? record.worktreePath : null,
     branch: typeof record.branch === 'string' ? record.branch : null,
     baseCommit: typeof record.baseCommit === 'string' ? record.baseCommit : null,
@@ -410,7 +526,7 @@ export function projectRun(record) {
 
 /** The fields whose change is worth a watch line. updatedAt is excluded so a bare timestamp refresh stays quiet. */
 export function stateKey(projection) {
-  return JSON.stringify([projection.status, projection.capacityReserved, projection.launchAction, projection.phase, projection.progress, projection.currentTask?.id ?? null, projection.blocker, projection.blockerTruncated]);
+  return JSON.stringify([projection.status, projection.capacityReserved, projection.launchAction, projection.phase, projection.progress, projection.currentTask?.id ?? null, projection.blocker, projection.blockerTruncated, projection.wait]);
 }
 
 /** Why a watch must stop once it has seen this state, or null to keep going. */
@@ -603,6 +719,100 @@ async function watchCommand({ coordinator, cwd, env, positional, options, config
   return { report: null, exitCode: summary.reason === 'transport-error' ? 1 : 0 };
 }
 
+// --- Complete approval request ---------------------------------------------------------------------------------
+
+const REQUEST_TEXT_FIELDS = Object.freeze(['question', 'scope', 'completedWork']);
+const REQUEST_LIST_FIELDS = Object.freeze(['verification', 'artifacts', 'onApprove', 'onRequestChanges']);
+const HEX = /^[0-9a-f]{1,128}$/i;
+
+/**
+ * Validate the coordinator's complete answer for one approval request against the run and request that were asked for and
+ * the limits of an accepted request. Nothing is shortened and nothing is repaired: a text or list that is missing, mistyped
+ * or over a limit makes the whole answer invalid, because a partly valid request is not a request the owner can review.
+ * Returns { ok: true, request } with the content verbatim, or { ok: false, message }.
+ */
+export function parseCompleteRequest(value, { runId, requestId }) {
+  const bad = what => ({ ok: false, message: `${what} is missing or not valid` });
+  if (!isObject(value)) return bad('The answer');
+  if (value.runId !== runId) return bad('The run id');
+  if (value.requestId !== requestId) return bad('The request id');
+  const content = {};
+  for (const field of REQUEST_TEXT_FIELDS) {
+    if (typeof value[field] !== 'string' || value[field].length > REQUEST_TEXT_LIMIT) return bad(`The ${field} text`);
+    content[field] = value[field];
+  }
+  for (const field of REQUEST_LIST_FIELDS) {
+    const entries = value[field];
+    if (!Array.isArray(entries) || entries.length > REQUEST_LIST_LIMIT) return bad(`The ${field} list`);
+    if (entries.some(entry => typeof entry !== 'string' || entry.length > REQUEST_TEXT_LIMIT)) return bad(`An entry of the ${field} list`);
+    content[field] = [...entries];
+  }
+  if (Buffer.byteLength(JSON.stringify(content), 'utf8') > REQUEST_PAYLOAD_LIMIT) return bad('The request size');
+  const revision = value.revision;
+  if (!isObject(revision) || typeof revision.head !== 'string' || !HEX.test(revision.head) || typeof revision.digest !== 'string' || !HEX.test(revision.digest)) return bad('The revision');
+  if (typeof value.taskId !== 'string' || !value.taskId || value.taskId.length > 128) return bad('The task id');
+  if (typeof value.attemptId !== 'string' || !value.attemptId || value.attemptId.length > 128) return bad('The attempt id');
+  if (!Number.isSafeInteger(value.taskIndex) || value.taskIndex < 0) return bad('The task index');
+  const state = oneOf(value.state, WAIT_STATES);
+  const continuation = oneOf(value.continuation, WAIT_CONTINUATIONS);
+  const progress = oneOf(value.progress, WAIT_PROGRESS);
+  if (state === null) return bad('The state');
+  if (continuation === null) return bad('The continuation');
+  if (progress === null) return bad('The progress');
+  let response = null;
+  if (state === 'answered') {
+    const answer = value.response;
+    if (!isObject(answer) || oneOf(answer.decision, WAIT_DECISIONS) === null) return bad('The response');
+    if (answer.feedback !== null && answer.feedback !== undefined && typeof answer.feedback !== 'string') return bad('The feedback');
+    // The owner's feedback is not copied into a report, only the decision and whether feedback exists.
+    response = { decision: answer.decision, answeredAt: timestamp(answer.answeredAt), feedbackRecorded: typeof answer.feedback === 'string' && answer.feedback.length > 0 };
+  } else if (value.response !== null && value.response !== undefined) return bad('The response');
+  return {
+    ok: true,
+    request: {
+      requestId, runId, state, continuation, progress,
+      task: { id: value.taskId, index: value.taskIndex }, attemptId: value.attemptId,
+      revision: { head: revision.head, digest: revision.digest },
+      ...content,
+      response, createdAt: timestamp(value.createdAt),
+    },
+  };
+}
+
+/**
+ * Read one approval request completely, read-only: a single `run approval` call, validated, with nothing shortened. When the
+ * read or the validation fails the report says that review information is incomplete and carries no request content, so a
+ * summary can never be mistaken for the request.
+ */
+async function requestCommand({ coordinator, options, positional, configFile, env }) {
+  const runId = positional[0];
+  if (runId === undefined) throw new UsageError('request requires RUN_ID');
+  if (!validRunId(runId)) throw new UsageError('RUN_ID must be letters, digits, underscore or dash and must not start with a dash');
+  const requestId = options['--request'];
+  if (requestId === undefined) throw new UsageError('request requires --request ID');
+  if (!validRunId(requestId)) throw new UsageError('--request must be letters, digits, underscore or dash and must not start with a dash');
+  const configuration = configurationSelection({ configFile, env });
+  const incomplete = (kind, message) => ({
+    report: {
+      ok: false, command: 'request', outcome: 'error', complete: false, runId, requestId, error: { kind, message },
+      note: 'The complete request could not be read, so the review information is incomplete. Do not present a summary as the full request or ask the owner to approve on it; say that the review is incomplete.',
+      coordinator: { configuration },
+    },
+    exitCode: 1,
+  });
+  const read = await coordinator.call(['run', 'approval', runId, '--request', requestId]);
+  if (!read.ok) {
+    const older = read.kind === 'error' && /Unknown coordinator command|does not support reading an approval request/i.test(read.message);
+    return incomplete(older ? 'unsupported' : read.kind, older ? 'The coordinator or command line is too old to read a complete approval request' : read.message);
+  }
+  const parsed = parseCompleteRequest(read.value, { runId, requestId });
+  if (!parsed.ok) return incomplete('invalid-response', limitText(parsed.message, 200));
+  return {
+    report: { ok: true, command: 'request', outcome: 'request', complete: true, request: parsed.request, coordinator: { configuration } },
+    exitCode: 0,
+  };
+}
+
 // --- Input files -------------------------------------------------------------------------------------------
 
 const PROBLEM_MESSAGES = {
@@ -612,6 +822,7 @@ const PROBLEM_MESSAGES = {
   'too-large': 'The text is larger than the allowed size.',
   'not-utf8': 'The text is not valid UTF-8.',
   'contains-nul': 'The text contains a NUL character, which cannot be passed on a command line.',
+  'too-long': `The text is longer than the ${RESPONSE_INPUT_LIMIT} characters the coordinator accepts for a response.`,
 };
 
 function decodeText(buffer, limit) {
@@ -713,6 +924,7 @@ const SERVER_REJECTIONS = [
   /Project configuration/, /Runtime dependencies/, /Run not found/, /Unknown run/,
   /Only a confirmed idle paused run may be resumed/, /Native parent and children must be confirmed idle/,
   /Runtime snapshot refused/, /Resume requires a released paused run/,
+  /An approval request is waiting for an owner decision/, /An owner decision is recorded and its continuation has not been consumed/,
 ];
 
 /**
@@ -726,6 +938,60 @@ export function classifyMutationFailure(result) {
   if (/Coordinator unavailable: connect (?:ENOENT|ECONNREFUSED)\b/.test(result.stderr)) return 'not-sent';
   if (SERVER_REJECTIONS.some(pattern => pattern.test(result.stderr))) return 'rejected';
   return 'uncertain';
+}
+
+/**
+ * What a failed `run respond` tells us, from its exit status and first diagnostic line. `not-sent`: the request provably
+ * never reached the coordinator. `rejected`: the coordinator answered with a refusal and recorded nothing. `unsupported`:
+ * the command line or the coordinator does not know the operation, so nothing was sent. Exit status 2 is the command
+ * line's own "may or may not have been recorded"; anything unrecognized is uncertain, never guessed to be a refusal.
+ */
+export function classifyRespondFailure(result) {
+  if (result.kind === 'not-installed') return 'not-sent';
+  if (result.kind !== 'error' || result.exitCode !== 1) return 'uncertain';
+  const diagnostic = firstLine(result.stderr.replace(/^Heimdall:\s*/, '').trimStart());
+  if (/^The coordinator at .+ does not support this response operation/.test(diagnostic)) return 'unsupported';
+  if (/^Unknown coordinator command; see --help$/.test(diagnostic) || /^Unknown or repeated option: --(?:request|pause)$/.test(diagnostic)) return 'unsupported';
+  if (/^The coordinator refused the response \(\d{3}(?: [a-z-]+)?\): /.test(diagnostic)) return 'rejected';
+  if (/^The coordinator at .+ refused authorization; .*Nothing was recorded\.$/.test(diagnostic)) return 'rejected';
+  if (/^The coordinator at .+ is unavailable: .*Nothing was sent\.$/.test(diagnostic)) return 'not-sent';
+  return 'uncertain';
+}
+
+/** The HTTP status and code the command line printed for a refusal, when it printed them. */
+function refusalCode(result) {
+  const match = /^The coordinator refused the response \((\d{3})(?: ([a-z-]+))?\)/.exec(firstLine(result.stderr.replace(/^Heimdall:\s*/, '').trimStart()));
+  return match ? { status: Number(match[1]), code: match[2] ?? null } : null;
+}
+
+/** Validate the acknowledgement `run respond` prints against the response that was sent. Null when it is anything else. */
+function responseAck(stdout, expected) {
+  const ack = parseJson(stdout);
+  if (!isObject(ack) || ack.runId !== expected.runId) return null;
+  if (expected.requestId !== undefined && (ack.requestId !== expected.requestId || ack.decision !== expected.decision)) return null;
+  if (expected.pauseId !== undefined && ack.pauseId !== expected.pauseId) return null;
+  if (typeof ack.continuation !== 'string' || typeof ack.retried !== 'boolean' || !isObject(ack.run) || typeof ack.run.status !== 'string') return null;
+  return {
+    runId: ack.runId,
+    ...(expected.requestId === undefined ? { pauseId: ack.pauseId } : { requestId: ack.requestId, decision: ack.decision }),
+    continuation: limitText(ack.continuation, 40), retried: ack.retried, recordedAt: timestamp(ack.recordedAt),
+    run: { status: limitText(ack.run.status, 40), version: Number.isInteger(ack.run.version) ? ack.run.version : null },
+  };
+}
+
+/**
+ * Send exactly one `run respond` and classify the outcome. The text travels as the value of `--input=`, so it can never
+ * be read as an option, and the call is never repeated: whatever happens, the caller reports it.
+ */
+async function deliverResponse(coordinator, args, expected) {
+  const result = await coordinator.raw(['run', 'respond', ...args], { timeoutMs: MUTATION_TIMEOUT_MS });
+  if (!result.ok) {
+    const kind = classifyRespondFailure(result);
+    return { kind, message: failureText(result), ...(kind === 'rejected' ? { refusal: refusalCode(result) } : {}) };
+  }
+  const ack = responseAck(result.stdout, expected);
+  if (!ack) return { kind: 'uncertain', message: 'The coordinator answered, but the answer is not the expected acknowledgement.' };
+  return { kind: 'recorded', ack };
 }
 
 function failureText(result) {
@@ -902,9 +1168,30 @@ function resumeNextAction(projection) {
   }
 }
 
+/** What to do about a typed request that is still open. Generic resume or guidance is never a way to answer it. */
+function approvalNextAction(wait) {
+  if (withdrawnDeliveryOwed(wait)) {
+    return { action: 'wait', detail: 'The owner decision was withdrawn because the reviewed material changed, and its feedback is being delivered to the agent; nothing is authorized. Guidance cannot replace the delivery and the old request cannot be approved. Monitor the run: the agent keeps its work and files a fresh approval request.' };
+  }
+  if (wait.kind === 'approval' && wait.state === 'answered') {
+    return { action: 'wait', detail: 'The owner decision is recorded and the run continues from it automatically. Guidance cannot replace it. Monitor the run.' };
+  }
+  if (wait.kind === 'approval') {
+    return {
+      action: 'owner-decision',
+      detail: `The run waits for an owner decision on request ${wait.requestId}. Show the owner the request. Only an explicit approval, or explicit change feedback, sent with \`respond RUN_ID --request ${wait.requestId} --decision approve|request-changes\` answers it. A request to resume or continue is not a decision.`,
+    };
+  }
+  return { action: 'monitor', detail: 'The coordinator reports a wait this helper does not recognize, so nothing was sent. Inspect the run with the owner. Guidance is delivered only with a valid pause identity, which needs a coordinator and client of matching versions that support the guarded response.' };
+}
+
 /**
- * Resume a paused run with the owner's guidance. The guidance is data: it is read from a file or stdin, wrapped in a
- * labeled message (so text beginning with a dash never reaches the command line as an option) and sent once.
+ * Resume a paused run with the owner's guidance. The guidance is data: it is read from a file or stdin and sent once, only
+ * as the guarded response for exactly the generic pause the coordinator reports (so text beginning with a dash never
+ * reaches the command line as an option). A run whose record does not carry a valid pause identity (no wait reported, no
+ * wait, a typed request that is no longer open, or a shape this helper does not know) is refused with nothing sent: the
+ * unguarded `run resume` is never used here, because it cannot tell which pause the guidance was written for. A typed
+ * approval request that is still open is never answered, replaced or bypassed from here.
  */
 async function resumeCommand({ coordinator, cwd, env, options, positional, configFile, stdin, signal }) {
   const runId = positional[0];
@@ -920,6 +1207,12 @@ async function resumeCommand({ coordinator, cwd, env, options, positional, confi
     exitCode: ok ? 0 : 1,
   });
 
+  const pauseIdentityRefusal = run => done('refused', {
+    reason: 'pause-identity-unavailable', run,
+    message: 'The coordinator does not report a valid pause identity for this run, so no guidance was sent. Guidance is delivered only as a guarded response to the exact pause it was written for, which needs a coordinator and an OpenHeimdall client of matching versions that support the guarded response. The unguarded resume is not used instead.',
+    next: { action: 'owner-decision', detail: 'Use matching coordinator and client versions that support the guarded response, then read the run again. If the run then shows a pause identity, send the guidance again; otherwise nothing was changed.' },
+  });
+
   let guidance = fromStdin ? await readStdin(stdin, MAX_GUIDANCE_BYTES) : await readTextFile(path.resolve(cwd, guidanceFile), MAX_GUIDANCE_BYTES);
   if (guidance.ok && guidance.text.includes('\0')) guidance = { ok: false, reason: 'contains-nul', bytes: guidance.bytes };
   if (!guidance.ok) return done('refused', { reason: `guidance-${guidance.reason}`, message: PROBLEM_MESSAGES[guidance.reason], guidance: { source: fromStdin ? 'stdin' : 'file', ...(guidance.bytes === undefined ? {} : { bytes: guidance.bytes }), maxBytes: MAX_GUIDANCE_BYTES } });
@@ -930,42 +1223,167 @@ async function resumeCommand({ coordinator, cwd, env, options, positional, confi
     if (before.kind === 'not-found') return done('not-found', { message: 'The coordinator has no run with this ID.' });
     return done('error', { error: { kind: before.kind, message: before.message } });
   }
+  const { wait } = before.projection;
+  if (wait?.kind === 'unrecognized' && before.record.wait?.kind === 'generic') return pauseIdentityRefusal(before.projection);
+  if (approvalUnresolved(wait)) {
+    return done('refused', { reason: 'approval-pending', run: before.projection, next: approvalNextAction(wait), message: 'The run has a typed approval request that is not resolved, so no guidance was sent. Guidance cannot answer or replace it.' });
+  }
   if (before.record.status !== 'paused' || before.record.capacityReserved === true) {
     return done('not-resumable', { run: before.projection, next: resumeNextAction(before.projection), message: 'The run is not a confirmed idle paused run, so nothing was sent.' });
   }
+  if (wait?.kind !== 'generic') return pauseIdentityRefusal(before.projection);
+  if (guidance.text.length > RESPONSE_INPUT_LIMIT) {
+    return done('refused', { reason: 'guidance-too-long', message: PROBLEM_MESSAGES['too-long'], guidance: { ...guidanceSummary, maxCharacters: RESPONSE_INPUT_LIMIT } });
+  }
   if (signal?.aborted) return done('interrupted', { reason: 'interrupted-before-mutation' });
 
-  const message = `${GUIDANCE_HEADER}\n${guidance.text}`;
-  attempted.push('run resume');
-  const resumed = await coordinator.raw(['run', 'resume', runId, '--input', message], { timeoutMs: MUTATION_TIMEOUT_MS });
   const known = { guidance: guidanceSummary, before: { status: before.projection.status, version: before.record.version ?? null, completedResults: before.projection.progress?.completed ?? null } };
-  if (!resumed.ok) {
-    const kind = classifyMutationFailure(resumed);
-    const text = failureText(resumed);
-    if (kind === 'not-sent') return done('not-resumed', { message: text, ...known });
-    if (kind === 'rejected') return done('rejected', { message: text, ...known });
-    return done('uncertain', { message: text, rule: UNCERTAIN_RULE, ...known, inspection: await inspectRun(coordinator, runId) });
+  // The guarded response names this pause and is checked again by the coordinator. It is never replaced by `run resume`.
+  attempted.push('run respond');
+  const sent = await deliverResponse(coordinator, [runId, '--pause', wait.pauseId, `--input=${guidance.text}`], { runId, pauseId: wait.pauseId });
+  if (sent.kind === 'not-sent') return done('not-resumed', { message: sent.message, via: 'respond', ...known });
+  if (sent.kind === 'rejected' || sent.kind === 'unsupported') return done('rejected', { message: sent.message, via: 'respond', ...(sent.kind === 'unsupported' ? { unsupported: true } : { refusal: sent.refusal }), ...known });
+  if (sent.kind === 'uncertain') return done('uncertain', { message: sent.message, via: 'respond', rule: UNCERTAIN_RULE, ...known, inspection: await inspectRun(coordinator, runId) });
+  if (sent.ack.continuation !== 'queued' || sent.ack.run.status !== 'queued') {
+    return done('uncertain', { message: 'The coordinator acknowledged the response, but not as a queued resume.', via: 'respond', acknowledgement: sent.ack, rule: UNCERTAIN_RULE, ...known, inspection: await inspectRun(coordinator, runId) });
   }
-  const answer = parseJson(resumed.stdout);
-  let accepted;
-  try { accepted = isObject(answer) && answer.id === runId ? projectRun(answer) : null; } catch { accepted = null; }
-  if (!accepted || accepted.status !== 'queued') {
-    return done('uncertain', { message: 'The coordinator answered, but the answer is not a queued run record.', rule: UNCERTAIN_RULE, ...known, inspection: await inspectRun(coordinator, runId) });
-  }
+  const acknowledgement = sent.ack;
   const after = await showRun(coordinator, runId);
-  const current = after.ok ? after.projection : accepted;
+  // When the follow-up read fails, the acceptance still stands: report what the coordinator itself acknowledged.
+  const current = after.ok ? after.projection : null;
   const original = before.projection;
   return done('resumed', {
-    accepted: true, status: current.status,
+    accepted: true, status: current ? current.status : acknowledgement.run.status,
+    via: 'respond',
     note: 'The coordinator accepted the resume and queued the same run again. It is not running until it is admitted; monitor it.',
-    run: current,
-    preserved: {
-      runId: current.runId === runId, worktreePath: current.worktreePath === original.worktreePath, branch: current.branch === original.branch,
-      parentSessionId: current.parentSessionId === original.parentSessionId,
-    },
-    completedResults: { before: original.progress?.completed ?? null, after: current.progress?.completed ?? null },
+    ...(current ? {
+      run: current,
+      preserved: {
+        runId: current.runId === runId, worktreePath: current.worktreePath === original.worktreePath, branch: current.branch === original.branch,
+        parentSessionId: current.parentSessionId === original.parentSessionId,
+      },
+      completedResults: { before: original.progress?.completed ?? null, after: current.progress?.completed ?? null },
+    } : {}),
+    acknowledgement,
     ...(after.ok ? {} : { confirmation: { available: false, reason: after.kind, message: after.message } }),
     guidance: guidanceSummary,
+  }, true);
+}
+
+// --- respond -----------------------------------------------------------------------------------------------
+
+/** Validate the target and text source of `respond` before anything is read or sent. Throws UsageError. */
+function respondTarget(options, runId) {
+  if (runId === undefined) throw new UsageError('respond requires RUN_ID');
+  if (!validRunId(runId)) throw new UsageError('RUN_ID must be letters, digits, underscore or dash and must not start with a dash');
+  const requestId = options['--request'];
+  const pauseId = options['--pause'];
+  const decision = options['--decision'];
+  const feedbackSources = (options['--feedback-file'] !== undefined ? 1 : 0) + (options['--feedback-stdin'] === true ? 1 : 0);
+  const guidanceSources = (options['--guidance-file'] !== undefined ? 1 : 0) + (options['--guidance-stdin'] === true ? 1 : 0);
+  if (requestId !== undefined && pauseId !== undefined) throw new UsageError('respond takes one target: --request ID for an approval request or --pause ID for a generic pause');
+  if (requestId === undefined && pauseId === undefined) throw new UsageError('respond requires --request ID (approval request) or --pause ID (generic pause)');
+  if (requestId !== undefined) {
+    if (!validRunId(requestId)) throw new UsageError('--request must be letters, digits, underscore or dash and must not start with a dash');
+    if (decision === undefined) throw new UsageError('--request requires --decision approve or --decision request-changes');
+    if (decision !== 'approve' && decision !== 'request-changes') throw new UsageError('--decision must be approve or request-changes');
+    if (guidanceSources > 0) throw new UsageError('Guidance options apply to --pause only; send change feedback with --feedback-file or --feedback-stdin');
+    if (decision === 'approve') {
+      if (feedbackSources > 0) throw new UsageError('Approving takes no feedback; use --decision request-changes to send feedback');
+      return { kind: 'decision', runId, requestId, decision };
+    }
+    if (feedbackSources !== 1) throw new UsageError('--decision request-changes requires exactly one of --feedback-file FILE or --feedback-stdin');
+    return { kind: 'decision', runId, requestId, decision, label: 'feedback', fromStdin: options['--feedback-stdin'] === true, file: options['--feedback-file'] };
+  }
+  if (!validRunId(pauseId)) throw new UsageError('--pause must be letters, digits, underscore or dash and must not start with a dash');
+  if (decision !== undefined) throw new UsageError('--decision applies to --request only; a generic pause takes guidance');
+  if (feedbackSources > 0) throw new UsageError('Feedback options apply to --request only; send guidance with --guidance-file or --guidance-stdin');
+  if (guidanceSources !== 1) throw new UsageError('--pause requires exactly one of --guidance-file FILE or --guidance-stdin');
+  return { kind: 'pause', runId, pauseId, label: 'guidance', fromStdin: options['--guidance-stdin'] === true, file: options['--guidance-file'] };
+}
+
+/**
+ * Carry one explicit owner response to the coordinator, exactly once: the decision on a displayed approval request, or
+ * guidance for a displayed generic pause. The run is read again first and the response is sent only if it still targets
+ * what is displayed. Nothing here decides for the owner: an approval is sent only because `--decision approve` was passed.
+ */
+async function respondCommand({ coordinator, cwd, env, options, positional, configFile, stdin, signal }) {
+  const target = respondTarget(options, positional[0]);
+  const { runId } = target;
+  const attempted = [];
+  const configuration = configurationSelection({ configFile, env });
+  const targetSummary = target.kind === 'decision' ? { request: target.requestId, decision: target.decision } : { pause: target.pauseId };
+  const done = (outcome, fields = {}, ok = false) => ({
+    report: { ok, command: 'respond', outcome, runId, target: targetSummary, ...fields, sent: attempted.length > 0, mutationsAttempted: attempted, coordinator: { configuration } },
+    exitCode: ok ? 0 : 1,
+  });
+  const refuse = (reason, message, fields = {}) => done('refused', { reason, message, ...fields });
+
+  let text = null;
+  let textSummary = null;
+  if (target.label) {
+    text = target.fromStdin ? await readStdin(stdin, MAX_GUIDANCE_BYTES) : await readTextFile(path.resolve(cwd, target.file), MAX_GUIDANCE_BYTES);
+    if (text.ok && text.text.includes('\0')) text = { ok: false, reason: 'contains-nul', bytes: text.bytes };
+    if (text.ok && text.text.length > RESPONSE_INPUT_LIMIT) text = { ok: false, reason: 'too-long', bytes: text.bytes };
+    textSummary = { source: target.fromStdin ? 'stdin' : 'file', ...(text.bytes === undefined ? {} : { bytes: text.bytes }) };
+    if (!text.ok) return refuse(`${target.label}-${text.reason}`, PROBLEM_MESSAGES[text.reason], { [target.label]: { ...textSummary, maxCharacters: RESPONSE_INPUT_LIMIT } });
+  }
+
+  const before = await showRun(coordinator, runId);
+  if (!before.ok) {
+    if (before.kind === 'not-found') return refuse('run-not-found', 'The coordinator has no run with this ID.');
+    return done('error', { error: { kind: before.kind, message: before.message } });
+  }
+  const { wait, waitReported } = before.projection;
+  const shown = { run: before.projection };
+  if (!waitReported) {
+    return refuse('wait-not-reported', 'This coordinator does not report what a run waits for, so there is no displayed request or pause to answer. Nothing was sent.', shown);
+  }
+  if (target.kind === 'decision') {
+    if (wait?.kind !== 'approval' || wait.requestId !== target.requestId) {
+      return refuse(wait?.kind === 'approval' ? 'request-mismatch' : 'no-approval-request', wait?.kind === 'approval'
+        ? `The run now waits on a different request (${wait.requestId}). Show the owner that request; a decision for ${target.requestId} was not sent.`
+        : 'The run has no approval request with this ID. Nothing was sent.', shown);
+    }
+    if (wait.state === 'answered') return refuse('already-answered', 'This request already has a recorded decision. Nothing was sent; read the run instead of repeating the response.', shown);
+    if (wait.state === 'superseded') return refuse('request-superseded', 'This request was superseded: the reviewed work changed or the task moved on, so it can no longer be decided. Nothing was sent.', shown);
+  } else {
+    if (wait?.kind === 'approval') {
+      return refuse('approval-pending', `The run waits on approval request ${wait.requestId}, not on a generic pause. Guidance cannot answer it. Nothing was sent.`, { ...shown, next: approvalNextAction(wait) });
+    }
+    if (wait?.kind !== 'generic' || wait.pauseId !== target.pauseId) {
+      return refuse(wait?.kind === 'generic' ? 'pause-mismatch' : 'no-generic-pause', wait?.kind === 'generic'
+        ? 'The run is now at a different pause than the one displayed. Show the owner the current pause. Nothing was sent.'
+        : 'The run is not at a generic pause. Nothing was sent.', shown);
+    }
+    if (before.record.status !== 'paused' || before.record.capacityReserved === true) {
+      return refuse('not-paused-and-released', 'The run is not a confirmed idle paused run. Nothing was sent.', { ...shown, next: resumeNextAction(before.projection) });
+    }
+  }
+  if (signal?.aborted) return done('interrupted', { reason: 'interrupted-before-mutation' });
+
+  const known = { ...(textSummary ? { [target.label]: textSummary } : {}), before: { status: before.projection.status, version: before.record.version ?? null } };
+  const args = target.kind === 'decision'
+    ? [runId, '--request', target.requestId, '--decision', target.decision, ...(target.decision === 'request-changes' ? [`--input=${text.text}`] : [])]
+    : [runId, '--pause', target.pauseId, `--input=${text.text}`];
+  attempted.push('run respond');
+  const sent = await deliverResponse(coordinator, args, target.kind === 'decision'
+    ? { runId, requestId: target.requestId, decision: target.decision } : { runId, pauseId: target.pauseId });
+  if (sent.kind === 'not-sent') return refuse('not-sent', sent.message, known);
+  if (sent.kind === 'unsupported') return refuse('coordinator-unsupported', sent.message, { ...known, note: 'Nothing was sent and the unguarded resume was not used instead.' });
+  if (sent.kind === 'rejected') return refuse('coordinator-refused', sent.message, { ...known, ...(sent.refusal ? { refusal: sent.refusal } : {}) });
+  if (sent.kind === 'uncertain') return done('uncertain', { message: sent.message, rule: UNCERTAIN_RULE, ...known, inspection: await inspectRun(coordinator, runId) });
+
+  const after = await showRun(coordinator, runId);
+  const outcome = sent.ack.continuation === 'queued' ? 'queued' : sent.ack.continuation === 'pending' ? 'waiting-for-idle' : 'recorded';
+  const note = {
+    queued: 'The response is recorded and the same run is queued to continue. It is not running until it is admitted, and the task is not complete.',
+    'waiting-for-idle': 'The response is recorded. The coordinator continues the run once it has proof that the run is idle. Nothing is running yet, and the task is not complete.',
+    recorded: 'The response is recorded. Read the run for how it continues.',
+  }[outcome];
+  return done(outcome, {
+    accepted: true, recorded: true, retried: sent.ack.retried, note, acknowledgement: sent.ack, ...known,
+    ...(after.ok ? { run: after.projection } : { confirmation: { available: false, reason: after.kind, message: after.message } }),
   }, true);
 }
 
@@ -981,7 +1399,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, s
     const configFile = parsed.options['--coordinator-config'] === undefined ? undefined : path.resolve(cwd, parsed.options['--coordinator-config']);
     const coordinator = createCoordinator({ env, configFile, signal });
     const context = { coordinator, cwd, env, options: parsed.options, positional: parsed.positional, configFile, stdout, stdin, signal };
-    const handlers = { context: contextReport, snapshot: snapshotReport, watch: watchCommand, 'inspect-spec': inspectSpecCommand, start: startCommand, resume: resumeCommand };
+    const handlers = { context: contextReport, snapshot: snapshotReport, watch: watchCommand, request: requestCommand, 'inspect-spec': inspectSpecCommand, start: startCommand, resume: resumeCommand, respond: respondCommand };
     const result = await handlers[parsed.command](context);
     if (result.report) stdout.write(`${JSON.stringify(result.report, null, 2)}\n`);
     return result.exitCode;

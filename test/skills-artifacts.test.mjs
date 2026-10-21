@@ -178,6 +178,11 @@ test('the shared operating contract is stated in every skill', () => {
   assert.match(resume, /--guidance-file/);
   assert.match(resume, /--guidance-stdin/);
   assert.match(resume, /Never submit a fresh run/);
+  assert.match(resume, /never repeat `respond` automatically/);
+  assert.match(resume, /--feedback-file/);
+  assert.match(resume, /Only explicit words decide/);
+  assert.match(resume, /never translate a generic "resume" or "continue" into approval/);
+  assert.match(resume, /owner supplies decisions and access, never implementation chores/i);
   assert.match(resume, /file-writing tool/);
   const start = loaded.get('openheimdall-start').body;
   assert.match(start, /inspect-spec/);
@@ -210,7 +215,7 @@ test('every helper subcommand and option named in a SKILL.md exists in the helpe
   const commands = new Map([
     ['openheimdall-start', ['inspect-spec', 'context', 'start']],
     ['openheimdall-monitor', ['snapshot', 'watch', 'context']],
-    ['openheimdall-resume', ['snapshot', 'resume']],
+    ['openheimdall-resume', ['snapshot', 'resume', 'respond']],
   ]);
   for (const name of expectedSkills) {
     const { body } = loaded.get(name);
@@ -227,17 +232,23 @@ test('every helper subcommand and option named in a SKILL.md exists in the helpe
 test('the monitor skill names no state-changing command outside its prohibitions', () => {
   const { text } = loaded.get('openheimdall-monitor');
   const found = sections(parseFrontmatter(text).body);
-  const outside = text.replace(/^## Prohibitions[\s\S]*?(?=^## |(?![\s\S]))/m, '');
-  assert.ok(outside.length < text.length, 'Prohibitions section not removed');
+  const withoutProhibitions = text.replace(/^## Prohibitions[\s\S]*?(?=^## |(?![\s\S]))/m, '');
+  assert.ok(withoutProhibitions.length < text.length, 'Prohibitions section not removed');
+  // The one place the monitor may name --request is the read-only command that reads a complete approval request; any other
+  // use of the option (a response target) is still a state-changing mention.
+  const READ_REQUEST = 'request RUN_ID --request REQUEST_ID';
+  assert.ok(withoutProhibitions.includes(READ_REQUEST), 'the monitor names the read-only request command');
+  const outside = withoutProhibitions.replaceAll(READ_REQUEST, 'request RUN_ID');
   const mutating = [
     /\bsubmit\b/i, /\breconcile\b/i, /\bproject add\b/i, /\bregister\b/i,
     /\brun (?:resume|submit)\b/i, /\bcoordinator (?:start|stop)\b/i, /\bheimdall (?:start|stop)\b/i,
     /openheimdall\.mjs"? +(?:start|resume|inspect-spec)\b/, /`(?:start|resume)(?: |`)/,
     /--(?:register|start-coordinator|guidance-file|guidance-stdin|input)\b/,
+    /\brespond\b/i, /--(?:request|decision|pause|feedback-file|feedback-stdin)\b/,
   ];
   for (const pattern of mutating) assert.ok(!pattern.test(outside), `monitor SKILL.md mentions ${pattern} outside Prohibitions`);
   const prohibitions = found.get('Prohibitions');
-  for (const word of ['run submit', 'run resume', 'run reconcile', 'project add', 'start', 'stop']) {
+  for (const word of ['run submit', 'run resume', 'run respond', 'run reconcile', 'project add', 'start', 'stop', 'respond']) {
     assert.ok(prohibitions.includes(word), `Prohibitions should forbid ${word}`);
   }
   assert.match(prohibitions, /never changes anything/i);
@@ -291,4 +302,32 @@ test('the resume skill writes guidance to a uniquely named file and removes it a
   assert.match(body, /unique(?:ly named)? (?:file )?name|new, uniquely named file/i);
   assert.match(body, /(?:remove|delete) (?:that|the) (?:temporary )?file/i);
   assert.match(body, /may be sensitive/i);
+});
+
+test('the monitor skill reports the approval wait read-only and sends the owner to the resume skill', () => {
+  const { body, data } = loaded.get('openheimdall-monitor');
+  assert.match(data.description, /pending approval request/);
+  assert.match(data.description, /never answers it/);
+  for (const field of ['run.wait', 'requestId', 'question', 'scope', 'onApprove', 'onRequestChanges', 'revision', 'pauseId', 'waitReported']) assert.ok(body.includes(field), `monitor SKILL.md does not describe ${field}`);
+  assert.match(body, /Waiting for:/);
+  const prohibitions = sections(body).get('Prohibitions');
+  assert.match(prohibitions, /`respond`/);
+  assert.match(prohibitions, /never record an approval/);
+  assert.match(prohibitions, /`openheimdall-resume`/);
+});
+
+test('the resume skill transports only explicit owner decisions and keeps the agent responsible for the work', () => {
+  const { body, data } = loaded.get('openheimdall-resume');
+  assert.match(data.description, /explicit approval or requested changes/);
+  assert.match(data.description, /plain resume or continue request into an approval/);
+  for (const command of ['respond RUN_ID --request REQUEST_ID --decision approve', 'respond RUN_ID --request REQUEST_ID --decision request-changes', 'respond RUN_ID --pause PAUSE_ID']) assert.ok(body.includes(command), command);
+  assert.match(body, /Only explicit words decide/);
+  assert.match(body, /Never choose a decision for the owner/);
+  assert.match(body, /never use `resume` or guidance to answer a request/);
+  assert.match(body, /does not complete any gate/);
+  assert.match(body, /agent corrects its work and submits a fresh request/);
+  assert.match(body, /Never put credentials or private configuration/);
+  assert.match(body, /Do not ask the owner to edit files, run commands or migrate data/);
+  for (const outcome of ['queued', 'waiting-for-idle', 'recorded', 'refused', 'uncertain']) assert.ok(body.includes(`\`${outcome}\``), outcome);
+  assert.match(body, /Never work around an unsupported or refusing coordinator/);
 });

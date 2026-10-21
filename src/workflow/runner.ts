@@ -4,16 +4,17 @@ import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { chooseExecutor, authExpired, executorCandidates } from '../policy/quota.js';
 
-import { classifyError, classifyResult, pauseReportRecovery, REPORT_FIELDS, reportPauseReason, submissionPauseReason, submissionRepairPauseReason } from './report.js';
+import { bounded, classifyError, classifyResult, pauseReportRecovery, REPORT_FIELDS, reportPauseReason, submissionPauseReason, submissionRepairPauseReason } from './report.js';
 import { MAX_SUBMISSION_REPAIRS } from './submission-repair.js';
 import { writeCheckpointFile } from './repair-state.js';
+import { approvalPromptBlock, parseApprovalContext } from './approval-context.js';
 import { runtimeIdentity } from './runtime-identity.js';
 import type { ConflictInfo, RepairDecision, RepairHandler, RepairRequest } from './submission-repair.js';
 import type { OriginReason } from './submission.js';
 import { isTaskId, SUBMISSION_PROTOCOL, SUBMISSION_TOOL_IDS } from './contracts.js';
 import { closeSubmissionBinding, createLocalSubmissionStore, openSubmissionBinding, recordDispatchPrompt, submissionKindForPhase } from './submission-store.js';
 import type {
-  CompletionResult, PlanResult, ProgressUpdate, ReportDiagnostic, ReportOnlyCheck, RunArguments, RunState,
+  CompletionResult, PlanResult, ProgressUpdate, ReportDiagnostic, ReportOnlyCheck, RunArguments, RunState, RunWait,
   RunnerContext, RunnerOptions, RunnerSettings, SubmissionReceipt, SubmissionRepairRecord, SubmissionRepairRefusal, WorkflowResult, WorkflowTask,
 } from './types.js';
 export type { RunnerBackend, RunnerContext, RunnerOptions, RunnerSettings } from './types.js';
@@ -165,8 +166,10 @@ export function structuredExecutorContract(task: WorkflowTask): string {
     'Include exactly one evidence entry for every gate below. Do not include taskId, gate text or any run, attempt, session or owner identity: the host supplies them.',
     'Gates:',
     ...task.dod.map((gate, i) => 'G' + (i + 1) + ' = ' + gate),
-    'Blocked payload: {"status":"blocked","reason":"<specific blocker and owner steps>"}',
-    'Rules: evidence must already exist before you submit; report results truthfully; set passed=true only for a gate you fully proved; if any gate is unresolved, submit the blocked payload. A call the tool rejects records nothing.',
+    'Blocked payload: {"status":"blocked","reason":"<the exact owner decision or capability still needed>"}',
+    'Approval payload: {"status":"approval-required","question":"<the decision asked>","scope":"<exactly what approval authorizes>","completedWork":"<what is already done>","verification":["<check and result>"],"artifacts":["<reviewable path, commit or revision>"],"onApprove":["<action you will perform after approval>"],"onRequestChanges":["<what you will do with feedback>"]}',
+    'Approval rules: before asking, do all work and read-only checks you are already authorized to do. An approval records only the scope you name and gates nothing else. The owner supplies decisions and access, never implementation chores: you keep every remaining action, including integration, migration, correction and verification. Put no credentials, environment file contents or private configuration values in the request. If the owner requests changes, never perform the gated action: correct within the task scope and submit a fresh approval request. If you change the material under review, request fresh approval.',
+    'Rules: evidence must already exist before you submit; report results truthfully; set passed=true only for a gate you fully proved; if any gate is unresolved, submit the blocked payload (or an approval request when a decision is what remains). A call the tool rejects records nothing.',
     'A malformed call may be corrected at most twice. After the first rejection every other tool is disabled for this session, so submit the complete payload from results you already have; do no further work.',
     'After the tool acknowledges the submission, stop: reply with one short sentence and call no other tool.',
   ].join('\n');
@@ -275,6 +278,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
     let state!: RunState;
     let started = false;
     let rejection: ReportDiagnostic | undefined; // Set only when an executor completion report is rejected.
+    let approvalWait: RunWait | undefined; // Set only by an admitted approval-required submission; becomes the checkpoint's semantic wait.
     let unverifiedOrigin: { attemptId: string; reason: OriginReason } | undefined; // Process-local note of a submission call denied for an unverifiable origin.
     let pendingCorrection: string | undefined; // A correction attempt persisted by this invocation and not yet dispatched.
     let correctionRelease: (() => Promise<void>) | undefined; // Report-only restriction held for the pending or running correction.
@@ -337,9 +341,18 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
         }
         state.settings = settings;
         state.caller = callerIdentity(context);
+        // A coordinator-rendered approval decision for exactly the task that asked is kept as structured context; other text stays a free-text resolution.
+        const decision = persistence ? parseApprovalContext(args.input) : undefined;
+        if (decision) {
+          const waiting = state.wait;
+          if (state.phase !== 'executor' || state.status !== 'paused' || !waiting || waiting.kind !== 'approval' || waiting.index !== decision.index || waiting.taskId !== decision.taskId
+            || state.index !== decision.index || state.tasks[state.index]?.id !== decision.taskId) throw new Error('The approval continuation does not match the task that asked for approval');
+          state.approval = decision;
+          delete state.resolution;
+        } else state.resolution = args.input;
         state.status = 'running';
-        state.resolution = args.input;
         delete state.reason;
+        delete state.wait; // A resumed run is running again; any later pause records its own wait.
         await save(state);
         started = true;
         await recordLockOwner();
@@ -431,6 +444,8 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
         const next = { ...state, child: null };
         delete next.attempt;
         delete next.resolution;
+        delete next.approval; // The decision belongs to the task it was about.
+        delete next.wait; // The semantic wait ends with the task it was about.
         delete next.taskStartedAt;
         delete next.taskElapsedMs;
         delete next.reportRecovery; // Real advancement only: restarts, new attempts and resumes keep the record.
@@ -474,6 +489,14 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
           const gateIds = (Array.isArray(canonical.evidence) ? canonical.evidence : []).filter(isRecord).filter(entry => entry.passed !== true).map(entry => entry.gateId).filter((id): id is string => typeof id === 'string').slice(0, 50);
           if (task) rejection = { code: 'unfinished_work', ...(gateIds.length ? { gateIds } : {}) };
           throw new Error('Unfinished work: the submission reported unresolved gates');
+        }
+        if (stored.outcome === 'approval-required' && !planning && task) {
+          // A typed semantic wait: the attempt is finished and nothing is added, advanced, repaired or reprompted. The rejection
+          // is not correctable, so no report correction or submission repair is consumed. The wait is recorded with the pause.
+          attempt.status = 'rejected';
+          rejection = { code: 'approval_required' };
+          approvalWait = { kind: 'approval', attemptId: attempt.id, index: state.index, taskId: task.id };
+          throw new Error('Approval required for ' + task.id + ': ' + bounded(nonempty(canonical.question) ? canonical.question : 'the owner decision was not stated', 500));
         }
         if (stored.outcome !== (planning ? 'planned' : 'completed')) throw new Error('Saved submission has an unknown outcome');
         // Receipt AND confirmed native stop. Anything short of that pauses with the receipt kept for the next resume.
@@ -611,7 +634,7 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
           const variant = correcting ? correcting.variant : planning ? cfg.plannerVariant : state.selection!.variant;
           const attemptID = correcting ? correcting.id : randomUUID();
           const instructions = correcting ? '' : await fs.readFile(promptPaths[planning ? 'planner' : 'executor'], 'utf8');
-          const prompt = correcting ? correctionInstruction(task, state.reportRecovery!.corrections, state.reportRecovery!.diagnostic ?? { code: 'report_format' }) : (tokenLimitsDisabled ? 'Token limits disabled by owner; usage tracking remains enabled.' : 'Budget: ' + (planning ? cfg.maxPlannerTokens : cfg.maxSessionTokens) + ' reported tokens for this session, ' + cfg.maxRunTokens + ' for the ADR;') + ' ' + (timeoutMinutes > 0 ? 'Time warning after ' + cfg.timeoutMinutes + ' active minutes: continue working toward the DoD; elapsed time alone is not a blocker.' : 'No elapsed-time warning or task deadline is configured.') + ' Keep context narrow. Token limits, when enabled, still apply.\n' + instructions + '\n\nADR: ' + state.adr + '\nProject: ' + directory + '\nBranch: ' + state.branch + ' (stay on this branch; return blocked if another branch is required)\nPre-existing changes, do not overwrite or commit:\n' + state.baseline + '\nRun directory: ' + runDir + '\nPlanning artifact directory: ' + path.join(planRoot, 'adr-' + state.id) + '\n' + (planning ? '' : 'Task: ' + JSON.stringify(task) + '\nRead facts.md and ledger.md in the run directory. Do not read prior session transcripts.') + '\n' + (state.resolution ? 'Owner resolution: ' + state.resolution : '') + '\nDo not invoke other agents, background jobs, or Session Goals. ' + (structured ? 'Report only through the submission tool named in the contract below; your final chat text is human-readable and is never parsed.' : 'Return the specified JSON as your final answer.') + ' If interrupted, reconcile files and existing completed work before continuing. Do not repeat passed checks unless affected by new changes.';
+          const prompt = correcting ? correctionInstruction(task, state.reportRecovery!.corrections, state.reportRecovery!.diagnostic ?? { code: 'report_format' }) : (tokenLimitsDisabled ? 'Token limits disabled by owner; usage tracking remains enabled.' : 'Budget: ' + (planning ? cfg.maxPlannerTokens : cfg.maxSessionTokens) + ' reported tokens for this session, ' + cfg.maxRunTokens + ' for the ADR;') + ' ' + (timeoutMinutes > 0 ? 'Time warning after ' + cfg.timeoutMinutes + ' active minutes: continue working toward the DoD; elapsed time alone is not a blocker.' : 'No elapsed-time warning or task deadline is configured.') + ' Keep context narrow. Token limits, when enabled, still apply.\n' + instructions + '\n\nADR: ' + state.adr + '\nProject: ' + directory + '\nBranch: ' + state.branch + ' (stay on this branch; return blocked if another branch is required)\nPre-existing changes, do not overwrite or commit:\n' + state.baseline + '\nRun directory: ' + runDir + '\nPlanning artifact directory: ' + path.join(planRoot, 'adr-' + state.id) + '\n' + (planning ? '' : 'Task: ' + JSON.stringify(task) + '\nRead facts.md and ledger.md in the run directory. Do not read prior session transcripts.') + '\n' + (state.resolution ? 'Owner resolution: ' + state.resolution : '') + (state.approval && !planning ? '\n' + approvalPromptBlock(state.approval) : '') + '\nDo not invoke other agents, background jobs, or Session Goals. ' + (structured ? 'Report only through the submission tool named in the contract below; your final chat text is human-readable and is never parsed.' : 'Return the specified JSON as your final answer.') + ' If interrupted, reconcile files and existing completed work before continuing. Do not repeat passed checks unless affected by new changes.';
           if (!correcting) {
             state.attempt = { id: attemptID, phase: state.phase, index: state.index, child: state.child, status: 'launching', startedAt: Date.now(), model: chosen, ...(variant ? { variant } : {}) };
             // Structured runs persist the submission authority with the attempt, in the same save, before any prompt is sent.
@@ -951,6 +974,13 @@ export function createRunner({ backend, directory, quota, authRefresh, guards = 
       state.reason = errorMessage(error);
       if (state.submissionBinding) state.submissionBinding = closeSubmissionBinding(state.submissionBinding); // A stopped run accepts no late submission.
       const failedTask = state.phase === 'executor' ? state.tasks[state.index] : undefined;
+      // Only an admitted approval request for this very attempt is a semantic wait; every other pause clears any stale one.
+      if (approvalWait && failedTask && approvalWait.index === state.index && approvalWait.taskId === failedTask.id && approvalWait.attemptId === state.attempt?.id) {
+        state.wait = approvalWait;
+        // A fresh request concerns material the earlier approval did not review, so that approval must not be presented again by a
+        // later plain resume. A context that only restricts (requested changes, withdrawn authorization) stays: it grants nothing.
+        if (state.approval?.decision === 'approve' && !state.approval.superseded) delete state.approval;
+      } else delete state.wait;
       if (rejection && failedTask) {
         state.reportRecovery = pauseReportRecovery(state.reportRecovery, { index: state.index, taskId: failedTask.id, child: state.child, attemptId: state.attempt?.id ?? '' }, rejection);
         // A missing submission explains itself with the bounded origin reason only; every other code keeps the stored reason as its detail.

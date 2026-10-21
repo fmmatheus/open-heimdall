@@ -35,7 +35,8 @@ export const isTaskId = (id: unknown): boolean => TASK_ID_PATTERN.test(id as str
 export type ContractErrorCode =
   | 'invalid_type' | 'missing_field' | 'unknown_field' | 'identity_field' | 'empty_string' | 'invalid_value'
   | 'empty_array' | 'invalid_task_id' | 'duplicate_task_id' | 'invalid_dependency' | 'task_limit'
-  | 'invalid_gate_id' | 'duplicate_gate_id' | 'gate_out_of_range' | 'missing_gate' | 'too_many_errors';
+  | 'invalid_gate_id' | 'duplicate_gate_id' | 'gate_out_of_range' | 'missing_gate' | 'too_many_errors'
+  | 'text_too_long' | 'list_too_long' | 'payload_too_large';
 
 export interface ContractError {
   /** `$` is the payload root, then `.field` and `[index]` segments. */
@@ -97,6 +98,13 @@ const plannerVariants = {
   }),
 } as const;
 
+/** Bounds of an approval request. Enforced in the contract refinement with exact paths, so an oversize request is a format error. */
+export const APPROVAL_TEXT_LIMIT = 4000;
+export const APPROVAL_LIST_LIMIT = 20;
+export const APPROVAL_PAYLOAD_LIMIT = 32 * 1024;
+const APPROVAL_TEXT_FIELDS = ['question', 'scope', 'completedWork'] as const;
+const APPROVAL_LIST_FIELDS = ['verification', 'artifacts', 'onApprove', 'onRequestChanges'] as const;
+
 const executorVariants = {
   completed: object({
     status: literal('completed', 'Completed outcome'),
@@ -110,7 +118,17 @@ const executorVariants = {
   }),
   blocked: object({
     status: literal('blocked', 'Blocked outcome'),
-    reason: text('Specific blocker and the owner steps that resolve it'),
+    reason: text('The exact owner decision or capability (access, credential, permission) still needed; never implementation steps the agent can perform'),
+  }),
+  approval: object({
+    status: literal('approval-required', 'Approval request: the owner approves or requests changes; the agent keeps the remaining work'),
+    question: text(`The concrete decision asked of the owner (at most ${APPROVAL_TEXT_LIMIT} characters)`),
+    scope: text(`Exactly what an approval authorizes and nothing beyond it (at most ${APPROVAL_TEXT_LIMIT} characters)`),
+    completedWork: text(`What was already done and checked under the task's authorization (at most ${APPROVAL_TEXT_LIMIT} characters)`),
+    verification: list(text('One check that was run and its result'), 1, `Evidence for the completed work; at most ${APPROVAL_LIST_LIMIT} entries`),
+    artifacts: list(text('A reviewable path, commit or revision reference'), 1, `What the owner should review; at most ${APPROVAL_LIST_LIMIT} entries`),
+    onApprove: list(text('A concrete remaining action you will perform after approval'), 1, `Your own remaining actions if approved; at most ${APPROVAL_LIST_LIMIT} entries`),
+    onRequestChanges: list(text('What you will do with the owner feedback'), 1, `Your own actions if changes are requested; at most ${APPROVAL_LIST_LIMIT} entries`),
   }),
 } as const;
 
@@ -118,7 +136,7 @@ export type PlannerPlan = Infer<(typeof plannerVariants)[keyof typeof plannerVar
 export type ExecutorResult = Infer<(typeof executorVariants)[keyof typeof executorVariants]>;
 export type PlannedTask = Infer<typeof taskSpec>;
 export type PlannerOutcome = 'planned' | 'blocked';
-export type ExecutorOutcome = 'completed' | 'blocked' | 'unfinished';
+export type ExecutorOutcome = 'completed' | 'blocked' | 'unfinished' | 'approval-required';
 
 export interface ContractRef {
   protocol: typeof SUBMISSION_PROTOCOL;
@@ -166,12 +184,34 @@ export const plannerPlanContract: ContractDefinition<typeof plannerVariants, { l
   outcome: variant => variant === 'blocked' ? 'blocked' : 'planned',
 };
 
+/**
+ * Version 2 adds the `approval-required` variant: a typed, semantic wait for an owner decision on executor work. The
+ * planner contract is deliberately unchanged: planner clarification stays on `blocked` and the resume resolution, and
+ * a generic blocked/unfinished result, a quota or authentication stop or a native form/permission wait is never an
+ * approval request.
+ */
 export const executorResultContract: ContractDefinition<typeof executorVariants, { dodCount: number }> = {
   kind: 'executor-result',
-  version: 1,
+  version: 2,
   variants: executorVariants,
-  select: { completed: () => 'completed', blocked: () => 'blocked' },
+  select: { completed: () => 'completed', blocked: () => 'blocked', 'approval-required': () => 'approval' },
   refine(variant, value, context, report) {
+    if (variant === 'approval') {
+      const request = value as Infer<(typeof executorVariants)['approval']>;
+      for (const field of APPROVAL_TEXT_FIELDS) {
+        if (request[field].length > APPROVAL_TEXT_LIMIT) report(`$.${field}`, 'text_too_long', `Has ${request[field].length} characters; maximum is ${APPROVAL_TEXT_LIMIT}`);
+      }
+      for (const field of APPROVAL_LIST_FIELDS) {
+        const entries = request[field];
+        if (entries.length > APPROVAL_LIST_LIMIT) report(`$.${field}`, 'list_too_long', `Has ${entries.length} entries; maximum is ${APPROVAL_LIST_LIMIT}`);
+        entries.forEach((entry, index) => {
+          if (entry.length > APPROVAL_TEXT_LIMIT) report(`$.${field}[${index}]`, 'text_too_long', `Has ${entry.length} characters; maximum is ${APPROVAL_TEXT_LIMIT}`);
+        });
+      }
+      const size = Buffer.byteLength(JSON.stringify(request), 'utf8');
+      if (size > APPROVAL_PAYLOAD_LIMIT) report('$', 'payload_too_large', `The request is ${size} bytes; maximum is ${APPROVAL_PAYLOAD_LIMIT}. Shorten it and reference artifacts instead of quoting them`);
+      return;
+    }
     if (variant !== 'completed') return;
     const { evidence } = value as Infer<(typeof executorVariants)['completed']>;
     const covered = new Set<number>();
@@ -189,6 +229,7 @@ export const executorResultContract: ContractDefinition<typeof executorVariants,
   },
   outcome: (variant, value) => {
     if (variant === 'blocked') return 'blocked';
+    if (variant === 'approval') return 'approval-required';
     return (value as Infer<(typeof executorVariants)['completed']>).evidence.every(entry => entry.passed === true) ? 'completed' : 'unfinished';
   },
 };
@@ -416,6 +457,8 @@ export function negativeSignal(rule: SubmissionRule, raw: unknown, errors: reado
     return { outcome: 'blocked', gateIds: [], ...(typeof reason === 'string' && reason.trim() ? { reason } : {}), fields };
   }
   if (rule.kind !== 'executor-result') return undefined;
+  // A malformed approval request is a format error to repair. Stray completion fields inside it never make it a negative outcome.
+  if (ownValue(raw, 'status') === 'approval-required') return undefined;
   const evidence = ownValue(raw, 'evidence');
   if (!Array.isArray(evidence)) return undefined;
   const failed = evidence.filter(isPlainObject).filter(entry => ownValue(entry, 'passed') === false);

@@ -6,8 +6,8 @@ OpenCode or OpenChamber session, using the installed `heimdall` CLI:
 | Skill (ID) | Use it to | Changes coordinator state |
 | --- | --- | --- |
 | `openheimdall-start` | Submit a new run from a task-spec Markdown file. | Yes: at most one `run submit` per use; optionally registers the project and starts the coordinator when asked. |
-| `openheimdall-monitor` | Read the state of a run once, or watch it for a bounded time. | Never. |
-| `openheimdall-resume` | Send the owner's guidance to a paused run so the same run continues. | Yes: at most one `run resume` per use. |
+| `openheimdall-monitor` | Read the state of a run once, or watch it for a bounded time. It shows what the run waits for, including an approval request (in full when the compact copy is shortened), and never answers it. | Never. |
+| `openheimdall-resume` | Send the owner's guidance to a paused run, or the owner's explicit approval or requested changes for an approval request, so the same run continues. | Yes: at most one `run respond` per use. |
 
 Each skill is a directory with a `SKILL.md` and `scripts/openheimdall.mjs`, a
 dependency-free Node helper (identical in all three directories) that calls the
@@ -55,16 +55,19 @@ The skills run the coordinator workflow; they do not set it up.
   checks, not for guidance for an existing run and refuses to start a run from a
   file that looks like guidance without asking.
 - **`openheimdall-monitor`**: "what is the state of this run?", "watch it until
-  it pauses". It reads the run record (`status`, progress, current task, blocker,
-  worktree, branch, session) and reports it. It selects the run from an explicit
+  it pauses", "is it waiting for me?". It reads the run record (`status`,
+  progress, current task, blocker, what the run waits for, worktree, branch,
+  session) and reports it. It selects the run from an explicit
   ID, else from the managed `heimdall/run/<id>` branch of your working directory,
   else from the only active run of the matching project, and asks when that is
   ambiguous.
 - **`openheimdall-resume`**: "resume run RUN_ID with this guidance" (typed text
-  or a Markdown file). The run must be paused with no reserved capacity. It keeps
-  its ID, worktree, branch and accepted results; it never creates a new run.
-  Anything else (still running, `reconciliation-required`, finished) is reported
-  and left alone.
+  or a Markdown file), "I approve that request", "do not approve it yet; here is
+  what to change". Guidance needs a run that is paused with no reserved capacity.
+  The run keeps its ID, worktree, branch and accepted results; this skill never
+  creates a new run. Anything else (still running, `reconciliation-required`,
+  finished) is reported and left alone. See [Answering an approval
+  request](#answering-an-approval-request).
 
 ## Install for OpenCode
 
@@ -248,6 +251,122 @@ still finite. Ending a watch never affects the run. A
 reserved capacity slot is not proof that an agent is active and a quiet run is not
 proof of a stall.
 
+## Approval requests and pauses in reports
+
+A paused run reports what it waits for as `run.wait`:
+
+- **Approval request** (`kind` `approval`). An executor task asked for an owner
+  decision with the typed `approval-required` result. The report carries a bounded
+  copy: `requestId`, `state` (`pending`, `answered` or `superseded`),
+  `continuation` and `progress`, the task, the `question`, `scope`,
+  `completedWork`, `verification`, `artifacts`, `onApprove`, `onRequestChanges` and
+  an abbreviated `revision`, plus the recorded `response.decision` once answered.
+  Text is limited to 1500 characters (1000 for scope and completed work), lists to
+  10 entries of 300 characters, and `clippedFields` names text the coordinator cut.
+  `shortened` is `true` when the coordinator or the helper cut any text or list
+  entry; the wait then carries `completeRequest`, which names the `request` command
+  that reads the whole request (see below). The feedback an owner gave is never
+  copied into a report.
+- **Generic pause** (`kind` `generic`). Any other pause. It carries the `pauseId`
+  the owner response must name; the reason is the existing `blocker` field.
+- `wait` is `null` for a run that waits for nothing, and `waitReported` is `false`
+  when the coordinator does not report waits. A shape the helper does not know is
+  shown as `unrecognized` and is never acted on.
+
+An approval that is `answered` and queued, or `waiting-for-idle`, is recorded but
+not running, and approval never completes a task: the agent still finishes its work
+and submits ordinary evidence. A `superseded` request cannot be decided any more
+because the reviewed work changed; the agent has to ask again.
+
+## Reading the complete approval request
+
+A report's `wait` is a compact copy of the request, bounded so that run lists and
+watches stay small. The coordinator accepts longer requests (4000 characters per
+text, 20 entries per list, 32 KiB in all), so a shortened wait can leave out a late
+part of the scope or later list entries. The helper's `request` command reads the
+whole request, read-only:
+
+```text
+openheimdall.mjs request RUN_ID --request ID
+```
+
+It sends one `heimdall coordinator run approval RUN_ID --request ID` (with the
+selected `--coordinator-config`), checks the answer against the run, the request and
+the accepted limits, and reports the `question`, `scope`, `completedWork`,
+`verification`, `artifacts`, `onApprove`, `onRequestChanges`, the full `revision`
+and the request's state with `complete: true`. Nothing is shortened. It changes no
+state, so the monitor skill uses it freely; reading a request is not a decision.
+
+When the request cannot be read in full (an older coordinator or command line, an
+unknown request, an invalid answer or an unavailable coordinator), the report has
+`complete: false`, no request content and exit status 1. The skills then say that the
+review information is incomplete. They never present the shortened wait as the full
+scope, never offer approval of content the owner has not been shown, and never
+invent an approval.
+
+## Answering an approval request
+
+Only the owner decides, and only in the owner's own explicit words. The monitor
+skill shows a request, reading it in full with `request` when the wait is
+shortened, and stops. The resume skill sends a response only when you
+clearly approve the displayed request, which it has shown you in full, or clearly ask for changes and give the text:
+
+```text
+openheimdall.mjs respond RUN_ID --request ID --decision approve
+openheimdall.mjs respond RUN_ID --request ID --decision request-changes (--feedback-file FILE | --feedback-stdin)
+openheimdall.mjs respond RUN_ID --pause ID (--guidance-file FILE | --guidance-stdin)
+```
+
+Each call reads the run again and sends one `heimdall coordinator run respond`
+(see [Approvals and owner responses](coordinator.md#approvals-and-owner-responses))
+only if the run still shows the request or pause you were shown. Text travels as
+the value of `--input=VALUE`, so multiline text, quotes and leading dashes are data.
+Feedback and guidance are limited to 8000 characters. Nothing is written to disk by
+the helper, and approving needs no file.
+
+What the skills never do:
+
+- A plain "resume", "continue" or "go ahead", a guidance file, or approval of
+  something else is not an approval. With a request open, the resume skill shows the
+  request and asks you to approve or to give changes. `resume` is refused while a
+  request is pending or its decision has not been consumed, and it never sends a
+  decision.
+- They never choose a decision for you and never retry a refused one with another.
+- A decision withdrawn because the reviewed work changed after it was recorded stays
+  owed to the agent until a fresh attempt has received the feedback (the wait is still
+  an approval with `continuation` `superseded` and a `progress` other than
+  `superseded`). The coordinator delivers it on its own once the run is idle. The
+  skills treat it as unresolved: they report that delivery is under way, offer
+  monitoring, and `resume` and `respond --pause` refuse with `approval-pending` and
+  send nothing. Nothing is authorized by it; the agent files a fresh request.
+- For a generic pause, `resume` sends the guidance as the guarded response for
+  exactly the pause the run showed, with one `run respond RUN_ID --pause ID`. It is
+  labelled as owner guidance, not as an approval. When the run does not show a valid
+  pause identity (no wait reported, a null or unrecognized wait, a malformed pause
+  identity, or a superseded request), `resume` refuses with
+  `pause-identity-unavailable` and sends nothing: guidance cannot be tied to a pause,
+  so it could land on a later one. Use coordinator and client versions that both
+  support the guarded response, then read the run again.
+- A guarded response that is unsupported, stale or refused is reported as such after
+  exactly one attempt. The helper never falls back to the unguarded `run resume`
+  command, which stays available to the owner as the explicit coordinator command.
+
+Results of `respond`:
+
+| Outcome | Meaning |
+| --- | --- |
+| `queued` | The response is recorded and the same run is queued to continue. It is not running until admitted, and the task is not complete. |
+| `waiting-for-idle` | The response is recorded. The coordinator continues the run once it has proof that the run is idle. |
+| `recorded` | The response is recorded; read the run for how it continues. |
+| `refused` | Nothing was recorded. `reason` says why: for example `request-mismatch`, `already-answered`, `request-superseded`, `approval-pending`, `pause-mismatch`, `pause-identity-unavailable` (for `resume`), `wait-not-reported`, `coordinator-refused`, `coordinator-unsupported` or `not-sent`. `sent` says whether a request left. |
+| `uncertain` | A request was sent and no answer could be read. See [Uncertain outcomes](#uncertain-outcomes). |
+
+The agent keeps the work. The owner supplies decisions and access, never
+implementation chores: the skills do not ask you to edit files, run commands or
+migrate data to unblock a run. After requested changes the agent corrects its work
+and submits a fresh request, and changed reviewed material needs a fresh approval.
+Never put credentials or private configuration in feedback or guidance.
+
 ## Advanced: helper binary override
 
 The helper runs `heimdall` from `PATH`. Setting `HEIMDALL_BIN` to an executable
@@ -257,28 +376,41 @@ and set `blockerTruncated` when the text was cut.
 
 ## Uncertain outcomes
 
-The start and resume helpers send their request once and never retry. If the
+The start, resume and respond helpers send their request once and never retry. If the
 response is lost (a timeout, a reset, an invalid or oversized reply, or an unknown
 error after the request may have been delivered), the result is `uncertain`:
 
 - the skill follows only with read-only inspection and shows what it found;
 - it does not claim the request failed and does not claim it was accepted because a
   similar run exists, since every accepted submission creates another run;
-- it does not repeat the request. Deciding whether to submit or resume again is
-  yours, after checking with the monitor skill or `heimdall coordinator run show`.
+- it does not repeat the request. Deciding whether to submit, resume or respond again
+  is yours, after checking with the monitor skill or `heimdall coordinator run show`.
+  For `respond`, the inspection shows whether the decision or guidance was recorded
+  and how the run continues. The command line itself ends with status 2 for this case,
+  and an identical repeat would be answered from the stored record rather than applied
+  twice, but the helper still leaves that choice to you.
 
 A refusal that happens before anything is sent (for example the coordinator is not
-reachable, the spec is empty or the run is not paused) is reported as nothing sent.
+reachable, the spec is empty, the run is not paused or the displayed request is no
+longer the current one) is reported as nothing sent. A refusal the coordinator
+answers with is reported as such and recorded nothing.
 A `run list` can be incomplete or too large, so a run missing from it is not proof
 that it does not exist; `run show RUN_ID` is authoritative.
 
 ## What monitoring never does
 
 `openheimdall-monitor` reads only. It runs `status --json`, `project list`,
-`run list` and `run show`, and read-only Git inspection. It never runs
-`run submit`, `run resume`, `run reconcile`, `project add`, `coordinator start` or
-`stop`, the helper's `start` or `resume`, and never edits locks, keys, state files
-or sessions. If a run needs recovery, it reports that and stops.
+`run list`, `run show` and `run approval` (the helper's `request`), and read-only Git
+inspection. It never runs
+`run submit`, `run resume`, `run respond`, `run reconcile`, `project add`,
+`coordinator start` or `stop`, the helper's `start`, `resume` or `respond`, and never
+edits locks, keys, state files or sessions. It can show you an approval request
+and what approving it would permit; it cannot approve, reject or answer it, however
+the request is worded, and it points you to `openheimdall-resume` for that. If a run
+needs recovery, it reports that and stops. The evaluation kit enforces this: a
+recorded `run respond` fails every monitor scenario, and the whole map of recorded
+mutations must match each scenario's policy
+([evaluation kit](../scripts/live/skills-eval/README.md)).
 
 ## Permissions the skills do not grant
 
@@ -310,6 +442,14 @@ two-task spec, a guidance file and the steps to start a run, watch it pause,
 resume it and check that the first result was kept. It is operated by the owner
 and has not been run yet.
 
+[`examples/approval-workflow/`](../examples/approval-workflow/README.md) shows the
+typed approval flow instead: the run pauses on an approval request, the owner makes
+one decision (through these skills or `heimdall coordinator run respond`), and the
+agent does the remaining work in the same run. Its automated test uses a scripted
+stand-in model; the owner-operated steps with real skills, a real model and the
+panel are unverified, and are listed in the
+[approval workflow record](validation/approval-workflow.md).
+
 ## Verification status
 
 Statements about OpenCode and OpenChamber behavior in this guide come from these
@@ -324,8 +464,15 @@ pinned sources.
 | `/` mid-message opens the skill picker; the catalog, custom Git source, scopes and skip/overwrite prompt | OpenChamber v2.1.0: `packages/docs/content/docs/skills.mdx`, `skills-catalog.mdx` |
 | Source forms (`owner/repo[/subpath]`, `https://`, `git@`), `SKILL.md` discovery, project and personal targets, copy without symbolic links, name check | OpenChamber v2.1.0: `packages/web/server/lib/skills-catalog/source.js`, `scan.js`, `install.js`; `packages/web/server/lib/opencode/shared.js` |
 | `opencode debug` subcommands in 2.0.22 | Local `opencode debug --help` (v2.0.22) |
+| Helper behavior for waits, `respond`, refusals and uncertain outcomes, against a scripted command line and an in-process coordinator | Automated tests: `test/skills-helper-readonly.test.mjs`, `test/skills-helper-mutations.test.mjs`; installed tarball copies against a stand-in coordinator: `test/package/skills.test.mjs` |
+| Which commands each scenario may issue, with `run respond` allowed only in the resume scenarios | Evaluation kit selftest and `test/skills-eval-policy.test.mjs`, `test/skills-eval-runner.test.mjs` (no model) |
 
 **Unverified:**
+
+- Whether a model that loads these skills asks for an explicit decision instead of
+  approving on a bare "resume". The evaluation kit has scenarios for it
+  (`no-invented-approval`, `approve-pending-request`, `request-changes-feedback`);
+  they have not been run against a model.
 
 - Loading the skills and following them in a model-backed OpenCode 2.0.32 or
   OpenChamber 2.1.0 session (the `skill` tool call, the printed base directory,

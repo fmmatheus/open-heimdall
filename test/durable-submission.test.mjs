@@ -102,7 +102,7 @@ const gateOf = (backend, persistence = backend.persistence(), now = (() => { let
 
 // --- Coordinator store --------------------------------------------------------------------------------------
 
-test('schema v2 upgrades to v3 additively: receipts and checkpoints survive and submissions become writable', async t => {
+test('schema v2 upgrades additively: receipts and checkpoints survive and submissions become writable', async t => {
   const c = await coordinator(t);
   c.store.bindStart(c.run.id, c.token, c.start);
   const state = structured(c.base);
@@ -112,13 +112,13 @@ test('schema v2 upgrades to v3 additively: receipts and checkpoints survive and 
   const checkpointBefore = c.store.getRun(c.run.id).checkpoint;
   c.store.close();
   const old = new DatabaseSync(c.databasePath);
-  assert.equal(old.prepare('PRAGMA user_version').get().user_version, 3);
+  assert.equal(old.prepare('PRAGMA user_version').get().user_version, 4);
   old.exec('DROP TABLE submissions; PRAGMA user_version = 2');
   old.close();
   const upgraded = c.open();
   const db = new DatabaseSync(c.databasePath);
   try {
-    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 3);
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 4);
     const table = db.prepare("SELECT sql FROM sqlite_schema WHERE name = 'submissions'").get().sql;
     assert.match(table, /STRICT\s*$/i);
     assert.match(table, /PRIMARY KEY \(run_id, attempt_id, kind\)/);
@@ -134,11 +134,11 @@ test('schema v2 upgrades to v3 additively: receipts and checkpoints survive and 
   assert.deepEqual(reopened.readSubmission(c.run.id, c.token, 'attempt_1', 'executor-result'), receipt);
 });
 
-test('a fresh database is created at schema v3 with the submissions table', async t => {
+test('a fresh database is created at the current schema with the submissions table', async t => {
   const c = await coordinator(t);
   const db = new DatabaseSync(c.databasePath);
   try {
-    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 3);
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 4);
     assert.ok(db.prepare("SELECT 1 FROM sqlite_schema WHERE name = 'submissions'").get());
   } finally { db.close(); }
 });
@@ -371,7 +371,7 @@ for (const [name, make] of backends) {
     assert.deepEqual({ protocol: stored.protocol, kind: stored.kind, phase: stored.phase, index: stored.index, taskId: stored.taskId, attemptId: stored.attemptId, dispatch: stored.dispatch, child: stored.child, receiptVersion: stored.receiptVersion }, { protocol: 'structured-v1', kind: 'executor-result', phase: 'executor', index: 0, taskId: 'T1', attemptId: 'attempt_1', dispatch: 1, child: CHILD, receiptVersion: 1 });
     assert.equal(stored.parent, backend.state.parent);
     assert.deepEqual(stored.caller, { sessionID: CHILD, agent: 'executor', messageID: 'msg_1', callId: 'call_1' });
-    assert.deepEqual(stored.contract, { protocol: 'structured-v1', kind: 'executor-result', version: 1 });
+    assert.deepEqual(stored.contract, { protocol: 'structured-v1', kind: 'executor-result', version: 2 });
     assert.equal(typeof stored.runtime.packageVersion, 'string');
     assert.match(stored.runtime.build.digest, /^[0-9a-f]{64}$/, 'the receipt carries the loaded build identity');
     assert.equal(stored.runtime.protocol, 'structured-v1');

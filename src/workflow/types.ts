@@ -1,3 +1,4 @@
+import type { ApprovalContext } from './approval-context.js';
 import type { ExecutorSelection, QuotaSettings, QuotaSnapshot } from '../policy/types.js';
 import type { ContractRef, SubmissionKind, SUBMISSION_PROTOCOL } from './contracts.js';
 import type { DispatchPromptSync } from './prompt-sync.js';
@@ -194,7 +195,9 @@ export type ReportDiagnosticCode =
   | 'report_format' | 'unfinished_work' | 'agent_blocked' | 'identity_mismatch' | 'ambiguous_output'
   | 'native_failure' | 'auth_or_quota' | 'correction_exhausted' | 'correction_unsupported' | 'correction_ambiguous'
   | 'submission_missing' | 'submission_unconfirmed'
-  | 'submission_repair_exhausted' | 'submission_refused' | 'submission_unsupported' | 'conflicting_work';
+  | 'submission_repair_exhausted' | 'submission_refused' | 'submission_unsupported' | 'conflicting_work'
+  /** A valid approval-required submission: a semantic wait for an owner decision, never a format error. */
+  | 'approval_required';
 
 /** Field names and gate IDs only: never reply text. */
 export interface ReportDiagnostic {
@@ -387,6 +390,19 @@ export interface SavedCompletion extends CompletionResult {
   reportCorrections?: number;
 }
 
+/**
+ * What a paused run is semantically waiting for. Set only when a valid structured approval-required submission was admitted
+ * for the unfinished executor task `taskId` at `index`, by attempt `attemptId`. It is never set for a generic blocked or
+ * unfinished result, a missing submission, a quota/authentication stop or a native form/permission wait, and it is cleared
+ * when the task advances, when a run resumes, and whenever the run pauses for any other reason.
+ */
+export interface RunWait {
+  kind: 'approval';
+  attemptId: string;
+  index: number;
+  taskId: string;
+}
+
 export interface RunState {
   id: string;
   status: 'running' | 'paused' | 'completed';
@@ -411,6 +427,10 @@ export interface RunState {
   selection?: ExecutorSelection;
   resolution?: string;
   reason?: string;
+  /** The typed semantic wait of a paused run, when it is waiting for an owner decision. See `RunWait`. */
+  wait?: RunWait;
+  /** The owner decision a resumed task received from the coordinator. Kept until the task really advances; see `ApprovalContext`. */
+  approval?: ApprovalContext;
   reportRecovery?: ReportRecovery;
   /** Structured runs only: the durable format-repair bound of the current planner phase or executor task. */
   submissionRepair?: SubmissionRepairRecord;

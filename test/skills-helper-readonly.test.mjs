@@ -6,11 +6,14 @@ import path from 'node:path';
 import { execFile, spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
+import { DatabaseSync } from 'node:sqlite';
 import { startCoordinatorService } from '../dist/coordinator/service.js';
 import { loadCoordinatorConfiguration } from '../dist/coordinator/config.js';
+import { CANONICAL, COMPACT, hiddenTailRequest, nearLimitRequest } from './fixtures/approval-requests.mjs';
 import {
   ACTIVE_STATUSES, DEFAULT_WATCH_BUDGET_SECONDS, DEFAULT_WATCH_INTERVAL_SECONDS, MAX_WATCH_BUDGET_SECONDS,
-  chooseActiveRun, countStatus, gitEnvironment, limitText, main, parseArguments, parseRunList, projectRun, stateKey, stopReasonFor, UsageError, watchRun, watchTiming,
+  WAIT_ENTRY_LIMIT, WAIT_LIST_LIMIT, WAIT_QUESTION_LIMIT, WAIT_TEXT_LIMIT, approvalUnresolved, chooseActiveRun, countStatus, gitEnvironment, limitText, main, parseArguments, parseRunList,
+  parseCompleteRequest, projectRun, projectWait, stateKey, stopReasonFor, UsageError, watchRun, watchTiming,
 } from '../skills/openheimdall-start/scripts/openheimdall.mjs';
 
 const exec = promisify(execFile);
@@ -21,7 +24,7 @@ const helperFile = helperPath(skillDirectories[0]);
 const distCli = path.join(checkout, 'dist', 'cli.js');
 
 // Commands the read-only helper may send to the coordinator command line.
-const READ_ONLY_COMMANDS = /^(status --json|project list|run list|run show [A-Za-z0-9_-]+)$/;
+const READ_ONLY_COMMANDS = /^(status --json|project list|run list|run show [A-Za-z0-9_-]+|run approval [A-Za-z0-9_-]+ --request [A-Za-z0-9_-]+)$/;
 const MUTATING_WORDS = ['submit', 'resume', 'reconcile', 'add', 'start', 'stop', 'serve', 'logs', 'events'];
 
 // --- Fixtures ----------------------------------------------------------------------------------------------
@@ -274,6 +277,87 @@ test('run projection is compact and never carries the feature, checkpoint bodies
   assert.equal(projectRun(runRecord({ checkpoint: { ...runRecord().checkpoint, phase: 'planner' } })).currentTask, null);
   assert.equal(projectRun(runRecord({ checkpoint: { ...runRecord().checkpoint, tasks: [{}, {}], index: 0 } })).currentTask.id, 'task-1');
   assert.throws(() => projectRun({}), /unexpected shape/);
+});
+
+const approvalWait = (overrides = {}) => ({
+  kind: 'approval', requestId: 'apr_run-1_0001', state: 'pending', continuation: 'none', progress: 'none', phase: 'executor', taskIndex: 1, taskId: 'T2', taskTitle: 'Second task',
+  attemptId: 'attempt_1', question: 'Ship the migration?', scope: 'Only the reviewed commit', completedWork: 'Migration written', verification: ['unit tests pass'],
+  artifacts: ['src/migrate.ts'], onApprove: ['merge the migration'], onRequestChanges: ['fix and ask again'], revision: { head: 'a'.repeat(40), digest: 'b'.repeat(64) },
+  response: null, createdAt: 1, clipped: {}, ...overrides,
+});
+const PAUSE = 'pau_0123456789abcdef0123456789abcdef';
+
+test('the wait of a run is projected as a bounded approval request or a generic pause identity', () => {
+  assert.equal(projectWait(undefined), null);
+  assert.equal(projectWait(null), null);
+  const approval = projectWait(approvalWait());
+  assert.deepEqual({ kind: approval.kind, requestId: approval.requestId, state: approval.state, continuation: approval.continuation, progress: approval.progress, taskId: approval.taskId }, { kind: 'approval', requestId: 'apr_run-1_0001', state: 'pending', continuation: 'none', progress: 'none', taskId: 'T2' });
+  assert.equal(approval.question, 'Ship the migration?');
+  assert.deepEqual(approval.verification, ['unit tests pass']);
+  assert.deepEqual(approval.revision, { head: 'a'.repeat(12), digest: 'b'.repeat(12) });
+  assert.equal(approval.response, null);
+  assert.deepEqual(projectWait({ kind: 'generic', pauseId: PAUSE, reason: 'SECRET-LONG-REASON', reasonClipped: true }), { kind: 'generic', pauseId: PAUSE, reasonClipped: true });
+  // Text, lists and entries are bounded however much the coordinator sends, and control characters are removed.
+  const huge = projectWait(approvalWait({
+    question: `Q\u0000\n${'q'.repeat(50000)}`, scope: 's'.repeat(50000), completedWork: 'w'.repeat(50000), taskTitle: 't'.repeat(5000),
+    verification: Array.from({ length: 200 }, () => 'v'.repeat(5000)), artifacts: Array.from({ length: 200 }, () => 'a'.repeat(5000)),
+    onApprove: ['x', 7, null, 'y'], onRequestChanges: Array.from({ length: 200 }, () => 'r'.repeat(5000)),
+    clipped: { question: true, scope: false, verification: true },
+  }));
+  assert.ok(huge.question.length <= WAIT_QUESTION_LIMIT && !/[\u0000-\u001f]/.test(huge.question));
+  assert.ok(huge.scope.length <= WAIT_TEXT_LIMIT && huge.completedWork.length <= WAIT_TEXT_LIMIT && huge.taskTitle.length <= 200);
+  for (const list of [huge.verification, huge.artifacts, huge.onRequestChanges]) {
+    assert.equal(list.length, WAIT_LIST_LIMIT);
+    assert.ok(list.every(entry => entry.length <= WAIT_ENTRY_LIMIT));
+  }
+  assert.deepEqual(huge.onApprove, ['x', 'y']);
+  assert.deepEqual(huge.clippedFields, ['question', 'verification']);
+  assert.ok(JSON.stringify(huge).length < 16 * 1024, 'the whole wait stays small');
+  // The owner's feedback is never copied, only the decision and whether feedback exists.
+  const answered = projectWait(approvalWait({ state: 'answered', continuation: 'queued', progress: 'queued', response: { decision: 'request-changes', feedback: 'FEEDBACK-SECRET', answeredAt: 1700000000000 } }));
+  assert.deepEqual(answered.response, { decision: 'request-changes', answeredAt: new Date(1700000000000).toISOString(), feedbackRecorded: true });
+  assert.ok(!JSON.stringify(answered).includes('FEEDBACK-SECRET'));
+  // Anything this helper does not know is reported as such rather than guessed.
+  for (const odd of ['text', 7, [], { kind: 'mystery' }, { kind: 'generic' }, { kind: 'generic', pauseId: 'bad id' }, { kind: 'approval' }, approvalWait({ requestId: '-bad' }), approvalWait({ state: 'odd' })]) {
+    assert.deepEqual(projectWait(odd), { kind: 'unrecognized' }, JSON.stringify(odd));
+  }
+  assert.equal(projectWait(approvalWait({ continuation: 'odd', progress: 'odd' })).continuation, null);
+});
+
+test('a typed request is unresolved until its decision is consumed or it is superseded', () => {
+  const unresolved = wait => approvalUnresolved(projectWait(wait));
+  assert.equal(unresolved(approvalWait()), true);
+  assert.equal(unresolved(approvalWait({ state: 'answered', continuation: 'pending' })), true);
+  assert.equal(unresolved(approvalWait({ state: 'answered', continuation: 'queued' })), true);
+  assert.equal(unresolved(approvalWait({ state: 'answered', continuation: 'consumed' })), false);
+  assert.equal(unresolved(approvalWait({ state: 'superseded', continuation: 'superseded' })), false);
+  // A withdrawn decision is owed delivery until a fresh attempt carries it; afterwards it is history.
+  for (const progress of ['recorded', 'waiting-for-idle', 'queued', 'executing', 'none']) assert.equal(unresolved(approvalWait({ state: 'answered', continuation: 'superseded', progress })), true, progress);
+  assert.equal(unresolved(approvalWait({ state: 'answered', continuation: 'superseded', progress: 'superseded' })), false);
+  assert.equal(unresolved(approvalWait({ state: 'answered', continuation: 'superseded', progress: 'junk' })), true, 'an unreadable progress is not assumed to be delivered');
+  assert.equal(unresolved({ kind: 'mystery' }), true, 'an unreadable wait is not assumed to be harmless');
+  assert.equal(unresolved({ kind: 'generic', pauseId: PAUSE }), false);
+  assert.equal(unresolved(null), false);
+  assert.equal(unresolved(undefined), false);
+});
+
+test('run projections carry the wait and say whether the coordinator reports waits', () => {
+  const generic = projectRun(runRecord({ status: 'paused', capacityReserved: false, wait: { kind: 'generic', pauseId: PAUSE, reason: 'Needs an owner decision', reasonClipped: false } }));
+  assert.equal(generic.waitReported, true);
+  assert.deepEqual(generic.wait, { kind: 'generic', pauseId: PAUSE, reasonClipped: false });
+  const none = projectRun(runRecord({ wait: null }));
+  assert.equal(none.waitReported, true);
+  assert.equal(none.wait, null);
+  const older = projectRun(runRecord());
+  assert.equal(older.waitReported, false);
+  assert.equal(older.wait, null);
+  const text = JSON.stringify(projectRun(runRecord({ status: 'paused', capacityReserved: false, wait: approvalWait() })));
+  for (const secret of ['FEATURE-SECRET', 'RESOLUTION-SECRET', 'CHECKPOINT-SECRET', 'BRIEF-SECRET', 'SETTINGS-SECRET']) assert.ok(!text.includes(secret), secret);
+  const base = projectRun(runRecord({ status: 'paused', capacityReserved: false, wait: approvalWait() }));
+  assert.equal(stateKey(base), stateKey(projectRun(runRecord({ status: 'paused', capacityReserved: false, wait: approvalWait(), updatedAt: 1800000000000, version: 9 }))));
+  assert.notEqual(stateKey(base), stateKey(projectRun(runRecord({ status: 'paused', capacityReserved: false, wait: approvalWait({ requestId: 'apr_run-1_0002' }) }))));
+  assert.notEqual(stateKey(base), stateKey(projectRun(runRecord({ status: 'paused', capacityReserved: false, wait: approvalWait({ state: 'answered', continuation: 'queued' }) }))));
+  assert.notEqual(stateKey(base), stateKey(projectRun(runRecord({ status: 'paused', capacityReserved: false, wait: null }))));
 });
 
 test('a long blocker keeps its closing question and is flagged only when it is actually cut', () => {
@@ -680,6 +764,207 @@ test('snapshot is one run read, projects a compact report and reports its eviden
   assert.equal(wrong.report.error.kind, 'invalid-response');
 });
 
+test('snapshot of a run with a pending approval request is one read that shows the bounded request', async t => {
+  const f = await fakeFixture(t);
+  await f.script({ 'run show run-1': { json: runRecord({ status: 'paused', capacityReserved: false, reason: 'Approval required for T2', wait: approvalWait({ question: `Ship it? ${'x'.repeat(20000)}` }) }) } });
+  await f.reset();
+  const result = await runHelper(['snapshot', 'run-1', '--cwd', f.root], f.env);
+  assert.equal(result.exitCode, 0, result.stderr);
+  const { wait } = result.report.run;
+  assert.equal(wait.kind, 'approval');
+  assert.equal(wait.requestId, 'apr_run-1_0001');
+  assert.equal(wait.state, 'pending');
+  assert.ok(wait.question.length <= WAIT_QUESTION_LIMIT);
+  assert.deepEqual(wait.onApprove, ['merge the migration']);
+  assert.ok(result.text.length < 16 * 1024);
+  for (const secret of ['FEATURE-SECRET', 'RESOLUTION-SECRET', 'CHECKPOINT-SECRET', 'BRIEF-SECRET', 'SETTINGS-SECRET']) assert.ok(!result.text.includes(secret), secret);
+  const calls = await f.calls();
+  assertReadOnly(calls);
+  assert.deepEqual(calls, [['coordinator', 'run', 'show', 'run-1']]);
+});
+
+// --- Complete approval request ---------------------------------------------------------------------------------
+
+const REQUEST_KEY = 'run approval run-1 --request apr_run-1_0001';
+const approvalView = (request, overrides = {}) => ({
+  requestId: 'apr_run-1_0001', runId: 'run-1', state: 'pending', continuation: 'none', progress: 'none', taskId: 'T2', taskIndex: 1, attemptId: 'attempt_1',
+  revision: { head: 'a'.repeat(40), digest: 'b'.repeat(64) }, ...request, response: null, createdAt: 1700000000000, ...overrides,
+});
+const requestArguments = (f, extra = []) => ['request', 'run-1', '--request', 'apr_run-1_0001', '--cwd', f.root, ...extra];
+
+test('a wait the coordinator or the helper cut is marked shortened and names the request command; a whole one is not', () => {
+  const whole = projectRun(runRecord({ status: 'paused', capacityReserved: false, wait: approvalWait() }));
+  assert.equal(whole.wait.shortened, false);
+  assert.equal(whole.wait.completeRequest, undefined);
+  const flagged = projectRun(runRecord({ status: 'paused', capacityReserved: false, wait: approvalWait({ clipped: { scope: true } }) }));
+  assert.equal(flagged.wait.shortened, true);
+  assert.equal(flagged.wait.completeRequest.command, 'request run-1 --request apr_run-1_0001');
+  assert.match(flagged.wait.completeRequest.note, /do not treat this summary as the full scope/);
+  // Text or lists that fit the coordinator's compact limits but not the helper's own are cut by the helper, and say so.
+  for (const overrides of [
+    { scope: 's'.repeat(WAIT_TEXT_LIMIT + 1) }, { completedWork: 'w'.repeat(WAIT_TEXT_LIMIT + 1) }, { question: 'q'.repeat(WAIT_QUESTION_LIMIT + 1) },
+    { verification: Array.from({ length: WAIT_LIST_LIMIT + 1 }, () => 'v') }, { onApprove: ['a'.repeat(WAIT_ENTRY_LIMIT + 1)] }, { artifacts: ['fine', 7] },
+  ]) {
+    const projected = projectRun(runRecord({ status: 'paused', capacityReserved: false, wait: approvalWait(overrides) }));
+    assert.equal(projected.wait.shortened, true, JSON.stringify(Object.keys(overrides)));
+    assert.equal(projected.wait.completeRequest.command, 'request run-1 --request apr_run-1_0001');
+  }
+  // Whitespace collapsing alone loses nothing.
+  assert.equal(projectWait(approvalWait({ scope: 'a\n\n  b' })).shortened, false);
+  assert.notEqual(stateKey(whole), stateKey(flagged));
+});
+
+test('request validates a complete answer against the run, the request and the accepted limits', () => {
+  const ask = { runId: 'run-1', requestId: 'apr_run-1_0001' };
+  const good = parseCompleteRequest(approvalView(hiddenTailRequest()), ask);
+  assert.equal(good.ok, true);
+  assert.equal(good.request.scope.length, 1900);
+  assert.deepEqual(good.request.task, { id: 'T2', index: 1 });
+  assert.deepEqual(good.request.revision, { head: 'a'.repeat(40), digest: 'b'.repeat(64) });
+  assert.equal(parseCompleteRequest(approvalView(nearLimitRequest()), ask).ok, true, 'a request exactly at the accepted size is complete');
+  const answered = parseCompleteRequest(approvalView(hiddenTailRequest(), { state: 'answered', continuation: 'queued', progress: 'queued', response: { decision: 'request-changes', feedback: 'FEEDBACK-SECRET', answeredAt: 1700000000000 } }), ask);
+  assert.deepEqual(answered.request.response, { decision: 'request-changes', answeredAt: new Date(1700000000000).toISOString(), feedbackRecorded: true });
+  assert.ok(!JSON.stringify(answered).includes('FEEDBACK-SECRET'));
+  const base = hiddenTailRequest();
+  const invalid = {
+    'another run': approvalView(base, { runId: 'run-2' }),
+    'another request': approvalView(base, { requestId: 'apr_other' }),
+    'a missing text': approvalView({ ...base, scope: undefined }),
+    'a text over the limit': approvalView({ ...base, scope: 's'.repeat(CANONICAL.text + 1) }),
+    'a list over the limit': approvalView({ ...base, verification: Array.from({ length: CANONICAL.list + 1 }, () => 'v') }),
+    'a list that is not a list': approvalView({ ...base, artifacts: 'x' }),
+    'a mistyped entry': approvalView({ ...base, onApprove: ['ok', 7] }),
+    'an entry over the limit': approvalView({ ...base, onApprove: ['o'.repeat(CANONICAL.text + 1)] }),
+    'a request over the payload limit': approvalView({ ...base, verification: Array.from({ length: 20 }, () => 'v'.repeat(CANONICAL.text)) }),
+    'a missing revision': approvalView(base, { revision: undefined }),
+    'a revision that is not hexadecimal': approvalView(base, { revision: { head: 'zz', digest: 'b'.repeat(64) } }),
+    'an unknown state': approvalView(base, { state: 'odd' }),
+    'an unknown progress': approvalView(base, { progress: 'odd' }),
+    'a missing task': approvalView(base, { taskId: '' }),
+    'a bad task index': approvalView(base, { taskIndex: -1 }),
+    'an answered request without a response': approvalView(base, { state: 'answered' }),
+    'a response on a pending request': approvalView(base, { response: { decision: 'approve', feedback: null, answeredAt: 1 } }),
+    'not an object': 'text',
+  };
+  for (const [name, value] of Object.entries(invalid)) {
+    const result = parseCompleteRequest(value, ask);
+    assert.equal(result.ok, false, name);
+    assert.equal(result.request, undefined, name);
+  }
+});
+
+test('request reads the complete request through run approval: tail text, late list entries and order survive, and nothing is mutated', async t => {
+  const f = await fakeFixture(t);
+  const content = hiddenTailRequest();
+  assert.ok(content.scope.length > COMPACT.text && content.verification.length > COMPACT.list);
+  await f.script({ [REQUEST_KEY]: { json: approvalView(content) } });
+  await f.reset();
+  const result = await runHelper(requestArguments(f), f.env);
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.report.complete, true);
+  assert.equal(result.report.outcome, 'request');
+  const { request } = result.report;
+  for (const field of ['question', 'scope', 'completedWork', 'verification', 'artifacts', 'onApprove', 'onRequestChanges']) assert.deepEqual(request[field], content[field], field);
+  assert.ok(request.scope.includes('ACTION-AFTER-1500'));
+  assert.ok(request.verification[12].includes('EVIDENCE-ENTRY-12'));
+  assert.ok(request.onApprove[13].includes('PROPOSED-ACTION-13'));
+  assert.equal(request.state, 'pending');
+  assert.equal(request.revision.digest, 'b'.repeat(64));
+  const calls = await f.calls();
+  assertReadOnly(calls);
+  assert.deepEqual(calls, [['coordinator', 'run', 'approval', 'run-1', '--request', 'apr_run-1_0001']]);
+
+  // The snapshot of the same request is compact, says so, and names this command.
+  await f.script({ 'run show run-1': { json: runRecord({ status: 'paused', capacityReserved: false, wait: approvalWait({ scope: content.scope.slice(0, COMPACT.text), clipped: { scope: true } }) }) } });
+  const snapshot = await runHelper(['snapshot', 'run-1', '--cwd', f.root], f.env);
+  assert.equal(snapshot.report.run.wait.shortened, true);
+  assert.ok(!JSON.stringify(snapshot.report.run.wait).includes('ACTION-AFTER-1500'));
+  assert.equal(snapshot.report.run.wait.completeRequest.command, 'request run-1 --request apr_run-1_0001');
+});
+
+test('request forwards the selected coordinator configuration and an exact-limit request is complete', async t => {
+  const f = await fakeFixture(t);
+  const content = nearLimitRequest();
+  await f.script({ [REQUEST_KEY]: { json: approvalView(content) } });
+  await f.reset();
+  const config = path.join(f.root, 'coordinator.toml');
+  const result = await runHelper(requestArguments(f, ['--coordinator-config', config]), f.env);
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.deepEqual(result.report.request.onRequestChanges, content.onRequestChanges);
+  assert.equal(result.report.coordinator.configuration.file, config);
+  const calls = await f.calls();
+  assert.deepEqual(calls, [['coordinator', 'run', 'approval', 'run-1', '--request', 'apr_run-1_0001', '--coordinator-config', config]]);
+  assertReadOnly(calls);
+});
+
+test('request that cannot read the whole request reports incomplete review information, with no content, and exit status 1', async t => {
+  const f = await fakeFixture(t);
+  const base = hiddenTailRequest();
+  const failures = {
+    'an unknown request': { stderr: 'Heimdall: The coordinator at http://x has no approval request apr_run-1_0001 for run run-1.\n', code: 1 },
+    'an older command line': { stderr: 'Heimdall: Unknown coordinator command; see --help\n', code: 1 },
+    'an older coordinator': { stderr: 'Heimdall: The coordinator at http://x does not support reading an approval request (likely an older version). Nothing was changed.\n', code: 1 },
+    'an unavailable coordinator': { stderr: 'Heimdall: Coordinator unavailable\n', code: 1 },
+    'output that is not JSON': { stdout: 'not json\n' },
+    'an answer for another request': { json: approvalView(base, { requestId: 'apr_other' }) },
+    'an answer over the accepted limit': { json: approvalView({ ...base, scope: 's'.repeat(CANONICAL.text + 1) }) },
+    'a partial answer': { json: { requestId: 'apr_run-1_0001', runId: 'run-1', question: 'Only this' } },
+  };
+  for (const [name, entry] of Object.entries(failures)) {
+    await f.script({ [REQUEST_KEY]: entry });
+    await f.reset();
+    const result = await runHelper(requestArguments(f), f.env);
+    assert.equal(result.exitCode, 1, name);
+    assert.equal(result.report.ok, false, name);
+    assert.equal(result.report.complete, false, name);
+    assert.equal(result.report.request, undefined, name);
+    assert.match(result.report.note, /review information is incomplete/, name);
+    assert.ok(!result.text.includes('ACTION-AFTER-1500') && !result.text.includes('Only this'), name);
+    assertReadOnly(await f.calls());
+  }
+  await f.script({ [REQUEST_KEY]: { stderr: 'Heimdall: Unknown coordinator command; see --help\n', code: 1 } });
+  assert.equal((await runHelper(requestArguments(f), f.env)).report.error.kind, 'unsupported');
+});
+
+test('request arguments are validated before anything is sent', async t => {
+  const f = await fakeFixture(t);
+  await f.reset();
+  for (const argv of [
+    ['request', '--cwd', f.root], ['request', 'run-1', '--cwd', f.root], ['request', '--request', 'apr_1', '--cwd', f.root],
+    ['request', '-bad', '--request', 'apr_1', '--cwd', f.root], ['request', 'run-1', '--request', '-bad', '--cwd', f.root], ['request', 'run-1', '--request', 'a b', '--cwd', f.root],
+    ['request', 'run-1', '--request', 'apr_1', 'extra', '--cwd', f.root], ['request', 'run-1', '--request', 'apr_1', '--decision', 'approve', '--cwd', f.root],
+    ['request', 'run-1', '--request', 'apr_1', '--guidance-file', 'x', '--cwd', f.root],
+  ]) {
+    const result = await runHelper(argv, f.env);
+    assert.equal(result.exitCode, 2, JSON.stringify(argv));
+    assert.equal(result.text, '');
+  }
+  assert.deepEqual(await f.calls(), [], 'nothing reached the command line');
+});
+
+test('request is listed as a read in the help and the usage of the helper', async () => {
+  const out = [];
+  assert.equal(await main(['--help'], { stdout: { write: text => out.push(text) } }), 0);
+  const help = out.join('');
+  assert.match(help, /openheimdall\.mjs request  RUN_ID --request ID/);
+  assert.match(help, /context, snapshot, watch, request and inspect-spec only read/);
+});
+
+test('watch reports a new, answered and superseded request as changes and stops when the run pauses on one', async t => {
+  const f = await fakeFixture(t);
+  const at = (wait, extra = {}) => ({ json: runRecord({ wait, ...extra }) });
+  await f.script({ 'run show run-1': [at(null), at(approvalWait(), { status: 'paused', capacityReserved: false })] });
+  await f.reset();
+  const result = await runHelper(['watch', 'run-1', '--cwd', f.root, '--budget-seconds', '30', '--interval-seconds', '0.1'], f.env);
+  assert.equal(result.exitCode, 0, result.stderr);
+  const events = result.lines.map(line => JSON.parse(line));
+  assert.deepEqual(events.map(event => event.event), ['watching', 'state', 'state', 'stopped']);
+  assert.equal(events[2].run.wait.requestId, 'apr_run-1_0001');
+  assert.equal(events.at(-1).reason, 'paused');
+  assert.equal(events.at(-1).lastState.wait.state, 'pending');
+  assertReadOnly(await f.calls());
+});
+
 test('watch emits only changes, stops on pause, and issues only run reads', async t => {
   const f = await fakeFixture(t);
   const at = (completed, extra = {}) => ({ json: runRecord({ checkpoint: { ...runRecord().checkpoint, results: Array.from({ length: completed }, (_, index) => ({ taskId: `T${index + 1}` })) }, ...extra }) });
@@ -801,8 +1086,38 @@ async function coordinatorFixture(t) {
     run = service.store.transition(id, run.ownerToken, run.version, 'running');
     return service.store.transition(id, run.ownerToken, run.version, 'paused', 'Needs an owner decision', true);
   };
-  const state = () => ({ runs: service.store.listRuns(), events: service.store.events(), counts: service.store.statusCounts() });
-  return { root, env, configFile, repository, linked, project, service, enqueue, savePaused, state, executorCalls: () => executorCalls, ...recorder };
+  const databasePath = path.join(configuration.stateDirectory, 'coordinator.sqlite');
+  const sql = (statement, ...values) => {
+    const database = new DatabaseSync(databasePath);
+    try { return statement.trimStart().toUpperCase().startsWith('SELECT') ? database.prepare(statement).all(...values) : database.prepare(statement).run(...values); }
+    finally { database.close(); }
+  };
+  // A paused, released run with a pending typed approval request, as the coordinator stores one after an executor submission.
+  const saveApproval = (id, content = {}) => {
+    let run = service.store.admitNext() ?? (enqueue(id), service.store.admitNext());
+    assert.equal(run.id, id);
+    const caller = { sessionID: run.parentSessionId, id: `call-${id}`, messageID: `message-${id}`, agent: 'adr-orchestrator' };
+    const attempt = { id: `attempt_${id}_1`, phase: 'executor', index: 1, child: 'ses_child', status: 'rejected', startedAt: 1, model: 'anthropic/x' };
+    const saved = {
+      id, status: 'paused', adr: 'feature.md', parent: run.parentSessionId, caller, branch: run.branch, baseline: '', index: 1,
+      tasks: [{ id: 'T1', title: 'First task', brief: 'BRIEF-SECRET', dependsOn: [], dod: [] }, { id: 'T2', title: 'Second task', brief: 'BRIEF-SECRET', dependsOn: ['T1'], dod: ['gate'] }],
+      results: [{ taskId: 'T1', status: 'completed', summary: 'CHECKPOINT-SECRET', handoff: 'next', evidence: [], model: 'anthropic/executor', sessionId: `child-${id}` }],
+      phase: 'executor', child: 'ses_child', settings: specification.settings, attempt, reason: 'Approval required for T2', resolution: 'RESOLUTION-SECRET',
+      wait: { kind: 'approval', attemptId: attempt.id, index: 1, taskId: 'T2' }, protocol: 'structured-v1',
+    };
+    service.store.bindStart(id, run.ownerToken, caller);
+    // The request is published before the runner records its pause on it.
+    const request = { question: 'Ship the migration?', scope: 'Only the reviewed commit', completedWork: 'Migration written', verification: ['unit tests pass'], artifacts: ['src/migrate.ts'], onApprove: ['merge the migration'], onRequestChanges: ['fix and ask again'], ...content };
+    const requestId = `apr_${id}_1`;
+    sql(`INSERT INTO approval_requests(run_id, request_id, phase, task_index, task_id, attempt_id, receipt_digest, request_json, revision_json, state, continuation, created_at)
+      VALUES (?, ?, 'executor', 1, 'T2', ?, 'digest', ?, ?, 'pending', 'none', 1000)`, id, requestId, attempt.id, JSON.stringify(request), JSON.stringify({ head: 'a'.repeat(40), digest: 'b'.repeat(64) }));
+    service.store.saveCheckpoint(id, run.ownerToken, saved);
+    run = service.store.transition(id, run.ownerToken, run.version, 'running');
+    service.store.transition(id, run.ownerToken, run.version, 'paused', saved.reason, true);
+    return { requestId };
+  };
+  const state = () => ({ runs: service.store.listRuns(), events: service.store.events(), counts: service.store.statusCounts(), approvals: sql('SELECT * FROM approval_requests ORDER BY rowid'), responses: sql('SELECT * FROM run_responses ORDER BY rowid') });
+  return { root, env, configFile, repository, linked, project, service, enqueue, savePaused, saveApproval, sql, state, executorCalls: () => executorCalls, ...recorder };
 }
 
 test('context against a coordinator resolves the base in the selected linked worktree', async t => {
@@ -892,6 +1207,81 @@ test('snapshot and watch read a real coordinator without changing any run, event
   const after = f.state();
   assert.deepEqual(after, before, 'runs, events and counts are unchanged');
   for (const run of after.runs) assert.equal(run.version, versions[run.id], `${run.id} version`);
+  assert.equal(f.executorCalls(), 0);
+});
+
+test('snapshot and watch of a real pending approval request show it and change nothing', { timeout: 60000 }, async t => {
+  const f = await coordinatorFixture(t);
+  const { requestId } = f.saveApproval('run-approval', { question: 'Ship the migration? Q-MARKER' });
+  const before = f.state();
+  assert.equal(before.approvals.length, 1);
+  assert.equal(before.approvals[0].state, 'pending');
+  await f.reset();
+  const configFlag = ['--coordinator-config', f.configFile];
+
+  let result = await runHelper(['snapshot', 'run-approval', '--cwd', f.linked, ...configFlag], f.env);
+  assert.equal(result.exitCode, 0, result.stderr);
+  const { wait } = result.report.run;
+  assert.equal(result.report.run.status, 'paused');
+  assert.equal(wait.kind, 'approval');
+  assert.equal(wait.requestId, requestId);
+  assert.equal(wait.state, 'pending');
+  assert.equal(wait.continuation, 'none');
+  assert.equal(wait.taskId, 'T2');
+  assert.match(wait.question, /Q-MARKER/);
+  assert.deepEqual(wait.onRequestChanges, ['fix and ask again']);
+  assert.equal(wait.revision.head, 'a'.repeat(12));
+  for (const secret of ['FEATURE-SECRET', 'RESOLUTION-SECRET', 'CHECKPOINT-SECRET', 'BRIEF-SECRET', 'PRIVATE-PLANNER-PROMPT', 'SYNTHETIC_PASSWORD']) assert.ok(!result.text.includes(secret), secret);
+
+  result = await runHelper(['watch', 'run-approval', '--cwd', f.linked, ...configFlag, '--budget-seconds', '30', '--interval-seconds', '0.1'], f.env);
+  const events = result.lines.map(line => JSON.parse(line));
+  assert.deepEqual(events.map(event => event.event), ['watching', 'state', 'stopped']);
+  assert.equal(events[1].run.wait.requestId, requestId);
+  assert.equal(events.at(-1).reason, 'paused');
+
+  const calls = await f.calls();
+  assertReadOnly(calls);
+  assert.ok(calls.every(argv => argv.includes('--coordinator-config')));
+  const after = f.state();
+  assert.deepEqual(after, before, 'runs, events, approval requests and responses are unchanged');
+  assert.equal(f.sql('SELECT decision FROM approval_requests WHERE request_id = ?', requestId)[0].decision, null);
+  assert.equal(f.executorCalls(), 0);
+});
+
+test('request reads a real hidden-tail request in full through the real command line, while the snapshot stays compact, and changes nothing', { timeout: 60000 }, async t => {
+  const f = await coordinatorFixture(t);
+  const content = hiddenTailRequest();
+  const { requestId } = f.saveApproval('run-hidden', content);
+  const before = f.state();
+  await f.reset();
+  const configFlag = ['--coordinator-config', f.configFile];
+
+  const snapshot = await runHelper(['snapshot', 'run-hidden', '--cwd', f.linked, ...configFlag], f.env);
+  assert.equal(snapshot.exitCode, 0, snapshot.stderr);
+  const { wait } = snapshot.report.run;
+  assert.equal(wait.shortened, true);
+  assert.ok(wait.clippedFields.includes('scope'));
+  assert.ok(!snapshot.text.includes('ACTION-AFTER-1500'), 'the compact wait hides the late action');
+  assert.equal(wait.completeRequest.command, `request run-hidden --request ${requestId}`);
+
+  const result = await runHelper(['request', 'run-hidden', '--request', requestId, '--cwd', f.linked, ...configFlag], f.env);
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.report.complete, true);
+  const { request } = result.report;
+  for (const field of ['question', 'scope', 'completedWork', 'verification', 'artifacts', 'onApprove', 'onRequestChanges']) assert.deepEqual(request[field], content[field], field);
+  assert.ok(request.scope.includes('ACTION-AFTER-1500') && request.verification[12].includes('EVIDENCE-ENTRY-12') && request.onApprove[13].includes('PROPOSED-ACTION-13'));
+  assert.equal(request.revision.head, 'a'.repeat(40));
+  for (const secret of ['FEATURE-SECRET', 'RESOLUTION-SECRET', 'CHECKPOINT-SECRET', 'BRIEF-SECRET', 'PRIVATE-PLANNER-PROMPT', 'SYNTHETIC_PASSWORD']) assert.ok(!result.text.includes(secret), secret);
+
+  const missing = await runHelper(['request', 'run-hidden', '--request', 'apr_unknown', '--cwd', f.linked, ...configFlag], f.env);
+  assert.equal(missing.exitCode, 1);
+  assert.equal(missing.report.complete, false);
+  assert.match(missing.report.error.message, /no approval request/);
+
+  const calls = await f.calls();
+  assertReadOnly(calls);
+  assert.ok(calls.some(argv => argv.includes('approval')));
+  assert.deepEqual(f.state(), before, 'runs, events, approval requests and responses are unchanged');
   assert.equal(f.executorCalls(), 0);
 });
 

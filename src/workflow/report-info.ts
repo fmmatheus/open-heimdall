@@ -11,7 +11,7 @@ export const REPORT_CODES = [
   'report_format', 'unfinished_work', 'agent_blocked', 'identity_mismatch', 'ambiguous_output',
   'native_failure', 'auth_or_quota', 'correction_exhausted', 'correction_unsupported', 'correction_ambiguous',
   'submission_missing', 'submission_unconfirmed', 'submission_repair_exhausted', 'submission_refused',
-  'submission_unsupported', 'conflicting_work',
+  'submission_unsupported', 'conflicting_work', 'approval_required',
 ] as const;
 
 export const REPORT_MODES = ['idle', 'correcting', 'paused'] as const;
@@ -86,5 +86,10 @@ export function submissionRepairInfo(value: unknown): ReportInfo | null {
 /** The repair or correction state of a checkpoint: a structured run's repair record wins, then the legacy report record. */
 export function checkpointReportInfo(checkpoint: unknown): ReportInfo | null {
   if (!isRecord(checkpoint)) return null;
+  // A recorded approval wait is the pause's real category: the repair record of that attempt only counts its (unspent) repairs.
+  if (isRecord(checkpoint.wait) && checkpoint.wait.kind === 'approval') {
+    const waiting = reportInfo(checkpoint.reportRecovery);
+    if (waiting?.code === 'approval_required') return waiting;
+  }
   return submissionRepairInfo(checkpoint.submissionRepair) ?? reportInfo(checkpoint.reportRecovery);
 }

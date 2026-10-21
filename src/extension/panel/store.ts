@@ -1,8 +1,14 @@
-import { createPanelClient, IDENTIFIER, mapHostFailure } from './client.js';
-import type { PanelClient, PanelError, PanelHost, RunFilters } from './client.js';
-import { RUN_STATUSES } from '../shared/protocol.js';
+import { createPanelClient, IDENTIFIER, mapHostFailure, PanelError } from './client.js';
+import type { PanelClient, PanelHost, RunFilters } from './client.js';
+import { approvalContentDigest } from '../shared/approval-digest.js';
+import { approvalDetailsKey, approvalIsClipped, completeRequestProblem, EMPTY_APPROVAL_DETAILS } from './approval-details.js';
+import type { ApprovalDetailsSlice } from './approval-details.js';
+export { approvalDetailsKey, approvalIsClipped, completeRequestProblem, EMPTY_APPROVAL_DETAILS } from './approval-details.js';
+export type { ApprovalDetailsSlice } from './approval-details.js';
+import type { ReviewedBinding } from '../shared/approval-digest.js';
+import { APPROVAL_LIMITS, RUN_STATUSES } from '../shared/protocol.js';
 import type {
-  BlockerContentResponse, ProjectSummary, ReviewFileResponse, ReviewResponse, RunDetail, RunSummary, TaskContentResponse, WireRunStatus,
+  ApprovalDecisionAck, ApprovalDecisionKind, ApprovalRequestView, BlockerContentResponse, PauseResponseAck, ProjectSummary, ReviewFileResponse, ReviewResponse, RunDetail, RunSummary, TaskContentResponse, WireRunStatus,
 } from '../shared/protocol.js';
 
 export type ConnectionState = 'connecting' | 'online' | 'offline' | 'service-unavailable';
@@ -54,6 +60,44 @@ export interface ContentSlice {
 
 export const EMPTY_CONTENT: ContentSlice = { runId: null, tasks: {}, blocker: null };
 
+/** Fixed sentences shown next to the approval card. None of them quotes the coordinator or the response text. */
+export const ACTION_NOTICES = {
+  unverified: 'This card may be out of date, so nothing was sent. Heimdall is reading the run again from the coordinator; check the refreshed card and choose again.',
+  mismatch: 'This card no longer matches the run, so nothing was sent. The run is being read again from the coordinator.',
+  uncertain: 'Heimdall could not confirm whether your response was recorded. Nothing is sent again automatically; the run is being read again from the coordinator to show what it holds.',
+  refused: 'The response was not recorded. The run is being read again to show its current state.',
+  feedbackRequired: 'Enter the changes you want before requesting changes.',
+  inputRequired: 'Enter your response before continuing.',
+  inputTooLong: `Keep the response within ${APPROVAL_LIMITS.input} characters.`,
+  loadFirst: 'This card shows a shortened request, so nothing was sent. Load the full request, read it, then approve.',
+} as const;
+
+/** Error codes after which the card is stale: the run is read again and the owner chooses from what it now shows. */
+const REFRESH_CODES = new Set(['review-required', 'review-mismatch', 'stale-card', 'approval-stale', 'approval-conflict', 'approval-pending', 'pause-stale', 'response-conflict', 'not-found']);
+
+/**
+ * The owner's answer to the card of the selected run. `target` names the request or pause it concerns; `verifying`
+ * keeps the buttons off after an unconfirmed response until the coordinator has been read again.
+ */
+export interface ActionSlice {
+  runId: string | null;
+  target: string | null;
+  inFlight: boolean;
+  verifying: boolean;
+  notice: string | null;
+  /** The coordinator's acknowledgement of the last response to `target`, until the run is read again. */
+  ack: ApprovalDecisionAck | PauseResponseAck | null;
+}
+
+export const EMPTY_ACTION: ActionSlice = { runId: null, target: null, inFlight: false, verifying: false, notice: null, ack: null };
+
+/**
+ * `recorded`: the coordinator acknowledged it. `refused`: it answered and recorded nothing (or nothing was sent).
+ * `refreshed`: nothing was sent because the card could not be trusted. `uncertain`: sent, not confirmed.
+ * `invalid`: the input was not acceptable. `ignored`: another action is running or the card is not on screen.
+ */
+export type ActionOutcome = 'recorded' | 'refused' | 'refreshed' | 'uncertain' | 'invalid' | 'ignored';
+
 export interface PanelState {
   connection: ConnectionState;
   /** Fixed user-facing sentence about the connection; null while online. */
@@ -74,6 +118,8 @@ export interface PanelState {
   detailError: string | null;
   review: ReviewSlice;
   content: ContentSlice;
+  approvalDetails: ApprovalDetailsSlice;
+  action: ActionSlice;
   cursor: string | null;
   /** Consecutive failed polls; drives the backoff. */
   failures: number;
@@ -121,8 +167,20 @@ export interface PanelStore {
   loadTaskContent(runId: string, index: number): void;
   /** Load more of the blocker reason and resolution, once per run detail. */
   loadBlockerContent(runId: string): void;
+  /**
+   * Load the complete request behind the pending approval card. Ignored unless the card on screen is that run's pending
+   * request; the answer is used only if the card still has the key it was asked for and the request matches it.
+   */
+  loadApprovalDetails(runId: string, requestId: string): void;
   /** Drop loaded content and reload the selected run now (the task list may have changed). */
   refreshDetail(): void;
+  /**
+   * The Approve / Request changes buttons. The first click is the decision: there is no confirmation step. Nothing is
+   * sent unless the card on screen is for this run and request, still pending, and verified against the coordinator.
+   */
+  decideApproval(runId: string, requestId: string, decision: ApprovalDecisionKind, feedback?: string): Promise<ActionOutcome>;
+  /** The Respond and continue button of a generic pause. */
+  respondToPause(runId: string, pauseId: string, input: string): Promise<ActionOutcome>;
   /** Stop all timers and ignore every in-flight response. */
   dispose(): void;
 }
@@ -160,7 +218,7 @@ export function createPanelStore(options: PanelStoreOptions): PanelStore {
     connection: 'connecting', message: null, hint: null, lastSuccessAt: null, stale: false,
     projects: [], runs: [], runsTotal: 0, runsTruncated: false,
     filters: { projectId: null, status: null }, selectedRunId: null, detail: null, detailError: null,
-    review: EMPTY_REVIEW, content: EMPTY_CONTENT, cursor: null, failures: 0, nextAttemptAt: null,
+    review: EMPTY_REVIEW, content: EMPTY_CONTENT, approvalDetails: EMPTY_APPROVAL_DETAILS, action: EMPTY_ACTION, cursor: null, failures: 0, nextAttemptAt: null,
   };
   const listeners = new Set<(state: PanelState) => void>();
   let disposed = false;
@@ -178,10 +236,20 @@ export function createPanelStore(options: PanelStoreOptions): PanelStore {
   let contentGen = 0;
   let reviewVisible = false;
   let projectsGen = 0;
+  // One owner response at a time; a second click while one is in flight does nothing.
+  let actionGen = 0;
+  let actionBusy = false;
+  // Bumped whenever the complete request is dropped or asked for; a response applies only to the request it was asked in.
+  let approvalGen = 0;
 
   function update(patch: Partial<PanelState>): void {
     if (disposed) return;
     state = { ...state, ...patch };
+    // Complete-request details belong to one card: when the card on screen has another key, they are gone before anyone sees them.
+    if (state.approvalDetails.key !== null && state.approvalDetails.key !== approvalDetailsKey(state.detail)) {
+      approvalGen++;
+      state = { ...state, approvalDetails: EMPTY_APPROVAL_DETAILS };
+    }
     for (const listener of [...listeners]) listener(state);
   }
 
@@ -373,6 +441,114 @@ export function createPanelStore(options: PanelStoreOptions): PanelStore {
     }
   }
 
+  /** Resolves true only when the service answered with a request that matches the card; everything else leaves approval off. */
+  async function loadApprovalDetails(runId: string, requestId: string): Promise<boolean> {
+    const detail = state.detail;
+    const key = approvalDetailsKey(detail);
+    const wait = detail?.wait ?? null;
+    // Only the pending request the selected run's card shows is ever requested.
+    if (disposed || key === null || detail === null || detail.id !== runId || state.selectedRunId !== runId || wait === null || wait.kind !== 'approval' || wait.requestId !== requestId) return false;
+    const existing = state.approvalDetails;
+    if (existing.key === key && (existing.status === 'loading' || existing.status === 'loaded')) return false;
+    const gen = ++approvalGen;
+    const put = (slice: Omit<ApprovalDetailsSlice, 'key'>): void => { update({ approvalDetails: { key, ...slice } }); };
+    const current = (): boolean => !disposed && gen === approvalGen && state.approvalDetails.key === key && approvalDetailsKey(state.detail) === key && state.selectedRunId === runId;
+    put({ status: 'loading', data: null, contentDigest: null, error: null });
+    try {
+      const response = await client.approval(runId, requestId);
+      if (!current()) return false;
+      const problem = completeRequestProblem(response.request, state.detail!);
+      if (problem !== null) { put({ status: 'error', data: null, contentDigest: null, error: problem }); return true; }
+      const contentDigest = await approvalContentDigest(response.request);
+      if (!current()) return false;
+      put({ status: 'loaded', data: response.request, contentDigest, error: null });
+      return true;
+    } catch (caught) {
+      const error = mapHostFailure(caught);
+      if (!current()) return false;
+      put({ status: 'error', data: null, contentDigest: null, error: error.message });
+      if (error.category !== 'request') throw error;
+      return false;
+    }
+  }
+
+  /** The complete request this card may be approved with: loaded, validated and still bound to the card on screen. */
+  function reviewedBinding(): ReviewedBinding | null {
+    const slice = state.approvalDetails;
+    const key = approvalDetailsKey(state.detail);
+    if (key === null || slice.key !== key || slice.status !== 'loaded' || slice.data === null || slice.contentDigest === null) return null;
+    if (completeRequestProblem(slice.data, state.detail!) !== null) return null;
+    return { requestId: slice.data.requestId, revision: { head: slice.data.revision.head, digest: slice.data.revision.digest }, contentDigest: slice.contentDigest };
+  }
+
+  /** Reads the selected run again. True when the coordinator answered (or no longer knows the run). */
+  async function readRunAgain(): Promise<boolean> {
+    try { await loadDetail(); standaloneSuccess(); return true; }
+    catch (caught) { standaloneFailure(caught); return false; }
+  }
+
+  const waitMatches = (target: string): boolean => {
+    const wait = state.detail?.wait ?? null;
+    if (wait === null) return false;
+    return wait.kind === 'approval' ? target === `approval:${wait.requestId}` && wait.state === 'pending' : target === `pause:${wait.pauseId}`;
+  };
+
+  /**
+   * Shared by both buttons. Order matters: the card must match the run and the input must be acceptable before anything
+   * is sent; an unverified card refreshes instead; and an unconfirmed response is never sent a second time here.
+   */
+  async function act(
+    runId: string, target: string, invalid: () => string | null,
+    send: (displayedVersion: number) => Promise<ApprovalDecisionAck | PauseResponseAck>,
+  ): Promise<ActionOutcome> {
+    if (disposed || actionBusy || state.action.inFlight) return 'ignored';
+    const detail = state.detail;
+    if (state.selectedRunId !== runId || detail === null || detail.id !== runId) return 'ignored';
+    const gen = ++actionGen;
+    const slice = (patch: Partial<ActionSlice>): void => { if (gen === actionGen) update({ action: { ...state.action, runId, target, ...patch } }); };
+    if (!waitMatches(target)) {
+      slice({ notice: ACTION_NOTICES.mismatch, ack: null });
+      await readRunAgain();
+      return 'refreshed';
+    }
+    const problem = invalid();
+    if (problem !== null) { slice({ notice: problem }); return 'invalid'; }
+    if (state.connection !== 'online' || state.stale || state.detailError !== null || (state.action.verifying && state.action.runId === runId)) {
+      slice({ notice: ACTION_NOTICES.unverified, ack: null });
+      const read = await readRunAgain();
+      if (read && gen === actionGen) update({ action: { ...state.action, verifying: false } });
+      return 'refreshed';
+    }
+    actionBusy = true;
+    slice({ inFlight: true, verifying: false, notice: null, ack: null });
+    try {
+      const ack = await send(detail.version);
+      slice({ inFlight: false, ack, notice: null });
+      await readRunAgain();
+      return 'recorded';
+    } catch (caught) {
+      const error = mapHostFailure(caught);
+      if (error.uncertain) {
+        slice({ inFlight: false, verifying: true, notice: ACTION_NOTICES.uncertain, ack: null });
+        const read = await readRunAgain();
+        // The coordinator now shows what it holds; if the response is not there, the owner chooses again on purpose.
+        if (read) slice({ verifying: false });
+        return 'uncertain';
+      }
+      if (error.category === 'request') {
+        slice({ inFlight: false, notice: `${error.message}${REFRESH_CODES.has(error.code) ? ' Showing the current state.' : ''}`, ack: null });
+        if (REFRESH_CODES.has(error.code)) await readRunAgain();
+        return 'refused';
+      }
+      // Nothing reached the coordinator (it is unreachable): say so and let the usual connection handling take over.
+      slice({ inFlight: false, notice: `Nothing was sent. ${error.message}`, ack: null });
+      standaloneFailure(error);
+      return 'refused';
+    } finally {
+      if (gen === actionGen) actionBusy = false;
+    }
+  }
+
   const reviewLoad = (): void => { void loadReview().then(standaloneSuccess, standaloneFailure); };
 
   /** Full reload after a resync or the first load. The cursor is taken before the lists. */
@@ -485,10 +661,12 @@ export function createPanelStore(options: PanelStoreOptions): PanelStore {
       if (runId !== null && !IDENTIFIER.test(runId)) return;
       const id = runId;
       if (id === state.selectedRunId) return;
-      detailGen++; reviewGen++; reviewFileGen++; contentGen++;
+      detailGen++; reviewGen++; reviewFileGen++; contentGen++; approvalGen++;
       // The tab announces itself again once the new run is drawn.
       reviewVisible = false;
-      update({ selectedRunId: id, detail: null, detailError: null, review: EMPTY_REVIEW, content: EMPTY_CONTENT });
+      // An owner response still in flight for the previous run continues on its own; its result is not shown here.
+      actionGen++; actionBusy = false;
+      update({ selectedRunId: id, detail: null, detailError: null, review: EMPTY_REVIEW, content: EMPTY_CONTENT, approvalDetails: EMPTY_APPROVAL_DETAILS, action: EMPTY_ACTION });
       if (id !== null) void loadDetail().then(standaloneSuccess, standaloneFailure);
     },
     setReviewVisible(visible) {
@@ -521,14 +699,39 @@ export function createPanelStore(options: PanelStoreOptions): PanelStore {
       if (disposed || !IDENTIFIER.test(runId)) return;
       void loadBlockerContent(runId).then(answered => { if (answered) standaloneSuccess(); }, standaloneFailure);
     },
+    loadApprovalDetails(runId, requestId) {
+      if (disposed || !IDENTIFIER.test(runId) || !IDENTIFIER.test(requestId)) return;
+      void loadApprovalDetails(runId, requestId).then(answered => { if (answered) standaloneSuccess(); }, standaloneFailure);
+    },
     refreshDetail() {
       if (disposed || state.selectedRunId === null) return;
       contentGen++;
       update({ content: EMPTY_CONTENT });
       void loadDetail().then(standaloneSuccess, standaloneFailure);
     },
+    decideApproval(runId, requestId, decision, feedback) {
+      if (!IDENTIFIER.test(runId) || !IDENTIFIER.test(requestId)) return Promise.resolve('ignored');
+      return act(runId, `approval:${requestId}`, () => {
+        // A shortened card is approved only with the complete request the owner loaded for exactly this card.
+        if (decision === 'approve') return approvalIsClipped(state.detail) && reviewedBinding() === null ? ACTION_NOTICES.loadFirst : null;
+        if (feedback === undefined || feedback.trim() === '') return ACTION_NOTICES.feedbackRequired;
+        return feedback.length > APPROVAL_LIMITS.input ? ACTION_NOTICES.inputTooLong : null;
+      }, async displayedVersion => {
+        const reviewed = decision === 'approve' && approvalIsClipped(state.detail) ? reviewedBinding() ?? undefined : undefined;
+        if (decision === 'approve' && approvalIsClipped(state.detail) && reviewed === undefined) throw new PanelError('request', 'review-required', ACTION_NOTICES.loadFirst, null);
+        return (await client.decideApproval(runId, requestId, decision === 'approve' ? { decision, displayedVersion, ...(reviewed === undefined ? {} : { reviewed }) } : { decision, feedback, displayedVersion })).ack;
+      });
+    },
+    respondToPause(runId, pauseId, input) {
+      if (!IDENTIFIER.test(runId) || !IDENTIFIER.test(pauseId)) return Promise.resolve('ignored');
+      return act(runId, `pause:${pauseId}`, () => {
+        if (input.trim() === '') return ACTION_NOTICES.inputRequired;
+        return input.length > APPROVAL_LIMITS.input ? ACTION_NOTICES.inputTooLong : null;
+      }, async displayedVersion => (await client.respondToPause(runId, { pauseId, input, displayedVersion })).ack);
+    },
     dispose() {
       disposed = true;
+      actionGen++;
       cycleGen++; runsGen++; detailGen++; projectsGen++; reviewGen++; reviewFileGen++; contentGen++;
       if (pollTimer !== null) timers.clearTimeout(pollTimer);
       if (staleTimer !== null) timers.clearTimeout(staleTimer);

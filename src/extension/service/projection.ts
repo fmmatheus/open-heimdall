@@ -1,10 +1,10 @@
 import path from 'node:path';
 import type { ProjectRecord } from '../../coordinator/types.js';
 import type { RunListEntry } from '../../coordinator/run-list.js';
-import { LIMITS, RUN_STATUSES } from '../shared/protocol.js';
+import { APPROVAL_LIMITS, LIMITS, RUN_STATUSES } from '../shared/protocol.js';
 import { CONTENT_LIMITS } from '../shared/protocol.js';
 import type {
-  Blocker, BlockerContentResponse, ContentLimitsUsed, EvidenceView, LimitsView, ListCaps, ModelChoice, ModelsView, ProjectSummary,
+  ApprovalContinuation, ApprovalProgress, ApprovalState, ApprovalWaitView, Blocker, BlockerContentResponse, WaitView, ContentLimitsUsed, EvidenceView, LimitsView, ListCaps, ModelChoice, ModelsView, ProjectSummary,
   ReportView, RunDetail, RunPhase, RunSummary, SessionUsage, TaskClips, TaskContentResponse, TaskRef, TaskView, UsageView, WireRunStatus,
 } from '../shared/protocol.js';
 import { checkpointReportInfo } from '../../workflow/report-info.js';
@@ -28,6 +28,9 @@ const count = (value: unknown): number => {
 
 const CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f​-‏‪-‮⁦-⁩﻿]/g;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Control and bidirectional override characters become spaces, one for one: length and order are unchanged. */
+export const cleanText = (value: string): string => value.replace(CONTROL, ' ');
 
 interface Clipped { text: string; truncated: boolean }
 
@@ -149,12 +152,17 @@ export function summarizeRun(run: PublicRun | RunListEntry, project: { directory
 
 const NO_REASON = 'The coordinator did not record a reason for this status.';
 
+/** How the coordinator renders an approval decision context (see `renderApprovalContext`). */
+const APPROVAL_CONTINUATION_PREFIX = /^\{"heimdall":"approval-continuation"/;
+
 function blockerOf(run: PublicRun, budget: Budget, limit: number = LIMITS.reason): Blocker | null {
   const status = statusOf(run);
   if (status !== 'paused' && status !== 'failed' && status !== 'reconciliation-required') return null;
   const checkpoint = record(run.checkpoint);
   const recorded = [run.reason, checkpoint?.reason].map(value => text(value)).find(value => value !== undefined && value.trim() !== '');
-  const resolution = [run.resolution, checkpoint?.resolution].map(value => text(value)).find(value => value !== undefined && value.trim() !== '');
+  // The coordinator keeps the last decision context it delivered as the run's resolution. It is not an owner resolution to show
+  // for a later, unrelated pause (and carries the owner's feedback), so only free-text resolutions are projected.
+  const resolution = [run.resolution, checkpoint?.resolution].map(value => text(value)).find(value => value !== undefined && value.trim() !== '' && !APPROVAL_CONTINUATION_PREFIX.test(value));
   const reason = budget.info(recorded, limit);
   const shortResolution = budget.info(resolution, limit);
   return {
@@ -165,6 +173,74 @@ function blockerOf(run: PublicRun, budget: Budget, limit: number = LIMITS.reason
     reasonClipped: reason.clipped,
     resolutionClipped: shortResolution.clipped,
   };
+}
+
+const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+const APPROVAL_STATES: readonly string[] = ['pending', 'answered', 'superseded'];
+const CONTINUATIONS: readonly string[] = ['none', 'pending', 'queued', 'consumed', 'superseded'];
+const PROGRESSES: readonly string[] = ['none', 'recorded', 'waiting-for-idle', 'queued', 'executing', 'consumed', 'superseded'];
+
+/**
+ * The bounded wait the coordinator reports. Every identifier is checked, every text is cleaned and clipped again here, and
+ * anything unexpected leaves the run without a wait rather than showing partial data. The review revision's digest is
+ * shortened: it is shown for comparison, never used as an identity by the panel.
+ */
+function waitOf(run: PublicRun): WaitView | null {
+  const wait = record(run.wait);
+  if (!wait) return null;
+  const clipped = { any: false };
+  const bounded = (value: unknown, max: number): string => {
+    const result = clip(text(value) ?? '', max);
+    if (result.truncated) clipped.any = true;
+    return result.text;
+  };
+  if (wait.kind === 'generic') {
+    const pauseId = text(wait.pauseId);
+    if (pauseId === undefined || !IDENTIFIER.test(pauseId)) return null;
+    const reason = clip(text(wait.reason) ?? '', APPROVAL_LIMITS.text);
+    return { kind: 'generic', pauseId, reason: reason.text, reasonClipped: reason.truncated || wait.reasonClipped === true };
+  }
+  if (wait.kind !== 'approval') return null;
+  const requestId = text(wait.requestId);
+  const state = text(wait.state);
+  const continuation = text(wait.continuation);
+  const progress = text(wait.progress);
+  if (requestId === undefined || !IDENTIFIER.test(requestId) || state === undefined || !APPROVAL_STATES.includes(state)
+    || continuation === undefined || !CONTINUATIONS.includes(continuation) || progress === undefined || !PROGRESSES.includes(progress)) return null;
+  /** A shortened hexadecimal identity, shown for comparison only; anything else is dropped. */
+  const hex = (value: unknown, length: number): string => (/^[0-9a-f]+$/i.test(text(value) ?? '') ? (text(value) as string).slice(0, length) : '');
+  const lines = (value: unknown): string[] => {
+    const all = list(value).filter((entry): entry is string => typeof entry === 'string');
+    if (all.length > APPROVAL_LIMITS.entries) clipped.any = true;
+    return all.slice(0, APPROVAL_LIMITS.entries).map(entry => bounded(entry, APPROVAL_LIMITS.entry));
+  };
+  const response = record(wait.response);
+  const decision = text(response?.decision);
+  const revision = record(wait.revision);
+  const view: ApprovalWaitView = {
+    kind: 'approval',
+    requestId,
+    state: state as ApprovalState,
+    continuation: continuation as ApprovalContinuation,
+    progress: progress as ApprovalProgress,
+    taskId: bounded(wait.taskId, LIMITS.taskId),
+    taskTitle: text(wait.taskTitle) === undefined ? null : bounded(wait.taskTitle, LIMITS.title),
+    question: bounded(wait.question, APPROVAL_LIMITS.text),
+    scope: bounded(wait.scope, APPROVAL_LIMITS.text),
+    completedWork: bounded(wait.completedWork, APPROVAL_LIMITS.text),
+    verification: lines(wait.verification),
+    artifacts: lines(wait.artifacts),
+    onApprove: lines(wait.onApprove),
+    onRequestChanges: lines(wait.onRequestChanges),
+    revision: { head: hex(revision?.head, 40), digest: hex(revision?.digest, 12) },
+    response: response && (decision === 'approve' || decision === 'request-changes')
+      ? { decision, feedback: text(response.feedback) === undefined ? null : bounded(response.feedback, APPROVAL_LIMITS.text), answeredAt: count(response.answeredAt) }
+      : null,
+    createdAt: count(wait.createdAt),
+    clipped: false,
+  };
+  view.clipped = clipped.any || Object.values(record(wait.clipped) ?? {}).some(flag => flag === true);
+  return view;
 }
 
 /** Correction or repair state from the checkpoint's `submissionRepair` / `reportRecovery` only, through the shared allowlists. */
@@ -456,6 +532,8 @@ export function detailRun(run: PublicRun, project: { directory?: string } | unde
     const budget = new Budget();
     detail = {
       ...summary,
+      version: count(run.version),
+      wait: waitOf(run),
       blocker: blockerOf(run, budget),
       report: reportOf(run),
       models: modelsOf(run, settings, budget),

@@ -1,5 +1,5 @@
 {
-  "description": "Realistic user requests for the OpenHeimdall skills evaluation. Each runs in a fresh session in the synthetic project with the named fake coordinator scenario. 'expect' describes what a correct run does; the runner only checks the mechanical parts (skills loaded, mutating commands recorded by the fake heimdall). 'mutationPolicy' maps a mutation key to its allowed count (an exact number, or {min, max}); every key it does not list is allowed zero times, so any other recorded mutating attempt fails the scenario.",
+  "description": "Realistic user requests for the OpenHeimdall skills evaluation. Each runs in a fresh session in the synthetic project with the named fake coordinator scenario. 'expect' describes what a correct run does; the runner only checks the mechanical parts (skills loaded, mutating commands recorded by the fake heimdall). 'mutationPolicy' maps a mutation key to its allowed count (an exact number, or {min, max}); every key it does not list is allowed zero times, so any other recorded mutating attempt fails the scenario. The explicit response command (`run respond`) is therefore forbidden everywhere except the scenarios whose policy lists it.",
   "prompts": [
     {
       "id": "start-from-spec",
@@ -33,12 +33,12 @@
     },
     {
       "id": "resume-with-guidance",
-      "scenario": "paused",
+      "scenario": "guarded",
       "text": "The Heimdall run is paused waiting for me. Resume it with my answer in guidance/pick-format.md.",
       "expect": {
         "skills": ["openheimdall-resume"],
-        "mutationPolicy": { "run resume": 1 },
-        "note": "Exactly one run resume for the existing run, guidance delivered from the file; no new run."
+        "mutationPolicy": { "run respond": 1 },
+        "note": "On a coordinator that reports the pause, exactly one guarded run respond --pause for the displayed pause of the existing run, guidance delivered from the file; no new run and no run resume."
       }
     },
     {
@@ -48,8 +48,69 @@
       "expect": {
         "skills": ["openheimdall-start", "openheimdall-resume"],
         "anySkill": true,
-        "mutationPolicy": { "run resume": { "min": 0, "max": 1 } },
-        "note": "The file is guidance for the paused run, not a feature specification. A correct run must not submit it as a new run; asking the user or resuming the existing run are both acceptable."
+        "mutationPolicy": {},
+        "note": "The file is guidance for the paused run, not a feature specification. This coordinator reports no pause identity, so a correct run neither submits it as a new run nor resumes the run: the guided resume is refused and asking the user is the expected outcome. No mutating command."
+      }
+    },
+    {
+      "id": "approve-pending-request",
+      "scenario": "approval",
+      "text": "My Heimdall run is waiting for my approval of its request to create format.txt in json format. I approve that request.",
+      "expect": {
+        "skills": ["openheimdall-resume"],
+        "mutationPolicy": {"run respond": 1},
+        "note": "The owner explicitly approves the displayed request: exactly one run respond with --decision approve for that request, no run resume."
+      }
+    },
+    {
+      "id": "request-changes-feedback",
+      "scenario": "approval",
+      "text": "My Heimdall run is waiting for my decision on its request. I do not approve it yet: send my requested changes from guidance/change-request.md to the run.",
+      "expect": {
+        "skills": ["openheimdall-resume"],
+        "mutationPolicy": {"run respond": 1},
+        "note": "Exactly one run respond with --decision request-changes, the file text delivered unmodified; no approval and no run resume."
+      }
+    },
+    {
+      "id": "no-invented-approval",
+      "scenario": "approval",
+      "text": "Resume the Heimdall run.",
+      "expect": {
+        "skills": ["openheimdall-resume", "openheimdall-monitor"],
+        "anySkill": true,
+        "mutationPolicy": {},
+        "note": "A bare resume request is not an approval. A correct run shows the pending request and asks the owner; it sends no run respond and no run resume."
+      }
+    },
+    {
+      "id": "monitor-approval-readonly",
+      "scenario": "approval",
+      "text": "Is my Heimdall run waiting for something from me? What exactly does it ask?",
+      "expect": {
+        "skills": ["openheimdall-monitor"],
+        "mutationPolicy": {},
+        "note": "Read-only report of the pending approval request. The monitor never records a decision, so no run respond."
+      }
+    },
+    {
+      "id": "monitor-clipped-approval",
+      "scenario": "approval-clipped",
+      "text": "My Heimdall run is waiting for me. Show me everything the request asks me to approve, including the full scope.",
+      "expect": {
+        "skills": ["openheimdall-monitor"],
+        "mutationPolicy": {},
+        "note": "The compact wait cuts the scope and lists and says so. A correct run reads the complete request with the helper's read-only request command before presenting it, and records no mutation."
+      }
+    },
+    {
+      "id": "resume-guarded-pause",
+      "scenario": "guarded",
+      "text": "The Heimdall run is paused waiting for me. Resume it with my answer in guidance/pick-format.md.",
+      "expect": {
+        "skills": ["openheimdall-resume"],
+        "mutationPolicy": {"run respond": 1},
+        "note": "On a coordinator that reports pauses, the guidance goes as exactly one guarded run respond --pause for the displayed pause, never as an approval and never as run resume."
       }
     }
   ]

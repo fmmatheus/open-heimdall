@@ -9,7 +9,9 @@ import {
   mountProgress,
   mountSelect,
   mountTabs,
+  mountTextField,
 } from '@openchamber/sdk/ui';
+import { mountCardControls } from './card-controls.js';
 import { createPanelClient } from './client.js';
 import { createNavigation, sessionTargets } from './navigation.js';
 import type { HeimdallProjectRef, NavigationView } from './navigation.js';
@@ -21,6 +23,8 @@ import {
   DEFAULT_DETAIL_TAB,
   bannerInfo,
   blockerDisplay,
+  canRequestChanges,
+  canRespond,
   detailNotice,
   detailPlaceholder,
   detailTabs,
@@ -33,6 +37,7 @@ import {
   taskDisplay,
   taskRows,
   technicalSections,
+  waitCard,
 } from './view-model.js';
 import type { Badge, BlockerField, ContentStatus, DetailTabId, FieldDisplay, LabeledRow, ShortenedField } from './view-model.js';
 import { reviewView } from './review-view.js';
@@ -142,6 +147,13 @@ function mountPanel(): void {
   /** Repaint the blocker and task text in place when the store's on-demand content changes. */
   let contentPainters: Array<(state: PanelState) => void> = [];
   let paintedContent: PanelState['content'] | null = null;
+  /** Repaints the approval card in place when the owner's action state or the connection changes; set while a card is drawn. */
+  let cardPainter: ((state: PanelState) => void) | null = null;
+  let paintedCard = '';
+  /** What the owner has typed into the card, by card key. Kept across redraws; dropped once the response is recorded. */
+  const drafts = new Map<string, string>();
+  /** A file named by an approval request that the owner asked to see; opened once the Review tab has loaded. */
+  let pendingReviewPath: string | null = null;
   /** Fields the user asked to see in full, for the run drawn; dropped when another run is drawn. */
   let revealedRun = '';
   const revealedTaskFields = new Map<string, Set<ShortenedField>>();
@@ -272,6 +284,8 @@ function mountPanel(): void {
     updatedPainter = null;
     contentPainters = [];
     paintedContent = null;
+    cardPainter = null;
+    paintedCard = '';
     detailContent.replaceChildren();
   };
 
@@ -416,11 +430,100 @@ function mountPanel(): void {
       box.append(blocker);
     }
 
+    drawCard(detail, box);
+
     const slot = node('div', 'hm-slot');
     slot.dataset.slot = 'summary-actions';
     box.append(slot);
     extensions.summaryActions?.(detail, slot);
     container.append(box);
+  }
+
+  /** Whether an artifact reference looks like a repository file the Review tab could list (not a commit id or a sentence). */
+  const reviewablePath = (value: string): boolean =>
+    value.length > 0 && value.length <= 1024 && !value.startsWith('/') && !value.includes('..') && !/^[0-9a-f]{7,64}$/i.test(value) && /^[\w.@+~/-]+$/.test(value);
+
+  /**
+   * The approval or response card. The text part is rebuilt whenever the coordinator's data or the owner's action
+   * state changes; the field and buttons are built once per drawn card and updated in place, so what the owner typed
+   * and where the keyboard is survive a poll. Leaving the panel decides nothing: only a click on a button sends.
+   */
+  function drawCard(detail: RunDetail, container: HTMLElement): void {
+    const wait = detail.wait ?? null;
+    const first = waitCard(detail, store.getState());
+    if (wait === null || first === null) return;
+    for (const key of [...drafts.keys()]) if (key !== first.key) drafts.delete(key);
+    const box = node('section', 'hm-card');
+    box.setAttribute('aria-label', 'Owner response');
+    const info = node('div', 'hm-card-info');
+    const controls = node('div', 'hm-card-controls');
+    box.append(info, controls);
+    container.append(box);
+
+    const controlsHandle = mountCardControls({
+      ui: { mountButton, mountTextField, element: tag => node(tag) },
+      store, detail, drafts, container: controls,
+      repaint: () => paintCard(store.getState()),
+    });
+    detailHandles.push(controlsHandle);
+    let cardBadge: { dispose: () => void } | null = null;
+    const cardHandles: Array<{ dispose: () => void }> = [];
+
+    function paintCard(state: PanelState): void {
+      const view = controlsHandle.paint(state);
+      if (view === null) return;
+      cardBadge?.dispose();
+      cardBadge = null;
+      for (const handle of cardHandles.splice(0)) handle.dispose();
+      const body: HTMLElement[] = [];
+      const head = node('div', 'hm-card-head');
+      head.append(node('h2', 'hm-card-title', view.title));
+      const badgeSlot = node('span');
+      head.append(badgeSlot);
+      const badgeHandle = mountBadge(badgeSlot, { label: view.badge.label, tone: view.badge.tone });
+      body.push(head);
+      if (view.task) body.push(node('p', 'hm-meta', `Task ${view.task}`));
+      if (view.unverified) body.push(node('p', 'hm-meta', view.unverified));
+      for (const entry of view.fields) body.push(node('p', 'hm-label', entry.label), node('p', 'hm-text', entry.text));
+      for (const entry of view.lists) {
+        body.push(node('p', 'hm-label', entry.label));
+        const list = node('ul', 'hm-card-list');
+        for (const item of entry.items) list.append(node('li', 'hm-text', item));
+        body.push(list);
+      }
+      if (view.artifacts.length > 0) {
+        body.push(node('p', 'hm-label', 'Artifacts to review'));
+        const list = node('ul', 'hm-card-list');
+        for (const item of view.artifacts) {
+          const entry = node('li');
+          entry.append(node('span', 'hm-text', item));
+          if (reviewablePath(item)) {
+            const holder = node('span');
+            entry.append(' ', holder);
+            const open = mountButton(holder, {
+              label: 'Show in Review', variant: 'ghost', size: 'xs',
+              onClick: () => { pendingReviewPath = item; tab = 'review'; drawDetail(detail); },
+            });
+            holder.querySelector<HTMLElement>('button')?.setAttribute('aria-label', `Show ${item} in Review`);
+            cardHandles.push(open);
+          }
+          list.append(entry);
+        }
+        body.push(list);
+      }
+      if (view.revision) body.push(node('p', 'hm-meta', `Reviewed revision ${view.revision}`));
+      if (view.clippedNote) body.push(node('p', 'hm-meta', view.clippedNote));
+      if (view.fullRequest?.status) { const loading = node('p', 'hm-text', view.fullRequest.status); loading.setAttribute('role', 'status'); body.push(loading); }
+      if (view.status) { const status = node('p', 'hm-text', view.status); status.setAttribute('role', 'status'); body.push(status); }
+      const artifactNote = feedbackNode('card');
+      body.push(artifactNote);
+      if (view.notice) { const notice = node('p', 'hm-text', view.notice); notice.setAttribute('role', 'status'); notice.setAttribute('aria-live', 'assertive'); body.push(notice); }
+      info.replaceChildren(...body);
+      cardBadge = badgeHandle;
+    }
+    detailHandles.push({ dispose: () => { cardBadge?.dispose(); cardBadge = null; for (const handle of cardHandles.splice(0)) handle.dispose(); } });
+    cardPainter = paintCard;
+    paintCard(store.getState());
   }
 
   /** Technical details tab: every recorded model, usage, limit and identifier, with exact UTC times. */
@@ -728,6 +831,13 @@ function mountPanel(): void {
 
       paintHeader(view);
       const ready = view.mode === 'ready';
+      if (ready && pendingReviewPath !== null) {
+        // A file named by an approval request: open it once the list is loaded, or say it is not among the changes.
+        const wanted = pendingReviewPath;
+        pendingReviewPath = null;
+        if (view.files.some(row => row.id === wanted)) store.selectReviewFile(wanted);
+        else setFeedback('card', `${wanted} is not among the changed files of this run.`);
+      }
       filesBox.hidden = !ready;
       if (!ready) { painted.files = ''; painted.generated = ''; painted.diff = ''; diffBox.hidden = true; return; }
       const filesKey = JSON.stringify(view.files);
@@ -786,6 +896,9 @@ function mountPanel(): void {
   };
 
   function drawDetail(detail: RunDetail): void {
+    // A redraw (for example after a poll) must not take the keyboard away from the response field.
+    const typing = document.activeElement instanceof HTMLTextAreaElement && document.activeElement.closest('[data-card-field]') !== null ? document.activeElement : null;
+    const caret = typing ? [typing.selectionStart, typing.selectionEnd] as const : null;
     disposeDetail();
     renderedDetail = detail;
     if (revealedRun !== detail.id) {
@@ -795,6 +908,11 @@ function mountPanel(): void {
     }
     ensureNavigation(detail);
     drawSummary(detail, detailContent);
+    if (typing !== null) {
+      const again = detailContent.querySelector<HTMLTextAreaElement>('[data-card-field] textarea');
+      again?.focus();
+      if (again && caret) again.setSelectionRange(caret[0], caret[1]);
+    }
     const notice = detailNotice(detail);
     if (notice) detailContent.append(node('p', 'hm-meta', notice));
     const tabRoot = node('div');
@@ -815,6 +933,7 @@ function mountPanel(): void {
     detailContent.append(body);
     (extensions.tabs?.[tab] ?? drawers[tab])(detail, body);
     paintedContent = store.getState().content;
+    paintedCard = JSON.stringify([store.getState().action, store.getState().connection, store.getState().stale]);
     // The store loads the review only while its tab is showing.
     store.setReviewVisible(tab === 'review');
   }
@@ -833,6 +952,9 @@ function mountPanel(): void {
     if (state.detail === renderedDetail && renderedKey === 'detail') {
       updatedPainter?.();
       reviewPainter?.(state);
+      // The approval card follows the owner's action state and the connection without a redraw.
+      const cardKey = JSON.stringify([state.action, state.connection, state.stale, state.approvalDetails]);
+      if (cardPainter !== null && cardKey !== paintedCard) { paintedCard = cardKey; cardPainter(state); }
       // Text is rebuilt only when the on-demand content changed, not on every poll.
       if (state.content !== paintedContent) {
         paintedContent = state.content;

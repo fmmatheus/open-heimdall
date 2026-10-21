@@ -26,6 +26,13 @@ const plan = {
     { id: 'T2', title: 'Wait for an explicit fixture resolution', brief: 'Report blocked until the owner supplies the fixture resolution.', dependsOn: ['T1'], dod: ['The resumed attempt received the fixture resolution.'] },
   ],
 };
+// `approval` makes the second task ask for a typed owner decision instead of reporting a generic blocker.
+const scenario = process.env.HEIMDALL_COMPAT_SCENARIO ?? 'blocked';
+const approvalRequest = {
+  status: 'approval-required', question: 'Apply the fixture change?', scope: 'Only the fixture change under review', completedWork: 'The fixture marker exists.',
+  verification: ['The native write tool created the fixture marker.'], artifacts: ['compatibility-marker.txt'],
+  onApprove: ['Apply the fixture change and report completion'], onRequestChanges: ['Correct the fixture change and ask again'],
+};
 const result = { status: 'completed', summary: 'Fixture gate satisfied.', handoff: 'Continue the deterministic fixture.', evidence: [{ gateId: 'G1', passed: true, detail: 'Observed through the real native host fixture.' }] };
 
 function respond(options) {
@@ -59,7 +66,7 @@ function respond(options) {
       if (!names.includes('write')) throw new Error('Native write tool was not exposed');
       return call('write', { path: 'compatibility-marker.txt', content: 'verified\n' });
     }
-    if (task.id === 'T2' && !prompt.includes('COMPAT_RESUME')) return call('heimdall_submit_result', { status: 'blocked', reason: 'Fixture owner must supply COMPAT_RESUME.' });
+    if (task.id === 'T2' && !prompt.includes('COMPAT_RESUME')) return call('heimdall_submit_result', scenario === 'approval' ? approvalRequest : { status: 'blocked', reason: 'Fixture owner must supply COMPAT_RESUME.' });
     return call('heimdall_submit_result', result);
   }
   return text('Fixture generation complete.');

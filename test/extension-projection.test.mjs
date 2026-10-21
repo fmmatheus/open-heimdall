@@ -233,6 +233,16 @@ test('blockers use only recorded reasons and say so when none was recorded', () 
   assert.equal(detailRun(makeRun({ status: 'running', reason: 'stale' }), project).blocker, null);
 });
 
+test('a delivered approval continuation is never shown as the blocker resolution of a later pause', () => {
+  const envelope = JSON.stringify({ heimdall: 'approval-continuation', version: 1, requestId: 'apr_1', decision: 'request-changes', feedback: 'Private feedback', scope: 'Scope', revision: { head: 'a'.repeat(40), digest: 'b'.repeat(64) }, onApprove: [], onRequestChanges: [], taskId: 'T2', index: 1 });
+  const later = detailRun({ ...fixtures.paused(), resolution: envelope }, project);
+  assert.equal(later.blocker.resolution, null, 'the coordinator-rendered envelope is not an owner resolution to display');
+  assert.equal(later.blocker.reason, 'Executor quota is below the minimum');
+  assert.equal(JSON.stringify(later).includes('Private feedback'), false);
+  const ordinary = detailRun({ ...fixtures.paused(), resolution: '{"note":"plain owner text that merely looks like JSON"}' }, project);
+  assert.equal(ordinary.blocker.resolution, '{"note":"plain owner text that merely looks like JSON"}');
+});
+
 test('succeeded detail lists every result with its evidence', () => {
   const detail = detailRun(fixtures.succeeded(), project);
   assert.equal(detail.phase, 'succeeded');
@@ -894,4 +904,68 @@ test('GET /runs/:id serves report state through the real service route without l
   assert.equal((await call(server, '/runs/run_plain')).json.run.report, null);
   const list = await call(server, '/runs');
   assert.ok(!list.text.includes('"report"'), 'the list stays summary-only');
+});
+
+// ----- approval and pause waits -----
+
+const coordinatorWait = (overrides = {}) => ({
+  kind: 'approval', requestId: 'apr_1', state: 'pending', continuation: 'none', progress: 'none', phase: 'executor', taskIndex: 0, taskId: 'T1', taskTitle: 'First',
+  attemptId: 'ATTEMPT-SECRET', question: 'Q?', scope: 'S', completedWork: 'C', verification: ['v'], artifacts: ['a.ts'], onApprove: ['merge'], onRequestChanges: ['fix'],
+  revision: { head: 'a'.repeat(40), digest: 'b'.repeat(64) }, response: null, createdAt: 5,
+  clipped: { question: false, scope: false, completedWork: false, verification: false, artifacts: false, onApprove: false, onRequestChanges: false, taskTitle: false, feedback: false },
+  ...overrides,
+});
+
+test('the run detail carries the run version and a bounded approval wait with nothing the panel does not need', () => {
+  const detail = detailRun(makeRun({ status: 'paused', version: 12, wait: coordinatorWait() }), project);
+  assert.equal(detail.version, 12);
+  assert.deepEqual(detail.wait, {
+    kind: 'approval', requestId: 'apr_1', state: 'pending', continuation: 'none', progress: 'none', taskId: 'T1', taskTitle: 'First',
+    question: 'Q?', scope: 'S', completedWork: 'C', verification: ['v'], artifacts: ['a.ts'], onApprove: ['merge'], onRequestChanges: ['fix'],
+    revision: { head: 'a'.repeat(40), digest: 'b'.repeat(12) }, response: null, createdAt: 5, clipped: false,
+  });
+  const text = JSON.stringify(detail);
+  for (const forbidden of [...FORBIDDEN, 'ATTEMPT-SECRET', 'attemptId', 'b'.repeat(13)]) assert.equal(text.includes(forbidden), false, forbidden);
+  assert.equal(detailRun(makeRun({ status: 'running' }), project).wait, null);
+  assert.equal(detailRun(makeRun({ status: 'paused', wait: null }), project).wait, null);
+});
+
+test('a withdrawn decision whose feedback is still owed stays an approval wait, distinct from a generic pause, until a fresh attempt carries it', () => {
+  for (const progress of ['waiting-for-idle', 'queued', 'executing']) {
+    const wait = detailRun(makeRun({ status: 'paused', wait: coordinatorWait({
+      state: 'answered', continuation: 'superseded', progress, response: { decision: 'request-changes', feedback: 'Keep LEDGER_TENANT', answeredAt: 9 },
+    }) }), project).wait;
+    assert.deepEqual({ kind: wait.kind, state: wait.state, continuation: wait.continuation, progress: wait.progress, requestId: wait.requestId }, { kind: 'approval', state: 'answered', continuation: 'superseded', progress, requestId: 'apr_1' });
+    assert.deepEqual(wait.response, { decision: 'request-changes', feedback: 'Keep LEDGER_TENANT', answeredAt: 9 });
+    assert.equal('pauseId' in wait, false, 'it is not a pause the owner can answer');
+    assert.equal(JSON.stringify(wait).includes('ATTEMPT-SECRET'), false);
+  }
+  // Once a fresh attempt carries the context the coordinator reports no wait, and the projection invents none.
+  assert.equal(detailRun(makeRun({ status: 'paused', wait: null }), project).wait, null);
+});
+
+test('the wait is cleaned, clipped and counted again here, and anything malformed leaves the run without a wait', () => {
+  const long = 'q'.repeat(5000);
+  const wait = detailRun(makeRun({ status: 'paused', wait: coordinatorWait({
+    question: `${long}\u202e\u0007`, verification: Array.from({ length: 30 }, (_, index) => `${'v'.repeat(900)}${index}`),
+    artifacts: ['ok', 7, null, 'z\u0000z'], response: { decision: 'request-changes', feedback: long, answeredAt: 9 }, state: 'answered', continuation: 'queued', progress: 'queued',
+  }) }), project).wait;
+  assert.equal(wait.question.length <= 1500, true);
+  assert.equal(wait.question.endsWith('…'), true);
+  assert.equal(/[\u202e\u0007]/.test(wait.question), false);
+  assert.equal(wait.verification.length, 10);
+  assert.equal(wait.verification.every(entry => entry.length <= 400), true);
+  assert.deepEqual(wait.artifacts, ['ok', 'z z']);
+  assert.equal(wait.response.feedback.length <= 1500, true);
+  assert.equal(wait.response.decision, 'request-changes');
+  assert.equal(wait.clipped, true);
+  assert.equal(Buffer.byteLength(JSON.stringify(wait)) < 12000, true, 'a wait stays far below the detail budget');
+
+  for (const bad of [
+    { kind: 'approval', requestId: '../x' }, coordinatorWait({ requestId: 'a b' }), coordinatorWait({ state: 'weird' }), coordinatorWait({ continuation: 'x' }), coordinatorWait({ progress: 'x' }),
+    { kind: 'generic', pauseId: '../p', reason: 'r' }, { kind: 'other' }, 'wait', 5, [],
+  ]) assert.equal(detailRun(makeRun({ status: 'paused', wait: bad }), project).wait, null, JSON.stringify(bad));
+  assert.deepEqual(detailRun(makeRun({ status: 'paused', wait: { kind: 'generic', pauseId: 'pau_a', reason: `${long}`, reasonClipped: false, secret: 'x' } }), project).wait, {
+    kind: 'generic', pauseId: 'pau_a', reason: `${'q'.repeat(1499)}…`, reasonClipped: true,
+  });
 });

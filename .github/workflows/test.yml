@@ -8,6 +8,7 @@ permissions:
 jobs:
   baseline:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -16,8 +17,45 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npm run check
-      - run: npm test
+      - name: Build and run bounded test suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          diagnostic_dir="${RUNNER_TEMP}/baseline-diagnostics"
+          mkdir -p "$diagnostic_dir"
+          npm run build 2>&1 | tee "$diagnostic_dir/build.log"
+          (
+            timeout --signal=TERM --kill-after=15s 10m node --test --test-timeout=180000 test/*.test.mjs 2>&1 | tee "$diagnostic_dir/tests.log"
+          ) &
+          test_pid=$!
+          (
+            sleep 240 &
+            delay_pid=$!
+            trap 'kill "$delay_pid" 2>/dev/null || true; wait "$delay_pid" 2>/dev/null || true' EXIT
+            trap 'exit 0' TERM INT
+            wait "$delay_pid"
+            if kill -0 "$test_pid" 2>/dev/null; then
+              ps -eo pid,ppid,etimes,stat,wchan:32,args --forest | tee "$diagnostic_dir/processes.log"
+            fi
+          ) &
+          watcher_pid=$!
+          cleanup() {
+            kill "$watcher_pid" 2>/dev/null || true
+            wait "$watcher_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          test_status=0
+          wait "$test_pid" || test_status=$?
+          exit "$test_status"
       - run: npm run build:extension
+      - name: Upload baseline diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: baseline-diagnostics-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/baseline-diagnostics/
+          if-no-files-found: warn
+          retention-days: 7
   macos-harness:
     runs-on: macos-latest
     steps:

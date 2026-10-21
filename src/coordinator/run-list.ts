@@ -1,4 +1,4 @@
-import type { RunRecord } from './types.js';
+import type { RunRecord, RunWaitSummary } from './types.js';
 
 export const RUN_LIST_PAGE_SIZE = 100;
 export const RUN_LIST_MAX_BYTES = 1024 * 1024;
@@ -13,6 +13,8 @@ export interface RunListEntry extends Pick<RunRecord, 'id' | 'projectId' | 'work
     completed: number;
     currentTask: { id: string; title: string } | null;
   };
+  /** Bounded summary of what the run is waiting for, or null. Details are on the run detail route. */
+  wait: RunWaitSummary | null;
 }
 
 export interface RunListPage {

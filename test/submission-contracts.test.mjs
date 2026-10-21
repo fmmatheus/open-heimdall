@@ -6,7 +6,7 @@ import path from 'node:path';
 import {
   SUBMISSION_PROTOCOL, SUBMISSION_KINDS, SUBMISSION_TOOL_IDS, IDENTITY_FIELDS, plannerPlanContract, executorResultContract,
   contractFieldNames, submissionInputSchema, submissionToolDescription, validatePlannerPlan, validateExecutorResult,
-  validateSubmission, submissionKindOfTool, isLookalikeSubmissionTool,
+  validateSubmission, submissionKindOfTool, isLookalikeSubmissionTool, negativeSignal,
 } from '../dist/workflow/contracts.js';
 import { loadPlanSnapshot } from '../dist/workflow/plan-snapshot.js';
 import { validatePlan } from '../dist/workflow/runner.js';
@@ -18,6 +18,11 @@ const completed = (extra = {}) => ({
     { gateId: 'G1', passed: true, detail: 'proved one' }, { gateId: 'G2', passed: true, detail: 'proved two' },
   ], ...extra,
 });
+const approval = (extra = {}) => ({
+  status: 'approval-required', question: 'Approve the schema migration?', scope: 'Apply migration 0042 to the staging database only',
+  completedWork: 'Wrote the migration and ran it against a scratch copy', verification: ['npm test: 120 passed'], artifacts: ['db/migrations/0042.sql', 'commit 1a2b3c4'],
+  onApprove: ['Run the migration on staging', 'Re-run the integration tests'], onRequestChanges: ['Revise the migration within the same scope and submit a fresh request'], ...extra,
+});
 const plan = raw => validatePlannerPlan(raw, { limit: 7 });
 const result = raw => validateExecutorResult(raw, { dodCount: 2 });
 const errorsOf = outcome => { assert.equal(outcome.ok, false, JSON.stringify(outcome)); return outcome.errors; };
@@ -27,7 +32,7 @@ test('protocol, versions and tool ids are defined once per kind', () => {
   assert.equal(SUBMISSION_PROTOCOL, 'structured-v1');
   assert.deepEqual([...SUBMISSION_KINDS], ['planner-plan', 'executor-result']);
   assert.equal(plannerPlanContract.version, 1);
-  assert.equal(executorResultContract.version, 1);
+  assert.equal(executorResultContract.version, 2, 'executor-result v2 adds the approval-required variant');
   assert.deepEqual({ ...SUBMISSION_TOOL_IDS }, { 'planner-plan': 'heimdall_submit_plan', 'executor-result': 'heimdall_submit_result' });
   const ok = plan(inline());
   assert.deepEqual(ok.contract, { protocol: 'structured-v1', kind: 'planner-plan', version: 1 });
@@ -49,7 +54,7 @@ test('tool schema, description and validator derive from one definition', () => 
     for (const identity of IDENTITY_FIELDS) assert.ok(description.includes(identity));
   }
   // The validator is driven by the same definition: dropping any specified field of a valid sample reports exactly that path.
-  const samples = { 'planner-plan': { rule: { kind: 'planner-plan', limit: 7 }, variants: { inline: inline(), blocked: { status: 'blocked', reason: 'why' }, artifacts: { status: 'planned', artifacts: true } } }, 'executor-result': { rule: { kind: 'executor-result', dodCount: 2 }, variants: { completed: completed(), blocked: { status: 'blocked', reason: 'why' } } } };
+  const samples = { 'planner-plan': { rule: { kind: 'planner-plan', limit: 7 }, variants: { inline: inline(), blocked: { status: 'blocked', reason: 'why' }, artifacts: { status: 'planned', artifacts: true } } }, 'executor-result': { rule: { kind: 'executor-result', dodCount: 2 }, variants: { completed: completed(), blocked: { status: 'blocked', reason: 'why' }, approval: approval() } } };
   for (const kind of SUBMISSION_KINDS) {
     for (const [name, sample] of Object.entries(samples[kind].variants)) {
       assert.equal(validateSubmission(samples[kind].rule, sample).ok, true, `${kind}/${name} sample valid`);
@@ -211,6 +216,72 @@ test('blocked results and unpassed gates are semantic outcomes, never format-rep
   // A malformed payload stays a format error even when it also reports an unpassed gate.
   const mixed = result(completed({ evidence: [{ gateId: 'G1', passed: false, detail: 'a' }] }));
   assert.deepEqual([mixed.ok, mixed.classification], [false, 'format']);
+});
+
+test('approval-required is a valid semantic outcome of contract version 2, never repairable', () => {
+  const ok = result(approval());
+  assert.equal(ok.ok, true, JSON.stringify(ok));
+  assert.deepEqual([ok.variant, ok.outcome, ok.classification, ok.repairable], ['approval', 'approval-required', 'semantic', false]);
+  assert.deepEqual(ok.contract, { protocol: 'structured-v1', kind: 'executor-result', version: 2 });
+  assert.match(ok.digest, /^[0-9a-f]{64}$/);
+  assert.ok(Object.isFrozen(ok.value) && Object.isFrozen(ok.value.onApprove));
+  // The planner contract is unchanged: it has no approval variant and still pairs clarification with blocked.
+  assert.equal(plannerPlanContract.version, 1);
+  const planner = plan(approval());
+  assert.deepEqual([planner.ok, planner.classification], [false, 'format']);
+  has(errorsOf(planner), '$.status', 'invalid_value');
+  assert.ok(submissionToolDescription('executor-result').includes('approval-required'));
+  assert.ok(!submissionToolDescription('planner-plan').includes('approval-required'));
+  assert.match(submissionToolDescription('executor-result'), /blocked: status \("blocked"\), reason/);
+});
+
+test('approval-required: missing, empty, wrongly typed, unknown and identity fields are path-specific format errors', () => {
+  for (const field of ['question', 'scope', 'completedWork', 'verification', 'artifacts', 'onApprove', 'onRequestChanges']) {
+    const { [field]: _dropped, ...rest } = approval();
+    has(errorsOf(result(rest)), '$.' + field, 'missing_field');
+  }
+  for (const field of ['question', 'scope', 'completedWork']) {
+    has(errorsOf(result(approval({ [field]: '   ' }))), '$.' + field, 'empty_string');
+    has(errorsOf(result(approval({ [field]: 7 }))), '$.' + field, 'invalid_type');
+  }
+  for (const field of ['verification', 'artifacts', 'onApprove', 'onRequestChanges']) {
+    has(errorsOf(result(approval({ [field]: [] }))), '$.' + field, 'empty_array');
+    has(errorsOf(result(approval({ [field]: ['ok', ''] }))), `$.${field}[1]`, 'empty_string');
+    has(errorsOf(result(approval({ [field]: 'one entry' }))), '$.' + field, 'invalid_type');
+  }
+  has(errorsOf(result(approval({ extra: 1 }))), '$.extra', 'unknown_field');
+  for (const field of IDENTITY_FIELDS) has(errorsOf(result(approval({ [field]: 'x' }))), '$.' + field, 'identity_field');
+  // An approval payload is not a completion: gates and evidence are unknown to it.
+  has(errorsOf(result(approval({ evidence: [] }))), '$.evidence', 'unknown_field');
+  has(errorsOf(result({ ...approval(), status: 'approved' })), '$.status', 'invalid_value');
+});
+
+test('approval-required: size bounds are enforced with exact paths', () => {
+  assert.equal(result(approval({ question: 'q'.repeat(4000) })).ok, true);
+  has(errorsOf(result(approval({ question: 'q'.repeat(4001) }))), '$.question', 'text_too_long');
+  has(errorsOf(result(approval({ scope: 's'.repeat(4001) }))), '$.scope', 'text_too_long');
+  has(errorsOf(result(approval({ completedWork: 'c'.repeat(4001) }))), '$.completedWork', 'text_too_long');
+  has(errorsOf(result(approval({ artifacts: ['fine', 'a'.repeat(4001)] }))), '$.artifacts[1]', 'text_too_long');
+  assert.equal(result(approval({ verification: Array.from({ length: 20 }, (_, i) => 'v' + i) })).ok, true);
+  has(errorsOf(result(approval({ verification: Array.from({ length: 21 }, (_, i) => 'v' + i) }))), '$.verification', 'list_too_long');
+  has(errorsOf(result(approval({ onApprove: Array.from({ length: 21 }, (_, i) => 'a' + i) }))), '$.onApprove', 'list_too_long');
+  // Each part is within its own limit but the canonical payload exceeds 32 KiB.
+  const big = approval({ verification: Array.from({ length: 10 }, () => 'v'.repeat(3900)) });
+  const errors = errorsOf(result(big));
+  has(errors, '$', 'payload_too_large');
+  assert.equal(errors.filter(e => e.code === 'text_too_long').length, 0);
+  assert.equal(big.status, 'approval-required', 'the oversize request is a format error, not a semantic outcome');
+});
+
+test('a malformed approval request is never converted into a blocked or unfinished outcome', () => {
+  for (const raw of [approval({ question: '' }), { status: 'approval-required' }, approval({ evidence: [{ gateId: 'G1', passed: false, detail: 'x' }], reason: 'blocked by owner' })]) {
+    const rejected = result(raw);
+    assert.deepEqual([rejected.ok, rejected.classification, rejected.repairable], [false, 'format', true]);
+    assert.equal(negativeSignal({ kind: 'executor-result', dodCount: 2 }, raw, rejected.errors), undefined);
+  }
+  // The existing negative signals are untouched.
+  const blocked = { status: 'blocked' };
+  assert.equal(negativeSignal({ kind: 'executor-result', dodCount: 2 }, blocked, errorsOf(result(blocked))).outcome, 'blocked');
 });
 
 test('error output is bounded', () => {

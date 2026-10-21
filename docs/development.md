@@ -127,6 +127,13 @@ removes its fixture. It does not contact a model provider or the configured live
 coordinator. See [the compatibility record](validation/opencode-2.0.32.md) for
 the checked environment and limits.
 
+Add `--scenario approval` to make the second task submit a typed
+`approval-required` result through the real native tool schema instead of a
+generic blocker. The run then pauses with an approval wait and the ordinary resume
+completes it. The fixture has no coordinator, so this checks the host accepting and
+the runner pausing on the typed outcome; it does not record or answer an owner
+decision. See [the approval workflow record](validation/approval-workflow.md).
+
 To try the native plugin, build the tarball as described in
 [Packaging](#packaging) and install it into a **separate development Git
 project** with ordinary `npm install`; no consumer overrides, links or peer

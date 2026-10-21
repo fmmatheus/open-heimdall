@@ -22,6 +22,13 @@ const { prompts } = JSON.parse(fs.readFileSync(path.join(here, 'prompts.json'), 
 
 const RUN_ID = '3f2a9c1e-7b64-4d0a-9e58-1c2d3e4f5a6b';
 const PROJECT_ID = 'project-eval';
+const REQUEST_ID = 'apr_eval_0001';
+const PAUSE_ID = 'pau_0123456789abcdef0123456789abcdef';
+const CHANGES = `Please change the plan:
+
+- keep \`greeting.txt\` as it is
+- write the format as "json" only, and show me the final file in your next request
+`;
 const SPEC = `# Add a greeting file
 
 Create \`greeting.txt\` containing the word \`hello\` and a newline, then commit it.
@@ -76,6 +83,7 @@ export function createSandbox(root, { scenario, withSkills }) {
   fs.writeFileSync(path.join(dirs.project, 'README.md'), '# Synthetic evaluation project\n');
   fs.writeFileSync(path.join(dirs.project, 'specs', 'add-greeting.md'), SPEC);
   fs.writeFileSync(path.join(dirs.project, 'guidance', 'pick-format.md'), GUIDANCE);
+  fs.writeFileSync(path.join(dirs.project, 'guidance', 'change-request.md'), CHANGES);
   git(dirs.project, ['add', '.']);
   git(dirs.project, ['commit', '--quiet', '-m', 'Initial commit']);
   const head = git(dirs.project, ['rev-parse', 'HEAD']);
@@ -203,20 +211,30 @@ function selftest() {
       assert.deepEqual(countMutations(readCalls(box.callsFile)), {});
     });
 
-    check('resume-with-guidance: helper resumes the same run once with the labeled guidance', () => {
-      const box = createSandbox(root, { scenario: 'paused', withSkills: false });
+    check('resume-with-guidance: helper resumes the same run once through the guarded response for its pause', () => {
+      const box = createSandbox(root, { scenario: 'guarded', withSkills: false });
       const result = helperRun(box, ['resume', RUN_ID, '--guidance-file', 'guidance/pick-format.md']);
       assert.equal(result.status, 0, result.stderr);
       const report = result.json();
       assert.equal(report.outcome, 'resumed');
+      assert.equal(report.via, 'respond');
       assert.equal(report.preserved.runId, true);
       assert.deepEqual(report.completedResults, { before: 1, after: 1 });
-      assert.deepEqual(countMutations(readCalls(box.callsFile)), { 'run resume': 1 });
-      const resume = readCalls(box.callsFile).find(call => call.mutating);
-      assert.equal(resume.argv[2], 'resume');
-      assert.equal(resume.argv[3], RUN_ID);
-      assert.equal(resume.argv[4], '--input');
-      assert.match(resume.argv[5], /^Owner guidance for resuming this run/);
+      assert.deepEqual(countMutations(readCalls(box.callsFile)), { 'run respond': 1 });
+      const sent = readCalls(box.callsFile).find(call => call.mutating);
+      assert.deepEqual(sent.argv.slice(0, 6), ['coordinator', 'run', 'respond', RUN_ID, '--pause', PAUSE_ID]);
+      assert.equal(sent.argv[6], `--input=${GUIDANCE}`);
+    });
+
+    check('resume without a pause identity: a coordinator that reports no waits is refused and nothing is mutated', () => {
+      const box = createSandbox(root, { scenario: 'paused', withSkills: false });
+      const result = helperRun(box, ['resume', RUN_ID, '--guidance-file', 'guidance/pick-format.md']);
+      assert.equal(result.status, 1);
+      const report = result.json();
+      assert.equal(report.outcome, 'refused');
+      assert.equal(report.reason, 'pause-identity-unavailable');
+      assert.deepEqual(report.mutationsAttempted, []);
+      assert.deepEqual(countMutations(readCalls(box.callsFile)), {});
     });
 
     check('boundary-guidance-as-spec: inspect-spec flags the guidance file and nothing is mutated', () => {
@@ -235,6 +253,115 @@ function selftest() {
       assert.equal(result.status, 1);
       assert.equal(result.json().outcome, 'not-resumable');
       assert.deepEqual(countMutations(readCalls(box.callsFile)), {});
+    });
+
+    check('approval-snapshot: the monitor path shows the pending request and mutates nothing', () => {
+      const box = createSandbox(root, { scenario: 'approval', withSkills: false });
+      const result = helperRun(box, ['snapshot']);
+      assert.equal(result.status, 0, result.stderr);
+      const { wait } = result.json().run;
+      assert.equal(wait.kind, 'approval');
+      assert.equal(wait.requestId, REQUEST_ID);
+      assert.equal(wait.state, 'pending');
+      assert.match(wait.question, /format\.txt/);
+      assert.deepEqual(countMutations(readCalls(box.callsFile)), {});
+    });
+
+    check('request: a clipped approval wait names the read, and the read returns the complete request without any mutation', () => {
+      const box = createSandbox(root, { scenario: 'approval-clipped', withSkills: false });
+      const snapshot = helperRun(box, ['snapshot']);
+      assert.equal(snapshot.status, 0, snapshot.stderr);
+      const { wait } = snapshot.json().run;
+      assert.equal(wait.shortened, true);
+      assert.ok(!wait.scope.includes('LATE-ACTION-AFTER-1500'), 'the compact scope hides the late action');
+      assert.equal(wait.verification.length, 10);
+      assert.equal(wait.completeRequest.command, `request ${RUN_ID} --request ${REQUEST_ID}`);
+      const result = helperRun(box, ['request', RUN_ID, '--request', REQUEST_ID]);
+      assert.equal(result.status, 0, result.stderr);
+      const report = result.json();
+      assert.equal(report.complete, true);
+      assert.equal(report.outcome, 'request');
+      assert.match(report.request.scope, /LATE-ACTION-AFTER-1500: also delete greeting\.txt\.$/);
+      assert.equal(report.request.verification.length, 14);
+      assert.match(report.request.verification[12], /LATE-CHECK-ENTRY-12/);
+      assert.equal(report.request.onApprove.length, 12);
+      assert.match(report.request.onApprove[11], /^LATE-APPROVE-ENTRY-11/);
+      assert.deepEqual(report.request.revision, { head: 'a'.repeat(40), digest: 'b'.repeat(64) });
+      const calls = readCalls(box.callsFile);
+      const read = calls.find(call => call.argv.includes('approval'));
+      assert.deepEqual(read.argv, ['coordinator', 'run', 'approval', RUN_ID, '--request', REQUEST_ID]);
+      assert.equal(read.mutating, false);
+      assert.deepEqual(countMutations(calls), {});
+      assert.ok(calls.every(call => call.mutating === false));
+    });
+
+    check('request: an unknown request or an unreadable run reports incomplete review information and mutates nothing', () => {
+      const box = createSandbox(root, { scenario: 'approval', withSkills: false });
+      const other = helperRun(box, ['request', RUN_ID, '--request', 'apr_other']);
+      assert.equal(other.status, 1);
+      assert.equal(other.json().complete, false);
+      assert.equal(other.json().request, undefined);
+      assert.match(other.json().note, /review information is incomplete/);
+      const usage = helperRun(box, ['request', RUN_ID]);
+      assert.equal(usage.status, 2);
+      const queued = createSandbox(root, { scenario: 'queued', withSkills: false });
+      const none = helperRun(queued, ['request', RUN_ID, '--request', REQUEST_ID]);
+      assert.equal(none.status, 1);
+      assert.equal(none.json().complete, false);
+      assert.deepEqual(countMutations(readCalls(box.callsFile)), {});
+      assert.deepEqual(countMutations(readCalls(queued.callsFile)), {});
+    });
+
+    check('approve: one explicit respond for the displayed request, and nothing else', () => {
+      const box = createSandbox(root, { scenario: 'approval', withSkills: false });
+      const result = helperRun(box, ['respond', RUN_ID, '--request', REQUEST_ID, '--decision', 'approve']);
+      assert.equal(result.status, 0, result.stderr);
+      const report = result.json();
+      assert.equal(report.outcome, 'queued');
+      assert.equal(report.run.wait.state, 'answered');
+      assert.deepEqual(countMutations(readCalls(box.callsFile)), { 'run respond': 1 });
+      const sent = readCalls(box.callsFile).find(call => call.mutating);
+      assert.deepEqual(sent.argv.slice(0, 8), ['coordinator', 'run', 'respond', RUN_ID, '--request', REQUEST_ID, '--decision', 'approve']);
+      assert.equal(sent.argv.length, 8);
+    });
+
+    check('request-changes: the feedback file reaches the coordinator verbatim as one --input= argument', () => {
+      const box = createSandbox(root, { scenario: 'approval', withSkills: false });
+      const result = helperRun(box, ['respond', RUN_ID, '--request', REQUEST_ID, '--decision', 'request-changes', '--feedback-file', 'guidance/change-request.md']);
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.json().outcome, 'queued');
+      assert.deepEqual(countMutations(readCalls(box.callsFile)), { 'run respond': 1 });
+      const sent = readCalls(box.callsFile).find(call => call.mutating);
+      assert.equal(sent.argv[8], `--input=${CHANGES}`);
+      assert.equal(sent.argv.length, 9);
+    });
+
+    check('refusal to invent approval: resume with a pending request, and a respond for another request, send nothing', () => {
+      const box = createSandbox(root, { scenario: 'approval', withSkills: false });
+      const resumed = helperRun(box, ['resume', RUN_ID, '--guidance-file', 'guidance/pick-format.md']);
+      assert.equal(resumed.status, 1);
+      assert.equal(resumed.json().outcome, 'refused');
+      assert.equal(resumed.json().reason, 'approval-pending');
+      const other = helperRun(box, ['respond', RUN_ID, '--request', 'apr_other', '--decision', 'approve']);
+      assert.equal(other.status, 1);
+      assert.equal(other.json().reason, 'request-mismatch');
+      const pause = helperRun(box, ['respond', RUN_ID, '--pause', PAUSE_ID, '--guidance-file', 'guidance/pick-format.md']);
+      assert.equal(pause.status, 1);
+      assert.equal(pause.json().reason, 'approval-pending');
+      assert.deepEqual(countMutations(readCalls(box.callsFile)), {});
+    });
+
+    check('guarded pause: resume sends the guidance as a response to exactly that pause, never as approval', () => {
+      const box = createSandbox(root, { scenario: 'guarded', withSkills: false });
+      const result = helperRun(box, ['resume', RUN_ID, '--guidance-file', 'guidance/pick-format.md']);
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.json().outcome, 'resumed');
+      assert.equal(result.json().via, 'respond');
+      assert.deepEqual(countMutations(readCalls(box.callsFile)), { 'run respond': 1 });
+      const sent = readCalls(box.callsFile).find(call => call.mutating);
+      assert.deepEqual(sent.argv.slice(0, 6), ['coordinator', 'run', 'respond', RUN_ID, '--pause', PAUSE_ID]);
+      assert.equal(sent.argv[6], `--input=${GUIDANCE}`);
+      assert.ok(!sent.argv.includes('--decision') && !sent.argv.includes('--request'));
     });
 
     check('sandbox: skills present only in the with-skills arm; no path outside the sandbox is used by the environment', () => {

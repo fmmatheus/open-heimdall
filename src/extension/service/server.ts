@@ -2,6 +2,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
 import { adapterErrorMessage, CoordinatorAdapterError } from './coordinator.js';
 import type { AdapterErrorKind, CoordinatorAdapter } from './coordinator.js';
+import { actionRoutes } from './actions.js';
 import { directoryRoutes } from './projects.js';
 import { projectionRoutes, reviewRoutes } from './routes.js';
 import type { ReviewRoutesOptions } from './routes.js';
@@ -87,6 +88,7 @@ export function builtInRoutes(options: Pick<ExtensionServerOptions, 'adapter' | 
     },
     ...projectionRoutes({ adapter: options.adapter, now: options.now }),
     ...directoryRoutes({ adapter: options.adapter }),
+    ...actionRoutes({ adapter: options.adapter, now: options.now }),
     ...reviewRoutes({ adapter: options.adapter, now: options.now, loadConfiguration: options.loadConfiguration, configPath: options.configPath }),
   ];
 }
@@ -116,6 +118,10 @@ function statusFor(kind: ErrorKind): number {
   switch (kind) {
     case 'not-found': return 404;
     case 'coordinator-timeout': return 504;
+    case 'stale-card': case 'approval-stale': case 'approval-conflict': case 'approval-pending': case 'pause-stale': case 'pause-not-ready':
+    case 'response-conflict': case 'response-refused': case 'review-required': case 'review-mismatch': return 409;
+    case 'delivery-uncertain': case 'approval-unreadable': return 502;
+    case 'coordinator-unsupported': case 'coordinator-draining': case 'approval-unsupported': return 503;
     case 'coordinator-offline': case 'coordinator-unauthorized': case 'configuration-invalid': case 'coordinator-error':
     case 'coordinator-response-too-large': case 'coordinator-incompatible': return 503;
     default: return 500;

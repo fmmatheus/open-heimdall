@@ -227,6 +227,19 @@ test('built service answers run, change, review and diff requests for a real tem
     assert.ok([404, 405].includes(refused.status), `${method} ${target}: ${refused.status}`);
   }
 
+  // The two owner-response routes answer from the built bundle. This run waits on nothing, so each card is stale: refused
+  // by the service itself, with no write to the coordinator.
+  for (const [target, body] of [
+    [`/runs/${run.id}/approvals/apr_none/decision`, { decision: 'approve', displayedVersion: runBefore.version }],
+    [`/runs/${run.id}/pause-response`, { pauseId: 'pau_none', input: 'go on', displayedVersion: runBefore.version }],
+  ]) {
+    const refused = await call(port, target, { method: 'POST', body: JSON.stringify(body) });
+    responses.push(refused);
+    assert.equal(refused.status, 409, target);
+    assert.equal(refused.json.error.kind, 'stale-card');
+    assert.equal((await call(port, target, { method: 'POST', body: JSON.stringify(body), token: null })).status, 401);
+  }
+
   // No secret ever appears in a response or on the console, and nothing changed.
   for (const response of responses) {
     for (const secret of [key, ownerToken, SERVICE_TOKEN, OMC_MARKER]) assert.equal(response.text.includes(secret), false);

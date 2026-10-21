@@ -124,6 +124,9 @@ export function reportPauseReason(diagnostic: ReportDiagnostic, task: WorkflowTa
       return 'Unfinished work for ' + task.id + ': ' + (ids ? 'gates ' + ids + ' were reported unresolved' : 'evidence was reported unresolved') + '. Resolve the work or the owner decision before resuming.';
     case 'agent_blocked':
       return 'Unfinished work for ' + task.id + ': the agent reported blocked: ' + (detail ? bounded(detail, 2000) : 'no reason given');
+    case 'approval_required':
+      // `detail` is the host-built reason 'Approval required for <taskId>: <question>', already bounded.
+      return bounded(detail || 'Approval required for ' + task.id, 2000);
     case 'identity_mismatch':
       return 'Wrong task or session identity: the reply did not identify ' + task.id + '. Check the child session and branch before resuming.';
     case 'auth_or_quota':

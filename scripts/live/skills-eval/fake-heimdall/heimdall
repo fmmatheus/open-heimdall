@@ -12,7 +12,16 @@
 //   ready     project registered, no run yet; `run submit` creates a queued run
 //   queued    one queued run
 //   progress  one run whose `run show` answers advance per call: queued, preparing, running, then paused
-//   paused    one paused run (capacity released) whose first task has a result; `run resume` queues it again
+//   paused    one paused run (capacity released) whose first task has a result; `run resume` queues it again. The record
+//             has no `wait` field, like a coordinator that does not report waits, so the helper's guided resume refuses.
+//   guarded   the same paused run on a coordinator that reports waits: a generic wait with a pause ID. `run respond --pause`
+//             queues it again; `run resume` is still accepted as the unguarded legacy operation.
+//   approval  a paused run with a pending typed approval request. `run respond --request` records the decision and queues
+//             the run. `run resume` is refused the way the real coordinator refuses it, but is still recorded as an attempt.
+//   approval-clipped  the same, but the request is longer than a compact run view shows: the wait cuts the scope and
+//             lists and flags them as clipped, while the read-only `run approval` returns the complete request.
+//
+// `run approval RUN_ID --request ID` only reads: it is not in MUTATING and changes no state.
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -22,7 +31,7 @@ const statePath = path.join(dir, 'state.json');
 const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
 const save = () => fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
 
-const MUTATING = new Set(['project add', 'run submit', 'run resume', 'run reconcile', 'start', 'stop']);
+const MUTATING = new Set(['project add', 'run submit', 'run resume', 'run respond', 'run reconcile', 'start', 'stop']);
 const argv = process.argv.slice(2);
 
 const HELP = `Global coordinator (explicit opt-in)
@@ -37,6 +46,10 @@ Usage:
   heimdall coordinator run list
   heimdall coordinator run show RUN_ID
   heimdall coordinator run resume RUN_ID --input RESOLUTION
+  heimdall coordinator run approval RUN_ID --request REQUEST_ID
+  heimdall coordinator run respond RUN_ID --request REQUEST_ID --decision approve
+  heimdall coordinator run respond RUN_ID --request REQUEST_ID --decision request-changes --input FEEDBACK
+  heimdall coordinator run respond RUN_ID --pause PAUSE_ID --input GUIDANCE
   heimdall coordinator run reconcile RUN_ID
   heimdall coordinator events [--after SEQUENCE]
   heimdall coordinator status [--json] [--coordinator-config FILE]
@@ -68,12 +81,47 @@ const task = [{ id: 'T1', title: 'Add the greeting file' }, { id: 'T2', title: '
 const checkpoint = (index, results) => ({
   phase: 'executor', index, tasks: task, results: results.map(id => ({ taskId: id, status: 'completed' })), status: 'running',
 });
+const REQUEST_ID = 'apr_eval_0001';
+const PAUSE_ID = 'pau_0123456789abcdef0123456789abcdef';
+const REVISION = { head: 'a'.repeat(40), digest: 'b'.repeat(64) };
+const clippedScenario = state.scenario === 'approval-clipped';
+const approvalScenario = state.scenario === 'approval' || clippedScenario;
+// The complete request. In the clipped scenario its scope has a late action beyond 1,500 characters and a list has more than
+// ten entries, so the compact wait cuts them and only `run approval` shows them.
+const FULL = {
+  question: 'Create format.txt with the json format?',
+  scope: clippedScenario
+    ? `Only format.txt in the repository root. ${'Nothing else is touched. '.repeat(70)}LATE-ACTION-AFTER-1500: also delete greeting.txt.`
+    : 'Only format.txt in the repository root.',
+  completedWork: 'greeting.txt is committed.',
+  verification: clippedScenario ? Array.from({ length: 14 }, (_, index) => `check-${index}: passed${index === 12 ? ' LATE-CHECK-ENTRY-12' : ''}`) : ['git status is clean'],
+  artifacts: ['format.txt'],
+  onApprove: clippedScenario ? Array.from({ length: 12 }, (_, index) => (index === 11 ? 'LATE-APPROVE-ENTRY-11: delete greeting.txt' : `approve-step-${index}`)) : ['create and commit format.txt'],
+  onRequestChanges: ['revise the plan and ask again'],
+};
+const COMPACT_TEXT = 1500;
+const COMPACT_LIST = 10;
+const compactWait = () => ({
+  question: FULL.question,
+  scope: FULL.scope.slice(0, COMPACT_TEXT),
+  completedWork: FULL.completedWork,
+  verification: FULL.verification.slice(0, COMPACT_LIST),
+  artifacts: FULL.artifacts,
+  onApprove: FULL.onApprove.slice(0, COMPACT_LIST),
+  onRequestChanges: FULL.onRequestChanges,
+  clipped: clippedScenario ? { scope: true, verification: true, onApprove: true } : {},
+});
+const approvalWait = (overrides = {}) => ({
+  kind: 'approval', requestId: REQUEST_ID, state: 'pending', continuation: 'none', progress: 'none', phase: 'executor', taskIndex: 1, taskId: 'T2', taskTitle: 'Choose the output format',
+  attemptId: 'attempt_eval_1', ...compactWait(), revision: REVISION, response: null, createdAt: 1, ...overrides,
+});
 const record = view => ({
   id: state.runId, projectId: project.id, feature: state.feature ?? '(synthetic feature text)', baseCommit: state.baseCommit,
   worktreePath: state.worktreePath, branch: `heimdall/run/${state.runId}`, status: view.status, capacityReserved: view.capacityReserved ?? false,
   version: view.version ?? 1, parentSessionId: 'ses_eval_parent', promptMessageId: 'msg_eval', launchAction: view.launchAction ?? 'start',
   resolution: view.resolution ?? null, checkpoint: view.checkpoint ?? null, reason: view.reason ?? null,
   createdAt: state.createdAt, updatedAt: view.updatedAt ?? state.createdAt, settings: {},
+  ...(view.wait === undefined ? {} : { wait: view.wait }),
 });
 
 function currentRun() {
@@ -93,6 +141,19 @@ function currentRun() {
     case 'paused':
       if (state.resumed) return record({ status: 'queued', launchAction: 'resume', version: 3, resolution: state.resumed, checkpoint: checkpoint(1, ['T1']), updatedAt: state.createdAt + 120000 });
       return record({ status: 'paused', version: 2, reason: 'Task T2 needs an owner choice: plain or json output.', checkpoint: checkpoint(1, ['T1']), updatedAt: state.createdAt + 60000 });
+    case 'guarded':
+      if (state.responded) return record({ status: 'queued', launchAction: 'resume', version: 3, checkpoint: checkpoint(1, ['T1']), updatedAt: state.createdAt + 120000, wait: null });
+      return record({
+        status: 'paused', version: 2, reason: 'Task T2 needs an owner choice: plain or json output.', checkpoint: checkpoint(1, ['T1']), updatedAt: state.createdAt + 60000,
+        wait: { kind: 'generic', pauseId: PAUSE_ID, reason: 'Task T2 needs an owner choice: plain or json output.', reasonClipped: false },
+      });
+    case 'approval':
+    case 'approval-clipped':
+      if (state.responded) {
+        const answered = approvalWait({ state: 'answered', continuation: 'queued', progress: 'queued', response: { decision: state.responded.decision, feedback: state.responded.feedback ?? null, answeredAt: 2 } });
+        return record({ status: 'queued', launchAction: 'resume', version: 3, checkpoint: checkpoint(1, ['T1']), updatedAt: state.createdAt + 120000, wait: answered });
+      }
+      return record({ status: 'paused', version: 2, reason: 'Approval required for T2: Create format.txt with the json format?', checkpoint: checkpoint(1, ['T1']), updatedAt: state.createdAt + 60000, wait: approvalWait() });
     default: return null;
   }
 }
@@ -121,6 +182,20 @@ switch (key) {
     print(run);
     break;
   }
+  case 'run approval': {
+    // Read-only: the complete request, as the real command prints it (the view's own fields, nothing clipped).
+    const run = currentRun();
+    if (!run || subcommand[2] !== state.runId) fail('Run not found');
+    const requestId = valueOf('--request');
+    if (requestId === undefined) fail('run approval requires --request REQUEST_ID');
+    if (!approvalScenario || requestId !== REQUEST_ID) fail(`The coordinator has no approval request ${requestId} for run ${state.runId}.`);
+    const answered = state.responded ? { decision: state.responded.decision, feedback: state.responded.feedback ?? null, answeredAt: 2 } : null;
+    print({
+      requestId: REQUEST_ID, runId: state.runId, state: answered ? 'answered' : 'pending', continuation: answered ? 'queued' : 'none', progress: answered ? 'queued' : 'none',
+      taskId: 'T2', taskIndex: 1, attemptId: 'attempt_eval_1', revision: REVISION, ...FULL, response: answered, createdAt: 1,
+    });
+    break;
+  }
   case 'run submit': {
     if (state.scenario !== 'ready') fail('Run submission is not available in this scenario');
     if (subcommand[2] !== project.id) fail('Project not found');
@@ -135,12 +210,45 @@ switch (key) {
   case 'run resume': {
     const run = currentRun();
     if (!run || subcommand[2] !== state.runId) fail('Run not found');
+    if (approvalScenario && !state.responded) fail('An approval request is waiting for an owner decision; answer it with the approval decision operation instead of resuming');
+    if (approvalScenario) fail('An owner decision is recorded and its continuation has not been consumed; it continues automatically and cannot be replaced by a generic resume');
     if (run.status !== 'paused' || run.capacityReserved) fail('Only a confirmed idle paused run may be resumed');
     const input = valueOf('--input');
     if (!input) fail('--input requires a value');
     state.resumed = input;
+    if (state.scenario === 'guarded') state.responded = { input };
     save();
     print(currentRun());
+    break;
+  }
+  case 'run respond': {
+    const run = currentRun();
+    if (!run || subcommand[2] !== state.runId) fail('Run not found');
+    const optionValue = name => { const entry = subcommand.slice(3).find(word => word === name || word.startsWith(`${name}=`)); if (entry === undefined) return undefined; return entry.includes('=') ? entry.slice(name.length + 1) : subcommand[subcommand.indexOf(entry) + 1]; };
+    const request = optionValue('--request');
+    const pause = optionValue('--pause');
+    const decision = optionValue('--decision');
+    const input = optionValue('--input');
+    if ((request === undefined) === (pause === undefined)) fail('run respond requires exactly one of --request REQUEST_ID or --pause PAUSE_ID');
+    const refuse = (status, code, message) => fail(`The coordinator refused the response (${status} ${code}): ${message}. Nothing was recorded.`);
+    const ack = fields => ({ runId: state.runId, ...fields, recordedAt: 1760000000000, retried: false, continuation: 'queued', run: { status: 'queued', version: 3 } });
+    if (approvalScenario) {
+      if (request === undefined) refuse(409, 'approval-pending', 'An approval request is waiting for an owner decision; answer it with the approval decision operation instead of resuming');
+      if (state.responded) refuse(409, 'approval-conflict', 'This request was already answered');
+      if (request !== REQUEST_ID) refuse(404, 'approval-not-found', 'Approval request not found');
+      if (decision !== 'approve' && decision !== 'request-changes') fail('--decision must be approve or request-changes');
+      if (decision === 'request-changes' && !input?.trim()) fail('--decision request-changes requires --input FEEDBACK');
+      state.responded = { decision, feedback: decision === 'request-changes' ? input : null };
+      save();
+      print(ack({ requestId: REQUEST_ID, decision }));
+    } else if (state.scenario === 'guarded') {
+      if (pause === undefined) refuse(404, 'approval-not-found', 'Approval request not found');
+      if (pause !== PAUSE_ID) refuse(409, 'pause-stale', 'This is not the current pause of the run');
+      if (!input?.trim()) fail('--pause requires --input GUIDANCE');
+      state.responded = { input };
+      save();
+      print(ack({ pauseId: PAUSE_ID }));
+    } else fail('The coordinator at the fake socket does not support this response operation (likely an older version). Nothing was sent to resume the run; Heimdall does not fall back to the unguarded "run resume".');
     break;
   }
   default:

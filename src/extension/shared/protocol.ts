@@ -195,7 +195,112 @@ export interface SessionsView {
   completed: SessionRef[];
 }
 
+/**
+ * Limits of the approval and response controls. The coordinator's own limits are the same: feedback and guidance are
+ * accepted up to `input` characters, and the wait projection it returns is already clipped to `text` / `entry` / `entries`.
+ */
+export const APPROVAL_LIMITS = {
+  /** Longest feedback or guidance, in characters. */
+  input: 8000,
+  text: 1500,
+  entry: 400,
+  entries: 10,
+  /** Largest accepted body of the two response routes, in bytes (8000 characters can be six bytes each once escaped). */
+  bodyBytes: 64 * 1024,
+} as const;
+
+/**
+ * Limits of a complete approval request (`GET /runs/:id/approvals/:requestId`). They equal the coordinator's canonical
+ * request limits, so a legal request is never shortened or refused; a test pins them to the contract.
+ */
+export const APPROVAL_FULL_LIMITS = {
+  /** Longest question, scope, completed work and list entry, in characters. */
+  text: 4000,
+  /** Most entries of a list. */
+  entries: 20,
+  /** Largest request content, in bytes of JSON. */
+  payloadBytes: 32 * 1024,
+  /** Longest recorded feedback, in characters. */
+  feedback: 8000,
+} as const;
+
+export type ApprovalState = 'pending' | 'answered' | 'superseded';
+export type ApprovalContinuation = 'none' | 'pending' | 'queued' | 'consumed' | 'superseded';
+export type ApprovalProgress = 'none' | 'recorded' | 'waiting-for-idle' | 'queued' | 'executing' | 'consumed' | 'superseded';
+export type ApprovalDecisionKind = 'approve' | 'request-changes';
+
+/** What a paused run waits for on a typed approval request. All text is already bounded and cleaned by the service. */
+export interface ApprovalWaitView {
+  kind: 'approval';
+  requestId: string;
+  state: ApprovalState;
+  continuation: ApprovalContinuation;
+  progress: ApprovalProgress;
+  taskId: string;
+  taskTitle: string | null;
+  question: string;
+  scope: string;
+  completedWork: string;
+  verification: string[];
+  artifacts: string[];
+  /** What the agent will do after an approval; the owner supplies decisions, never implementation steps. */
+  onApprove: string[];
+  onRequestChanges: string[];
+  /** The reviewed revision, shortened: commit and content digest. */
+  revision: { head: string; digest: string };
+  response: { decision: ApprovalDecisionKind; feedback: string | null; answeredAt: number } | null;
+  createdAt: number;
+  /** Any text or list of the request was shortened. */
+  clipped: boolean;
+}
+
+/**
+ * One approval request with all of its recorded content, in order and within `APPROVAL_FULL_LIMITS`. Text and data only:
+ * no acknowledgement internals, keys, capabilities, checkpoints or raw error text.
+ */
+export interface ApprovalRequestView {
+  requestId: string;
+  runId: string;
+  state: ApprovalState;
+  continuation: ApprovalContinuation;
+  progress: ApprovalProgress;
+  taskId: string;
+  taskIndex: number;
+  attemptId: string;
+  /** The reviewed revision: full commit and content digest. */
+  revision: { head: string; digest: string };
+  question: string;
+  scope: string;
+  completedWork: string;
+  verification: string[];
+  artifacts: string[];
+  onApprove: string[];
+  onRequestChanges: string[];
+  response: { decision: ApprovalDecisionKind; feedback: string | null; answeredAt: number } | null;
+  createdAt: number;
+}
+
+/** Answer of `GET /runs/:id/approvals/:requestId`. */
+export interface ApprovalRequestResponse {
+  request: ApprovalRequestView;
+  fetchedAt: string;
+}
+
+/** A paused run that waits for owner guidance without a typed request. */
+export interface GenericWaitView {
+  kind: 'generic';
+  pauseId: string;
+  reason: string;
+  reasonClipped: boolean;
+}
+
+export type WaitView = ApprovalWaitView | GenericWaitView;
+
 export interface RunDetail extends RunSummary {
+  /** The coordinator's version of the run; a response names the version its card was drawn from. */
+  version: number;
+  /** The bounded approval request or generic pause the run waits on; null when it waits on nothing. */
+  wait: WaitView | null;
   blocker: Blocker | null;
   /** Null when the checkpoint has no report-recovery record. */
   report: ReportView | null;
@@ -343,6 +448,21 @@ export interface ReviewFileResponse {
   text: string;
   fetchedAt: string;
 }
+
+/** The coordinator's acknowledgement of a recorded response, reduced to what the panel shows. */
+export interface ResponseAck {
+  runId: string;
+  recordedAt: number;
+  /** True when an identical earlier response was found and nothing new was recorded. */
+  retried: boolean;
+  /** `queued` means the continuation is waiting, not that the agent is running. */
+  continuation: ApprovalContinuation | 'queued';
+  run: { status: WireRunStatus; version: number };
+}
+export interface ApprovalDecisionAck extends ResponseAck { requestId: string; decision: ApprovalDecisionKind }
+export interface PauseResponseAck extends ResponseAck { pauseId: string }
+export interface ApprovalDecisionResponse { ack: ApprovalDecisionAck; fetchedAt: string }
+export interface PauseResponseResponse { ack: PauseResponseAck; fetchedAt: string }
 
 export interface ErrorBody { error: { kind: string; message: string } }
 

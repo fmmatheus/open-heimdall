@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import http from 'node:http';
+import { DatabaseSync } from 'node:sqlite';
 import { createCoordinatorClient } from '../dist/coordinator/client.js';
 import { startCoordinatorService, readCoordinatorToken } from '../dist/coordinator/service.js';
 import { RUN_LIST_MAX_BYTES, RUN_LIST_PAGE_SIZE } from '../dist/coordinator/run-list.js';
@@ -281,4 +282,71 @@ test('run-list queries reject invalid cursors, invalid limits and non-administra
   assert.deepEqual(empty, { runs: [], total: 0, nextCursor: null, through: 0 });
   assert.deepEqual(snapshot(f.store), before);
   assert.equal(f.executorCalls(), 0);
+});
+
+test('list entries and run details carry the same bounded wait summary and the same pause identity', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  const project = await f.registerProject('project');
+  const long = 'Blocked: choose é between the options.\n' + 'é'.repeat(30000) + ' END-OF-BLOCKER';
+  const specimens = {
+    short: 'Need the owner to pick the database',
+    long,
+    empty: undefined,
+    quotes: 'Line one\n"quoted" and --option-like text',
+  };
+  for (const [name, reason] of Object.entries(specimens)) {
+    startSavedRun(f, project, `paused-${name}`, { status: 'paused', state: { status: 'paused', ...(reason === undefined ? {} : { reason }) } });
+  }
+  startSavedRun(f, project, 'running-run', { status: 'running' });
+  startSavedRun(f, project, 'done-run', { status: 'succeeded', state: { status: 'completed' } });
+  // A paused run whose checkpoint is not a paused checkpoint is not offered a guarded response.
+  startSavedRun(f, project, 'odd-run', { status: 'paused', state: { status: 'running' } });
+
+  const page = await f.client.request('GET', '/run-list');
+  const byId = Object.fromEntries(page.runs.map(run => [run.id, run]));
+  const detail = Object.fromEntries((await f.client.request('GET', '/runs')).map(run => [run.id, run]));
+  for (const name of Object.keys(specimens)) {
+    const entry = byId[`paused-${name}`].wait;
+    assert.equal(entry.kind, 'generic', name);
+    assert.match(entry.pauseId, /^pau_[0-9a-f]{32}$/);
+    assert.deepEqual(entry, detail[`paused-${name}`].wait, `${name}: the list entry and the run detail agree exactly`);
+    assert.ok(entry.reason.length <= 1500, name);
+  }
+  assert.equal(byId['paused-short'].wait.reason, specimens.short);
+  assert.equal(byId['paused-short'].wait.reasonClipped, false);
+  assert.equal(byId['paused-long'].wait.reasonClipped, true);
+  assert.equal(byId['paused-long'].wait.reason.length, 1500);
+  assert.ok(!JSON.stringify(page).includes('END-OF-BLOCKER'));
+  assert.equal(byId['paused-empty'].wait.reason, '');
+  assert.equal(byId['paused-quotes'].wait.reason, specimens.quotes);
+  const identities = new Set(['short', 'long', 'empty', 'quotes'].map(name => byId[`paused-${name}`].wait.pauseId));
+  assert.equal(identities.size, 4, 'each pause has its own identity');
+  for (const id of ['running-run', 'done-run', 'odd-run']) {
+    assert.equal(byId[id].wait, null, id);
+    assert.equal(detail[id].wait, null, id);
+  }
+  // The identity is stable between reads and changes when the blocker changes.
+  const again = await f.client.request('GET', '/run-list');
+  assert.equal(again.runs.find(run => run.id === 'paused-long').wait.pauseId, byId['paused-long'].wait.pauseId);
+});
+
+test('a run list entry summarises a typed approval request by identity and state, and the page stays bounded', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  const project = await f.registerProject('project');
+  startSavedRun(f, project, 'asking', { status: 'paused', state: { status: 'paused', reason: 'Approval required for T2: ship?' } });
+  const db = new DatabaseSync(path.join(f.configuration.stateDirectory, 'coordinator.sqlite'));
+  t.after(() => { if (db.isOpen) db.close(); });
+  const insert = (requestId, state, continuation) => db.prepare(`INSERT INTO approval_requests(run_id, request_id, phase, task_index, task_id, attempt_id, receipt_digest, request_json, revision_json, state, decision, feedback, response_json, answered_at, continuation, created_at)
+    VALUES ('asking', ?, 'executor', 1, 'T2', ?, 'digest', '{"question":"q","scope":"s","completedWork":"w","verification":["v"],"artifacts":["a"],"onApprove":["x"],"onRequestChanges":["y"]}', '{"head":"h","digest":"d"}', ?, ?, ?, ?, ?, ?, 1)`)
+    .run(requestId, 'attempt_' + requestId, state, state === 'answered' ? 'approve' : null, null, state === 'answered' ? '{}' : null, state === 'answered' ? 1 : null, continuation);
+  insert('apr_one', 'pending', 'none');
+  const page = await f.client.request('GET', '/run-list');
+  assert.deepEqual(page.runs[0].wait, { kind: 'approval', requestId: 'apr_one', state: 'pending', continuation: 'none', taskId: 'T2' });
+  assert.deepEqual((await f.client.request('GET', '/runs/asking')).wait.requestId, 'apr_one');
+  // A consumed decision is history: the run's wait falls back to what it is now waiting for.
+  db.prepare("UPDATE approval_requests SET state = 'answered', decision = 'approve', response_json = '{}', answered_at = 2, continuation = 'consumed' WHERE request_id = 'apr_one'").run();
+  const history = await f.client.request('GET', '/run-list');
+  assert.equal(history.runs[0].wait.kind, 'generic');
+  assert.equal((await f.client.request('GET', '/runs/asking')).wait.kind, 'generic');
+  assert.ok(Buffer.byteLength(JSON.stringify(history)) <= RUN_LIST_MAX_BYTES);
 });
